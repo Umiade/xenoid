@@ -1,0 +1,29 @@
+{
+  "schema": "dev.xenoid.hide/v1",
+  "hideRoot": true,
+  "hideFrida": true,
+  "hideHookFrameworks": true,
+  "propertyOverrides": {
+    "ro.debuggable": "0",
+    "ro.secure": "1",
+    "ro.build.tags": "release-keys",
+    "ro.adb.secure": "1",
+    "service.adb.tcp.port": "-1",
+    "init.svc.adbd": "stopped"
+  },
+  "packageDenylist": [
+    "com.topjohnwu.magisk",
+    "org.lsposed.manager",
+    "re.frida.server"
+  ],
+  "processNameDenylist": [
+    "frida-server",
+    "magiskd",
+    "zygisk",
+    "adbd"
+  ],
+  "hideAdb": true,
+  "tcpPortDenylist": [
+    "5555"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "backend": "linux-docker",
+  "image": "redroid/redroid:13.0.0_64only-latest",
+  "runtime_image_tag": "xenoid/redroid:local",
+  "auto_build_runtime_image": true,
+  "container_name": "xenoid-android",
+  "adb_port": 5555,
+  "daemon_port": 18765,
+  "data_dir": "~/.xenoid",
+  "android_data_volume": "xenoid-data",
+  "extra_docker_args": [],
+  "docker_context": "",
+  "android_adb_port": 62111
+}

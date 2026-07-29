@@ -1,0 +1,93 @@
+{
+  "battery": {
+    "level": 83,
+    "plugged": 0,
+    "scale": 100,
+    "temperature": 310,
+    "voltage": 4100
+  },
+  "build": {
+    "brand": "google",
+    "device": "raven",
+    "fingerprint": "google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys",
+    "manufacturer": "Google",
+    "model": "Pixel 6 Pro",
+    "product": "raven"
+  },
+  "display": {
+    "brightness": 512
+  },
+  "display_brightness": 512,
+  "display_height": 1920,
+  "display_width": 1080,
+  "ids": {
+    "android_id": "REGENERATE",
+    "boot_id": "REGENERATE",
+    "serial": "3A4940E5EDFA"
+  },
+  "input": {
+    "height": 1920,
+    "input_bustype": 24,
+    "input_name": "sec_touchscreen",
+    "input_product": 26720,
+    "input_vendor": 1256,
+    "input_version": 256,
+    "pressure_max": 255,
+    "tracking_max": 65535,
+    "width": 1080
+  },
+  "input_bustype": 24,
+  "input_name": "sec_touchscreen",
+  "input_product": 26720,
+  "input_vendor": 1256,
+  "input_version": 256,
+  "locale": "en-US",
+  "network": {
+    "ifname": "eth0",
+    "ip": "192.168.1.100/24",
+    "mtu": 1500
+  },
+  "pressure_max": 255,
+  "schema": "dev.xenoid.fingerprint/v1",
+  "thermal": {
+    "zone0": {
+      "temp": 32000,
+      "type": "skin"
+    },
+    "zone1": {
+      "temp": 31000,
+      "type": "battery"
+    },
+    "zone2": {
+      "temp": 36000,
+      "type": "cpu-0"
+    },
+    "zone3": {
+      "temp": 35500,
+      "type": "cpu-1"
+    },
+    "zone4": {
+      "temp": 34000,
+      "type": "gpu"
+    }
+  },
+  "thermal_zone0_temp": 32000,
+  "thermal_zone0_type": "skin",
+  "thermal_zone1_temp": 31000,
+  "thermal_zone1_type": "battery",
+  "thermal_zone2_temp": 36000,
+  "thermal_zone2_type": "cpu-0",
+  "thermal_zone3_temp": 35500,
+  "thermal_zone3_type": "cpu-1",
+  "thermal_zone4_temp": 34000,
+  "thermal_zone4_type": "gpu",
+  "timezone": "America/Los_Angeles",
+  "tracking_max": 65535,
+  "usb": {
+    "manufacturer": "Google",
+    "product": "Pixel 6 Pro",
+    "product_id": "0x4ee7",
+    "serial": "3A4940E5EDFA",
+    "vendor_id": "0x18d1"
+  }
+}

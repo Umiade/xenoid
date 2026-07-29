@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Build output / packaged releases
+build/
+dist/
+
+# Runtime state (config, OTA staging, frida-server download, device dumps)
+.xenoid/
+
+node_modules/
+.DS_Store
+
+# Android daemon build
+daemon/.gradle/
+daemon/build/
+daemon/app/build/
+
+# Regenerable native binaries (built by scripts/build-native-*.sh; sources are .c/.h/Makefile)
+*.so
+native/xenoid-hide/xenoid-prop-area
+native/xenoid-hide/xenoid-prop-area-x86_64
+native/xenoid-hide/xenoid-hide
+native/xenoid-hide/xenoid-hide-x86_64
+native/xenoid-hide/xenoid-overlay
+native/xenoid-hide/xenoid-overlay-x86_64
+native/xenoid-hide/xenoid-overlay-arm64
+native/xenoid-hide/xenoid-ssaid
+native/xenoid-hide/xenoid-ssaid-x86_64
+native/xenoid-input/xenoid-input
+native/xenoid-input/xenoid-input-x86_64
+native/xenoid-profile/xenoid-profile
+native/xenoid-profile/xenoid-profile-x86_64
+native/xenoid-netctl/xenoid-netctl
+native/xenoid-netctl/xenoid-netctl-x86_64
+native/xenoid-rootd/xenoid-rootd-arm64
+native/xenoid-rootd/xenoid-rootd-x86_64
+native/xenoid-kmod/*.ko
+native/xenoid-kmod/*.o
+native/xenoid-kmod/*.mod*
+native/xenoid-kmod/Module.symvers
+native/xenoid-kmod/modules.order
+native/xenoid-kmod/.*.cmd
+
+.doc/
+.tmp/
+
+# Regenerable native runtime binaries
+native/xenoid-pivot/xenoid-pivot
+native/xenoid-camerahal/gen/
+native/xenoid-sensorshal/gen/
+native/xenoid-sensorshal/xenoid-sensorshal
+native/xenoid-camerahal/xenoid-camerahal
+native/xenoid-ebpf/vmlinux.h
+native/xenoid-ebpf/*.o
+native/xenoid-ebpf/*.skel.h
+native/xenoid-ebpf/xenoid-ebpf-loader
+
+# Downloaded frida-server (fetched by `xenoid frida fetch`)
+frida/frida-server
+.frida*
+
+# Local editor/OS noise
+*.swp
+.idea/
+.vscode/

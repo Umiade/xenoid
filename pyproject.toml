@@ -1,0 +1,17 @@
+[project]
+name = "xenoid"
+version = "0.1.0"
+description = "Xenoid Android runtime orchestration for Apple Silicon macOS and Linux ARM"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+xenoid = "xenoid.cli:main"
+xenoid-mcp = "xenoid.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$SELF_DIR/src/xenoid" ]]; then
+  ROOT="$SELF_DIR"
+elif [[ -d "$SELF_DIR/../src/xenoid" ]]; then
+  ROOT="$(cd "$SELF_DIR/.." && pwd)"
+else
+  ROOT="$SELF_DIR"
+fi
+PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m xenoid.mcp_server "$@"
