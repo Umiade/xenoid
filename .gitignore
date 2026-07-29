@@ -47,6 +47,7 @@ native/xenoid-kmod/.*.cmd
 
 .doc/
 .tmp/
+.skills/
 
 # Regenerable native runtime binaries
 native/xenoid-pivot/xenoid-pivot
