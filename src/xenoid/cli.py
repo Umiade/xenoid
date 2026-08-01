@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .backend import RuntimeManager
 from .config import XenoidConfig, load_config, save_config, merge_config
-from .daemon_client import DaemonClient
+from .daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS, DaemonClient
 from .doctor import build_doctor_report
 from .util import json_dumps, read_json_file, write_json_file
 
@@ -117,6 +120,12 @@ def cmd_build_netctl(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_build_gralloc(args: argparse.Namespace) -> int:
+    result = run_script("build-gralloc.sh")
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
 def cmd_verify_release(args: argparse.Namespace) -> int:
     script = project_root() / "scripts" / "verify-release.py"
     proc = subprocess.run([str(script), args.archive], text=True, capture_output=True, cwd=str(project_root()))
@@ -146,7 +155,8 @@ def cmd_build_all(args: argparse.Namespace) -> int:
         ("overlay", [root / "scripts" / "build-native-overlay.sh", "arm64"]),
         ("zygote", [root / "scripts" / "build-native-zygote.sh", "arm64"]),
         ("sensorsHal", [root / "scripts" / "build-sensors-hal.sh", "arm64"]),
-        ("cameraHal", [root / "scripts" / "build-camera-hal.sh", "arm64"]),
+        ("gralloc", [root / "scripts" / "build-gralloc.sh", "arm64"]),
+        ("cameraProvider", [root / "scripts" / "build-camera-hal.sh", "arm64"]),
         ("shimArm64", [root / "scripts" / "build-native-shim.sh", "arm64", "prop"]),
         ("pivot", [root / "scripts" / "build-native-for-arch.sh", "xenoid-pivot", root / "native" / "xenoid-pivot" / "xenoid_pivot.c", root / "native" / "xenoid-pivot" / "xenoid-pivot", "arm64", "static"]),
         ("propArea", [root / "scripts" / "build-native-for-arch.sh", "xenoid-prop-area", root / "native" / "xenoid-hide" / "xenoid_prop_area.c", root / "native" / "xenoid-hide" / "xenoid-prop-area", "arm64"]),
@@ -265,7 +275,9 @@ def daemon_ensured() -> DaemonClient:
 
 
 def cmd_daemon_ensure(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).ensure_daemon()
+    result = RuntimeManager(load_config()).ensure_daemon(
+        readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
+    )
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -303,6 +315,198 @@ def cmd_daemon_start(args: argparse.Namespace) -> int:
     result = {"ok": bool(start.get("ok") and forward.get("ok") and rootd.get("ok")), "start": start, "forward": forward, "rootd": rootd}
     print_json(result)
     return 0 if result["ok"] else 1
+
+_CAMERA_PRIVATE_KEYS = {
+    "bytes",
+    "command",
+    "digest",
+    "path",
+    "sha256",
+    "token",
+    "upload",
+    "uri",
+    "url",
+}
+
+
+def _sanitize_camera_result(value: Any) -> Any:
+    if isinstance(value, dict):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+            private = (
+                normalized in _CAMERA_PRIVATE_KEYS
+                or normalized.endswith(("bytes", "command", "digest", "path", "sha256", "token", "uri", "url"))
+                or normalized.startswith("original")
+                or "decoder" in normalized
+                or "mediabytes" in normalized
+                or "stagingpath" in normalized
+            )
+            if not private:
+                clean[str(key)] = _sanitize_camera_result(item)
+        return clean
+    if isinstance(value, list):
+        return [_sanitize_camera_result(item) for item in value]
+    return value
+
+
+def _emit_camera_result(result: dict[str, Any]) -> int:
+    sanitized = _sanitize_camera_result(result)
+    if not isinstance(sanitized, dict):
+        sanitized = {"ok": False, "error": "invalid camera response"}
+    print_json(sanitized)
+    return 0 if bool(sanitized.get("ok")) else 1
+
+
+def _camera_ready() -> tuple[Optional[RuntimeManager], Optional[DaemonClient]]:
+    try:
+        cfg = load_config()
+        manager = RuntimeManager(cfg)
+        ensured = manager.ensure_daemon(
+            readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
+        )
+        if not ensured.get("ok"):
+            return None, None
+        return manager, DaemonClient(port=cfg.daemon_port)
+    except Exception:
+        return None, None
+
+def _camera_request(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    try:
+        result = call()
+    except Exception:
+        return {"ok": False, "error": "camera request failed"}
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "invalid camera response"}
+    return result
+
+
+def cmd_camera_status(args: argparse.Namespace) -> int:
+    manager, client = _camera_ready()
+    if manager is None or client is None:
+        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+    if not args.check:
+        return _emit_camera_result(_camera_request(client.camera_status))
+
+    try:
+        permission = manager.grant_daemon_camera_permission()
+    except Exception:
+        permission = {"ok": False}
+    if not permission.get("ok"):
+        return _emit_camera_result({"ok": False, "error": "camera permission grant failed"})
+    run_id = secrets.token_hex(16)
+    authorization = _camera_request(lambda: client.camera_self_test_start(run_id))
+    if not authorization.get("ok"):
+        result = dict(authorization)
+        result.setdefault("runId", run_id)
+        result.setdefault("state", "error")
+        result.setdefault("error", "camera self-test authorization failed")
+        return _emit_camera_result(result)
+    try:
+        launch = manager.launch_camera_self_test(run_id)
+    except Exception:
+        launch = {"ok": False}
+    if not launch.get("ok"):
+        return _emit_camera_result({
+            "ok": False,
+            "runId": run_id,
+            "state": "error",
+            "error": "camera self-test launch failed",
+        })
+
+    deadline = time.monotonic() + 90.0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        status = _camera_request(lambda: client.camera_self_test_status(timeout=min(5.0, remaining)))
+        if status.get("runId") == run_id:
+            state = status.get("state")
+            if state == "success":
+                result = dict(status)
+                result["ok"] = bool(status.get("ok"))
+                if not result["ok"]:
+                    result.setdefault("error", "camera self-test failed")
+                return _emit_camera_result(result)
+            if state == "error":
+                result = dict(status)
+                result["ok"] = False
+                result.setdefault("error", "camera self-test failed")
+                return _emit_camera_result(result)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.5, remaining))
+    return _emit_camera_result({
+        "ok": False,
+        "runId": run_id,
+        "state": "error",
+        "error": "camera self-test timed out",
+    })
+
+
+def cmd_camera_set(args: argparse.Namespace) -> int:
+    try:
+        source = Path(args.file).expanduser().resolve(strict=True)
+        source_stat = source.stat()
+    except (OSError, RuntimeError, TypeError):
+        return _emit_camera_result({
+            "ok": False,
+            "error": "camera source must be a nonempty regular file",
+        })
+    if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size <= 0:
+        return _emit_camera_result({
+            "ok": False,
+            "error": "camera source must be a nonempty regular file",
+        })
+
+    manager, client = _camera_ready()
+    if manager is None or client is None:
+        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+
+    staging_path: Optional[str] = None
+    result: dict[str, Any]
+    try:
+        staged = manager.stage_camera_source(source)
+        if not staged.get("ok"):
+            result = {"ok": False, "error": str(staged.get("error") or "camera source upload failed")}
+        else:
+            staging_path = staged.get("stagingPath")
+            size = staged.get("size")
+            digest = staged.get("sha256")
+            if not isinstance(staging_path, str) or not isinstance(size, int) or not isinstance(digest, str):
+                result = {"ok": False, "error": "camera source staging failed"}
+            else:
+                result = _camera_request(lambda: client.camera_source(args.kind, staging_path, size, digest))
+    except Exception:
+        result = {"ok": False, "error": "camera source staging failed"}
+    finally:
+        if staging_path is not None:
+            try:
+                manager.cleanup_camera_staging(staging_path)
+            except Exception:
+                pass
+    return _emit_camera_result(result)
+
+
+def cmd_camera_mode(args: argparse.Namespace) -> int:
+    _, client = _camera_ready()
+    if client is None:
+        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+    return _emit_camera_result(_camera_request(lambda: client.camera_settings(args.mode)))
+
+
+def cmd_camera_clear(args: argparse.Namespace) -> int:
+    _, client = _camera_ready()
+    if client is None:
+        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+    return _emit_camera_result(_camera_request(lambda: client.camera_clear(args.kind)))
+
+
+def cmd_camera_apply(args: argparse.Namespace) -> int:
+    _, client = _camera_ready()
+    if client is None:
+        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+    return _emit_camera_result(_camera_request(client.camera_apply))
 
 
 def cmd_root_status(args: argparse.Namespace) -> int:
@@ -702,6 +906,8 @@ def build_parser() -> argparse.ArgumentParser:
     bp.set_defaults(func=cmd_build_profile)
     bn = bsub.add_parser("netctl")
     bn.set_defaults(func=cmd_build_netctl)
+    bg = bsub.add_parser("gralloc")
+    bg.set_defaults(func=cmd_build_gralloc)
     ba = bsub.add_parser("all")
     ba.set_defaults(func=cmd_build_all)
 
@@ -776,6 +982,24 @@ def build_parser() -> argparse.ArgumentParser:
     ds.set_defaults(func=cmd_daemon_start)
     de = dsub.add_parser("ensure")
     de.set_defaults(func=cmd_daemon_ensure)
+
+    s = sub.add_parser("camera", help="configure Android-owned camera media")
+    camera = s.add_subparsers(required=True)
+    camera_status = camera.add_parser("status", help="show camera source and activation status")
+    camera_status.add_argument("--check", action="store_true", help="run a fresh ordinary-app capture self-test")
+    camera_status.set_defaults(func=cmd_camera_status)
+    camera_set = camera.add_parser("set", help="validate, persist, and publish a camera source")
+    camera_set.add_argument("kind", choices=["photo", "video"])
+    camera_set.add_argument("file", metavar="FILE")
+    camera_set.set_defaults(func=cmd_camera_set)
+    camera_mode = camera.add_parser("mode", help="set camera rendering mode")
+    camera_mode.add_argument("mode", choices=["naturalized", "faithful"])
+    camera_mode.set_defaults(func=cmd_camera_mode)
+    camera_clear = camera.add_parser("clear", help="clear configured camera sources")
+    camera_clear.add_argument("kind", choices=["photo", "video", "all"])
+    camera_clear.set_defaults(func=cmd_camera_clear)
+    camera_apply = camera.add_parser("apply", help="reconcile persisted camera state")
+    camera_apply.set_defaults(func=cmd_camera_apply)
 
     s = sub.add_parser("root", help="root helper status and commands")
     root = s.add_subparsers(required=True)

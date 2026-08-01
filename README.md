@@ -132,6 +132,26 @@ Root access is provided through the daemon and token-gated rootd; users do not n
 
 The production rootfs contains no persistent application-visible `su` path. The CLI and MCP share the same privilege boundary.
 
+## Camera media
+
+Xenoid's Android settings screen and host CLI can configure a photo, a video, or both as the source for the two ordinary Camera2 devices:
+
+```bash
+./xenoid camera status
+./xenoid camera set photo FILE
+./xenoid camera set video FILE
+./xenoid camera mode naturalized
+./xenoid camera mode faithful
+./xenoid camera clear photo
+./xenoid camera clear all
+./xenoid camera apply
+./xenoid camera status --check
+```
+
+`naturalized` adds subtle frame-to-frame sensor variation; `faithful` preserves decoded source pixels apart from required scaling and camera transforms. Imports are validated and copied into private Android storage: the original host path and filename are not retained or returned. Saved camera state survives daemon and runtime restarts, while changes take effect on the next camera open.
+
+`up` republishes the saved source state and completes an ordinary-app YUV/JPEG capture through both cameras. A source-free runtime is valid and uses the built-in fallback scene. The runtime also publishes coherent framework camcorder profiles, so the stock Android Camera app can open, capture photos, and record H.264 video without a configured source.
+
 ## Frida
 
 Frida is an explicit analysis capability, not part of production startup. `up` stops and removes stale frida-server processes and temporary payloads.

@@ -61,6 +61,222 @@ fi
 if $XENOID_BIN input tap 1 1 >/tmp/xenoid-smoke-input.out 2>&1 && ./scripts/json-ok.py </tmp/xenoid-smoke-input.out; then add input_tap true "$(cat /tmp/xenoid-smoke-input.out)"; else add input_tap false "$(cat /tmp/xenoid-smoke-input.out)"; fi
 if $XENOID_BIN device collect --out /tmp/xenoid-runtime-fingerprint.json >/tmp/xenoid-smoke-device.out 2>&1 && ./scripts/json-ok.py </tmp/xenoid-smoke-device.out; then add device_collect true "$(cat /tmp/xenoid-smoke-device.out)"; else add device_collect false "$(cat /tmp/xenoid-smoke-device.out)"; fi
 
+# Camera2 static metadata must describe the same ordered output tuples across
+# stream configurations, minimum frame durations, and stall durations.
+if "$ADB_BIN" -s "$ADB_TARGET" shell dumpsys media.camera >/tmp/xenoid-smoke-camera-metadata.out 2>&1; then
+  if python3 - <<'PY' >/tmp/xenoid-smoke-camera-metadata-summary.out 2>&1
+import json
+import re
+import sys
+
+raw = open("/tmp/xenoid-smoke-camera-metadata.out").read()
+sizes = [
+    (1920, 1080),
+    (1440, 1080),
+    (1280, 960),
+    (1280, 720),
+    (1024, 768),
+    (800, 600),
+    (640, 480),
+    (320, 240),
+]
+formats = [33, 35, 34]
+blob_stalls = [
+    100000000,
+    90000000,
+    80000000,
+    70000000,
+    60000000,
+    50000000,
+    30000000,
+    15000000,
+]
+
+try:
+    marker_pattern = re.compile(
+        r"== Camera HAL device device@1\.0/internal/(\d+) "
+        r"\(v3\.0\) static information: =="
+    )
+    markers = list(marker_pattern.finditer(raw))
+    if len(markers) != 2:
+        raise ValueError(f"expected 2 static camera sections, found {len(markers)}")
+
+    sections = {}
+    for index, marker in enumerate(markers):
+        if index + 1 < len(markers):
+            end = markers[index + 1].start()
+        else:
+            end = raw.find("== Vendor tags:", marker.end())
+            if end < 0:
+                raise ValueError("camera metadata terminator is missing")
+        sections[marker.group(1)] = raw[marker.end():end]
+    if set(sections) != {"0", "1"}:
+        raise ValueError(f"unexpected camera IDs: {sorted(sections)}")
+
+    def tag_rows(section, name):
+        match = re.search(
+            re.escape(name)
+            + r" \([^\n]+\): [^\n]+\n((?:        \[[^\n]+\]\n)+)",
+            section,
+        )
+        if not match:
+            raise ValueError(f"missing {name}")
+        return [
+            row.split()
+            for row in re.findall(r"\[([^\]]+)\]", match.group(1))
+        ]
+
+    def stream_tuples(section):
+        rows = tag_rows(
+            section, "android.scaler.availableStreamConfigurations"
+        )
+        if any(len(row) != 4 for row in rows):
+            raise ValueError("malformed stream configuration tuple")
+        return [
+            (int(fmt), int(width), int(height), direction)
+            for fmt, width, height, direction in rows
+        ]
+
+    def duration_tuples(section, name):
+        values = [token for row in tag_rows(section, name) for token in row]
+        if len(values) % 4:
+            raise ValueError(f"{name} has {len(values)} scalar values")
+        return [
+            tuple(map(int, values[offset:offset + 4]))
+            for offset in range(0, len(values), 4)
+        ]
+
+    expected_keys = [
+        (fmt, width, height)
+        for fmt in formats
+        for width, height in sizes
+    ]
+    expected_stalls = [
+        stall if fmt == 33 else 0
+        for fmt in formats
+        for stall in blob_stalls
+    ]
+    camera_summary = {}
+    for camera_id, expected_facing in (("0", "Back"), ("1", "Front")):
+        section = sections[camera_id]
+        facing_match = re.search(r"\n    Facing: (\w+)", section)
+        if not facing_match:
+            raise ValueError(f"camera {camera_id} facing is missing")
+        facing = facing_match.group(1)
+        stream = stream_tuples(section)
+        minimum = duration_tuples(
+            section, "android.scaler.availableMinFrameDurations"
+        )
+        stall = duration_tuples(
+            section, "android.scaler.availableStallDurations"
+        )
+        stream_keys = [(fmt, width, height) for fmt, width, height, _ in stream]
+        minimum_keys = [(fmt, width, height) for fmt, width, height, _ in minimum]
+        stall_keys = [(fmt, width, height) for fmt, width, height, _ in stall]
+
+        if facing != expected_facing:
+            raise ValueError(
+                f"camera {camera_id} facing {facing}, expected {expected_facing}"
+            )
+        if stream_keys != expected_keys:
+            raise ValueError(f"camera {camera_id} stream tuples differ")
+        if minimum_keys != expected_keys or stall_keys != expected_keys:
+            raise ValueError(f"camera {camera_id} duration keys differ")
+        if len(set(stream_keys)) != len(expected_keys):
+            raise ValueError(f"camera {camera_id} stream tuples are duplicated")
+        if any(direction != "OUTPUT" for *_, direction in stream):
+            raise ValueError(f"camera {camera_id} contains a non-output tuple")
+        if any(duration != 33333333 for *_, duration in minimum):
+            raise ValueError(f"camera {camera_id} minimum duration differs")
+        if [duration for *_, duration in stall] != expected_stalls:
+            raise ValueError(f"camera {camera_id} stall durations differ")
+
+        camera_summary[camera_id] = {
+            "facing": facing,
+            "streamTupleCount": len(stream),
+        }
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "cameras": camera_summary,
+                "formats": formats,
+                "sizes": [f"{width}x{height}" for width, height in sizes],
+                "minFrameDurationNs": 33333333,
+                "blobStallDurationsNs": blob_stalls,
+            },
+            separators=(",", ":"),
+        )
+    )
+except Exception as error:
+    print(json.dumps({"ok": False, "error": str(error)}, separators=(",", ":")))
+    sys.exit(1)
+PY
+  then
+    add camera_metadata true "$(cat /tmp/xenoid-smoke-camera-metadata-summary.out)"
+  else
+    add camera_metadata false "$(cat /tmp/xenoid-smoke-camera-metadata-summary.out)"
+  fi
+else
+  add camera_metadata false "$(cat /tmp/xenoid-smoke-camera-metadata.out)"
+fi
+# Exercise the real provider through an ordinary-app Camera2 client. The daemon
+# self-test uses generated fallback frames when no operator media is configured.
+if "$XENOID_BIN" camera status --check >/tmp/xenoid-smoke-camera-session.out 2>&1; then
+  if python3 - <<'PY' >/tmp/xenoid-smoke-camera-session-summary.out 2>&1
+import json
+import sys
+
+result = json.load(open("/tmp/xenoid-smoke-camera-session.out"))
+cameras = result.get("cameras")
+if result.get("ok") is not True or result.get("state") != "success":
+    raise ValueError("camera self-test did not succeed")
+if not isinstance(cameras, dict) or set(cameras) != {"back", "front"}:
+    raise ValueError("camera self-test did not cover both cameras")
+required = (
+    "captureCompleted",
+    "jpegNonempty",
+    "timestampsMatched",
+    "yuvNonempty",
+)
+for camera, evidence in cameras.items():
+    if not isinstance(evidence, dict):
+        raise ValueError(f"{camera} camera evidence is malformed")
+    if any(evidence.get(key) is not True for key in required):
+        raise ValueError(f"{camera} camera capture evidence is incomplete")
+    if evidence.get("width") != 320 or evidence.get("height") != 240:
+        raise ValueError(f"{camera} camera capture dimensions differ")
+print(json.dumps({
+    "ok": True,
+    "state": "success",
+    "cameras": {
+        name: {key: value for key, value in evidence.items() if key != "facing"}
+        for name, evidence in cameras.items()
+    },
+}, separators=(",", ":")))
+PY
+  then
+    add camera_session true "$(cat /tmp/xenoid-smoke-camera-session-summary.out)"
+  else
+    add camera_session false "$(cat /tmp/xenoid-smoke-camera-session-summary.out)"
+  fi
+else
+  add camera_session false "$(cat /tmp/xenoid-smoke-camera-session.out)"
+fi
+
+# Build and drive the public ordinary-app runtime probe without changing
+# configured operator media. Configured replay coverage remains an explicit
+# full-mode gate in scripts/ci.sh.
+if ./scripts/smoke-camera-runtime.sh --quick \
+    --out /tmp/xenoid-smoke-camera-runtime.json \
+    >/tmp/xenoid-smoke-camera-runtime.out 2>&1; then
+  add camera_runtime_probe true "$(cat /tmp/xenoid-smoke-camera-runtime.json)"
+else
+  add camera_runtime_probe false "$(cat /tmp/xenoid-smoke-camera-runtime.json 2>/dev/null || printf '%s' '{"ok":false,"error":"camera runtime probe failed"}')"
+fi
+
+
 # Apply native overlays/hide helpers if they are deployed; these commands are idempotent.
 # These need uid=0 (bind mounts + /dev/__properties__ patches), so route through the root channel.
 as_root 'test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay-smoke.log 2>&1 || true; test -x /data/local/tmp/xenoid-hide-helper && /data/local/tmp/xenoid-hide-helper apply >/data/local/tmp/xenoid-hide-apply-smoke.log 2>&1 || true; PROP=$( { test -x /system/bin/xenoid-prop-area && echo /system/bin/xenoid-prop-area; } || { test -x /data/local/tmp/xenoid-prop-area && echo /data/local/tmp/xenoid-prop-area; } ) && "$PROP" --identity >/data/local/tmp/xenoid-prop-area-smoke.log 2>&1 || true' >/dev/null 2>&1 || true

@@ -49,6 +49,9 @@ cmds+=(
   "./xenoid ebpf load"
   "./scripts/smoke-ebpf.sh --verify-loaded"
   "./xenoid daemon health"
+  "./xenoid adb shell pm grant --user 0 dev.xenoid.daemon android.permission.CAMERA"
+  "./xenoid camera apply"
+  "./xenoid camera status --check"
   "./xenoid doctor --require-runtime"
 )
 if [[ "$DRY" == 1 ]]; then
@@ -89,8 +92,10 @@ if [[ "$SKIP_BUILD" == 1 ]]; then
     native/xenoid-pivot/xenoid-pivot
     native/xenoid-sensorshal/xenoid-sensorshal
     native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml
-    native/xenoid-camerahal/xenoid-camerahal
+    native/xenoid-gralloc/gralloc.redroid.so
+    native/xenoid-camerahal/android.hardware.camera.provider-service-aidl
     native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml
+    native/xenoid-camerahal/media_profiles_V1_0.xml
   )
   for f in "${ARM_ARTS[@]}"; do
     if [[ ! -f "$ROOT/$f" ]]; then MISSING+=("$f"); continue; fi
@@ -177,4 +182,7 @@ if [[ ! -f "$SHIM_SO" ]]; then echo "missing native shim for $ABI" >&2; false; f
 ./xenoid ebpf load
 ./scripts/smoke-ebpf.sh --verify-loaded
 ./xenoid daemon health
+./xenoid adb shell pm grant --user 0 dev.xenoid.daemon android.permission.CAMERA
+./xenoid camera apply
+./xenoid camera status --check
 ./xenoid doctor --require-runtime

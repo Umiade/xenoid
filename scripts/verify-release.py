@@ -1,6 +1,52 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse, hashlib, inspect, json, pathlib, tarfile, tempfile, sys
+GENERIC_CAMERA_PATHS = [
+  'native/xenoid-camerahal/android.hardware.camera.provider-service-aidl',
+  'native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml',
+  'native/xenoid-camerahal/media_profiles_V1_0.xml',
+  'native/xenoid-gralloc/gralloc.redroid.so',
+  'artifacts/android.hardware.camera.provider-service-aidl',
+  'artifacts/android.hardware.camera.provider.ICameraProvider.xml',
+  'artifacts/media_profiles_V1_0.xml',
+  'artifacts/gralloc.redroid.so',
+]
+RETIRED_CAMERA_BASENAMES = {
+  'xenoid-camerahal',
+  'xenoid-camerahal.rc',
+}
+GENERIC_RUNTIME_CAMERA_TOKENS = (
+  'service vendor.camera-provider-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl',
+  'COPY payload/android.hardware.camera.provider-service-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl',
+  'COPY --chmod=644 payload/gralloc.redroid.so /vendor/lib64/hw/gralloc.redroid.so',
+  'COPY --chmod=644 payload/media_profiles_V1_0.xml /vendor/etc/media_profiles_V1_0.xml',
+)
+RETIRED_RUNTIME_CAMERA_TOKENS = (
+  'service xenoid-camerahal ',
+  '/system/bin/xenoid-camerahal',
+  '/system/bin/hw/xenoid-camerahal',
+  'init.svc.xenoid-camerahal',
+)
+CAMERA_HARNESS_JAVA_PREFIX = 'tests/camera-runtime-probe/java/org/example/cameraruntimeprobe/'
+CAMERA_HARNESS_JAVA_PATHS = [
+  CAMERA_HARNESS_JAVA_PREFIX + name
+  for name in (
+    'CamcorderProfilesProbeActivity.java',
+    'Camera2ProbeActivity.java',
+    'CameraSupport.java',
+    'FrameSeriesProbeActivity.java',
+    'FixtureActivity.java',
+    'IsolationProbeService.java',
+    'LegacyProbeActivity.java',
+    'NdkProbeActivity.java',
+    'PrivacyProbeActivity.java',
+    'ProbeIo.java',
+    'RecorderProbeActivity.java',
+    'ReplayProbeActivity.java',
+    'UpdateProbeActivity.java',
+  )
+]
+
 REQUIRED = [
   'README.md', 'README_CN.md', 'RUNBOOK.md', 'doctor.json', 'manifest.json',
   'bin/xenoid', 'bin/xenoid-mcp',
@@ -21,20 +67,23 @@ REQUIRED = [
   'native/xenoid-pivot/xenoid-pivot',
   'native/xenoid-sensorshal/xenoid-sensorshal',
   'native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml',
-  'native/xenoid-camerahal/xenoid-camerahal',
-  'native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml',
+  *GENERIC_CAMERA_PATHS[:3],
   'artifacts/xenoid-daemon.apk', 'artifacts/xenoid-input',
   'artifacts/xenoid-hide-helper', 'artifacts/xenoid-profile-helper',
   'artifacts/xenoid-netctl', 'artifacts/xenoid-rootd-arm64',
   'artifacts/libxenoid_zygote.so', 'artifacts/libxenoid_shim-arm64.so',
   'artifacts/xenoid-pivot', 'artifacts/xenoid-sensorshal',
   'artifacts/android.hardware.sensors.ISensors.xml',
-  'artifacts/xenoid-camerahal',
-  'artifacts/android.hardware.camera.provider.ICameraProvider.xml',
+  *GENERIC_CAMERA_PATHS[3:],
   'artifacts/xenoid-overlay-helper', 'artifacts/xenoid-prop-area',
   'artifacts/xenoid-ssaid', 'config/config-macos-colima.json',
   'config/config-linux-arm.json', 'config/docker-compose.yml',
   'skills/xenoid/SKILL.md',
+  'scripts/smoke-camera-runtime.sh',
+  'tests/camera-runtime-probe/AndroidManifest.xml',
+  'tests/camera-runtime-probe/build.sh',
+  'tests/camera-runtime-probe/native/ndk_probe.cpp',
+  *CAMERA_HARNESS_JAVA_PATHS,
 ]
 def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
 def main():
@@ -81,6 +130,33 @@ def main():
             listed=req == 'manifest.json' or req in files
             ok=p.is_file() and listed
             out['checks'].append({'name':'required:'+req,'ok':ok,'detail':str(p),'listed':listed})
+        runtime_context_path = root/'scripts/make-runtime-context.sh'
+        try:
+            runtime_context = runtime_context_path.read_text()
+        except OSError:
+            runtime_context = ''
+        generic_runtime_paths = (
+            all(token in runtime_context for token in GENERIC_RUNTIME_CAMERA_TOKENS)
+            and not any(
+                token in runtime_context
+                for token in RETIRED_RUNTIME_CAMERA_TOKENS
+            )
+        )
+        out['checks'].append({
+            'name':'generic-camera-runtime-paths',
+            'ok':generic_runtime_paths,
+            'detail':str(runtime_context_path),
+        })
+        harness_java_sources = sorted(
+            rel for rel in files
+            if rel.startswith(CAMERA_HARNESS_JAVA_PREFIX) and rel.endswith('.java')
+        )
+        out['checks'].append({
+            'name':'camera-runtime-harness-java-sources',
+            'ok':bool(harness_java_sources)
+                 and all((root/rel).is_file() for rel in harness_java_sources),
+            'detail':harness_java_sources,
+        })
         for rel, meta in files.items():
             if rel == "manifest.json":
                 continue
@@ -93,6 +169,15 @@ def main():
             for p in root.rglob('*')
             if p.is_file() and p.name != 'manifest.json'
         }
+        retired_camera_paths = sorted(
+            rel for rel in set(files) | archive_files
+            if pathlib.PurePosixPath(rel).name in RETIRED_CAMERA_BASENAMES
+        )
+        out['checks'].append({
+            'name':'retired-camera-artifact-aliases',
+            'ok':not retired_camera_paths,
+            'detail':retired_camera_paths,
+        })
         for rel in sorted(archive_files - set(files)):
             out['checks'].append({'name':'unlisted:'+rel,'ok':False,'detail':str(root/rel)})
         out['schema']=manifest.get('schema')

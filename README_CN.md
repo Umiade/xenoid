@@ -132,6 +132,26 @@ root 通过 daemon 与 token-gated rootd 提供，用户无需进入 Android roo
 
 生产 rootfs 不包含可被应用长期发现的 `su` 路径。CLI 与 MCP 共用同一权限边界。
 
+## 相机媒体
+
+Xenoid 的 Android 设置界面与宿主 CLI 都可以把一张图片、一段视频或两者同时设为两个普通 Camera2 设备的来源：
+
+```bash
+./xenoid camera status
+./xenoid camera set photo FILE
+./xenoid camera set video FILE
+./xenoid camera mode naturalized
+./xenoid camera mode faithful
+./xenoid camera clear photo
+./xenoid camera clear all
+./xenoid camera apply
+./xenoid camera status --check
+```
+
+`naturalized` 会加入轻微的逐帧传感器变化；`faithful` 除必要的缩放与相机坐标变换外保留解码后的源像素。导入内容经验证后复制到 Android 私有存储，原始宿主路径与文件名不会被保留或返回。保存的相机状态可跨 daemon 与运行时重启恢复，修改会在下一次打开相机时生效。
+
+`up` 会重新发布已保存的来源状态，并通过两个相机完成普通应用权限下的 YUV/JPEG 捕获。未配置来源也是有效状态，此时使用内置的回退画面。运行时还会发布一致的框架录像档案，因此 Android 系统相机无需配置来源即可打开、拍照并录制 H.264 视频。
+
 ## Frida
 
 Frida 是显式分析能力，不属于生产启动。`up` 会停止并清除遗留的 frida-server 进程与临时 payload。

@@ -21,7 +21,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT/res" "$OUT/classes" "$OUT/dex" "$(dirname "$APK_OUT")" "$ROOT/.xenoid"
 
 "$BT/aapt2" compile --dir "$APP/res" -o "$OUT/res.zip"
-"$BT/aapt2" link -o "$OUT/linked.apk" -I "$ANDROID_JAR" --manifest "$APP/AndroidManifest.xml" -R "$OUT/res.zip" --auto-add-overlay
+"$BT/aapt2" link -o "$OUT/linked.apk" -I "$ANDROID_JAR" --manifest "$APP/AndroidManifest.xml" -R "$OUT/res.zip" --auto-add-overlay --rename-manifest-package dev.xenoid.daemon
 
 find "$APP/java" -name '*.java' | sort > "$OUT/sources.txt"
 javac -source 8 -target 8 -classpath "$ANDROID_JAR" -d "$OUT/classes" @"$OUT/sources.txt"

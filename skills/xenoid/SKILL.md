@@ -51,6 +51,21 @@ Use `doctor --require-runtime` when an online Android instance is mandatory. Use
 
 Profile application regenerates unique identifiers unless `--keep-unique` is selected.
 
+## Camera media
+
+```bash
+./xenoid camera status
+./xenoid camera set photo FILE
+./xenoid camera set video FILE
+./xenoid camera mode naturalized
+./xenoid camera mode faithful
+./xenoid camera clear all
+./xenoid camera apply
+./xenoid camera status --check
+```
+
+The daemon validates imports, stores them on persistent Android `/data`, and never retains the original host path. Changes apply on the next camera open. `up` republishes saved state and runs the ordinary-app Camera2 self-test; a source-free fallback is a ready state.
+
 ## Input and automation
 
 ```bash

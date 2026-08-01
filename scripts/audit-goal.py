@@ -118,8 +118,31 @@ proc = subprocess.run([str(ROOT / "scripts/smoke-daemon-api.sh"), "--mock"], tex
 add("profile helper mock", proc.returncode == 0 and "profileExists" in proc.stdout and "android_id" in proc.stdout, proc.stdout + proc.stderr)
 add("daemon api smoke mock", proc.returncode == 0 and "xenoid-mock-daemon" in proc.stdout and "driverLayer" in proc.stdout, proc.stdout + proc.stderr)
 
-proc = subprocess.run([str(ROOT / "scripts/smoke-runtime.sh"), "/tmp/xenoid-audit-runtime-smoke.json"], text=True, capture_output=True, cwd=ROOT)
-add("runtime smoke script", "boot_completed" in proc.stdout and "daemon_health" in proc.stdout, proc.stdout + proc.stderr)
+runtime_smoke_path = pathlib.Path("/tmp/xenoid-audit-runtime-smoke.json")
+try:
+    runtime_smoke_path.unlink()
+except FileNotFoundError:
+    pass
+proc = subprocess.run([str(ROOT / "scripts/smoke-runtime.sh"), str(runtime_smoke_path)], text=True, capture_output=True, cwd=ROOT)
+runtime_smoke_evidence = proc.stdout + proc.stderr
+runtime_smoke_ok = False
+try:
+    runtime_smoke = json.loads(runtime_smoke_path.read_text())
+    runtime_checks = {
+        check.get("name"): check
+        for check in runtime_smoke.get("checks", [])
+        if isinstance(check, dict) and isinstance(check.get("name"), str)
+    }
+    runtime_smoke_ok = (
+        proc.returncode == 0
+        and runtime_smoke.get("ok") is True
+        and runtime_checks.get("camera_metadata", {}).get("ok") is True
+        and runtime_checks.get("camera_session", {}).get("ok") is True
+    )
+    runtime_smoke_evidence += "\n" + json.dumps(runtime_smoke, ensure_ascii=False)
+except (OSError, json.JSONDecodeError, TypeError, AttributeError) as error:
+    runtime_smoke_evidence += "\ninvalid runtime smoke report: " + str(error)
+add("runtime smoke script", runtime_smoke_ok, runtime_smoke_evidence)
 
 # OTA bundle contents
 proc = subprocess.run([str(ROOT / "xenoid"), "ota", "make", "--version", "audit"], text=True, capture_output=True, cwd=ROOT)
@@ -159,9 +182,9 @@ add("js bridge automation", "JavascriptInterface" in bridge and "evaluateJavascr
 # Static API coverage
 cli = (ROOT / "src/xenoid/cli.py").read_text()
 daemon = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/XenoidDaemonService.java").read_text()
-for token in ["docker-context", "install-runtime", "up", "doctor", "logs", "view", "linux-binderfs", "runtime-compose", "verify-release", "package-release", "ebpf", "netctl", "root", "profile", "deploy-helper", "config", "runtime-build-image", "frida", "deploy-scripts", "load-script", "generate-frida", "generate-service-frida", "hide", "device", "automation", "run-host", "plan", "input", "app", "ota", "runtime-context"]:
+for token in ["docker-context", "install-runtime", "up", "doctor", "logs", "view", "linux-binderfs", "runtime-compose", "verify-release", "package-release", "ebpf", "netctl", "root", "profile", "deploy-helper", "config", "runtime-build-image", "frida", "deploy-scripts", "load-script", "generate-frida", "generate-service-frida", "hide", "device", "automation", "run-host", "plan", "input", "app", "camera", "ota", "runtime-context"]:
     add("cli token:" + token, token in cli, "src/xenoid/cli.py")
-for route in ["/root/status", "/frida/start", "/hide/apply", "/fingerprint/apply", "/automation/run", "/input/tap", "/app/install", "/ota/apply"]:
+for route in ["/root/status", "/frida/start", "/hide/apply", "/fingerprint/apply", "/automation/run", "/input/tap", "/app/install", "/camera/status", "/camera/source", "/camera/settings", "/camera/clear", "/camera/apply", "/camera/self-test/start", "/camera/self-test/status", "/ota/apply"]:
     add("daemon route:" + route, route in daemon, "XenoidDaemonService.java")
 
 ok = all(c["ok"] for c in checks)

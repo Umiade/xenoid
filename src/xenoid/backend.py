@@ -9,6 +9,7 @@ import json
 import lzma
 import re
 import shutil
+import stat
 import tarfile
 import time
 import urllib.request
@@ -17,7 +18,27 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import DEFAULT_IMAGE, XenoidConfig, default_image_for_host
+from .daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS
 from .util import host_info, run, which
+
+
+_CAMERA_UPLOAD_MIN_BYTES_PER_SECOND = 512 * 1024
+_CAMERA_UPLOAD_TIMEOUT_FLOOR_SECONDS = 600
+_CAMERA_UPLOAD_TIMEOUT_CAP_SECONDS = 7200
+_CAMERA_UPLOAD_SETUP_SECONDS = 300
+
+
+def _camera_upload_timeout_seconds(size: int) -> int:
+    transfer_seconds = (
+        size + _CAMERA_UPLOAD_MIN_BYTES_PER_SECOND - 1
+    ) // _CAMERA_UPLOAD_MIN_BYTES_PER_SECOND
+    return min(
+        _CAMERA_UPLOAD_TIMEOUT_CAP_SECONDS,
+        max(
+            _CAMERA_UPLOAD_TIMEOUT_FLOOR_SECONDS,
+            _CAMERA_UPLOAD_SETUP_SECONDS + transfer_seconds,
+        ),
+    )
 
 
 @dataclass
@@ -295,13 +316,20 @@ class RuntimeManager:
             "test -x /system/bin/xenoid-prop-area && "
             "test -x /system/bin/xenoid-overlay-helper && "
             "test -x /system/bin/xenoid-sensorshal && "
-            "test -x /system/bin/xenoid-camerahal && "
+            "test -x /system/bin/hw/android.hardware.camera.provider-service-aidl && "
+            "test ! -e /system/bin/xenoid-camerahal && "
+            "test ! -e /system/bin/hw/xenoid-camerahal && "
+            "test ! -e /system/etc/init/xenoid-camerahal.rc && "
+            "test ! -e /system/etc/init/hw/xenoid-camerahal.rc && "
+            "test -r /system/etc/init/android.hardware.camera.provider-service-aidl.rc && "
+            "grep -q '^service vendor.camera-provider-aidl ' "
+            "/system/etc/init/android.hardware.camera.provider-service-aidl.rc && "
             "test -r /system/lib64/libpiex_shim.so && "
             "test -r /system/lib64/libxenoid_core.so && "
             "grep -q '/system/lib64/libpiex_shim.so:/system/lib64/libxenoid_core.so' "
             "/system/etc/init/hw/init.zygote64.rc && "
             "test \"$(getprop init.svc.xenoid-sensorshal)\" = running && "
-            "test \"$(getprop init.svc.xenoid-camerahal)\" = running && "
+            "test \"$(getprop init.svc.vendor.camera-provider-aidl)\" = running && "
             "test \"$(getprop ro.hardware)\" = tensor && "
             "test \"$(getprop ro.product.device)\" = raven && "
             "zygote_pid=$(pidof zygote64 | cut -d' ' -f1) && "
@@ -316,7 +344,7 @@ class RuntimeManager:
             "overlay",
             "zygote-preload",
             "sensor-hal",
-            "camera-hal",
+            "camera-provider",
         ]
         return result
 
@@ -653,6 +681,15 @@ class RuntimeManager:
         # control token. This avoids a world-readable token under /data/local/tmp.
         result["rootdRoot"] = self.ensure_rootd_root()
         required.append(result["rootdRoot"])
+        if install_daemon_apk:
+            result["daemonReady"] = (
+                self.ensure_daemon(
+                    readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
+                )
+                if result["daemonForward"].get("ok") and result["rootdRoot"].get("ok")
+                else {"ok": False, "skipped": True}
+            )
+            required.append(result["daemonReady"])
         result["imageProtectionStatus"] = self.image_protection_status()
         required.append(result["imageProtectionStatus"])
         result["ok"] = all(bool(step.get("ok")) for step in required)
@@ -676,7 +713,7 @@ class RuntimeManager:
             adb_state = self.adb(["get-state"])
         return {"ok": proc.returncode == 0, "running": bool(rows), "rows": rows, "adb": adb_state}
 
-    def adb(self, args: list[str]) -> dict[str, Any]:
+    def adb(self, args: list[str], timeout: Optional[float] = None) -> dict[str, Any]:
         adb_bin = which("adb")
         if adb_bin is None:
             return {"ok": False, "error": "adb not found"}
@@ -687,7 +724,7 @@ class RuntimeManager:
         else:
             cmd = [adb_bin, "-s", self.adb_target, *args]
         try:
-            proc = run(cmd, timeout=15)
+            proc = run(cmd, timeout=15 if timeout is None else timeout)
         except Exception as e:
             return {"ok": False, "error": str(e), "command": cmd}
         return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "command": cmd}
@@ -766,6 +803,99 @@ class RuntimeManager:
 
     def forward_daemon_port(self) -> dict[str, Any]:
         return self.adb(["forward", f"tcp:{self.cfg.daemon_port}", f"tcp:{self.cfg.daemon_port}"])
+
+    def stage_camera_source(self, local_path: str) -> dict[str, Any]:
+        """Upload one immutable camera candidate for daemon-side validation."""
+        try:
+            source = Path(local_path).expanduser().resolve(strict=True)
+            before = source.stat()
+            if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+                return {"ok": False, "error": "camera source must be a nonempty regular file"}
+
+            digest = hashlib.sha256()
+            size = 0
+            with source.open("rb") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+
+            after = source.stat()
+            stable = (
+                stat.S_ISREG(after.st_mode)
+                and size == before.st_size == after.st_size
+                and before.st_dev == after.st_dev
+                and before.st_ino == after.st_ino
+                and before.st_mtime_ns == after.st_mtime_ns
+            )
+            if not stable:
+                return {"ok": False, "error": "camera source changed while reading"}
+        except (OSError, RuntimeError):
+            return {"ok": False, "error": "camera source must be a nonempty regular file"}
+
+        staging_path = f"/data/local/tmp/.camera-upload-{secrets.token_hex(16)}"
+        push = self.adb(
+            ["push", str(source), staging_path],
+            timeout=_camera_upload_timeout_seconds(size),
+        )
+        if not push.get("ok"):
+            self.cleanup_camera_staging(staging_path)
+            return {"ok": False, "error": "camera source upload failed"}
+        chmod = self.adb(["shell", "chmod", "0600", staging_path], timeout=300)
+        if not chmod.get("ok"):
+            self.cleanup_camera_staging(staging_path)
+            return {"ok": False, "error": "camera source upload failed"}
+        owner = self.adb([
+            "shell",
+            f'if [ "$(id -u)" = 0 ]; then chown 2000:2000 {staging_path}; fi',
+        ], timeout=300)
+        if not owner.get("ok"):
+            self.cleanup_camera_staging(staging_path)
+            return {"ok": False, "error": "camera source upload failed"}
+        return {
+            "ok": True,
+            "stagingPath": staging_path,
+            "size": size,
+            "sha256": digest.hexdigest(),
+        }
+
+    def cleanup_camera_staging(self, staging_path: str) -> dict[str, Any]:
+        """Best-effort removal restricted to names generated above."""
+        if re.fullmatch(r"/data/local/tmp/\.camera-upload-[0-9a-f]{32}", staging_path) is None:
+            return {"ok": False, "error": "invalid camera staging reference"}
+        result = self.adb(["shell", "rm", "-f", staging_path], timeout=300)
+        return {"ok": bool(result.get("ok"))}
+
+    def grant_daemon_camera_permission(self) -> dict[str, Any]:
+        result = self.adb([
+            "shell", "pm", "grant", "--user", "0",
+            "dev.xenoid.daemon", "android.permission.CAMERA",
+        ])
+        return {
+            "ok": bool(result.get("ok")),
+            **({} if result.get("ok") else {"error": "camera permission grant failed"}),
+        }
+
+    def launch_daemon_bootstrap(self) -> dict[str, Any]:
+        return self.adb([
+            "shell", "am", "start", "--user", "0", "-n",
+            "dev.xenoid.daemon/.MainActivity", "--ez", "bootstrap", "true",
+        ])
+
+    def launch_camera_self_test(self, run_id: str) -> dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", run_id) is None:
+            return {"ok": False, "error": "invalid camera self-test run id"}
+        result = self.adb([
+            "shell", "am", "start", "--user", "0", "-n",
+            "dev.xenoid.daemon/.MainActivity",
+            "--es", "cameraSelfTestRunId", run_id,
+        ])
+        return {
+            "ok": bool(result.get("ok")),
+            **({} if result.get("ok") else {"error": "camera self-test launch failed"}),
+        }
 
     def ensure_rootd_root(self, port: int = 18767) -> dict[str, Any]:
         """Start xenoid-rootd as uid=0 with the daemon's private control token."""
@@ -854,43 +984,78 @@ class RuntimeManager:
         }
 
 
-    def ensure_daemon(self) -> dict[str, Any]:
+    def ensure_daemon(self, readiness_timeout: float = 30.0) -> dict[str, Any]:
         steps: dict[str, Any] = {}
         steps["forward"] = self.forward_daemon_port()
-        health1 = None
         try:
             from .daemon_client import DaemonClient
-            health1 = DaemonClient(port=self.cfg.daemon_port).health()
-        except Exception as e:
-            health1 = {"ok": False, "error": str(e)}
+            client: Optional[DaemonClient] = DaemonClient(
+                port=self.cfg.daemon_port,
+                timeout=2.0,
+            )
+            health1 = client.health()
+        except Exception as error:
+            client = None
+            health1 = {"ok": False, "error": str(error)}
         steps["healthBefore"] = health1
         if isinstance(health1, dict) and health1.get("ok"):
             return {"ok": True, "already": True, "steps": steps}
-        steps["startActivity"] = self.adb(["shell", "am", "start", "-n", "dev.xenoid.daemon/.MainActivity"])
-        steps["startService"] = self.adb(["shell", "am", "startservice", "-n", "dev.xenoid.daemon/.XenoidDaemonService"])
-        time.sleep(1)
+
+        steps["startActivity"] = self.launch_daemon_bootstrap()
         steps["forwardAfter"] = self.forward_daemon_port()
-        try:
-            from .daemon_client import DaemonClient
-            health2 = DaemonClient(port=self.cfg.daemon_port).health()
-        except Exception as e:
-            health2 = {"ok": False, "error": str(e)}
-        steps["healthAfter"] = health2
-        return {"ok": isinstance(health2, dict) and bool(health2.get("ok")), "steps": steps}
+        deadline = time.monotonic() + max(0.0, readiness_timeout)
+        health_attempts: list[dict[str, Any]] = []
+        health_after: dict[str, Any] = {
+            "ok": False,
+            "error": "daemon health readiness timed out",
+        }
+        while True:
+            try:
+                if client is None:
+                    from .daemon_client import DaemonClient
+                    client = DaemonClient(port=self.cfg.daemon_port, timeout=2.0)
+                health_after = client.health()
+            except Exception as error:
+                health_after = {"ok": False, "error": str(error)}
+                client = None
+            health_attempts.append(health_after)
+            if health_after.get("ok"):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5, remaining))
+
+        steps["healthAfter"] = health_after
+        steps["healthAttempts"] = len(health_attempts)
+        return {"ok": bool(health_after.get("ok")), "steps": steps}
 
     def install_daemon(self, apk_path: str) -> dict[str, Any]:
         p = Path(apk_path).expanduser().resolve()
         if not p.exists():
             return {"ok": False, "error": f"daemon apk not found: {p}"}
-        return self.adb(["install", "-r", str(p)])
+        install = self.adb(["install", "-r", str(p)])
+        if not install.get("ok"):
+            return install
+        notification_grant = self.adb([
+            "shell",
+            'sdk="$(getprop ro.build.version.sdk)"; '
+            'case "$sdk" in ""|*[!0-9]*) exit 1;; esac; '
+            'if [ "$sdk" -ge 33 ]; then '
+            'pm grant --user 0 dev.xenoid.daemon android.permission.POST_NOTIFICATIONS; '
+            'fi',
+        ])
+        if notification_grant.get("ok"):
+            return install
+        failed = dict(install)
+        failed["ok"] = False
+        failed["error"] = "daemon notification permission grant failed"
+        return failed
 
     def start_daemon_service(self) -> dict[str, Any]:
         # The service remains non-exported. Its exported launcher activity
-        # enters the app UID, starts the service, and immediately finishes.
-        result = self.adb([
-            "shell", "am", "start", "--user", "0", "-n",
-            "dev.xenoid.daemon/.MainActivity",
-        ])
+        # enters the app UID and starts the service in explicit bootstrap mode.
+        result = self.launch_daemon_bootstrap()
         result["method"] = "self-start-activity"
         return result
 

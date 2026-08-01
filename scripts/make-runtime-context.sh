@@ -18,7 +18,9 @@ ZYGOTE="$ROOT/native/xenoid-zygote/libxenoid_zygote.so"
 SHIM="$ROOT/native/xenoid-shim/libxenoid_shim-arm64.so"
 PIVOT="$ROOT/native/xenoid-pivot/xenoid-pivot"
 SENSORSHAL="$ROOT/native/xenoid-sensorshal/xenoid-sensorshal"
-CAMERAHAL="$ROOT/native/xenoid-camerahal/xenoid-camerahal"
+CAMERA_PROVIDER="$ROOT/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
+GRALLOC="$ROOT/native/xenoid-gralloc/gralloc.redroid.so"
+MEDIA_PROFILES="$ROOT/native/xenoid-camerahal/media_profiles_V1_0.xml"
 [[ -f "$DAEMON" ]] || "$ROOT/scripts/build-daemon.sh" >/dev/null
 [[ -f "$INPUT" ]] || "$ROOT/scripts/build-native-input.sh" >/dev/null
 [[ -f "$HIDE" ]] || "$ROOT/scripts/build-native-hide.sh" >/dev/null
@@ -30,7 +32,8 @@ CAMERAHAL="$ROOT/native/xenoid-camerahal/xenoid-camerahal"
 [[ -f "$ZYGOTE" ]] || "$ROOT/scripts/build-native-zygote.sh" arm64 >/dev/null
 [[ -f "$SHIM" ]] || "$ROOT/scripts/build-native-shim.sh" arm64 prop >/dev/null
 [[ -f "$SENSORSHAL" ]] || "$ROOT/scripts/build-sensors-hal.sh" arm64 >/dev/null
-[[ -f "$CAMERAHAL" ]] || "$ROOT/scripts/build-camera-hal.sh" arm64 >/dev/null
+[[ -f "$GRALLOC" ]] || "$ROOT/scripts/build-gralloc.sh" arm64 >/dev/null
+[[ -f "$CAMERA_PROVIDER" ]] || "$ROOT/scripts/build-camera-hal.sh" arm64 >/dev/null
 rm -rf "$OUT"
 mkdir -p "$OUT/payload"
 cp "$DAEMON" "$OUT/payload/xenoid-daemon.apk"
@@ -43,8 +46,10 @@ cp "$PROP_AREA" "$OUT/payload/xenoid-prop-area"
 cp "$PIVOT" "$OUT/payload/xenoid-init"
 cp "$SENSORSHAL" "$OUT/payload/xenoid-sensorshal"
 cp "$ROOT/native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml" "$OUT/payload/android.hardware.sensors.ISensors.xml" || { echo "missing native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
-cp "$CAMERAHAL" "$OUT/payload/xenoid-camerahal"
+cp "$CAMERA_PROVIDER" "$OUT/payload/android.hardware.camera.provider-service-aidl"
+cp "$GRALLOC" "$OUT/payload/gralloc.redroid.so"
 cp "$ROOT/native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml" "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml" || { echo "missing native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
+cp "$MEDIA_PROFILES" "$OUT/payload/media_profiles_V1_0.xml" || { echo "missing native/xenoid-camerahal/media_profiles_V1_0.xml (required by Dockerfile camera profile COPY)" >&2; exit 1; }
 if [[ "${XENOID_ZYGOTE_PRELOAD:-0}" == "0" ]]; then
   # Omit the zygote preload payload when this optional layer is disabled.
   rm -f "$OUT/payload/libpiex_shim.so"
@@ -76,7 +81,7 @@ if command -v docker >/dev/null 2>&1; then
     # the Pixel identity is safe from the first graphics-stack initialization.
     _required_extract_ok=1
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libselinux.so" "$OUT/payload/libselinux.so" >/dev/null || _required_extract_ok=0
-    "${DOCKER[@]}" cp "$_cid:/vendor/lib64/hw/gralloc.redroid.so" "$OUT/payload/gralloc.redroid.so" >/dev/null || _required_extract_ok=0
+    "${DOCKER[@]}" cp "$_cid:/vendor/lib64/hw/gralloc.redroid.so" "$OUT/payload/gralloc.base.redroid.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/hw/hwcomposer.redroid.so" "$OUT/payload/hwcomposer.redroid.so" >/dev/null || _required_extract_ok=0
     # This library is patched below only to report a locked, verified
     # SoftKeymaster RootOfTrust; it does not provide hardware-backed KeyMint.
@@ -93,7 +98,7 @@ if command -v docker >/dev/null 2>&1; then
       "$OUT/payload/services.jar" "$OUT/payload/services.isolated-owner.jar"
     mv "$OUT/payload/services.isolated-owner.jar" "$OUT/payload/services.jar"
     python3 - \
-      "$OUT/payload/gralloc.redroid.so" \
+      "$OUT/payload/gralloc.base.redroid.so" \
       "$OUT/payload/hwcomposer.redroid.so" \
       "$OUT/payload/libpuresoftkeymasterdevice.so" <<'PY3'
 from pathlib import Path
@@ -133,8 +138,9 @@ for offset, original, replacement in patches:
     )
     data[offset:offset + len(original)] = replacement
 keymaster.write_bytes(data)
-print("verified tensor graphics HALs and patched SoftKeymaster RootOfTrust")
+print("verified base-image graphics ABI and patched SoftKeymaster RootOfTrust")
 PY3
+    rm -f "$OUT/payload/gralloc.base.redroid.so"
     python3 - "$OUT/payload/libandroid_runtime.so" <<'PY2'
 from pathlib import Path
 import sys
@@ -183,7 +189,6 @@ fi
 cat > "$OUT/payload/xenoid.rc" <<'RC'
 on init
     start xenoid-sensorshal
-    start xenoid-camerahal
 
 # Bind identity proc/sysfs files in init's mount namespace before zygote and
 # system_server fork. Post-boot docker/rootd mounts live in a different mount
@@ -217,13 +222,40 @@ service xenoid-sensorshal /system/bin/xenoid-sensorshal
     user root
     group root
 
-# Virtual AIDL camera provider. CameraProviderManager discovers only VINTF-declared
-# instances, so register this before cameraserver finishes provider enumeration.
-service xenoid-camerahal /system/bin/xenoid-camerahal
+RC
+cat > "$OUT/payload/android.hardware.camera.provider-service-aidl.rc" <<'RC'
+on init
+    start vendor.camera-provider-aidl
+
+service vendor.camera-provider-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl
     class main
     user root
     group root
 RC
+
+assert_no_artifact_markers() {
+  local artifact="$1"
+  shift
+  local marker
+  for marker in "$@"; do
+    if LC_ALL=C strings "$artifact" | grep -Fi "$marker" >/dev/null; then
+      echo "camera runtime artifact contains prohibited marker '$marker': $artifact" >&2
+      exit 1
+    fi
+  done
+}
+# ICameraInjectionSession is a required member of the stable Android camera
+# interface even when unsupported, so its standard descriptor is not a
+# product-specific marker.
+assert_no_artifact_markers "$OUT/payload/android.hardware.camera.provider-service-aidl" \
+  xenoid mock replay /Users/ /home/
+for artifact in \
+  "$OUT/payload/gralloc.redroid.so" \
+  "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml" \
+  "$OUT/payload/android.hardware.camera.provider-service-aidl.rc"; do
+  assert_no_artifact_markers "$artifact" \
+    xenoid mock replay inject /Users/ /home/
+done
 chmod 755 "$OUT/payload/xenoid-input" "$OUT/payload/xenoid-hide-helper" "$OUT/payload/xenoid-overlay-helper" "$OUT/payload/xenoid-profile-helper" "$OUT/payload/xenoid-netctl"
 cat > "$OUT/Dockerfile" <<DOCKER
 FROM $IMAGE
@@ -239,16 +271,20 @@ COPY payload/xenoid-prop-area /system/bin/xenoid-prop-area
 COPY payload/xenoid-overlay-helper /system/bin/xenoid-overlay-helper
 COPY payload/xenoid-sensorshal /system/bin/xenoid-sensorshal
 COPY payload/android.hardware.sensors.ISensors.xml /vendor/etc/vintf/manifest/android.hardware.sensors.ISensors.xml
-COPY payload/xenoid-camerahal /system/bin/xenoid-camerahal
+COPY payload/android.hardware.camera.provider-service-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl
 COPY payload/android.hardware.camera.provider.ICameraProvider.xml /vendor/etc/vintf/manifest/android.hardware.camera.provider.ICameraProvider.xml
 COPY payload/xenoid.rc /system/etc/init/xenoid.rc
+COPY payload/android.hardware.camera.provider-service-aidl.rc /system/etc/init/android.hardware.camera.provider-service-aidl.rc
 COPY payload/init.zygote64.rc /system/etc/init/hw/init.zygote64.rc
 COPY payload/libandroid_runtime.so /system/lib64/libandroid_runtime.so
 # Restore standard SELinux context APIs removed by redroid's HACKED stubs.
 COPY --chmod=644 payload/libselinux.so /system/lib64/libselinux.so
 # ro.hardware=tensor resolves these aliases during early graphics HAL loading.
+# Replace the owning redroid allocator and provide the existing tensor-name alias.
+COPY --chmod=644 payload/gralloc.redroid.so /vendor/lib64/hw/gralloc.redroid.so
 COPY --chmod=644 payload/gralloc.redroid.so /vendor/lib64/hw/gralloc.tensor.so
 COPY --chmod=644 payload/hwcomposer.redroid.so /vendor/lib64/hw/hwcomposer.tensor.so
+COPY --chmod=644 payload/media_profiles_V1_0.xml /vendor/etc/media_profiles_V1_0.xml
 # RootOfTrust-only SoftKeymaster patch; this is not hardware-backed KeyMint.
 COPY --chmod=644 payload/libpuresoftkeymasterdevice.so /vendor/lib64/libpuresoftkeymasterdevice.so
 # Preserve the owning package for isolated UIDs in PackageManager queries.
@@ -285,7 +321,7 @@ PY
 cat >> "$OUT/Dockerfile" <<'DOCKER'
 # Xenoid payloads are activated by the host CLI after Android boot:
 #   adb install -r /data/local/tmp/xenoid-daemon.apk
-#   adb shell am start --user 0 -n dev.xenoid.daemon/.MainActivity
+#   adb shell am start --user 0 -n dev.xenoid.daemon/.MainActivity --ez bootstrap true
 #   daemon applies device and runtime policies through the token-gated root channel.
 # Pivot into real ext4 rootfs+data loop images before Android init so the mount
 # table looks like a physical device (no container overlayfs/binds anywhere).

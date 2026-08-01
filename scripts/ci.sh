@@ -105,8 +105,15 @@ if [[ "$TIER" == "runtime" || "$TIER" == "full" ]]; then
   fi
 fi
 
-# --- Full tier: heavyweight audit (rebuilds everything; slow) ---
+# --- Full tier: configured camera replay plus heavyweight audit ---
 if [[ "$TIER" == "full" ]]; then
+  echo "[ci] full: source-generated camera replay"
+  if with_timeout 900 ./scripts/smoke-camera-runtime.sh --full --loop-seconds 10 \
+      --out /tmp/ci-camera-runtime.json >/tmp/ci-camera-runtime.out 2>&1; then
+    pass+=("camera-runtime-full")
+  else
+    fail+=("camera-runtime-full (rc=$?)")
+  fi
   echo "[ci] full: audit-goal (rebuilds; this is slow)"
   if XENOID_SKIP_AUDIT=1 with_timeout 900 python3 scripts/audit-goal.py >/tmp/ci-audit-goal.out 2>&1; then pass+=("audit-goal"); else fail+=("audit-goal (rc=$?)"); fi
 fi

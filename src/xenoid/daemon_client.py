@@ -7,6 +7,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional, Union
 
+# A source import can spend up to five sequential 600-second rootd phases on
+# copy, publication, rollback/cleanup, and staging cleanup. Keep the host
+# socket alive beyond that daemon-side bound so callers never clean staging
+# while the daemon can still be consuming it.
+CAMERA_MUTATION_TIMEOUT_SECONDS = 3605.0
+
 
 class DaemonClient:
     def __init__(self, port: int = 18765, host: str = "127.0.0.1", timeout: float = 10.0):
@@ -29,9 +35,10 @@ class DaemonClient:
             except OSError:
                 pass
         try:
+            from xenoid.backend import RuntimeManager
             from xenoid.config import load_config
             cfg = load_config()
-            base = ["docker"] + (["--context", cfg.docker_context] if cfg.docker_context else [])
+            base = RuntimeManager(cfg).docker_base_cmd()
             result = subprocess.run(
                 [*base, "exec", cfg.container_name, "cat", "/data/data/dev.xenoid.daemon/files/daemon.token"],
                 text=True,
@@ -83,6 +90,56 @@ class DaemonClient:
 
     def health(self) -> dict[str, Any]:
         return self.request("GET", "/health")
+
+    def camera_status(self) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            "/camera/status",
+            timeout=CAMERA_MUTATION_TIMEOUT_SECONDS,
+        )
+
+    def camera_source(self, kind: str, staging_path: str, size: int, sha256: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/camera/source",
+            {
+                "kind": kind,
+                "stagingPath": staging_path,
+                "size": size,
+                "sha256": sha256,
+            },
+            timeout=CAMERA_MUTATION_TIMEOUT_SECONDS,
+        )
+
+    def camera_settings(self, mode: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/camera/settings",
+            {"mode": mode},
+            timeout=CAMERA_MUTATION_TIMEOUT_SECONDS,
+        )
+
+    def camera_clear(self, kind: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/camera/clear",
+            {"kind": kind},
+            timeout=CAMERA_MUTATION_TIMEOUT_SECONDS,
+        )
+
+    def camera_apply(self) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/camera/apply",
+            {},
+            timeout=CAMERA_MUTATION_TIMEOUT_SECONDS,
+        )
+
+    def camera_self_test_start(self, run_id: str) -> dict[str, Any]:
+        return self.request("POST", "/camera/self-test/start", {"runId": run_id})
+
+    def camera_self_test_status(self, timeout: Optional[float] = None) -> dict[str, Any]:
+        return self.request("GET", "/camera/self-test/status", timeout=timeout)
 
     def root_status(self) -> dict[str, Any]:
         return self.request("GET", "/root/status")

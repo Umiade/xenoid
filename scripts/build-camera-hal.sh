@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Build the virtual AIDL camera provider for arm64.
+# Build the Android AIDL camera provider service for arm64.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HAL="$ROOT/native/xenoid-camerahal"
+SERVICE="android.hardware.camera.provider-service-aidl"
 ARCH="${1:-arm64}"
 source "$ROOT/scripts/android-sdk-root.sh"
 SDK="$(xenoid_android_sdk_root)"
 AIDL_BIN="$SDK/build-tools/35.0.0/aidl"
 [[ -x "$AIDL_BIN" ]] || AIDL_BIN="$(ls -d "$SDK"/build-tools/*/aidl 2>/dev/null | sort -V | tail -1)"
 if [[ "$ARCH" == x86_64 ]]; then
-  TOOL=x86_64-linux-android29-clang++
+  TOOL=x86_64-linux-android30-clang++
   TRIPLE=x86_64-linux-android
 else
-  TOOL=aarch64-linux-android29-clang++
+  TOOL=aarch64-linux-android30-clang++
   TRIPLE=aarch64-linux-android
 fi
 NDK=""
@@ -53,7 +54,7 @@ while IFS= read -r aidl; do
       echo "unknown AIDL package: $aidl" >&2
       exit 1 ;;
   esac
-  "$AIDL_BIN" --lang=ndk --structured --stability=vintf --min_sdk_version=29 \
+  "$AIDL_BIN" --lang=ndk --structured --stability=vintf --min_sdk_version=30 \
     --version "$version" --hash "$hash" \
     -o"$GEN" -h"$GEN" -p"$HAL/framework-min.aidl" -I"$HAL/aidl" "$aidl"
 done < <(find "$HAL/aidl" -name '*.aidl' | sort)
@@ -74,11 +75,50 @@ pull_system_lib() {
 pull_system_lib libbinder_ndk.so
 pull_system_lib libcamera_metadata.so
 
-SRCS=("$HAL/xenoid_camera_hal.cpp")
-while IFS= read -r source; do SRCS+=("$source"); done < <(find "$GEN" -name '*.cpp' | sort)
-"$CXX" -std=c++17 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2 --sysroot="$SYSROOT" -I"$GEN" -I"$SYSROOT/usr/include" \
-  -o "$HAL/xenoid-camerahal" "${SRCS[@]}" \
-  -L"$SYSROOT/usr/lib/$TRIPLE/29" "$HAL/libcamera_metadata.so" "$HAL/libbinder_ndk.so" \
-  -llog -landroid -static-libstdc++ -Wl,-s
+SRCS=(
+  "$HAL/camera_provider.cpp"
+  "$HAL/camera_device.cpp"
+  "$HAL/camera_session.cpp"
+  "$HAL/camera_metadata.cpp"
+  "$HAL/camera_buffer.cpp"
+  "$HAL/camera_renderer.cpp"
+  "$HAL/camera_source.cpp"
+)
+while IFS= read -r source; do
+  SRCS+=("$source")
+done < <(find "$GEN" -name '*.cpp' | sort)
+OUTPUT="$HAL/$SERVICE"
+rm -f "$HAL/xenoid-camerahal"
+CXXFLAGS=(
+  -std=c++17
+  -O2
+  -fPIC
+  -ffunction-sections
+  -fdata-sections
+  -fstack-protector-strong
+  -fvisibility=hidden
+  -fvisibility-inlines-hidden
+  -fno-rtti
+  -D_FORTIFY_SOURCE=2
+  "-ffile-prefix-map=$HAL=android/hardware/camera/provider/default"
+  "-fmacro-prefix-map=$HAL=android/hardware/camera/provider/default"
+  "-ffile-prefix-map=$SDK=android-sdk"
+  "-fmacro-prefix-map=$SDK=android-sdk"
+  --sysroot="$SYSROOT"
+  -I"$GEN"
+  -I"$SYSROOT/usr/include"
+)
+"$CXX" "${CXXFLAGS[@]}" -o "$OUTPUT" "${SRCS[@]}" \
+  -L"$SYSROOT/usr/lib/$TRIPLE/30" \
+  "$HAL/libcamera_metadata.so" "$HAL/libbinder_ndk.so" \
+  -llog -lmediandk -ljnigraphics -static-libstdc++ \
+  -Wl,-z,defs,--gc-sections,--exclude-libs,ALL,-s
 
-echo "$HAL/xenoid-camerahal"
+for marker in xenoid mock replay; do
+  if LC_ALL=C strings "$OUTPUT" | grep -Fi "$marker" >/dev/null; then
+    echo "provider artifact contains prohibited marker: $marker" >&2
+    exit 1
+  fi
+done
+
+echo "$OUTPUT"

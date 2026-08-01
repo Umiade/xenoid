@@ -106,6 +106,26 @@ With `backend=linux-docker`, Xenoid prepares binder and runtime protection on th
 
 Privileged operations pass through the daemon and loopback-only `xenoid-rootd`. Mutating requests require the per-instance token provisioned under `.xenoid/`; the Android rootfs exposes no persistent application-visible `su` path.
 
+## Camera media control
+
+Use the Android Xenoid settings screen for Storage Access Framework imports, or use the same persistent state through the host CLI:
+
+```bash
+./xenoid camera status
+./xenoid camera set photo FILE
+./xenoid camera set video FILE
+./xenoid camera mode naturalized
+./xenoid camera mode faithful
+./xenoid camera clear video
+./xenoid camera clear all
+./xenoid camera apply
+./xenoid camera status --check
+```
+
+Imports are copied into private Android storage and the original host path is discarded. `apply` is idempotent and republishes the saved state without requiring the original file. `status --check` opens both cameras from the daemon's ordinary application UID and requires nonempty 320x240 YUV and JPEG captures with matched timestamps.
+
+`up` always applies the saved camera state after daemon/rootd readiness and runs the same Camera2 self-test before final runtime validation. A missing source is valid and selects the fallback scene; a configured but missing or corrupt saved source fails convergence. The stock Android Camera app supports photo capture and H.264 recording in the source-free state.
+
 ## Frida
 
 Frida is opt-in and is not part of production startup.

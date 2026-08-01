@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.example.cameraruntimeprobe">
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="35" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="false"
+        android:label="Camera Runtime Probe"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name=".Camera2ProbeActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".CamcorderProfilesProbeActivity" android:exported="true" />
+        <activity android:name=".FrameSeriesProbeActivity" android:exported="true" />
+        <activity android:name=".FixtureActivity" android:exported="true" />
+        <activity android:name=".LegacyProbeActivity" android:exported="true" />
+        <activity android:name=".NdkProbeActivity" android:exported="true" />
+        <activity android:name=".PrivacyProbeActivity" android:exported="true" />
+        <activity android:name=".RecorderProbeActivity" android:exported="true" />
+        <activity android:name=".ReplayProbeActivity" android:exported="true" />
+        <activity android:name=".UpdateProbeActivity" android:exported="true" />
+        <service
+            android:name=".IsolationProbeService"
+            android:exported="false"
+            android:isolatedProcess="true" />
+    </application>
+</manifest>

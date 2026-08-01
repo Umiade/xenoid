@@ -54,7 +54,8 @@ native/xenoid-pivot/xenoid-pivot
 native/xenoid-camerahal/gen/
 native/xenoid-sensorshal/gen/
 native/xenoid-sensorshal/xenoid-sensorshal
-native/xenoid-camerahal/xenoid-camerahal
+native/xenoid-camerahal/android.hardware.camera.provider-service-aidl
+native/xenoid-gralloc/gralloc.redroid.so
 native/xenoid-ebpf/vmlinux.h
 native/xenoid-ebpf/*.o
 native/xenoid-ebpf/*.skel.h

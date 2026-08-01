@@ -44,6 +44,26 @@ Output:
 native/xenoid-input/xenoid-input
 ```
 
+## Camera provider and graphics allocator
+
+```bash
+scripts/build-gralloc.sh arm64
+scripts/build-camera-hal.sh arm64
+./xenoid build all
+```
+
+Outputs:
+
+```text
+native/xenoid-gralloc/gralloc.redroid.so
+native/xenoid-camerahal/android.hardware.camera.provider-service-aidl
+native/xenoid-camerahal/media_profiles_V1_0.xml
+```
+
+The runtime image installs the provider at `/system/bin/hw/android.hardware.camera.provider-service-aidl` and its framework camcorder profiles at `/vendor/etc/media_profiles_V1_0.xml`. The enhanced allocator replaces the owning `gralloc.redroid.so` and supplies the existing `gralloc.tensor.so` hardware-name alias from the same binary; it is not a second allocator.
+
+The provider build generates the Android 13 stable-AIDL NDK bindings, links the matching platform camera metadata/Binder libraries, strips the service, and rejects product-specific marker strings in the runtime artifact.
+
 ## Build all
 
 ```bash
@@ -55,6 +75,8 @@ Expected verification on Apple Silicon macOS:
 
 - daemon APK: built and signed
 - native input helper: built for `aarch64-linux-android21`
+- camera provider: built for Android ARM64 with stable-AIDL VINTF registration
+- enhanced gralloc: built for Android ARM64 with legacy RGB/framebuffer ABI preserved
 - doctor: passed
 
 ## Verify and bundle OTA

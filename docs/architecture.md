@@ -4,7 +4,7 @@ Xenoid is split into three layers:
 
 1. **Host layer** (`src/xenoid`) — CLI and MCP server for local agents/users.
 2. **Runtime layer** — Android container backend through Docker/Colima on Apple Silicon macOS or Docker on Linux ARM.
-3. **Android control layer** (`daemon`) — daemon APK exposing JSON APIs for root/frida/profile/automation/OTA.
+3. **Android control layer** (`daemon`) — daemon APK exposing JSON APIs for root, camera media, Frida, profiles, automation, and OTA.
 
 ## Why a Linux VM on macOS
 
@@ -22,6 +22,7 @@ xenoid daemon health
 xenoid device collect --out .xenoid/device.json
 xenoid device apply examples/fingerprints/sample-profile.json
 xenoid automation run examples/automation/tap-home.js
+xenoid camera status --check
 xenoid ota check
 xenoid mcp-config
 ```
@@ -38,6 +39,21 @@ xenoid mcp-config
 - `POST /input/tap`
 - `GET /ota/check`
 - `POST /ota/apply`
+- `GET /camera/status`
+- `POST /camera/source`
+- `POST /camera/settings`
+- `POST /camera/clear`
+- `POST /camera/apply`
+- `POST /camera/self-test/start`
+- `GET /camera/self-test/status`
+
+## Camera data plane
+
+The host streams camera media to a random, mode-`0600` ADB staging file and sends only its Android path, size, kind, and SHA-256 digest through the authenticated daemon API. The daemon validates and normalizes the import in app-private storage, then uses token-gated rootd to atomically publish a root-owned generation under `/data/misc/camera/source`. Public status omits source names, paths, and digests.
+
+The stable-AIDL camera provider snapshots one published generation when a camera opens. Its ordered worker writes preview, YUV, and JPEG buffers, emits a monotonic shutter timestamp, and then returns matching result metadata, including coherent AE/AWB lock state used by legacy camera clients. The runtime supplies matching framework camcorder profiles for both cameras. The image-matched legacy allocator remains the sole graphics allocator; its camera-only handle extension supports flexible YUV and JPEG BLOB buffers while retaining the original RGB/framebuffer handle layout.
+
+Photo requests fall back to the first video frame, video requests fall back to the photo, and a source-free runtime uses a generated sensor-like scene. Source changes therefore never invalidate an active session and become visible only on the next open.
 
 ## Environment hiding
 
