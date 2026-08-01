@@ -8,21 +8,29 @@
 #include <aidl/android/hardware/camera/device/NotifyMsg.h>
 #include <aidl/android/hardware/camera/device/ShutterMsg.h>
 #include <aidl/android/hardware/camera/device/StreamBuffer.h>
+#include <aidl/android/hardware/common/fmq/GrantorDescriptor.h>
 #include <android/log.h>
+#include <android/sharedmem.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
+#include <fcntl.h>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "camera_source.h"
 #include "camera_buffer.h"
@@ -96,6 +104,193 @@ void initializeResult(CaptureResult* result, int32_t frameNumber) {
     result->physicalCameraMetadata.clear();
 }
 
+using MetadataQueueDescriptor =
+        aidl::android::hardware::common::fmq::MQDescriptor<
+                int8_t,
+                aidl::android::hardware::common::fmq::SynchronizedReadWrite>;
+using GrantorDescriptor =
+        aidl::android::hardware::common::fmq::GrantorDescriptor;
+
+constexpr size_t kMetadataQueueCapacity = 1U << 18;
+constexpr int32_t kSynchronizedReadWriteFlag = 1;
+
+class MetadataQueue {
+public:
+    MetadataQueue() = default;
+    MetadataQueue(const MetadataQueue&) = delete;
+    MetadataQueue& operator=(const MetadataQueue&) = delete;
+    ~MetadataQueue() { reset(); }
+
+    bool initialize(const char* name, std::string* error) {
+        reset();
+        constexpr size_t kPointerBytes = sizeof(uint64_t);
+        constexpr size_t kDataOffset = kPointerBytes * 2U;
+        constexpr size_t kMemoryBytes =
+                kDataOffset + kMetadataQueueCapacity;
+        static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
+        const int fd = ASharedMemory_create(name, kMemoryBytes);
+        if (fd < 0) {
+            if (error != nullptr) {
+                *error = std::string("metadata queue allocation failed: ") +
+                        std::strerror(errno);
+            }
+            return false;
+        }
+        void* const mapping = mmap(nullptr, kMemoryBytes,
+                                   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapping == MAP_FAILED) {
+            const int savedErrno = errno;
+            close(fd);
+            if (error != nullptr) {
+                *error = std::string("metadata queue mapping failed: ") +
+                        std::strerror(savedErrno);
+            }
+            return false;
+        }
+
+        fd_ = fd;
+        mapping_ = mapping;
+        mappingBytes_ = kMemoryBytes;
+        uint8_t* const bytes = static_cast<uint8_t*>(mapping_);
+        readPointer_ = new (bytes) std::atomic<uint64_t>(0);
+        writePointer_ = new (bytes + kPointerBytes) std::atomic<uint64_t>(0);
+        data_ = bytes + kDataOffset;
+        return true;
+    }
+
+    bool dupeDescriptor(MetadataQueueDescriptor* out,
+                        std::string* error) const {
+        if (!ready() || out == nullptr) {
+            if (error != nullptr) {
+                *error = "metadata queue is unavailable";
+            }
+            return false;
+        }
+        const int descriptorFd = fcntl(fd_, F_DUPFD_CLOEXEC, 0);
+        if (descriptorFd < 0) {
+            if (error != nullptr) {
+                *error = std::string("metadata queue descriptor duplication failed: ") +
+                        std::strerror(errno);
+            }
+            return false;
+        }
+
+        MetadataQueueDescriptor descriptor;
+        descriptor.grantors.reserve(3);
+        const auto addGrantor = [&descriptor](int32_t offset,
+                                               int64_t extent) {
+            GrantorDescriptor grantor;
+            grantor.fdIndex = 0;
+            grantor.offset = offset;
+            grantor.extent = extent;
+            descriptor.grantors.push_back(grantor);
+        };
+        addGrantor(0, sizeof(uint64_t));
+        addGrantor(sizeof(uint64_t), sizeof(uint64_t));
+        addGrantor(sizeof(uint64_t) * 2,
+                   static_cast<int64_t>(kMetadataQueueCapacity));
+        descriptor.handle.fds.emplace_back(descriptorFd);
+        descriptor.quantum = sizeof(int8_t);
+        descriptor.flags = kSynchronizedReadWriteFlag;
+        *out = std::move(descriptor);
+        return true;
+    }
+
+    bool read(uint8_t* destination, size_t size) {
+        if (size == 0) {
+            return true;
+        }
+        if (!ready() || destination == nullptr ||
+            size > kMetadataQueueCapacity) {
+            return false;
+        }
+
+        const uint64_t write =
+                writePointer_->load(std::memory_order_acquire);
+        const uint64_t read =
+                readPointer_->load(std::memory_order_relaxed);
+        const uint64_t available = write - read;
+        if (available > kMetadataQueueCapacity) {
+            readPointer_->store(write, std::memory_order_release);
+            return false;
+        }
+        if (available < size) {
+            return false;
+        }
+
+        const size_t offset =
+                static_cast<size_t>(read % kMetadataQueueCapacity);
+        const size_t first = std::min(size,
+                                     kMetadataQueueCapacity - offset);
+        std::memcpy(destination, data_ + offset, first);
+        if (first != size) {
+            std::memcpy(destination + first, data_, size - first);
+        }
+        readPointer_->store(read + size, std::memory_order_release);
+        return true;
+    }
+
+    bool write(const uint8_t* source, size_t size) {
+        if (size == 0) {
+            return true;
+        }
+        if (!ready() || source == nullptr || size > kMetadataQueueCapacity) {
+            return false;
+        }
+
+        const uint64_t read =
+                readPointer_->load(std::memory_order_acquire);
+        const uint64_t write =
+                writePointer_->load(std::memory_order_relaxed);
+        const uint64_t used = write - read;
+        if (used > kMetadataQueueCapacity ||
+            kMetadataQueueCapacity - used < size) {
+            return false;
+        }
+
+        const size_t offset =
+                static_cast<size_t>(write % kMetadataQueueCapacity);
+        const size_t first = std::min(size,
+                                     kMetadataQueueCapacity - offset);
+        std::memcpy(data_ + offset, source, first);
+        if (first != size) {
+            std::memcpy(data_, source + first, size - first);
+        }
+        writePointer_->store(write + size, std::memory_order_release);
+        return true;
+    }
+
+private:
+    bool ready() const {
+        return fd_ >= 0 && mapping_ != MAP_FAILED &&
+                readPointer_ != nullptr && writePointer_ != nullptr &&
+                data_ != nullptr;
+    }
+
+    void reset() {
+        readPointer_ = nullptr;
+        writePointer_ = nullptr;
+        data_ = nullptr;
+        if (mapping_ != MAP_FAILED) {
+            munmap(mapping_, mappingBytes_);
+            mapping_ = MAP_FAILED;
+            mappingBytes_ = 0;
+        }
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    int fd_ = -1;
+    void* mapping_ = MAP_FAILED;
+    size_t mappingBytes_ = 0;
+    std::atomic<uint64_t>* readPointer_ = nullptr;
+    std::atomic<uint64_t>* writePointer_ = nullptr;
+    uint8_t* data_ = nullptr;
+};
+
 }  // namespace
 
 struct CameraSession::Impl {
@@ -135,12 +330,21 @@ struct CameraSession::Impl {
           onClosed(std::move(onClosedValue)),
           renderer(sensorOrientation) {
         std::string error;
-        sourceReady = source.openSnapshot(&error);
-        if (!sourceReady) {
+        if (!source.openSnapshot(&error)) {
             __android_log_print(ANDROID_LOG_ERROR, "camera-provider",
                                 "source snapshot rejected: %s", error.c_str());
             return;
         }
+        if (!requestMetadataQueue.initialize(
+                    "camera-request-metadata", &error) ||
+            !resultMetadataQueue.initialize(
+                    "camera-result-metadata", &error)) {
+            __android_log_print(ANDROID_LOG_ERROR, "camera-provider",
+                                "metadata queue rejected: %s", error.c_str());
+            source.release();
+            return;
+        }
+        sourceReady = true;
         queue.reserve(kMaximumQueuedRequests);
         worker = std::thread([this] { workerLoop(); });
     }
@@ -155,17 +359,52 @@ struct CameraSession::Impl {
     }
 
     void notify(const std::vector<NotifyMsg>& messages) {
-        if (!messages.empty() && callback != nullptr) {
-            (void)callback->notify(messages);
+        if (messages.empty()) {
+            return;
+        }
+        if (callback == nullptr) {
+            __android_log_print(
+                    ANDROID_LOG_ERROR, "camera-provider",
+                    "dropping %zu camera notifications: callback is unavailable",
+                    messages.size());
+            return;
+        }
+        const ScopedAStatus status = callback->notify(messages);
+        if (!status.isOk()) {
+            const std::string description = status.getDescription();
+            __android_log_print(
+                    ANDROID_LOG_ERROR, "camera-provider",
+                    "camera notify callback failed: %s",
+                    description.c_str());
         }
     }
 
     void returnResult(CaptureResult&& result) {
-        if (callback != nullptr) {
-            std::vector<CaptureResult> results;
-            results.reserve(1);
-            results.push_back(std::move(result));
-            (void)callback->processCaptureResult(results);
+        const int32_t frameNumber = result.frameNumber;
+        if (callback == nullptr) {
+            __android_log_print(
+                    ANDROID_LOG_ERROR, "camera-provider",
+                    "dropping capture result for frame %d: callback is unavailable",
+                    frameNumber);
+            return;
+        }
+        if (!result.result.metadata.empty() &&
+            resultMetadataQueue.write(result.result.metadata.data(),
+                                      result.result.metadata.size())) {
+            result.fmqResultSize =
+                    static_cast<int64_t>(result.result.metadata.size());
+            result.result.metadata.clear();
+        }
+        std::vector<CaptureResult> results;
+        results.reserve(1);
+        results.push_back(std::move(result));
+        const ScopedAStatus status = callback->processCaptureResult(results);
+        if (!status.isOk()) {
+            const std::string description = status.getDescription();
+            __android_log_print(
+                    ANDROID_LOG_ERROR, "camera-provider",
+                    "capture result callback failed for frame %d: %s",
+                    frameNumber, description.c_str());
         }
     }
 
@@ -363,6 +602,8 @@ struct CameraSession::Impl {
         std::lock_guard<std::mutex> shutdownLock(shutdownMutex);
         std::function<void()> release;
         {
+            std::lock_guard<std::mutex> submissionLock(submissionMutex);
+            acceptingSubmissions = false;
             std::lock_guard<std::mutex> lock(mutex);
             if (state != State::Closed) {
                 state = State::Closed;
@@ -379,7 +620,10 @@ struct CameraSession::Impl {
         source.release();
         renderer.releaseScratch();
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::unique_lock<std::mutex> lock(mutex);
+            condition.wait(lock, [&] {
+                return activeSubmissions.load(std::memory_order_acquire) == 0;
+            });
             bufferCache.clear();
             configuredStreams.clear();
             lastSettings.reset();
@@ -405,11 +649,14 @@ struct CameraSession::Impl {
     bool inFlight = false;
     bool closeReported = false;
     bool sourceReady = false;
+    bool acceptingSubmissions = true;
     std::thread worker;
     std::vector<PendingRequest> queue;
     CameraBufferCache bufferCache;
     CameraSource source;
     CameraRenderer renderer;
+    MetadataQueue requestMetadataQueue;
+    MetadataQueue resultMetadataQueue;
     std::vector<StreamDescriptor> configuredStreams;
     std::optional<RequestSettings> lastSettings;
     int32_t streamConfigCounter = -1;
@@ -556,7 +803,11 @@ ScopedAStatus CameraSession::getCaptureRequestMetadataQueue(
     if (impl_->state == Impl::State::Closed) {
         return halError(Status::INTERNAL_ERROR, "camera session is closed");
     }
-    *out = {};
+    std::string error;
+    if (!impl_->requestMetadataQueue.dupeDescriptor(out, &error)) {
+        *out = {};
+        return halError(Status::INTERNAL_ERROR, error);
+    }
     return ScopedAStatus::ok();
 }
 
@@ -567,7 +818,11 @@ ScopedAStatus CameraSession::getCaptureResultMetadataQueue(
     if (impl_->state == Impl::State::Closed) {
         return halError(Status::INTERNAL_ERROR, "camera session is closed");
     }
-    *out = {};
+    std::string error;
+    if (!impl_->resultMetadataQueue.dupeDescriptor(out, &error)) {
+        *out = {};
+        return halError(Status::INTERNAL_ERROR, error);
+    }
     return ScopedAStatus::ok();
 }
 
@@ -592,12 +847,16 @@ ScopedAStatus CameraSession::processCaptureRequest(
             impl->condition.notify_all();
         }
     };
+    *out = 0;
     {
         std::lock_guard<std::mutex> submissionLock(impl_->submissionMutex);
+        if (!impl_->acceptingSubmissions) {
+            return halError(Status::INTERNAL_ERROR,
+                            "camera session is closed");
+        }
         impl_->activeSubmissions.fetch_add(1, std::memory_order_acq_rel);
     }
     SubmissionGuard submission{impl_.get()};
-    *out = 0;
 
     std::unique_lock<std::mutex> lock(impl_->mutex);
     for (const auto& cache : cachesToRemove) {
@@ -637,9 +896,11 @@ ScopedAStatus CameraSession::processCaptureRequest(
             return halError(Status::ILLEGAL_ARGUMENT,
                             "frame numbers must increase");
         }
-        if (parcel.fmqSettingsSize != 0) {
+        if (parcel.fmqSettingsSize < 0 ||
+            parcel.fmqSettingsSize >
+                    static_cast<int64_t>(kMetadataQueueCapacity)) {
             return halError(Status::ILLEGAL_ARGUMENT,
-                            "request metadata FMQ is unavailable");
+                            "request metadata FMQ size is invalid");
         }
         if (!parcel.physicalCameraSettings.empty()) {
             return halError(Status::ILLEGAL_ARGUMENT,
@@ -659,8 +920,22 @@ ScopedAStatus CameraSession::processCaptureRequest(
         request.cancellationGeneration = requestGeneration;
         request.cancelAll = cancelBatch;
         std::string error;
+        CameraMetadata fmqSettings;
+        const CameraMetadata* settings = &parcel.settings;
+        if (parcel.fmqSettingsSize > 0) {
+            fmqSettings.metadata.resize(
+                    static_cast<size_t>(parcel.fmqSettingsSize));
+            if (!impl_->requestMetadataQueue.read(
+                        fmqSettings.metadata.data(),
+                        fmqSettings.metadata.size())) {
+                return halError(
+                        Status::ILLEGAL_ARGUMENT,
+                        "request metadata FMQ did not contain the declared bytes");
+            }
+            settings = &fmqSettings;
+        }
         if (!parseRequestSettings(
-                    parcel.settings,
+                    *settings,
                     nextSettings ? &*nextSettings : nullptr,
                     &request.settings, &error)) {
             return halError(Status::ILLEGAL_ARGUMENT, error);

@@ -76,6 +76,15 @@ int gralloc_unlock(gralloc_module_t const* module, buffer_handle_t handle);
 int gralloc_lock_ycbcr(gralloc_module_t const* module, buffer_handle_t handle,
                        int usage, int l, int t, int w, int h,
                        struct android_ycbcr* ycbcr);
+int gralloc_lock_async(gralloc_module_t const* module, buffer_handle_t handle,
+                       int usage, int l, int t, int w, int h, void** vaddr,
+                       int fenceFd);
+int gralloc_unlock_async(gralloc_module_t const* module, buffer_handle_t handle,
+                         int* fenceFd);
+int gralloc_lock_async_ycbcr(gralloc_module_t const* module,
+                             buffer_handle_t handle, int usage, int l, int t,
+                             int w, int h, struct android_ycbcr* ycbcr,
+                             int fenceFd);
 int32_t gralloc_get_transport_size(gralloc_module_t const* module,
                                    buffer_handle_t handle, uint32_t* outNumFds,
                                    uint32_t* outNumInts);

@@ -381,20 +381,20 @@ final class CameraSupport {
         boolean swapsAxes = rotation == 90 || rotation == 270;
         int orientedWidth = swapsAxes ? sourceHeight : sourceWidth;
         int orientedHeight = swapsAxes ? sourceWidth : sourceHeight;
-        double scale = Math.min((double) outputWidth / orientedWidth,
-                (double) outputHeight / orientedHeight);
+        double scaleX = (double) outputWidth / orientedWidth;
+        double scaleY = (double) outputHeight / orientedHeight;
         byte[] sample = new byte[SAMPLE_BYTES];
         for (int y = 0; y < SAMPLE_HEIGHT; ++y) {
             double outputY = ((2.0 * y + 1.0) * outputHeight)
                     / (2.0 * SAMPLE_HEIGHT);
-            double orientedY = (outputY - outputHeight * 0.5) / scale
+            double orientedY = (outputY - outputHeight * 0.5) / scaleY
                     + (orientedHeight - 1) * 0.5;
             orientedY = Math.max(0.0, Math.min(orientedHeight - 1.0, orientedY));
             for (int x = 0; x < SAMPLE_WIDTH; ++x) {
                 double outputX = ((2.0 * x + 1.0) * outputWidth)
                         / (2.0 * SAMPLE_WIDTH);
                 if (mirrored) outputX = outputWidth - outputX;
-                double orientedX = (outputX - outputWidth * 0.5) / scale
+                double orientedX = (outputX - outputWidth * 0.5) / scaleX
                         + (orientedWidth - 1) * 0.5;
                 orientedX = Math.max(0.0, Math.min(orientedWidth - 1.0, orientedX));
                 double sourceX;

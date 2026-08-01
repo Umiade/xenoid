@@ -111,7 +111,7 @@ CXXFLAGS=(
 "$CXX" "${CXXFLAGS[@]}" -o "$OUTPUT" "${SRCS[@]}" \
   -L"$SYSROOT/usr/lib/$TRIPLE/30" \
   "$HAL/libcamera_metadata.so" "$HAL/libbinder_ndk.so" \
-  -llog -lmediandk -ljnigraphics -static-libstdc++ \
+  -landroid -llog -lmediandk -ljnigraphics -static-libstdc++ \
   -Wl,-z,defs,--gc-sections,--exclude-libs,ALL,-s
 
 for marker in xenoid mock replay; do

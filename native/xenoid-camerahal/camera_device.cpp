@@ -254,7 +254,7 @@ ScopedAStatus CameraDevice::open(
             if (openState_->generation == openGeneration) {
                 openState_->open = false;
             }
-            return halError(Status::INTERNAL_ERROR, "camera source snapshot is invalid");
+            return halError(Status::INTERNAL_ERROR, "camera session initialization failed");
         }
         *out = std::move(session);
     } catch (...) {

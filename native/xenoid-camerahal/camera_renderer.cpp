@@ -901,12 +901,6 @@ bool CameraRenderer::renderSourceScratch(const SourceFrame& source,
     const bool swapsAxes = totalRotation == 90 || totalRotation == 270;
     const int32_t orientedWidth = swapsAxes ? source.height : source.width;
     const int32_t orientedHeight = swapsAxes ? source.width : source.height;
-    const bool widthLimited =
-            static_cast<int64_t>(width) * orientedHeight <=
-            static_cast<int64_t>(height) * orientedWidth;
-    const int32_t scaleNumerator = widthLimited ? width : height;
-    const int32_t scaleDenominator =
-            widthLimited ? orientedWidth : orientedHeight;
 
     int32_t motionX = 0;
     int32_t motionY = 0;
@@ -916,15 +910,13 @@ bool CameraRenderer::renderSourceScratch(const SourceFrame& source,
     }
     for (int32_t x = 0; x < width; ++x) {
         coordinateXScratch_[static_cast<size_t>(x)] = mappedCoordinate(
-                x, width, orientedWidth, scaleNumerator, scaleDenominator,
-                motionX);
+                x, width, orientedWidth, width, orientedWidth, motionX);
         normalizedXScratch_[static_cast<size_t>(x)] =
                 normalizedCoordinate(x, width);
     }
     for (int32_t y = 0; y < height; ++y) {
         coordinateYScratch_[static_cast<size_t>(y)] = mappedCoordinate(
-                y, height, orientedHeight, scaleNumerator, scaleDenominator,
-                motionY);
+                y, height, orientedHeight, height, orientedHeight, motionY);
     }
 
     const int64_t maximumRawX =

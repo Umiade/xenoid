@@ -54,7 +54,7 @@ __attribute__((visibility("default"))) struct private_module_t HAL_MODULE_INFO_S
         .base = {
                 .common = {
                         .tag = HARDWARE_MODULE_TAG,
-                        .module_api_version = GRALLOC_MODULE_API_VERSION_0_2,
+                        .module_api_version = GRALLOC_MODULE_API_VERSION_0_3,
                         .hal_api_version = 0,
                         .id = GRALLOC_HARDWARE_MODULE_ID,
                         .name = "Graphics Memory Allocator Module",
@@ -66,6 +66,9 @@ __attribute__((visibility("default"))) struct private_module_t HAL_MODULE_INFO_S
                 .lock = gralloc_lock,
                 .unlock = gralloc_unlock,
                 .lock_ycbcr = gralloc_lock_ycbcr,
+                .lockAsync = gralloc_lock_async,
+                .unlockAsync = gralloc_unlock_async,
+                .lockAsync_ycbcr = gralloc_lock_async_ycbcr,
                 .getTransportSize = gralloc_get_transport_size,
                 .validateBufferSize = gralloc_validate_buffer_size,
         },
@@ -301,6 +304,7 @@ static int gralloc_alloc(alloc_device_t* dev, int width, int height, int format,
         case HAL_PIXEL_FORMAT_RGBA_8888:
         case HAL_PIXEL_FORMAT_RGBX_8888:
         case HAL_PIXEL_FORMAT_BGRA_8888:
+        case HAL_PIXEL_FORMAT_RGBA_1010102:
             bytesPerPixel = 4;
             break;
         case HAL_PIXEL_FORMAT_RGB_888:
@@ -309,6 +313,9 @@ static int gralloc_alloc(alloc_device_t* dev, int width, int height, int format,
         case HAL_PIXEL_FORMAT_RGB_565:
         case HAL_PIXEL_FORMAT_RAW16:
             bytesPerPixel = 2;
+            break;
+        case HAL_PIXEL_FORMAT_R_8:
+            bytesPerPixel = 1;
             break;
         default:
             return -EINVAL;

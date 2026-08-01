@@ -20,7 +20,9 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -28,6 +30,69 @@
 
 #include "gr.h"
 #include "gralloc_priv.h"
+
+namespace {
+
+constexpr int kAcquireFenceTimeoutMs = 300;
+
+class OwnedFd {
+  public:
+    explicit OwnedFd(int fd) : fd_(fd) {}
+    ~OwnedFd() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    OwnedFd(const OwnedFd&) = delete;
+    OwnedFd& operator=(const OwnedFd&) = delete;
+
+    int get() const { return fd_; }
+
+  private:
+    int fd_;
+};
+
+int waitForAcquireFence(int fenceFd) {
+    if (fenceFd < 0) {
+        return 0;
+    }
+
+    int duplicate;
+    do {
+        duplicate = fcntl(fenceFd, F_DUPFD_CLOEXEC, 0);
+    } while (duplicate < 0 && errno == EINTR);
+    if (duplicate < 0) {
+        return -errno;
+    }
+    const OwnedFd waitFence(duplicate);
+
+    pollfd descriptor = {
+            .fd = waitFence.get(),
+            .events = POLLIN,
+            .revents = 0,
+    };
+    int result;
+    do {
+        result = poll(&descriptor, 1, kAcquireFenceTimeoutMs);
+    } while (result < 0 && errno == EINTR);
+
+    if (result == 0) {
+        return -ETIMEDOUT;
+    }
+    if (result < 0) {
+        return -errno;
+    }
+    if ((descriptor.revents & POLLNVAL) != 0) {
+        return -EBADF;
+    }
+    if ((descriptor.revents & POLLERR) != 0) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+}  // namespace
 
 static int gralloc_map(gralloc_module_t const*, buffer_handle_t buffer,
                        void** outAddress) {
@@ -135,6 +200,17 @@ int gralloc_lock(gralloc_module_t const*, buffer_handle_t buffer, int, int, int,
     return 0;
 }
 
+int gralloc_lock_async(gralloc_module_t const* module, buffer_handle_t buffer,
+                       int usage, int left, int top, int width, int height,
+                       void** outAddress, int fenceFd) {
+    const int waitError = waitForAcquireFence(fenceFd);
+    if (waitError != 0) {
+        return waitError;
+    }
+    return gralloc_lock(module, buffer, usage, left, top, width, height,
+                        outAddress);
+}
+
 int gralloc_lock_ycbcr(gralloc_module_t const*, buffer_handle_t buffer, int,
                        int left, int top, int width, int height,
                        struct android_ycbcr* outYcbcr) {
@@ -187,8 +263,29 @@ int gralloc_lock_ycbcr(gralloc_module_t const*, buffer_handle_t buffer, int,
     return 0;
 }
 
+int gralloc_lock_async_ycbcr(gralloc_module_t const* module,
+                             buffer_handle_t buffer, int usage, int left,
+                             int top, int width, int height,
+                             struct android_ycbcr* outYcbcr, int fenceFd) {
+    const int waitError = waitForAcquireFence(fenceFd);
+    if (waitError != 0) {
+        return waitError;
+    }
+    return gralloc_lock_ycbcr(module, buffer, usage, left, top, width, height,
+                              outYcbcr);
+}
+
 int gralloc_unlock(gralloc_module_t const*, buffer_handle_t buffer) {
     return private_handle_t::validate(buffer) < 0 ? -EINVAL : 0;
+}
+
+int gralloc_unlock_async(gralloc_module_t const* module, buffer_handle_t buffer,
+                         int* fenceFd) {
+    if (fenceFd == nullptr) {
+        return -EINVAL;
+    }
+    *fenceFd = -1;
+    return gralloc_unlock(module, buffer);
 }
 
 int32_t gralloc_get_transport_size(gralloc_module_t const*, buffer_handle_t buffer,
@@ -247,6 +344,7 @@ int32_t gralloc_validate_buffer_size(gralloc_module_t const*, buffer_handle_t bu
         case HAL_PIXEL_FORMAT_RGBA_8888:
         case HAL_PIXEL_FORMAT_RGBX_8888:
         case HAL_PIXEL_FORMAT_BGRA_8888:
+        case HAL_PIXEL_FORMAT_RGBA_1010102:
             bytesPerPixel = 4;
             break;
         case HAL_PIXEL_FORMAT_RGB_888:
@@ -255,6 +353,9 @@ int32_t gralloc_validate_buffer_size(gralloc_module_t const*, buffer_handle_t bu
         case HAL_PIXEL_FORMAT_RGB_565:
         case HAL_PIXEL_FORMAT_RAW16:
             bytesPerPixel = 2;
+            break;
+        case HAL_PIXEL_FORMAT_R_8:
+            bytesPerPixel = 1;
             break;
         default:
             return -EINVAL;

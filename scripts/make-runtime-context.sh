@@ -80,6 +80,7 @@ if command -v docker >/dev/null 2>&1; then
     # Preserve the base image's redroid implementations under those names so
     # the Pixel identity is safe from the first graphics-stack initialization.
     _required_extract_ok=1
+    "${DOCKER[@]}" cp "$_cid:/system/lib64/libui.so" "$OUT/payload/libui.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libselinux.so" "$OUT/payload/libselinux.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/hw/gralloc.redroid.so" "$OUT/payload/gralloc.base.redroid.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/hw/hwcomposer.redroid.so" "$OUT/payload/hwcomposer.redroid.so" >/dev/null || _required_extract_ok=0
@@ -154,6 +155,46 @@ data[OFF:OFF+4] = MOVZ_1
 p.write_bytes(data)
 print('patched libandroid_runtime: security_getenforce gate -> always-true')
 PY2
+    python3 - "$OUT/payload/libui.so" <<'PY4'
+from pathlib import Path
+import hashlib
+import sys
+
+path = Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+expected_hash = "709b80ed6f09f91bdb29f48138dc5e8a7dcbbdc72cdf73e16697576370a30c1e"
+actual_hash = hashlib.sha256(data).hexdigest()
+if actual_hash != expected_hash:
+    raise SystemExit(
+        f"SHA256 mismatch for {path}: expected {expected_hash}, got {actual_hash}"
+    )
+
+# Gralloc2Mapper owns every nonnegative acquire fence. Descriptor 0 is reserved
+# for stdin in zygote children and is also used as a legacy no-fence sentinel.
+# Close only positive fence descriptors in both RGB and YCbCr lock overloads.
+patches = (
+    (
+        0x2E2D0,
+        bytes.fromhex("7400f837e003142a"),
+        bytes.fromhex("800200714d000054"),
+    ),
+    (
+        0x2E4A8,
+        bytes.fromhex("9300f837e003132a"),
+        bytes.fromhex("600200716d000054"),
+    ),
+)
+for offset, original, replacement in patches:
+    actual = bytes(data[offset:offset + len(original)])
+    if actual != original:
+        raise SystemExit(
+            f"unexpected bytes at {offset:#x}: "
+            f"expected {original.hex()}, got {actual.hex()}"
+        )
+    data[offset:offset + len(original)] = replacement
+path.write_bytes(data)
+print("patched libui: Gralloc2Mapper preserves reserved descriptor 0")
+PY4
     rm -rf "$_stock"
   else
     echo "failed to create extraction container from $IMAGE" >&2
@@ -277,6 +318,8 @@ COPY payload/xenoid.rc /system/etc/init/xenoid.rc
 COPY payload/android.hardware.camera.provider-service-aidl.rc /system/etc/init/android.hardware.camera.provider-service-aidl.rc
 COPY payload/init.zygote64.rc /system/etc/init/hw/init.zygote64.rc
 COPY payload/libandroid_runtime.so /system/lib64/libandroid_runtime.so
+# Preserve descriptor 0 when legacy AHardwareBuffer clients use it as no-fence.
+COPY --chmod=644 payload/libui.so /system/lib64/libui.so
 # Restore standard SELinux context APIs removed by redroid's HACKED stubs.
 COPY --chmod=644 payload/libselinux.so /system/lib64/libselinux.so
 # ro.hardware=tensor resolves these aliases during early graphics HAL loading.
