@@ -36,7 +36,6 @@ required_files = [
     "scripts/redroid-preflight.sh",
     "scripts/probe-redroid-docker.sh",
     "scripts/setup-linux-binderfs.sh",
-    "scripts/make-compose.py",
     "scripts/smoke-daemon-api.sh",
     "scripts/smoke-runtime.sh",
     "scripts/json-ok.py",
@@ -100,18 +99,31 @@ add("runtime logs", proc.returncode == 0 and "outDir" in proc.stdout, proc.stdou
 
 # Runtime context
 proc = subprocess.run([str(ROOT / "xenoid"), "runtime-context"], text=True, capture_output=True, cwd=ROOT)
-add("runtime context", proc.returncode == 0 and (ROOT / "dist/runtime-context/Dockerfile").exists(), proc.stdout + proc.stderr)
+try:
+    runtime_context = pathlib.Path(json.loads(proc.stdout)["context"])
+except Exception:
+    runtime_context = pathlib.Path("/nonexistent")
+add("runtime context", proc.returncode == 0 and (runtime_context / "Dockerfile").exists(), proc.stdout + proc.stderr)
 proc = subprocess.run([str(ROOT / "xenoid"), "runtime-build-image", "--dry-run"], text=True, capture_output=True, cwd=ROOT)
 add("runtime build image dry-run", proc.returncode == 0 and "docker" in proc.stdout and "build" in proc.stdout, proc.stdout + proc.stderr)
-proc = subprocess.run([str(ROOT / "xenoid"), "runtime-compose", "--out", "/tmp/xenoid-compose-audit.yml"], text=True, capture_output=True, cwd=ROOT)
-add("runtime compose", proc.returncode == 0 and "xenoid-android" in pathlib.Path("/tmp/xenoid-compose-audit.yml").read_text(), proc.stdout + proc.stderr)
 proc = subprocess.run([str(ROOT / "xenoid"), "config", "show"], text=True, capture_output=True, cwd=ROOT)
 add("config show", proc.returncode == 0 and "runtime_image_tag" in proc.stdout and "docker_context" in proc.stdout, proc.stdout + proc.stderr)
-old_cfg = (ROOT/".xenoid/config.json").read_text() if (ROOT/".xenoid/config.json").exists() else None
-subprocess.run([str(ROOT/"xenoid"),"config","set","--docker-context","audit-context"], text=True, capture_output=True, cwd=ROOT)
-proc = subprocess.run([str(ROOT/"xenoid"),"runtime-build-image","--dry-run"], text=True, capture_output=True, cwd=ROOT)
-add("docker context dry-run", proc.returncode == 0 and "--context" in proc.stdout and "audit-context" in proc.stdout, proc.stdout + proc.stderr)
-if old_cfg is not None: (ROOT/".xenoid/config.json").write_text(old_cfg)
+sys.path.insert(0, str(ROOT / "src"))
+from xenoid.config import resolve_instance
+
+audit_context, _, _ = resolve_instance(
+    os.environ.get("XENOID_INSTANCE"),
+    project_root=ROOT,
+    env=os.environ,
+)
+config_path = audit_context.config_path
+old_cfg = config_path.read_bytes()
+try:
+    subprocess.run([str(ROOT/"xenoid"),"config","set","--docker-context","audit-context"], text=True, capture_output=True, cwd=ROOT)
+    proc = subprocess.run([str(ROOT/"xenoid"),"runtime-build-image","--dry-run"], text=True, capture_output=True, cwd=ROOT)
+    add("docker context dry-run", proc.returncode == 0 and "--context" in proc.stdout and "audit-context" in proc.stdout, proc.stdout + proc.stderr)
+finally:
+    config_path.write_bytes(old_cfg)
 
 # Profile helper smoke via mock
 proc = subprocess.run([str(ROOT / "scripts/smoke-daemon-api.sh"), "--mock"], text=True, capture_output=True, cwd=ROOT)
@@ -182,7 +194,7 @@ add("js bridge automation", "JavascriptInterface" in bridge and "evaluateJavascr
 # Static API coverage
 cli = (ROOT / "src/xenoid/cli.py").read_text()
 daemon = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/XenoidDaemonService.java").read_text()
-for token in ["docker-context", "install-runtime", "up", "doctor", "logs", "view", "linux-binderfs", "runtime-compose", "verify-release", "package-release", "ebpf", "netctl", "root", "profile", "deploy-helper", "config", "runtime-build-image", "frida", "deploy-scripts", "load-script", "generate-frida", "generate-service-frida", "hide", "device", "automation", "run-host", "plan", "input", "app", "camera", "ota", "runtime-context"]:
+for token in ["docker-context", "install-runtime", "up", "doctor", "logs", "view", "linux-binderfs", "verify-release", "package-release", "ebpf", "netctl", "root", "profile", "deploy-helper", "config", "runtime-build-image", "frida", "deploy-scripts", "load-script", "generate-frida", "generate-service-frida", "hide", "device", "automation", "run-host", "plan", "input", "app", "camera", "ota", "runtime-context"]:
     add("cli token:" + token, token in cli, "src/xenoid/cli.py")
 for route in ["/root/status", "/frida/start", "/hide/apply", "/fingerprint/apply", "/automation/run", "/input/tap", "/app/install", "/camera/status", "/camera/source", "/camera/settings", "/camera/clear", "/camera/apply", "/camera/self-test/start", "/camera/self-test/status", "/ota/apply"]:
     add("daemon route:" + route, route in daemon, "XenoidDaemonService.java")

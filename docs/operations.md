@@ -96,6 +96,48 @@ docker context create linux-arm --docker host=ssh://user@server
 
 With `backend=linux-docker`, Xenoid prepares binder and runtime protection on the selected Docker engine host and does not start local Colima.
 
+## Global proxy
+
+The Android Xenoid settings screen and host CLI modify the same daemon-owned desired state. Keep credentials out of argv, shell history, public configuration, and tracked files:
+
+```bash
+# Read one endpoint or URI without terminal echo.
+./xenoid proxy set --prompt
+
+# Import Clash YAML/JSON, a URI list, or a base64 URI subscription.
+chmod 600 /path/to/proxy-source
+./xenoid proxy import /path/to/proxy-source
+
+# Save an online configuration URL. HTTPS is mandatory by default.
+./xenoid proxy subscribe --prompt
+
+# Show redacted state and run a new data-plane proof.
+./xenoid proxy status --check
+```
+
+`set` and `import` infer `endpoint`, `uri_list`, or `clash`; use `--kind` only to resolve ambiguous input. `subscribe` fetches a bounded online source and detects Clash, URI-list, and base64 URI-list bodies. Plain HTTP fetches require `--allow-insecure-http` and cannot carry query credentials. Imports and URL files must be regular, non-symlink, current-user-owned mode-`0600` files. `export --out FILE` creates a private mode-`0600` backup atomically and refuses unsafe output paths.
+
+Supported URI/Clash node types are HTTP/HTTPS, SOCKS5, Shadowsocks, ShadowsocksR, Trojan, VMess, VLESS, Hysteria 1/2, TUIC, AnyTLS, Mieru, and Snell. Direct HTTP/HTTPS endpoint input requires `--no-udp`; other sources allow UDP by default and accept `--no-udp` to force TCP/DNS-only operation. Input Clash rules, groups, listeners, controller fields, direct fallbacks, and unsupported proxy/provider keys are rejected or discarded; the generated engine policy is always `MATCH,GLOBAL`.
+
+Node and lifecycle commands:
+
+```bash
+./xenoid proxy list
+./xenoid proxy select NAME
+./xenoid proxy off       # preserve the source; remove the active data plane
+./xenoid proxy on
+./xenoid proxy export --out /path/to/private-backup
+./xenoid proxy clear     # disable and erase the saved source
+./xenoid proxy prepare   # preinstall the pinned engine asset
+```
+
+`set`, `subscribe`, and `import` enable by default; add `--no-enable` to stage a source. `list`, `status`, MCP results, and daemon status never return source values, credentials, provider URLs, cache keys, paths, or configuration digests. `./xenoid up` converges any saved enabled source before declaring the runtime ready.
+
+The Docker engine host must provide root/sudo, systemd, Python 3, iproute2, and IPv4/IPv6 netfilter support. Xenoid installs missing supported distro packages and a digest-pinned Mihomo binary on first use. The proxy namespace and listener stay on that host, including with a remote Linux Docker context; Android retains its normal Ethernet interface and route.
+
+If activation returns `data_plane_unverified`, inspect `./xenoid proxy status --check`. The per-instance quarantine intentionally remains closed until the exact current generation proves every requested IPv4/IPv6 DNS, TCP, and UDP capability. A stopped daemon, engine dependency failure, mismatched container identity, stale check, or inaccessible upstream cannot fall back to direct traffic. Use `./xenoid proxy off` to make an explicit fail-open operator decision, or fix the source/upstream and run `./xenoid proxy on`.
+
+
 ## Root control
 
 ```bash

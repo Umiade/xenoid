@@ -6,18 +6,34 @@ import android.os.*;
 import org.json.*;
 import java.io.*;
 import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class XenoidDaemonService extends Service {
+    private static final int MAX_HEADER_LINE_BYTES = 8192;
+    private static final int MAX_HEADER_BYTES = 32768;
+    private static final int MAX_DEFAULT_BODY_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_AGENT_BODY_BYTES = 96 * 1024;
+    private static final int HEADER_READ_TIMEOUT_MS = 5000;
+    private static final int SOURCE_READ_TIMEOUT_MS = 15000;
     private volatile ExecutorService pool;
     private volatile ServerSocket server;
     private volatile CameraMediaManager cameraMediaManager;
+    private volatile ProxyManager proxyManager;
+    private volatile ProxyAgentChannel proxyAgentChannel;
     public IBinder onBind(Intent intent) { return null; }
     public int onStartCommand(Intent intent, int flags, int startId) { enterForeground(); startServer(); return START_STICKY; }
     public void onDestroy() {
         ServerSocket listener = server;
         try { if (listener != null) listener.close(); } catch(Exception ignored) {}
+        ProxyAgentChannel channel = proxyAgentChannel;
+        if (channel != null) channel.close();
+        ProxyManager manager = proxyManager;
+        if (manager != null) manager.close();
         ExecutorService workers = pool;
         if (workers != null) workers.shutdownNow();
     }
@@ -52,15 +68,23 @@ public class XenoidDaemonService extends Service {
         try {
             String controlToken = getToken();
             RootHelper.setRootdToken(controlToken);
-            listener = new ServerSocket(18765, 50, InetAddress.getByName("0.0.0.0"));
-            server = listener;
-            final ServerSocket activeListener = listener;
-            workers.submit(() -> acceptClients(activeListener, workers));
+            try {
+                ProxyManager manager = new ProxyManager(this);
+                ProxyAgentChannel channel = new ProxyAgentChannel(manager);
+                proxyManager = manager;
+                proxyAgentChannel = channel;
+            } catch (Throwable ignored) {
+                android.util.Log.e("xenoid-daemon", "proxy control initialization failed");
+            }
             try {
                 cameraMediaManager = CameraMediaManager.get(this);
             } catch (Throwable ignored) {
                 android.util.Log.e("xenoid-daemon", "camera manager initialization failed");
             }
+            listener = new ServerSocket(18765, 50, InetAddress.getByName("0.0.0.0"));
+            server = listener;
+            final ServerSocket activeListener = listener;
+            workers.submit(() -> acceptClients(activeListener, workers));
         } catch(Exception e) {
             try { if (listener != null) listener.close(); } catch (Exception ignored) { }
             android.util.Log.e("xenoid-daemon", "bind failed", e);
@@ -73,10 +97,13 @@ public class XenoidDaemonService extends Service {
             while (!listener.isClosed()) {
                 Socket client = listener.accept();
                 try {
+                    client.setSoTimeout(HEADER_READ_TIMEOUT_MS);
                     workers.submit(new Client(client));
                 } catch (RejectedExecutionException e) {
                     try { client.close(); } catch (Exception ignored) { }
                     break;
+                } catch (SocketException ignored) {
+                    try { client.close(); } catch (Exception closeIgnored) { }
                 }
             }
         } catch (Exception e) {
@@ -105,39 +132,227 @@ public class XenoidDaemonService extends Service {
         return token;
     }
     private boolean authorized(String tokenHeader, String path) {
-        // /health stays public (liveness probe); every other endpoint needs the token.
+        // /health is public; /proxy/agent has its separate process-scoped credential.
         if ("/health".equals(path)) return true;
-        String t = getToken();
-        return tokenHeader != null && tokenHeader.equals(t);
-    }
-    final class Client implements Runnable { final Socket s; Client(Socket s){this.s=s;} public void run(){ try { handle(s); } catch(Exception ignored) { } finally { try{s.close();}catch(Exception ignored){} } } }
-    private void handle(Socket sock) throws Exception {
-        BufferedReader br = new BufferedReader(new InputStreamReader(sock.getInputStream()));
-        String request = br.readLine(); if (request == null) return; String[] parts = request.split(" "); String method = parts[0], path = parts[1];
-        int len = 0; String line; String tokenHeader = null; while((line = br.readLine()) != null && line.length() > 0) { String l=line.toLowerCase(Locale.ROOT); if(l.startsWith("content-length:")) len = Integer.parseInt(line.substring(15).trim()); else if(l.startsWith("x-xenoid-token:")) tokenHeader = line.substring(15).trim(); }
-        Map<String,Object> resp;
-        boolean isAuthorized = authorized(tokenHeader, path);
-        if (!isAuthorized) {
-            resp = map("ok", false, "error", "unauthorized");
-        } else if (path.startsWith("/camera/") && (len < 0 || len > 2048)) {
-            resp = map("ok", false, "error", "invalid request body");
-        } else {
-            char[] bodyChars = new char[len]; int off=0; while(off<len){ int n=br.read(bodyChars, off, len-off); if(n<0) break; off+=n; } String body = new String(bodyChars,0,off);
-            resp = route(method, path, body);
+        if (tokenHeader == null) return false;
+        byte[] supplied = tokenHeader.getBytes(StandardCharsets.UTF_8);
+        byte[] expected = getToken().getBytes(StandardCharsets.UTF_8);
+        try {
+            return MessageDigest.isEqual(supplied, expected);
+        } finally {
+            Arrays.fill(supplied, (byte) 0);
+            Arrays.fill(expected, (byte) 0);
         }
-        byte[] bytes = Json.stringify(resp).getBytes(); OutputStream os = sock.getOutputStream();
-        String status = isAuthorized ? "200 OK" : "401 Unauthorized";
-        os.write(("HTTP/1.1 "+status+"\r\nContent-Type: application/json\r\nContent-Length: "+bytes.length+"\r\nConnection: close\r\n\r\n").getBytes()); os.write(bytes); os.flush();
     }
+    final class Client implements Runnable {
+        final Socket socket;
+        Client(Socket socket) { this.socket = socket; }
+        public void run() {
+            try {
+                handle(socket);
+            } catch (Exception ignored) {
+            } finally {
+                try { socket.close(); } catch (Exception ignored) { }
+            }
+        }
+    }
+
+    private void handle(Socket socket) throws Exception {
+        OutputStream output = socket.getOutputStream();
+        try {
+            InputStream input = new BufferedInputStream(socket.getInputStream());
+            long headerDeadline = SystemClock.elapsedRealtime() + HEADER_READ_TIMEOUT_MS;
+            applyReadDeadline(socket, headerDeadline);
+            String requestLine = readHttpLine(input, 4096);
+            if (requestLine == null) return;
+            String[] requestParts = requestLine.split(" ", -1);
+            if (requestParts.length != 3
+                    || requestParts[0].isEmpty() || requestParts[0].length() > 8
+                    || !requestParts[0].matches("[A-Z]+")
+                    || requestParts[1].isEmpty() || requestParts[1].length() > 256
+                    || requestParts[1].charAt(0) != '/'
+                    || requestParts[1].indexOf('?') >= 0 || requestParts[1].indexOf('#') >= 0
+                    || (!"HTTP/1.1".equals(requestParts[2])
+                    && !"HTTP/1.0".equals(requestParts[2]))) {
+                throw new HttpFailure();
+            }
+            String method = requestParts[0];
+            String path = requestParts[1];
+            int contentLength = 0;
+            boolean sawContentLength = false;
+            String tokenHeader = null;
+            String agentTokenHeader = null;
+            int headerBytes = 0;
+            for (int count = 0; count < 64; count++) {
+                applyReadDeadline(socket, headerDeadline);
+                String line = readHttpLine(input, MAX_HEADER_LINE_BYTES);
+                if (line == null) throw new HttpFailure();
+                headerBytes += line.length() + 2;
+                if (headerBytes > MAX_HEADER_BYTES) throw new HttpFailure();
+                if (line.isEmpty()) break;
+                int separator = line.indexOf(':');
+                if (separator <= 0) throw new HttpFailure();
+                String name = line.substring(0, separator).trim().toLowerCase(Locale.ROOT);
+                String value = line.substring(separator + 1).trim();
+                if ("content-length".equals(name)) {
+                    if (sawContentLength) throw new HttpFailure();
+                    sawContentLength = true;
+                    contentLength = parseContentLength(value);
+                } else if ("x-xenoid-token".equals(name)) {
+                    if (tokenHeader != null || value.length() > 256) throw new HttpFailure();
+                    tokenHeader = value;
+                } else if ("x-xenoid-agent-token".equals(name)) {
+                    if (agentTokenHeader != null || value.length() > 128) throw new HttpFailure();
+                    agentTokenHeader = value;
+                } else if ("transfer-encoding".equals(name)) {
+                    throw new HttpFailure();
+                }
+                if (count == 63) throw new HttpFailure();
+            }
+
+            boolean agentRequest = "/proxy/agent".equals(path);
+            ProxyAgentChannel activeChannel = proxyAgentChannel;
+            boolean isAuthorized = agentRequest
+                    ? tokenHeader == null && activeChannel != null
+                    && activeChannel.authorizedAgentToken(agentTokenHeader)
+                    : authorized(tokenHeader, path);
+            if (!isAuthorized) {
+                writeResponse(output, 401, map(
+                        "ok", false,
+                        "error", agentRequest ? "agent_rejected" : "unauthorized"));
+                return;
+            }
+            int maximumBody = bodyLimit(method, path);
+            if (contentLength < 0 || contentLength > maximumBody) {
+                writeResponse(output, 400, map("ok", false, "error", "invalid_request_body"));
+                return;
+            }
+            long bodyDeadline = SystemClock.elapsedRealtime()
+                    + ("/proxy/source".equals(path)
+                    ? SOURCE_READ_TIMEOUT_MS : HEADER_READ_TIMEOUT_MS);
+            byte[] bodyBytes = new byte[contentLength];
+            int offset = 0;
+            while (offset < contentLength) {
+                applyReadDeadline(socket, bodyDeadline);
+                int read = input.read(bodyBytes, offset, contentLength - offset);
+                if (read < 0) {
+                    Arrays.fill(bodyBytes, (byte) 0);
+                    throw new HttpFailure();
+                }
+                offset += read;
+            }
+            String body;
+            try {
+                body = decodeUtf8(bodyBytes);
+            } finally {
+                Arrays.fill(bodyBytes, (byte) 0);
+            }
+            writeResponse(output, 200, route(method, path, body));
+        } catch (HttpFailure | SocketTimeoutException ignored) {
+            writeResponse(output, 400, map("ok", false, "error", "invalid_request"));
+        }
+    }
+
+    private static void applyReadDeadline(Socket socket, long deadline)
+            throws SocketException, SocketTimeoutException {
+        long remaining = deadline - SystemClock.elapsedRealtime();
+        if (remaining <= 0) throw new SocketTimeoutException();
+        socket.setSoTimeout((int) Math.min(Integer.MAX_VALUE, remaining));
+    }
+
+    private static int bodyLimit(String method, String path) {
+        if ("/health".equals(path)) return "GET".equals(method) ? 0 : 0;
+        if ("/proxy/source".equals(path)) {
+            return "POST".equals(method) ? ProxyManager.MAX_REQUEST_BODY_BYTES : 0;
+        }
+        if ("/proxy/agent".equals(path)) {
+            return "POST".equals(method) ? MAX_AGENT_BODY_BYTES : 0;
+        }
+        if (path.startsWith("/proxy/")) {
+            if (("/proxy/status".equals(path) || "/proxy/export".equals(path))
+                    && "GET".equals(method)) return 0;
+            return "POST".equals(method) ? 4096 : 0;
+        }
+        if (path.startsWith("/camera/")) return 2048;
+        return MAX_DEFAULT_BODY_BYTES;
+    }
+
+    private static int parseContentLength(String value) throws HttpFailure {
+        if (value.isEmpty() || value.length() > 10) throw new HttpFailure();
+        long result = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char item = value.charAt(index);
+            if (item < '0' || item > '9') throw new HttpFailure();
+            result = result * 10 + item - '0';
+            if (result > Integer.MAX_VALUE) throw new HttpFailure();
+        }
+        return (int) result;
+    }
+
+    private static String readHttpLine(InputStream input, int maximum) throws IOException, HttpFailure {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(Math.min(maximum, 256));
+        while (bytes.size() <= maximum) {
+            int value = input.read();
+            if (value < 0) {
+                if (bytes.size() == 0) return null;
+                throw new HttpFailure();
+            }
+            if (value == '\n') {
+                byte[] line = bytes.toByteArray();
+                int length = line.length;
+                if (length > 0 && line[length - 1] == '\r') length--;
+                for (int index = 0; index < length; index++) {
+                    if ((line[index] & 0x80) != 0 || line[index] == 0) throw new HttpFailure();
+                }
+                return new String(line, 0, length, StandardCharsets.US_ASCII);
+            }
+            bytes.write(value);
+        }
+        throw new HttpFailure();
+    }
+
+    private static String decodeUtf8(byte[] value) throws HttpFailure {
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(value)).toString();
+        } catch (Exception ignored) {
+            throw new HttpFailure();
+        }
+    }
+
+    private static void writeResponse(OutputStream output, int status, Map<String, Object> response)
+            throws IOException {
+        byte[] bytes = new JSONObject(response).toString().getBytes(StandardCharsets.UTF_8);
+        try {
+            String label = status == 200 ? "200 OK"
+                    : status == 401 ? "401 Unauthorized" : "400 Bad Request";
+            output.write(("HTTP/1.1 " + label
+                    + "\r\nContent-Type: application/json\r\nContent-Length: " + bytes.length
+                    + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            output.write(bytes);
+            output.flush();
+        } finally {
+            Arrays.fill(bytes, (byte) 0);
+        }
+    }
+
+    private static final class HttpFailure extends Exception { }
     private Map<String,Object> route(String method, String path, String body) {
         try {
             if (path.equals("/health")) {
-                if (cameraMediaManager == null) {
+                if (!"GET".equals(method) || (body != null && !body.isEmpty())) {
+                    return map("ok", false, "error", "invalid_request");
+                }
+                if (cameraMediaManager == null || proxyManager == null
+                        || proxyAgentChannel == null) {
                     return map("ok", false, "service", "xenoid-daemon",
                             "version", "0.1.0", "error", "service not ready");
                 }
                 return map("ok", true, "service", "xenoid-daemon", "version", "0.1.0");
             }
+            if (path.startsWith("/proxy/")) return routeProxy(method, path, body);
             if (path.startsWith("/camera/")) return routeCamera(method, path, body);
             if (path.equals("/root/status")) return RootHelper.status();
             if (path.equals("/root/exec")) return RootHelper.exec(SimpleJson.stringValue(body, "command", "id"));
@@ -162,6 +377,88 @@ public class XenoidDaemonService extends Service {
             if (path.equals("/ota/apply")) return OtaManager.apply(SimpleJson.stringValue(body, "channel", "stable"));
             return map("ok", false, "error", "not found", "path", path);
         } catch(Exception e) { return map("ok", false, "error", e.toString()); }
+    }
+
+    private Map<String, Object> routeProxy(String method, String path, String body) {
+        try {
+            if ("/proxy/status".equals(path)) {
+                requireProxyMethod(method, "GET");
+                ProxyManager.requireEmptyBody(body);
+                return requireProxyManager().status();
+            }
+            if ("/proxy/source".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request =
+                        ProxyManager.parseObject(body, ProxyManager.MAX_REQUEST_BODY_BYTES);
+                return requireProxyManager().setSource(request);
+            }
+            if ("/proxy/enabled".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request = ProxyManager.parseObject(body, 4096);
+                return requireProxyManager().setEnabled(request);
+            }
+            if ("/proxy/select".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request = ProxyManager.parseObject(body, 4096);
+                return requireProxyManager().select(request);
+            }
+            if ("/proxy/clear".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request = ProxyManager.parseObject(body, 4096);
+                return requireProxyManager().clear(request);
+            }
+            if ("/proxy/check".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request = ProxyManager.parseObject(body, 4096);
+                return requireProxyManager().check(request);
+            }
+            if ("/proxy/export".equals(path)) {
+                requireProxyMethod(method, "GET");
+                ProxyManager.requireEmptyBody(body);
+                return requireProxyManager().exportDesired();
+            }
+            if ("/proxy/agent-bootstrap".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request = ProxyManager.parseObject(body, 4096);
+                ProxyAgentChannel channel = proxyAgentChannel;
+                if (channel == null || proxyManager == null) {
+                    throw new ProxyManager.ProxyException("proxy_unavailable");
+                }
+                return channel.bootstrap(request);
+            }
+            if ("/proxy/agent".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request =
+                        ProxyManager.parseObject(body, MAX_AGENT_BODY_BYTES);
+                ProxyAgentChannel channel = proxyAgentChannel;
+                if (channel == null || proxyManager == null) {
+                    throw new ProxyManager.ProxyException("proxy_unavailable");
+                }
+                return channel.handle(request);
+            }
+            return map("ok", false, "error", "not_found");
+        } catch (ProxyManager.ProxyException failure) {
+            return map("ok", false, "error", failure.code);
+        } catch (ProxyAgentChannel.AgentRejected ignored) {
+            return map("ok", false, "error", "agent_rejected");
+        } catch (Throwable ignored) {
+            return map("ok", false, "error", "proxy_request_failed");
+        }
+    }
+
+    private ProxyManager requireProxyManager() throws ProxyManager.ProxyException {
+        ProxyManager manager = proxyManager;
+        if (manager == null || proxyAgentChannel == null) {
+            throw new ProxyManager.ProxyException("proxy_unavailable");
+        }
+        return manager;
+    }
+
+    private static void requireProxyMethod(String actual, String expected)
+            throws ProxyManager.ProxyException {
+        if (!expected.equals(actual)) {
+            throw new ProxyManager.ProxyException("method_not_allowed");
+        }
     }
     private Map<String,Object> routeCamera(String method, String path, String body) {
         try {

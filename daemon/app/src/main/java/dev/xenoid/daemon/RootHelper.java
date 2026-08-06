@@ -78,6 +78,7 @@ final class RootHelper {
         return out;
     }
 
+
     static boolean copyCameraStage(String stagingPath, File destination, long size, String sha256, int appUid) {
         if (!isCameraStage(stagingPath) || destination == null || size <= 0
                 || sha256 == null || !sha256.matches("[0-9a-f]{64}") || appUid <= 0) return false;

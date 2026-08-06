@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -100,6 +101,17 @@ STATE = {
     "cameraSelfTest": _initial_camera_self_test(),
     "cameraSelfTestSucceeds": True,
     "cameraSelfTestAuthorization": None,
+    "proxy": {
+        "schemaVersion": 1,
+        "instanceId": "",
+        "generation": 0,
+        "enabled": False,
+        "source": None,
+        "selectedNode": "",
+        "udpAllowed": False,
+        "allowInsecureHttp": False,
+        "checkId": 0,
+    },
 }
 
 
@@ -114,8 +126,224 @@ def camera_failure(error: str) -> dict[str, Any]:
     STATE["camera"]["lastError"] = error
     return camera_status(False)
 
+PROXY_SOURCE_MAX_BYTES = 1024 * 1024
+PROXY_NODE_NAME_MAX_UTF16_UNITS = 128
+PROXY_SOURCE_KINDS = frozenset({"endpoint", "uri_list", "clash", "subscription"})
+PROXY_LOCK = threading.RLock()
+_PROXY_METHODS = {
+    "/proxy/status": "GET",
+    "/proxy/source": "POST",
+    "/proxy/enabled": "POST",
+    "/proxy/select": "POST",
+    "/proxy/clear": "POST",
+    "/proxy/check": "POST",
+    "/proxy/export": "GET",
+    "/proxy/agent-bootstrap": "POST",
+    "/proxy/agent": "POST",
+}
+
+
+def _proxy_error(error: str) -> dict[str, Any]:
+    return {"ok": False, "error": error}
+
+
+def _valid_proxy_name(value: Any, *, allow_empty: bool) -> bool:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        return False
+    try:
+        units = len(value.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        return False
+    return units <= PROXY_NODE_NAME_MAX_UTF16_UNITS
+
+
+def _proxy_status() -> dict[str, Any]:
+    proxy = STATE["proxy"]
+    source = proxy["source"]
+    return {
+        "ok": True,
+        "schemaVersion": proxy["schemaVersion"],
+        "instanceId": proxy["instanceId"],
+        "generation": proxy["generation"],
+        "enabled": proxy["enabled"],
+        "configured": source is not None,
+        "sourceKind": None if source is None else source["kind"],
+        "selectedNode": proxy["selectedNode"],
+        "udpAllowed": proxy["udpAllowed"],
+        "allowInsecureHttp": proxy["allowInsecureHttp"],
+        "checkId": proxy["checkId"],
+        "runtimeEpoch": "",
+        "report": None,
+        "probe": None,
+    }
+
+
+def _proxy_export() -> dict[str, Any]:
+    proxy = STATE["proxy"]
+    stored = proxy["source"]
+    source = None
+    if stored is not None:
+        source = {
+            "kind": stored["kind"],
+            "value": stored["value"],
+            "selectedNode": proxy["selectedNode"],
+            "udpAllowed": proxy["udpAllowed"],
+            "allowInsecureHttp": proxy["allowInsecureHttp"],
+        }
+    return {
+        "ok": True,
+        "schemaVersion": proxy["schemaVersion"],
+        "instanceId": proxy["instanceId"],
+        "generation": proxy["generation"],
+        "enabled": proxy["enabled"],
+        "checkId": proxy["checkId"],
+        "source": source,
+    }
+
+
+def _proxy_desired_state() -> tuple[Any, ...]:
+    proxy = STATE["proxy"]
+    source = proxy["source"]
+    source_key = None if source is None else (source["kind"], source["value"])
+    return (
+        proxy["enabled"],
+        source_key,
+        proxy["selectedNode"],
+        proxy["udpAllowed"],
+        proxy["allowInsecureHttp"],
+    )
+
+def _commit_proxy_mutation(before: tuple[Any, ...]) -> None:
+    proxy = STATE["proxy"]
+    if _proxy_desired_state() == before:
+        return
+    proxy["generation"] += 1
+    if proxy["enabled"]:
+        proxy["checkId"] += 1
+
+
+
+
+def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
+    required_method = _PROXY_METHODS[path]
+    if method != required_method:
+        return _proxy_error("method_not_allowed")
+    if path in {"/proxy/agent-bootstrap", "/proxy/agent"}:
+        return _proxy_error("agent_channel_unavailable_in_mock")
+    if not isinstance(body, dict):
+        return _proxy_error("invalid_request_schema")
+
+    with PROXY_LOCK:
+        if path == "/proxy/status":
+            if body:
+                return _proxy_error("invalid_request_schema")
+            return _proxy_status()
+
+        if path == "/proxy/export":
+            if body:
+                return _proxy_error("invalid_request_schema")
+            return _proxy_export()
+
+        if path == "/proxy/source":
+            expected = {
+                "kind",
+                "value",
+                "enable",
+                "selectedNode",
+                "udpAllowed",
+                "allowInsecureHttp",
+            }
+            if set(body) != expected:
+                return _proxy_error("invalid_request_schema")
+            kind = body["kind"]
+            value = body["value"]
+            enabled = body["enable"]
+            selected_node = body["selectedNode"]
+            udp_allowed = body["udpAllowed"]
+            allow_insecure_http = body["allowInsecureHttp"]
+            if (
+                not isinstance(kind, str)
+                or not isinstance(value, str)
+                or not isinstance(enabled, bool)
+                or not _valid_proxy_name(selected_node, allow_empty=True)
+                or not isinstance(udp_allowed, bool)
+                or not isinstance(allow_insecure_http, bool)
+            ):
+                return _proxy_error("invalid_request_schema")
+            if kind not in PROXY_SOURCE_KINDS or not value or "\x00" in value:
+                return _proxy_error("source_invalid")
+            try:
+                value_size = len(value.encode("utf-8"))
+            except UnicodeEncodeError:
+                return _proxy_error("invalid_request_schema")
+            if value_size > PROXY_SOURCE_MAX_BYTES:
+                return _proxy_error("invalid_request_schema")
+
+            before = _proxy_desired_state()
+            proxy = STATE["proxy"]
+            proxy["source"] = {"kind": kind, "value": value}
+            proxy["enabled"] = enabled
+            proxy["selectedNode"] = selected_node
+            proxy["udpAllowed"] = udp_allowed
+            proxy["allowInsecureHttp"] = allow_insecure_http
+            _commit_proxy_mutation(before)
+            return _proxy_status()
+
+        if path == "/proxy/enabled":
+            if set(body) != {"enabled"} or not isinstance(body["enabled"], bool):
+                return _proxy_error("invalid_request_schema")
+            proxy = STATE["proxy"]
+            enabled = body["enabled"]
+            if enabled and proxy["source"] is None:
+                return _proxy_error("source_invalid")
+            before = _proxy_desired_state()
+            proxy["enabled"] = enabled
+            _commit_proxy_mutation(before)
+            return _proxy_status()
+
+        if path == "/proxy/select":
+            if set(body) != {"name"} or not _valid_proxy_name(
+                body.get("name"), allow_empty=False
+            ):
+                return _proxy_error("invalid_request_schema")
+            proxy = STATE["proxy"]
+            if proxy["source"] is None:
+                return _proxy_error("source_invalid")
+            before = _proxy_desired_state()
+            proxy["selectedNode"] = body["name"]
+            _commit_proxy_mutation(before)
+            return _proxy_status()
+
+        if path == "/proxy/clear":
+            if body:
+                return _proxy_error("invalid_request_schema")
+            before = _proxy_desired_state()
+            proxy = STATE["proxy"]
+            proxy["enabled"] = False
+            proxy["source"] = None
+            proxy["selectedNode"] = ""
+            proxy["udpAllowed"] = False
+            proxy["allowInsecureHttp"] = False
+            _commit_proxy_mutation(before)
+            return _proxy_status()
+
+        if path == "/proxy/check":
+            if body:
+                return _proxy_error("invalid_request_schema")
+            proxy = STATE["proxy"]
+            if not proxy["enabled"] or proxy["source"] is None:
+                return _proxy_error("proxy_disabled")
+            proxy["checkId"] += 1
+            return _proxy_status()
+
+    raise AssertionError(f"unhandled proxy route: {path}")
+
+
+
 
 def response(path: str, method: str, body: dict[str, Any]) -> dict[str, Any]:
+    if path in _PROXY_METHODS:
+        return _proxy_response(path, method, body)
     if path == "/health":
         return {"ok": True, "service": "xenoid-mock-daemon", "version": STATE["version"]}
     if path == "/camera/status" and method == "GET":
@@ -267,12 +495,30 @@ def response(path: str, method: str, body: dict[str, Any]) -> dict[str, Any]:
 class Handler(BaseHTTPRequestHandler):
     def _handle(self) -> None:
         n = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(n).decode() if n else "{}"
+        raw = self.rfile.read(n).decode() if n else ""
+        proxy_route = self.path in _PROXY_METHODS
+        required_method = _PROXY_METHODS.get(self.path)
+        unavailable_route = self.path in {"/proxy/agent-bootstrap", "/proxy/agent"}
+        result = None
         try:
             body = json.loads(raw) if raw else {}
         except Exception:
-            body = {"raw": raw}
-        data = json.dumps(response(self.path, self.command, body), ensure_ascii=False).encode()
+            if proxy_route and self.command == required_method and not unavailable_route:
+                result = _proxy_error("invalid_request_body")
+            else:
+                body = {"raw": raw}
+        if (
+            result is None
+            and proxy_route
+            and self.command == required_method
+            and self.command == "POST"
+            and not unavailable_route
+            and not raw
+        ):
+            result = _proxy_error("invalid_request_body")
+        if result is None:
+            result = response(self.path, self.command, body)
+        data = json.dumps(result, ensure_ascii=False).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -281,6 +527,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None: self._handle()
     def do_POST(self) -> None: self._handle()
+    def do_PUT(self) -> None: self._handle()
+    def do_PATCH(self) -> None: self._handle()
+    def do_DELETE(self) -> None: self._handle()
     def log_message(self, fmt: str, *args: Any) -> None: return
 
 

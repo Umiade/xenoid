@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
+import getpass
 import json
+import os
 import secrets
 import stat
 import subprocess
@@ -9,39 +14,92 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from .backend import RuntimeManager
-from .config import XenoidConfig, load_config, save_config, merge_config
-from .daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS, DaemonClient
+from .config import (
+    InstanceError,
+    initialize_instance,
+    list_instances,
+    merge_config,
+    resolve_instance,
+    resolve_project_root,
+    save_config,
+    select_instance_name,
+)
+from .daemon_client import (
+    CAMERA_MUTATION_TIMEOUT_SECONDS,
+    PROXY_MAX_SOURCE_BYTES,
+    DaemonClient,
+)
 from .doctor import build_doctor_report
+from .proxy_controller import ProxyController
 from .util import json_dumps, read_json_file, write_json_file
 
 
-def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
 
 
 def print_json(data: Any) -> None:
     print(json_dumps(data))
+def runtime(args: argparse.Namespace) -> RuntimeManager:
+    return RuntimeManager(args.context, args.config, args.lease)
 
 
-def run_script(name: str) -> dict[str, Any]:
-    script = project_root() / "scripts" / name
-    proc = subprocess.run([str(script)], text=True, capture_output=True, cwd=str(project_root()))
+def daemon(
+    args: argparse.Namespace,
+    manager: Optional[RuntimeManager] = None,
+) -> DaemonClient:
+    active_manager = manager or runtime(args)
+    return DaemonClient(
+        args.context,
+        args.lease,
+        active_manager.docker_base_cmd(),
+    )
+
+
+def command_env(args: argparse.Namespace) -> dict[str, str]:
+    return {
+        **os.environ,
+        "XENOID_PROJECT": str(args.project_root),
+        "XENOID_INSTANCE": args.instance_name,
+    }
+
+
+def run_script(args: argparse.Namespace, name: str) -> dict[str, Any]:
+    script = args.project_root / "scripts" / name
+    proc = subprocess.run(
+        [str(script)],
+        text=True,
+        capture_output=True,
+        cwd=args.project_root,
+        env=command_env(args),
+    )
     return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
 
 
 def cmd_install_runtime(args: argparse.Namespace) -> int:
-    script = project_root() / "scripts" / "install-macos-runtime.sh"
+    script = args.project_root / "scripts" / "install-macos-runtime.sh"
     cmd = [str(script)] + (["--dry-run"] if args.dry_run else [])
-    proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(project_root()))
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        cwd=args.project_root,
+        env=command_env(args),
+    )
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    report = build_doctor_report(load_config(), full=args.full, require_runtime=args.require_runtime)
+    report = build_doctor_report(
+        args.context,
+        args.config,
+        args.lease,
+        full=args.full,
+        require_runtime=args.require_runtime,
+    )
     if args.out:
         write_json_file(Path(args.out), report)
     print_json(report)
@@ -51,9 +109,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_up(args: argparse.Namespace) -> int:
-    script = project_root() / "scripts" / "xenoid-up.sh"
-    cmd = [str(script)] + (["--dry-run"] if args.dry_run else []) + (["--skip-build"] if args.skip_build else [])
-    proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(project_root()))
+    script = args.context.project_root / "scripts" / "xenoid-up.sh"
+    cmd = [str(script), "--instance", args.context.instance_name]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.skip_build:
+        cmd.append("--skip-build")
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        cwd=str(args.context.project_root),
+        env=command_env(args),
+    )
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
     print_json(result)
     return 0 if result.get("ok") else 1
@@ -61,16 +129,18 @@ def cmd_up(args: argparse.Namespace) -> int:
 
 
 
-def cmd_runtime_compose(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).make_compose(args.out)
-    print_json(result)
-    return 0 if result.get("ok") else 1
 
 
 def cmd_linux_binderfs(args: argparse.Namespace) -> int:
-    script = project_root() / "scripts" / "setup-linux-binderfs.sh"
+    script = args.context.project_root / "scripts" / "setup-linux-binderfs.sh"
     cmd = [str(script)] + (["--dry-run"] if args.dry_run else [])
-    proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(project_root()))
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        cwd=args.context.project_root,
+        env=command_env(args),
+    )
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     print_json(result)
     return 0 if result.get("ok") else 1
@@ -79,56 +149,62 @@ def cmd_linux_binderfs(args: argparse.Namespace) -> int:
 
 
 def cmd_runtime_context(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).make_runtime_context(args.image)
+    result = runtime(args).make_runtime_context(args.image)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_make_rootfs(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).ensure_rootfs_images()
+    result = runtime(args).ensure_rootfs_images()
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_daemon(args: argparse.Namespace) -> int:
-    result = run_script("build-daemon.sh")
+    result = run_script(args, "build-daemon.sh")
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_input(args: argparse.Namespace) -> int:
-    result = run_script("build-native-input.sh")
+    result = run_script(args, "build-native-input.sh")
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_hide(args: argparse.Namespace) -> int:
-    result = run_script("build-native-hide.sh")
+    result = run_script(args, "build-native-hide.sh")
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_profile(args: argparse.Namespace) -> int:
-    result = run_script("build-native-profile.sh")
+    result = run_script(args, "build-native-profile.sh")
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_netctl(args: argparse.Namespace) -> int:
-    result = run_script("build-native-netctl.sh")
+    result = run_script(args, "build-native-netctl.sh")
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_gralloc(args: argparse.Namespace) -> int:
-    result = run_script("build-gralloc.sh")
+    result = run_script(args, "build-gralloc.sh")
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_verify_release(args: argparse.Namespace) -> int:
-    script = project_root() / "scripts" / "verify-release.py"
-    proc = subprocess.run([str(script), args.archive], text=True, capture_output=True, cwd=str(project_root()))
+    script = args.project_root / "scripts" / "verify-release.py"
+    proc = subprocess.run(
+        [str(script), args.archive],
+        text=True,
+        capture_output=True,
+        cwd=args.project_root,
+        env=command_env(args),
+    )
     print(proc.stdout, end="")
     if proc.stderr:
         print(proc.stderr, file=sys.stderr, end="")
@@ -136,15 +212,21 @@ def cmd_verify_release(args: argparse.Namespace) -> int:
 
 
 def cmd_package_release(args: argparse.Namespace) -> int:
-    script = project_root() / "scripts" / "package-release.sh"
-    proc = subprocess.run([str(script), args.version], text=True, capture_output=True, cwd=str(project_root()), env={**__import__("os").environ, "REL": ""})
+    script = args.project_root / "scripts" / "package-release.sh"
+    proc = subprocess.run(
+        [str(script), args.version],
+        text=True,
+        capture_output=True,
+        cwd=args.project_root,
+        env={**command_env(args), "REL": ""},
+    )
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip(), "archive": proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else None}
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_all(args: argparse.Namespace) -> int:
-    root = project_root()
+    root = args.project_root
     commands = [
         ("daemon", [root / "scripts" / "build-daemon.sh"]),
         ("input", [root / "scripts" / "build-native-input.sh"]),
@@ -161,10 +243,20 @@ def cmd_build_all(args: argparse.Namespace) -> int:
         ("pivot", [root / "scripts" / "build-native-for-arch.sh", "xenoid-pivot", root / "native" / "xenoid-pivot" / "xenoid_pivot.c", root / "native" / "xenoid-pivot" / "xenoid-pivot", "arm64", "static"]),
         ("propArea", [root / "scripts" / "build-native-for-arch.sh", "xenoid-prop-area", root / "native" / "xenoid-hide" / "xenoid_prop_area.c", root / "native" / "xenoid-hide" / "xenoid-prop-area", "arm64"]),
         ("ssaid", [root / "scripts" / "build-native-for-arch.sh", "xenoid-ssaid", root / "native" / "xenoid-hide" / "xenoid_ssaid.c", root / "native" / "xenoid-hide" / "xenoid-ssaid", "arm64"]),
+        (
+            "proxySandbox",
+            [root / "scripts" / "build-proxy-sandbox.sh"],
+        ),
     ]
     steps: dict[str, Any] = {}
     for name, command in commands:
-        proc = subprocess.run([str(part) for part in command], text=True, capture_output=True, cwd=str(root))
+        proc = subprocess.run(
+            [str(part) for part in command],
+            text=True,
+            capture_output=True,
+            cwd=root,
+            env=command_env(args),
+        )
         steps[name] = {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
@@ -179,14 +271,34 @@ def cmd_build_all(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    cfg = XenoidConfig(image=args.image or XenoidConfig().image, backend=args.backend or XenoidConfig().backend)
-    path = save_config(cfg)
-    print_json({"ok": True, "config": str(path), "data": cfg})
+    context, cfg, lease = initialize_instance(
+        args.instance_name,
+        project_root=args.project_root,
+        overrides={"image": args.image, "backend": args.backend},
+    )
+    print_json({
+        "ok": True,
+        "instance": context.public_dict(),
+        "slot": lease.slot,
+        "config": cfg,
+    })
+    return 0
+
+
+def cmd_instance_list(args: argparse.Namespace) -> int:
+    print_json({
+        "ok": True,
+        "instances": list_instances(project_root=args.project_root),
+    })
     return 0
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
-    print_json(load_config())
+    print_json({
+        "ok": True,
+        "instance": args.context.public_dict(),
+        "config": args.config,
+    })
     return 0
 
 
@@ -197,28 +309,28 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         "runtime_image_tag": args.runtime_image_tag,
         "auto_build_runtime_image": args.auto_build_runtime_image,
         "docker_context": args.docker_context,
-        "network_enabled": args.network_enabled,
-        "network_name": args.network_name,
-        "network_subnet": args.network_subnet,
-        "network_gateway": args.network_gateway,
-        "network_ip": args.network_ip,
-        "network_mac": args.network_mac,
+        "network_dns_servers": args.network_dns_servers,
     }
-    cfg = merge_config(overrides)
-    path = save_config(cfg)
-    print_json({"ok": True, "config": str(path), "data": cfg})
+    cfg = merge_config(args.context, overrides)
+    save_config(args.context, cfg)
+    args.config = cfg
+    print_json({
+        "ok": True,
+        "instance": args.context.public_dict(),
+        "config": cfg,
+    })
     return 0
 
 
 def cmd_runtime_build_image(args: argparse.Namespace) -> int:
-    mgr = RuntimeManager(load_config())
+    mgr = runtime(args)
     ctx = mgr.make_runtime_context(args.image)
     if not ctx.get("ok"):
         print_json(ctx); return 1
     if args.dry_run:
-        print_json({"ok": True, "dryRun": True, "context": ctx.get("context"), "command": [*(RuntimeManager(load_config()).docker_base_cmd()), "build", "-t", args.tag, ctx.get("context")]})
+        print_json({"ok": True, "dryRun": True, "context": ctx.get("context"), "command": [*(runtime(args).docker_base_cmd()), "build", "-t", args.tag, ctx.get("context")]})
         return 0
-    proc = subprocess.run([*(RuntimeManager(load_config()).docker_base_cmd()), "build", "-t", args.tag, ctx.get("context")], text=True, capture_output=True)
+    proc = subprocess.run([*(runtime(args).docker_base_cmd()), "build", "-t", args.tag, ctx.get("context")], text=True, capture_output=True)
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "tag": args.tag, "context": ctx.get("context")}
     print_json(result)
     return 0 if result.get("ok") else 1
@@ -227,94 +339,704 @@ def cmd_runtime_build_image(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    mgr = RuntimeManager(load_config())
+    mgr = runtime(args)
     result = mgr.start(dry_run=args.dry_run, wait=not args.no_wait, install_daemon_apk=args.install_daemon, start_colima=args.start_colima, adb_root=not args.no_adb_root, skip_preflight=args.skip_preflight, recreate=args.recreate)
     print_json(result)
     return 0 if result.get("ok") or args.dry_run else 1
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).stop()
+    result = runtime(args).stop()
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).runtime_logs(args.out_dir)
+    result = runtime(args).runtime_logs(args.out_dir)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_view(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).view()
+    result = runtime(args).view()
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).status()
+    result = runtime(args).status()
     print_json(result)
     return 0 if result.get("ok") and result.get("running") else 1
 
 
 def cmd_adb(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).adb(args.adb_args)
+    result = runtime(args).adb(args.adb_args)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
-def daemon() -> DaemonClient:
-    cfg = load_config()
-    return DaemonClient(port=cfg.daemon_port)
-
-
-def daemon_ensured() -> DaemonClient:
-    RuntimeManager(load_config()).ensure_daemon()
-    return daemon()
+def daemon_ensured(args: argparse.Namespace) -> DaemonClient:
+    manager = runtime(args)
+    manager.ensure_daemon()
+    return daemon(args, manager)
 
 
 
 def cmd_daemon_ensure(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).ensure_daemon(
+    mgr = runtime(args)
+    daemon_result = mgr.ensure_daemon(
         readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
     )
+    proxy = (
+        mgr.reconcile_proxy_desired()
+        if daemon_result.get("ok") else {"ok": False, "skipped": True}
+    )
+    result = {
+        "ok": bool(daemon_result.get("ok") and proxy.get("ok")),
+        "daemon": daemon_result,
+        "proxyConverged": proxy,
+    }
     print_json(result)
     return 0 if result.get("ok") else 1
 
 def cmd_daemon_health(args: argparse.Namespace) -> int:
-    result = daemon().health()
+    result = daemon(args).health()
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_daemon_install(args: argparse.Namespace) -> int:
-    mgr = RuntimeManager(load_config())
+    mgr = runtime(args)
     install = mgr.install_daemon(args.apk)
-    if not install.get("ok"):
-        print_json(install)
-        return 1
-    start = mgr.start_daemon_service()
-    forward = mgr.forward_daemon_port() if start.get("ok") else {"ok": False, "skipped": True}
-    rootd = mgr.ensure_rootd_root() if start.get("ok") else {"ok": False, "skipped": True}
+    start = (
+        mgr.start_daemon_service()
+        if install.get("ok") else {"ok": False, "skipped": True}
+    )
+    forward = (
+        mgr.forward_daemon_port()
+        if start.get("ok") else {"ok": False, "skipped": True}
+    )
+    rootd = (
+        mgr.ensure_rootd_root()
+        if forward.get("ok") else {"ok": False, "skipped": True}
+    )
+    ready = (
+        mgr.ensure_daemon(readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS)
+        if rootd.get("ok") else {"ok": False, "skipped": True}
+    )
+    proxy = (
+        mgr.reconcile_proxy_desired()
+        if ready.get("ok") else {"ok": False, "skipped": True}
+    )
     result = {
-        "ok": bool(install.get("ok") and start.get("ok") and forward.get("ok") and rootd.get("ok")),
+        "ok": all(
+            bool(step.get("ok"))
+            for step in (install, start, forward, rootd, ready, proxy)
+        ),
         "install": install,
         "start": start,
         "forward": forward,
         "rootd": rootd,
+        "ready": ready,
+        "proxyConverged": proxy,
     }
     print_json(result)
     return 0 if result["ok"] else 1
 
 
 def cmd_daemon_start(args: argparse.Namespace) -> int:
-    mgr = RuntimeManager(load_config())
+    mgr = runtime(args)
     start = mgr.start_daemon_service()
-    forward = mgr.forward_daemon_port() if start.get("ok") else {"ok": False, "skipped": True}
-    rootd = mgr.ensure_rootd_root() if start.get("ok") else {"ok": False, "skipped": True}
-    result = {"ok": bool(start.get("ok") and forward.get("ok") and rootd.get("ok")), "start": start, "forward": forward, "rootd": rootd}
+    forward = (
+        mgr.forward_daemon_port()
+        if start.get("ok") else {"ok": False, "skipped": True}
+    )
+    rootd = (
+        mgr.ensure_rootd_root()
+        if forward.get("ok") else {"ok": False, "skipped": True}
+    )
+    ready = (
+        mgr.ensure_daemon(readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS)
+        if rootd.get("ok") else {"ok": False, "skipped": True}
+    )
+    proxy = (
+        mgr.reconcile_proxy_desired()
+        if ready.get("ok") else {"ok": False, "skipped": True}
+    )
+    result = {
+        "ok": all(
+            bool(step.get("ok"))
+            for step in (start, forward, rootd, ready, proxy)
+        ),
+        "start": start,
+        "forward": forward,
+        "rootd": rootd,
+        "ready": ready,
+        "proxyConverged": proxy,
+    }
     print_json(result)
     return 0 if result["ok"] else 1
+_PROXY_ENDPOINT_SCHEMES = {"http", "https", "socks5", "socks5h"}
+_PROXY_URI_SCHEMES = {
+    "anytls",
+    "hysteria",
+    "hysteria2",
+    "http",
+    "https",
+    "hy2",
+    "mierus",
+    "shadowsocks",
+    "socks",
+    "socks5",
+    "socks5h",
+    "ss",
+    "ssr",
+    "trojan",
+    "tuic",
+    "vless",
+    "vmess",
+}
+_PROXY_CLASH_KEYS = {
+    "proxies",
+    "proxy-groups",
+    "proxy-providers",
+}
+_PROXY_PRIVATE_KEYS = {
+    "authorization",
+    "ciphertext",
+    "cookie",
+    "header",
+    "headers",
+    "key",
+    "masterkey",
+    "password",
+    "path",
+    "privatekey",
+    "source",
+    "sourcevalue",
+    "stagingpath",
+    "subscription",
+    "token",
+    "uri",
+    "url",
+    "userinfo",
+    "value",
+}
+
+
+def _proxy_failure(code: str) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": code}
+def _is_stable_proxy_code(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 64
+        and "a" <= value[0] <= "z"
+        and all(("a" <= ch <= "z") or ch.isdigit() or ch == "_" for ch in value)
+    )
+def _is_sensitive_proxy_text(value: str) -> bool:
+    lowered = value.lower()
+    if "://" in lowered or value.startswith(("/", "~/")):
+        return True
+    if "@" in value:
+        userinfo = value.split("@", 1)[0]
+        if ":" in userinfo and not any(ch.isspace() for ch in userinfo):
+            return True
+    return False
+
+
+
+
+
+
+def _sanitize_proxy_result(value: Any) -> Any:
+    if isinstance(value, dict):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _is_sensitive_proxy_text(name):
+                continue
+            normalized = "".join(ch for ch in name.lower() if ch.isalnum())
+            private = (
+                normalized in _PROXY_PRIVATE_KEYS
+                or normalized.endswith(
+                    (
+                        "authorization",
+                        "ciphertext",
+                        "cookie",
+                        "headers",
+                        "masterkey",
+                        "password",
+                        "privatekey",
+                        "sourcevalue",
+                        "stagingpath",
+                        "token",
+                        "userinfo",
+                    )
+                )
+            )
+            if private:
+                continue
+            if normalized in ("error", "message") and not _is_stable_proxy_code(item):
+                clean[name] = "proxy_request_failed"
+            else:
+                clean[name] = _sanitize_proxy_result(item)
+        return clean
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_proxy_result(item) for item in value]
+    if isinstance(value, str) and _is_sensitive_proxy_text(value):
+        return "[redacted]"
+    return value
+
+
+def _emit_proxy_result(result: dict[str, Any]) -> int:
+    sanitized = _sanitize_proxy_result(result)
+    if not isinstance(sanitized, dict):
+        sanitized = _proxy_failure("proxy_request_failed")
+    print_json(sanitized)
+    return 0 if sanitized.get("ok") is True else 1
+
+
+def _call_proxy_daemon(
+    args: argparse.Namespace,
+    operation: Callable[[DaemonClient], dict[str, Any]],
+) -> dict[str, Any]:
+    try:
+        client = daemon_ensured(args)
+        result = operation(client)
+    except InstanceError as exc:
+        return _proxy_failure(exc.code)
+    except Exception:
+        return _proxy_failure("daemon_unreachable")
+    if not isinstance(result, dict):
+        return _proxy_failure("daemon_response_invalid")
+    return result
+def _call_proxy_controller(
+    args: argparse.Namespace,
+    operation: Callable[[ProxyController], dict[str, Any]],
+    *,
+    ensure_daemon: bool = True,
+) -> dict[str, Any]:
+    try:
+        manager = runtime(args)
+        if ensure_daemon:
+            ensured = manager.ensure_daemon()
+            if not isinstance(ensured, dict) or ensured.get("ok") is not True:
+                return _proxy_failure("daemon_unreachable")
+        controller = ProxyController(
+            args.context,
+            args.config,
+            args.lease,
+            manager,
+            daemon(args, manager),
+        )
+        result = operation(controller)
+    except InstanceError as exc:
+        return _proxy_failure(exc.code)
+    except Exception:
+        return _proxy_failure("proxy_reconcile_failed")
+    if not isinstance(result, dict):
+        return _proxy_failure("proxy_reconcile_failed")
+    return result
+
+
+
+
+def _read_bounded_proxy_fd(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = PROXY_MAX_SOURCE_BYTES + 1
+    while remaining > 0:
+        chunk = os.read(fd, min(64 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_proxy_source_file(value: str) -> tuple[Optional[str], Optional[str]]:
+    fd: Optional[int] = None
+    try:
+        source_path = os.path.expanduser(os.fspath(value))
+        before = os.lstat(source_path)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            return None, "source_file_invalid"
+        if before.st_size > PROXY_MAX_SOURCE_BYTES:
+            return None, "source_too_large"
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(source_path, flags)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            return None, "source_file_invalid"
+        raw = _read_bounded_proxy_fd(fd)
+        after = os.fstat(fd)
+        if (
+            len(raw) > PROXY_MAX_SOURCE_BYTES
+            or after.st_size > PROXY_MAX_SOURCE_BYTES
+        ):
+            return None, "source_too_large"
+        if (
+            not raw
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_uid != os.getuid()
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+            or after.st_size != len(raw)
+        ):
+            return None, "source_file_invalid"
+        return raw.decode("utf-8"), None
+    except UnicodeError:
+        return None, "source_invalid"
+    except (OSError, TypeError, ValueError):
+        return None, "source_file_invalid"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _read_proxy_stdin() -> tuple[Optional[str], Optional[str]]:
+    try:
+        binary_stream = getattr(sys.stdin, "buffer", None)
+        if binary_stream is not None:
+            raw = binary_stream.read(PROXY_MAX_SOURCE_BYTES + 1)
+        else:
+            raw = sys.stdin.read(PROXY_MAX_SOURCE_BYTES + 1).encode("utf-8")
+        if len(raw) > PROXY_MAX_SOURCE_BYTES:
+            return None, "source_too_large"
+        if not raw:
+            return None, "source_invalid"
+        return raw.decode("utf-8"), None
+    except UnicodeError:
+        return None, "source_invalid"
+    except (OSError, ValueError):
+        return None, "source_read_failed"
+
+
+def _read_proxy_prompt() -> tuple[Optional[str], Optional[str]]:
+    try:
+        value = getpass.getpass("Proxy source: ")
+    except (EOFError, KeyboardInterrupt, OSError):
+        return None, "source_read_failed"
+    try:
+        if not value:
+            return None, "source_invalid"
+        if len(value.encode("utf-8")) > PROXY_MAX_SOURCE_BYTES:
+            return None, "source_too_large"
+    except UnicodeError:
+        return None, "source_invalid"
+    return value, None
+
+
+def _uri_lines_kind(text: str) -> Optional[str]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    schemes: list[str] = []
+    for line in lines:
+        try:
+            parsed = urlsplit(line)
+        except ValueError:
+            return None
+        scheme = parsed.scheme.lower()
+        if (
+            scheme not in _PROXY_URI_SCHEMES
+            or not line.lower().startswith(f"{scheme}://")
+        ):
+            return None
+        schemes.append(scheme)
+    if len(lines) == 1 and schemes[0] in _PROXY_ENDPOINT_SCHEMES:
+        return "endpoint"
+    return "uri_list"
+
+
+def _infer_proxy_kind(text: str) -> Optional[str]:
+    stripped = text.lstrip("\ufeff \t\r\n")
+    if not stripped:
+        return None
+    try:
+        parsed_json = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        parsed_json = None
+    if (
+        isinstance(parsed_json, dict)
+        and any(key in parsed_json for key in _PROXY_CLASH_KEYS)
+    ):
+        return "clash"
+
+    top_level_keys: set[str] = set()
+    for line in stripped.splitlines():
+        if not line or line[0].isspace() or ":" not in line:
+            continue
+        key = line.split(":", 1)[0].strip()
+        if key:
+            top_level_keys.add(key)
+    if top_level_keys.intersection(_PROXY_CLASH_KEYS):
+        return "clash"
+
+    direct = _uri_lines_kind(stripped)
+    if direct is not None:
+        return direct
+
+    compact = "".join(stripped.split())
+    if compact and all(ch.isalnum() or ch in "+/=_-" for ch in compact):
+        standard = compact.replace("-", "+").replace("_", "/")
+        standard += "=" * ((-len(standard)) % 4)
+        try:
+            decoded = base64.b64decode(standard, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeError, ValueError):
+            decoded = ""
+        if _uri_lines_kind(decoded) is not None:
+            return "uri_list"
+    return None
+
+
+def _proxy_source_input(
+    args: argparse.Namespace,
+) -> tuple[Optional[str], Optional[str]]:
+    if getattr(args, "prompt", False):
+        return _read_proxy_prompt()
+    if getattr(args, "stdin", False):
+        return _read_proxy_stdin()
+    file_value = getattr(args, "source_file", None)
+    if file_value is None:
+        file_value = getattr(args, "file", None)
+    if not isinstance(file_value, str):
+        return None, "source_file_invalid"
+    return _read_proxy_source_file(file_value)
+
+
+def _atomic_write_proxy_export(target: str, data: bytes) -> Optional[str]:
+    directory_fd: Optional[int] = None
+    temporary_name: Optional[str] = None
+    temporary_fd: Optional[int] = None
+    try:
+        expanded = os.path.expanduser(os.fspath(target))
+        parent, name = os.path.split(expanded)
+        if not name or name in (".", ".."):
+            return "export_target_invalid"
+        directory_fd = os.open(
+            parent or ".",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            before = None
+        if before is not None and not stat.S_ISREG(before.st_mode):
+            return "export_target_invalid"
+
+        for _ in range(32):
+            candidate = f".{name}.tmp-{secrets.token_hex(8)}"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                temporary_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if temporary_fd is None or temporary_name is None:
+            return "export_failed"
+
+        view = memoryview(data)
+        while view:
+            written = os.write(temporary_fd, view)
+            if written <= 0:
+                return "export_failed"
+            view = view[written:]
+        os.fchmod(temporary_fd, 0o600)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if before is None:
+            if current is not None:
+                return "export_target_invalid"
+        elif (
+            current is None
+            or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            return "export_target_invalid"
+
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+        return None
+    except (OSError, TypeError, ValueError):
+        return "export_failed"
+    finally:
+        if temporary_fd is not None:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        if directory_fd is not None and temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
+def cmd_proxy_status(args: argparse.Namespace) -> int:
+    result = _call_proxy_controller(
+        args,
+        lambda controller: controller.status(check=args.check),
+    )
+    return _emit_proxy_result(result)
+
+
+def cmd_proxy_set(args: argparse.Namespace) -> int:
+    source, error = _proxy_source_input(args)
+    if error is not None or source is None:
+        return _emit_proxy_result(_proxy_failure(error or "source_invalid"))
+    kind = args.kind or _infer_proxy_kind(source)
+    if kind is None:
+        return _emit_proxy_result(_proxy_failure("source_invalid"))
+    result = _call_proxy_controller(
+        args,
+        lambda controller: controller.set_source(
+            kind,
+            source,
+            args.enable,
+            selected_node=args.name or "",
+            udp_allowed=args.udp,
+            allow_insecure_http=args.allow_insecure_http,
+        ),
+    )
+    return _emit_proxy_result(result)
+
+
+def cmd_proxy_enabled(args: argparse.Namespace) -> int:
+    result = _call_proxy_controller(
+        args,
+        lambda controller: controller.set_enabled(args.proxy_enabled),
+    )
+    return _emit_proxy_result(result)
+
+
+def cmd_proxy_clear(args: argparse.Namespace) -> int:
+    return _emit_proxy_result(
+        _call_proxy_controller(args, lambda controller: controller.clear())
+    )
+
+
+def cmd_proxy_list(args: argparse.Namespace) -> int:
+    status_result = _call_proxy_controller(
+        args,
+        lambda controller: controller.reconcile_for_list(),
+    )
+    if not status_result.get("ok"):
+        return _emit_proxy_result(status_result)
+    report = status_result.get("report")
+    nodes: list[str] = []
+    node_count = 0
+    selected = ""
+    if isinstance(report, dict):
+        observed_nodes = report.get("nodes")
+        if isinstance(observed_nodes, list):
+            nodes = [node for node in observed_nodes if isinstance(node, str)]
+        observed_count = report.get("nodeCount")
+        if isinstance(observed_count, int) and not isinstance(observed_count, bool):
+            node_count = max(0, observed_count)
+        observed_selected = report.get("selectedNode")
+        if isinstance(observed_selected, str):
+            selected = observed_selected
+    if not nodes and isinstance(selected, str) and selected and node_count > 0:
+        nodes = [selected]
+    return _emit_proxy_result(
+        {
+            "ok": True,
+            "nodeCount": node_count,
+            "selectedNode": selected if isinstance(selected, str) else "",
+            "nodes": nodes,
+            "complete": len(nodes) == node_count,
+        }
+    )
+
+
+def cmd_proxy_select(args: argparse.Namespace) -> int:
+    return _emit_proxy_result(
+        _call_proxy_controller(
+            args,
+            lambda controller: controller.select(args.name),
+        )
+    )
+
+
+def cmd_proxy_export(args: argparse.Namespace) -> int:
+    exported = _call_proxy_daemon(args, lambda client: client.proxy_export())
+    if not exported.get("ok"):
+        return _emit_proxy_result(exported)
+    source = exported.get("source")
+    if not isinstance(source, dict):
+        return _emit_proxy_result(_proxy_failure("source_missing"))
+    kind = source.get("kind")
+    value = source.get("value")
+    if kind not in ("endpoint", "uri_list", "clash", "subscription") or not isinstance(value, str):
+        return _emit_proxy_result(_proxy_failure("daemon_response_invalid"))
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeError:
+        return _emit_proxy_result(_proxy_failure("daemon_response_invalid"))
+    if not raw or len(raw) > PROXY_MAX_SOURCE_BYTES:
+        return _emit_proxy_result(_proxy_failure("daemon_response_invalid"))
+    error = _atomic_write_proxy_export(args.out, raw)
+    if error is not None:
+        return _emit_proxy_result(_proxy_failure(error))
+    return _emit_proxy_result(
+        {
+            "ok": True,
+            "kind": kind,
+            "digest": hashlib.sha256(raw).hexdigest(),
+            "size": len(raw),
+        }
+    )
+
+
+def cmd_proxy_prepare(args: argparse.Namespace) -> int:
+    return _emit_proxy_result(
+        _call_proxy_controller(
+            args,
+            lambda controller: controller.prepare(args.asset),
+            ensure_daemon=False,
+        )
+    )
 
 _CAMERA_PRIVATE_KEYS = {
     "bytes",
@@ -358,16 +1080,17 @@ def _emit_camera_result(result: dict[str, Any]) -> int:
     return 0 if bool(sanitized.get("ok")) else 1
 
 
-def _camera_ready() -> tuple[Optional[RuntimeManager], Optional[DaemonClient]]:
+def _camera_ready(
+    args: argparse.Namespace,
+) -> tuple[Optional[RuntimeManager], Optional[DaemonClient]]:
     try:
-        cfg = load_config()
-        manager = RuntimeManager(cfg)
+        manager = runtime(args)
         ensured = manager.ensure_daemon(
             readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
         )
         if not ensured.get("ok"):
             return None, None
-        return manager, DaemonClient(port=cfg.daemon_port)
+        return manager, daemon(args, manager)
     except Exception:
         return None, None
 
@@ -382,7 +1105,7 @@ def _camera_request(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
 
 
 def cmd_camera_status(args: argparse.Namespace) -> int:
-    manager, client = _camera_ready()
+    manager, client = _camera_ready(args)
     if manager is None or client is None:
         return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
     if not args.check:
@@ -459,7 +1182,7 @@ def cmd_camera_set(args: argparse.Namespace) -> int:
             "error": "camera source must be a nonempty regular file",
         })
 
-    manager, client = _camera_ready()
+    manager, client = _camera_ready(args)
     if manager is None or client is None:
         return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
 
@@ -489,45 +1212,45 @@ def cmd_camera_set(args: argparse.Namespace) -> int:
 
 
 def cmd_camera_mode(args: argparse.Namespace) -> int:
-    _, client = _camera_ready()
+    _, client = _camera_ready(args)
     if client is None:
         return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
     return _emit_camera_result(_camera_request(lambda: client.camera_settings(args.mode)))
 
 
 def cmd_camera_clear(args: argparse.Namespace) -> int:
-    _, client = _camera_ready()
+    _, client = _camera_ready(args)
     if client is None:
         return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
     return _emit_camera_result(_camera_request(lambda: client.camera_clear(args.kind)))
 
 
 def cmd_camera_apply(args: argparse.Namespace) -> int:
-    _, client = _camera_ready()
+    _, client = _camera_ready(args)
     if client is None:
         return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
     return _emit_camera_result(_camera_request(client.camera_apply))
 
 
 def cmd_root_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured().root_status()
+    result = daemon_ensured(args).root_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_root_exec(args: argparse.Namespace) -> int:
-    result = daemon_ensured().root_exec(" ".join(args.command))
+    result = daemon_ensured(args).root_exec(" ".join(args.command))
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_frida_fetch(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).fetch_frida(version=args.version, arch=args.arch, out_dir=args.out_dir)
+    result = runtime(args).fetch_frida(version=args.version, arch=args.arch, out_dir=args.out_dir)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 def cmd_frida_install(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).install_frida(
+    result = runtime(args).install_frida(
         version=args.version,
         arch=args.arch,
         out_dir=args.out_dir,
@@ -539,68 +1262,68 @@ def cmd_frida_install(args: argparse.Namespace) -> int:
 
 
 def cmd_frida_deploy_scripts(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).deploy_frida_scripts(args.scripts_dir, args.remote_dir)
+    result = runtime(args).deploy_frida_scripts(args.scripts_dir, args.remote_dir)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_frida_load_script(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).load_frida_script(args.package, args.script, spawn=args.spawn, oneshot=args.oneshot)
+    result = runtime(args).load_frida_script(args.package, args.script, spawn=args.spawn, oneshot=args.oneshot)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_frida_deploy(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).deploy_frida(args.path, args.remote_path)
+    result = runtime(args).deploy_frida(args.path, args.remote_path)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_frida_start(args: argparse.Namespace) -> int:
-    result = daemon_ensured().frida_start(port=args.port)
+    result = daemon_ensured(args).frida_start(port=args.port)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_frida_stop(args: argparse.Namespace) -> int:
-    result = daemon_ensured().frida_stop()
+    result = daemon_ensured(args).frida_stop()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_frida_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured().frida_status()
+    result = daemon_ensured(args).frida_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 
 def cmd_profile_deploy_helper(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).deploy_profile_helper(args.path, args.remote_path)
+    result = runtime(args).deploy_profile_helper(args.path, args.remote_path)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_profile_helper_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured().profile_helper_status()
+    result = daemon_ensured(args).profile_helper_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_profile_helper_env(args: argparse.Namespace) -> int:
-    result = daemon_ensured().profile_helper_env()
+    result = daemon_ensured(args).profile_helper_env()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_profile_helper_dump(args: argparse.Namespace) -> int:
-    result = daemon_ensured().profile_helper_dump()
+    result = daemon_ensured(args).profile_helper_dump()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_device_collect(args: argparse.Namespace) -> int:
-    result = daemon_ensured().collect_fingerprint()
+    result = daemon_ensured(args).collect_fingerprint()
     if args.out and result.get("ok", True):
         write_json_file(args.out, result)
     print_json(result)
@@ -609,65 +1332,70 @@ def cmd_device_collect(args: argparse.Namespace) -> int:
 
 def cmd_device_apply(args: argparse.Namespace) -> int:
     profile = read_json_file(args.profile)
-    result = daemon_ensured().apply_fingerprint(profile, regenerate_unique=not args.keep_unique)
+    result = daemon_ensured(args).apply_fingerprint(profile, regenerate_unique=not args.keep_unique)
     if args.generate_frida:
-        result = {"daemon": result, "fridaProfile": RuntimeManager(load_config()).generate_profile_frida(args.profile, args.frida_out, args.keep_unique)}
+        result = {"daemon": result, "fridaProfile": runtime(args).generate_profile_frida(args.profile, args.frida_out, args.keep_unique)}
         result["ok"] = bool(result["daemon"].get("ok") and result["fridaProfile"].get("ok"))
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_device_generate_service_frida(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).generate_service_frida(args.profile, args.out, args.keep_unique)
+    result = runtime(args).generate_service_frida(args.profile, args.out, args.keep_unique)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_device_generate_frida(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).generate_profile_frida(args.profile, args.out, args.keep_unique)
+    result = runtime(args).generate_profile_frida(args.profile, args.out, args.keep_unique)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_device_set(args: argparse.Namespace) -> int:
     value: Any = args.value
-    result = daemon_ensured().set_fingerprint_field(args.field, value)
+    result = daemon_ensured(args).set_fingerprint_field(args.field, value)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_automation_plan(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).automation_plan(args.script)
+    result = runtime(args).automation_plan(args.script)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_automation_run_host(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).automation_run_host(args.script, execute=args.execute, endpoint=args.endpoint)
+    manager = runtime(args)
+    result = manager.automation_run_host(
+        args.script,
+        execute=args.execute,
+        endpoint=daemon(args, manager).base,
+    )
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_automation_run(args: argparse.Namespace) -> int:
-    result = daemon_ensured().run_automation(args.script)
+    result = daemon_ensured(args).run_automation(args.script)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_input_deploy(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).deploy_input_helper(args.path, args.remote_path)
+    result = runtime(args).deploy_input_helper(args.path, args.remote_path)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_input_tap(args: argparse.Namespace) -> int:
-    result = daemon_ensured().tap(args.x, args.y)
+    result = daemon_ensured(args).tap(args.x, args.y)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_input_swipe(args: argparse.Namespace) -> int:
-    result = daemon_ensured().swipe(args.x1, args.y1, args.x2, args.y2, args.duration_ms)
+    result = daemon_ensured(args).swipe(args.x1, args.y1, args.x2, args.y2, args.duration_ms)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -675,43 +1403,43 @@ def cmd_input_swipe(args: argparse.Namespace) -> int:
 def cmd_app_install(args: argparse.Namespace) -> int:
     source = Path(args.path).expanduser()
     if source.is_file():
-        manager = RuntimeManager(load_config())
+        manager = runtime(args)
         remote = "/data/local/tmp/xenoid-install.apk"
         upload = manager.adb(["push", str(source.resolve()), remote])
         if not upload.get("ok"):
             print_json({"ok": False, "error": "APK upload failed", "upload": upload})
             return 1
-        result = daemon_ensured().app_install(remote)
+        result = daemon_ensured(args).app_install(remote)
         result["upload"] = upload
         result["cleanup"] = manager.adb(["shell", "rm", "-f", remote])
         result["source"] = str(source.resolve())
     else:
-        result = daemon_ensured().app_install(args.path)
+        result = daemon_ensured(args).app_install(args.path)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_app_uninstall(args: argparse.Namespace) -> int:
-    result = daemon_ensured().app_uninstall(args.package)
+    result = daemon_ensured(args).app_uninstall(args.package)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_app_launch(args: argparse.Namespace) -> int:
-    result = daemon_ensured().app_launch(args.component)
+    result = daemon_ensured(args).app_launch(args.component)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 
 def cmd_hide_deploy(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).deploy_hide_helper(args.path, args.remote_path)
+    result = runtime(args).deploy_hide_helper(args.path, args.remote_path)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_hide_deploy_overlay(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).deploy_hide_helper(args.path, args.remote_path)
+    result = runtime(args).deploy_hide_helper(args.path, args.remote_path)
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -719,67 +1447,67 @@ def cmd_hide_deploy_overlay(args: argparse.Namespace) -> int:
 
 
 def cmd_netctl_deploy(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).deploy_netctl_helper(args.path, args.remote_path)
+    result = runtime(args).deploy_netctl_helper(args.path, args.remote_path)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_netctl_status(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).netctl_status(args.ifname)
+    result = runtime(args).netctl_status(args.ifname)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_netctl_set_mac(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).netctl_set_mac(args.mac, args.ifname)
+    result = runtime(args).netctl_set_mac(args.mac, args.ifname)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_hide_overlay_status(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).overlay_status()
+    result = runtime(args).overlay_status()
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_hide_cleanup_overlay(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).overlay_cleanup()
+    result = runtime(args).overlay_cleanup()
     print_json(result)
     return 0 if result.get("ok") else 1
 
 def cmd_hide_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured().hide_status()
+    result = daemon_ensured(args).hide_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_hide_apply(args: argparse.Namespace) -> int:
     policy = read_json_file(args.policy) if args.policy else None
-    result = daemon_ensured().hide_apply(policy)
+    result = daemon_ensured(args).hide_apply(policy)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_ota_make(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).make_ota_bundle(args.version)
+    result = runtime(args).make_ota_bundle(args.version)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_ota_install_bundle(args: argparse.Namespace) -> int:
-    result = RuntimeManager(load_config()).apply_ota_bundle(args.bundle)
+    result = runtime(args).apply_ota_bundle(args.bundle)
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_ota_check(args: argparse.Namespace) -> int:
-    result = daemon_ensured().ota_check()
+    result = daemon_ensured(args).ota_check()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_ota_apply(args: argparse.Namespace) -> int:
-    result = daemon_ensured().ota_apply(args.channel)
+    result = daemon_ensured(args).ota_apply(args.channel)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -804,9 +1532,15 @@ def _ebpf_script_args(args: argparse.Namespace) -> list[str]:
 
 
 def cmd_ebpf_build(args: argparse.Namespace) -> int:
-    script = project_root() / "scripts" / "build-ebpf.sh"
+    script = args.context.project_root / "scripts" / "build-ebpf.sh"
     cmd = [str(script), *_ebpf_script_args(args)]
-    proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(project_root()))
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        cwd=args.context.project_root,
+        env=command_env(args),
+    )
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
     # Prefer script JSON line when present.
     for line in reversed((proc.stdout or "").splitlines()):
@@ -822,10 +1556,16 @@ def cmd_ebpf_build(args: argparse.Namespace) -> int:
 
 
 def cmd_ebpf_action(args: argparse.Namespace) -> int:
-    script = project_root() / "scripts" / "load-ebpf.sh"
+    script = args.context.project_root / "scripts" / "load-ebpf.sh"
     action = args.ebpf_action
     cmd = [str(script), *_ebpf_script_args(args), action]
-    proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(project_root()))
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        cwd=args.context.project_root,
+        env=command_env(args),
+    )
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script), "action": action}
     for line in reversed((proc.stdout or "").splitlines()):
         line = line.strip()
@@ -845,7 +1585,10 @@ def cmd_mcp_config(args: argparse.Namespace) -> int:
             "xenoid": {
                 "command": sys.executable,
                 "args": ["-m", "xenoid.mcp_server"],
-                "env": {"XENOID_PROJECT": str(Path.cwd())},
+                "env": {
+                    "XENOID_PROJECT": str(args.context.project_root),
+                    "XENOID_INSTANCE": args.context.instance_name,
+                },
             }
         }
     })
@@ -854,7 +1597,11 @@ def cmd_mcp_config(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="xenoid", description="Xenoid Android runtime CLI")
-    sub = p.add_subparsers(required=True)
+    p.add_argument(
+        "--instance",
+        help="immutable instance name (default: XENOID_INSTANCE or default)",
+    )
+    sub = p.add_subparsers(dest="top_command", required=True)
 
     s = sub.add_parser("install-runtime", help="install macOS runtime dependencies via Homebrew and start Colima")
     s.add_argument("--dry-run", action="store_true")
@@ -876,9 +1623,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_linux_binderfs)
 
-    s = sub.add_parser("runtime-compose", help="generate docker-compose.yml for linux-docker backend")
-    s.add_argument("--out", default="dist/docker-compose.yml")
-    s.set_defaults(func=cmd_runtime_compose)
 
 
     s = sub.add_parser("runtime-build-image", help="build custom redroid Docker image with Xenoid payloads")
@@ -920,7 +1664,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_package_release)
 
 
-    s = sub.add_parser("config", help="show or update xenoid config")
+    s = sub.add_parser("instance", help="list initialized Xenoid instances")
+    instance_sub = s.add_subparsers(dest="instance_command", required=True)
+    instance_list = instance_sub.add_parser("list", help="list initialized instances")
+    instance_list.set_defaults(func=cmd_instance_list)
+
+    s = sub.add_parser("config", help="show or update selected instance config")
     csub = s.add_subparsers(required=True)
     cs = csub.add_parser("show")
     cs.set_defaults(func=cmd_config_show)
@@ -929,16 +1678,16 @@ def build_parser() -> argparse.ArgumentParser:
     cset.add_argument("--image")
     cset.add_argument("--runtime-image-tag")
     cset.add_argument("--docker-context")
-    cset.add_argument("--network-enabled", action=argparse.BooleanOptionalAction, default=None)
-    cset.add_argument("--network-name")
-    cset.add_argument("--network-subnet")
-    cset.add_argument("--network-gateway")
-    cset.add_argument("--network-ip")
-    cset.add_argument("--network-mac")
+    cset.add_argument(
+        "--network-dns-server",
+        dest="network_dns_servers",
+        action="append",
+        metavar="ADDRESS",
+    )
     cset.add_argument("--auto-build-runtime-image", action=argparse.BooleanOptionalAction, default=None)
     cset.set_defaults(func=cmd_config_set)
 
-    s = sub.add_parser("init", help="create .xenoid/config.json")
+    s = sub.add_parser("init", help="initialize the selected immutable instance")
     s.add_argument("--image")
     s.add_argument("--backend")
     s.set_defaults(func=cmd_init)
@@ -958,7 +1707,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_stop)
 
     s = sub.add_parser("logs", help="collect Docker/ADB runtime logs")
-    s.add_argument("--out-dir", default=".xenoid/logs")
+    s.add_argument("--out-dir")
     s.set_defaults(func=cmd_logs)
 
     s = sub.add_parser("view", help="open scrcpy for the Xenoid Android target")
@@ -982,6 +1731,135 @@ def build_parser() -> argparse.ArgumentParser:
     ds.set_defaults(func=cmd_daemon_start)
     de = dsub.add_parser("ensure")
     de.set_defaults(func=cmd_daemon_ensure)
+    s = sub.add_parser(
+        "proxy",
+        help="manage the selected instance global proxy without putting credentials in argv",
+    )
+    proxy = s.add_subparsers(required=True)
+    proxy_status = proxy.add_parser("status", help="show redacted proxy status")
+    proxy_status.add_argument(
+        "--check",
+        action="store_true",
+        help="request and wait for a fresh instance/runtime-bound check",
+    )
+    proxy_status.set_defaults(func=cmd_proxy_status)
+
+    def add_proxy_policy_flags(
+        command: argparse.ArgumentParser,
+        *,
+        include_kind: bool = True,
+    ) -> None:
+        if include_kind:
+            command.add_argument(
+                "--kind",
+                choices=["endpoint", "uri_list", "clash", "subscription"],
+                help="source structure (inferred from content when omitted)",
+            )
+        command.add_argument("--name", help="desired node name")
+        command.add_argument(
+            "--udp",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="allow UDP proxying (default: --udp)",
+        )
+        command.add_argument(
+            "--allow-insecure-http",
+            action="store_true",
+            help="explicitly allow an insecure HTTP source",
+        )
+        command.add_argument(
+            "--enable",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="enable after configuring (default: --enable)",
+        )
+
+    proxy_set = proxy.add_parser(
+        "set",
+        help="set a source from stdin or a current-user-owned mode-0600 file",
+    )
+    proxy_set_input = proxy_set.add_mutually_exclusive_group(required=True)
+    proxy_set_input.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read at most 1 MiB from stdin",
+    )
+    proxy_set_input.add_argument(
+        "--prompt",
+        action="store_true",
+        help="read one endpoint or URI without terminal echo",
+    )
+    proxy_set_input.add_argument(
+        "--source-file",
+        metavar="FILE",
+        help="read a regular, non-symlink, current-user-owned mode-0600 file",
+    )
+    add_proxy_policy_flags(proxy_set)
+    proxy_set.set_defaults(func=cmd_proxy_set)
+    proxy_subscribe = proxy.add_parser(
+        "subscribe",
+        help="set an online configuration URL from stdin or a private file",
+    )
+    proxy_subscribe_input = proxy_subscribe.add_mutually_exclusive_group(required=True)
+    proxy_subscribe_input.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read one HTTP(S) subscription URL from stdin",
+    )
+    proxy_subscribe_input.add_argument(
+        "--prompt",
+        action="store_true",
+        help="read one subscription URL without terminal echo",
+    )
+    proxy_subscribe_input.add_argument(
+        "--source-file",
+        metavar="FILE",
+        help="read one HTTP(S) subscription URL from a mode-0600 file",
+    )
+    add_proxy_policy_flags(proxy_subscribe, include_kind=False)
+    proxy_subscribe.set_defaults(func=cmd_proxy_set, kind="subscription")
+
+    proxy_import = proxy.add_parser(
+        "import",
+        help="import a regular, non-symlink, current-user-owned mode-0600 FILE",
+    )
+    proxy_import.add_argument(
+        "file",
+        metavar="FILE",
+        help="Clash or URI-list source; must be current-user-owned mode 0600",
+    )
+    add_proxy_policy_flags(proxy_import)
+    proxy_import.set_defaults(func=cmd_proxy_set, stdin=False, source_file=None)
+
+    proxy_on = proxy.add_parser("on", help="enable the configured source")
+    proxy_on.set_defaults(func=cmd_proxy_enabled, proxy_enabled=True)
+    proxy_off = proxy.add_parser(
+        "off",
+        help="disable proxying while preserving the configured source",
+    )
+    proxy_off.set_defaults(func=cmd_proxy_enabled, proxy_enabled=False)
+    proxy_clear = proxy.add_parser("clear", help="disable and clear the configured source")
+    proxy_clear.set_defaults(func=cmd_proxy_clear)
+    proxy_list = proxy.add_parser(
+        "list",
+        help="list only nodes present in redacted agent status observations",
+    )
+    proxy_list.set_defaults(func=cmd_proxy_list)
+    proxy_select = proxy.add_parser("select", help="select an observed node")
+    proxy_select.add_argument("name", metavar="NAME")
+    proxy_select.set_defaults(func=cmd_proxy_select)
+    proxy_export = proxy.add_parser(
+        "export",
+        help="atomically export source bytes to a private mode-0600 file",
+    )
+    proxy_export.add_argument("--out", required=True, metavar="FILE")
+    proxy_export.set_defaults(func=cmd_proxy_export)
+    proxy_prepare = proxy.add_parser(
+        "prepare",
+        help="prepare the digest-pinned proxy engine asset on the Docker engine host",
+    )
+    proxy_prepare.add_argument("--asset", metavar="FILE")
+    proxy_prepare.set_defaults(func=cmd_proxy_prepare)
 
     s = sub.add_parser("camera", help="configure Android-owned camera media")
     camera = s.add_subparsers(required=True)
@@ -1014,12 +1892,12 @@ def build_parser() -> argparse.ArgumentParser:
     ff = fr.add_parser("fetch")
     ff.add_argument("--version", default="latest")
     ff.add_argument("--arch", default="android-arm64")
-    ff.add_argument("--out-dir", default=".xenoid/frida")
+    ff.add_argument("--out-dir")
     ff.set_defaults(func=cmd_frida_fetch)
     fi = fr.add_parser("install", help="download and deploy frida-server")
     fi.add_argument("--version", default="latest")
     fi.add_argument("--arch", default="android-arm64")
-    fi.add_argument("--out-dir", default=".xenoid/frida")
+    fi.add_argument("--out-dir")
     fi.add_argument("--remote-path", default="/data/system/.core/svc.bin")
     fi.set_defaults(func=cmd_frida_install)
     fds = fr.add_parser("deploy-scripts")
@@ -1066,16 +1944,16 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("profile")
     a.add_argument("--keep-unique", action="store_true")
     a.add_argument("--generate-frida", action="store_true", help="also generate a Frida profile spoof script")
-    a.add_argument("--frida-out", default=".xenoid/frida/generated-profile.js")
+    a.add_argument("--frida-out")
     a.set_defaults(func=cmd_device_apply)
     gsf = dev.add_parser("generate-service-frida")
     gsf.add_argument("profile")
-    gsf.add_argument("--out", default=".xenoid/frida/generated-service-profile.js")
+    gsf.add_argument("--out")
     gsf.add_argument("--keep-unique", action="store_true")
     gsf.set_defaults(func=cmd_device_generate_service_frida)
     gf = dev.add_parser("generate-frida")
     gf.add_argument("profile")
-    gf.add_argument("--out", default=".xenoid/frida/generated-profile.js")
+    gf.add_argument("--out")
     gf.add_argument("--keep-unique", action="store_true")
     gf.set_defaults(func=cmd_device_generate_frida)
     st = dev.add_parser("set")
@@ -1091,7 +1969,6 @@ def build_parser() -> argparse.ArgumentParser:
     rh = aut.add_parser("run-host")
     rh.add_argument("script")
     rh.add_argument("--execute", action="store_true", help="execute through daemon API instead of only planning")
-    rh.add_argument("--endpoint", default="http://127.0.0.1:18765")
     rh.set_defaults(func=cmd_automation_run_host)
     r = aut.add_parser("run")
     r.add_argument("script")
@@ -1200,7 +2077,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        args.project_root = resolve_project_root()
+        args.instance_name = select_instance_name(args.instance)
+        unresolved = args.top_command in {
+            "build",
+            "init",
+            "install-runtime",
+            "package-release",
+            "verify-release",
+        }
+        listing = args.top_command == "instance" and args.instance_command == "list"
+        if not unresolved and not listing:
+            args.context, args.config, args.lease = resolve_instance(
+                args.instance_name,
+                project_root=args.project_root,
+            )
+        return int(args.func(args))
+    except InstanceError as exc:
+        print_json(exc.as_dict())
+        return 1
 
 
 if __name__ == "__main__":

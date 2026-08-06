@@ -558,9 +558,12 @@ route_source_rejected() {
   python3 - "$kind" "$staging" "$size" "$digest" "$destination" <<'PY' || return 1
 import json, pathlib, sys
 sys.path.insert(0, 'src')
-from xenoid.config import load_config
-from xenoid.daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS, DaemonClient
-client = DaemonClient(port=load_config().daemon_port)
+from xenoid.backend import RuntimeManager
+from xenoid.config import resolve_instance
+from xenoid.daemon_client import DaemonClient
+context, cfg, lease = resolve_instance()
+manager = RuntimeManager(context, cfg, lease)
+client = DaemonClient(context, lease, manager.docker_base_cmd())
 result = client.camera_source(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
 pathlib.Path(sys.argv[5]).write_text(
     json.dumps(result, sort_keys=True, separators=(',', ':')) + '\n',

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include <bpf/libbpf.h>
@@ -21,6 +22,7 @@
 #define PIN_UNAME_LINK PIN_DIR "/uname_link"
 #define PIN_UNAME_K_LINK PIN_DIR "/uname_k_link"
 #define STATE_PATH "/var/tmp/xenoid-ebpf-state.json"
+#define LOCK_PATH "/var/tmp/xenoid-ebpf-loader.lock"
 
 static void json_escape(char *dst, size_t n, const char *s)
 {
@@ -261,6 +263,12 @@ static int cmd_load(void)
 	const char *note = "";
 	int err;
 	enum attach_mode mode;
+	char existing[64] = {};
+	if (already_loaded(existing, sizeof(existing))) {
+		emit_json(1, 1, existing, "shared protection already loaded", NULL,
+			  read_deny_count());
+		return 0;
+	}
 
 	libbpf_set_print(libbpf_print_fn);
 
@@ -298,16 +306,31 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
+	int lock_fd;
+	int rc;
+
 	if (argc < 2) {
 		usage(argv[0]);
 		return 2;
 	}
+	lock_fd = open(LOCK_PATH, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+	if (lock_fd < 0 || flock(lock_fd, LOCK_EX) < 0) {
+		if (lock_fd >= 0)
+			close(lock_fd);
+		emit_json(0, 0, "none", "", "shared loader lock failed", 0);
+		return 1;
+	}
 	if (strcmp(argv[1], "load") == 0)
-		return cmd_load();
-	if (strcmp(argv[1], "status") == 0)
-		return cmd_status();
-	if (strcmp(argv[1], "unload") == 0)
-		return cmd_unload();
-	usage(argv[0]);
-	return 2;
+		rc = cmd_load();
+	else if (strcmp(argv[1], "status") == 0)
+		rc = cmd_status();
+	else if (strcmp(argv[1], "unload") == 0)
+		rc = cmd_unload();
+	else {
+		usage(argv[0]);
+		rc = 2;
+	}
+	flock(lock_fd, LOCK_UN);
+	close(lock_fd);
+	return rc;
 }

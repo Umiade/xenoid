@@ -1,6 +1,6 @@
 # Xenoid MCP tool contract
 
-The `xenoid-mcp` stdio server exposes these tools for agent/host use (62 total).
+The `xenoid-mcp` stdio server exposes these tools for agent/host use (67 total).
 Every tool returns a JSON object; `ok` indicates success. The daemon-backed tools
 require the runtime up and the daemon reachable (daemon control channel is
 authenticated with the per-instance `X-Xenoid-Token`).
@@ -49,10 +49,6 @@ _No parameters._
 Create custom redroid Docker build context with Xenoid payloads
   - `image` (string)
 
-### `xenoid_runtime_compose`
-Generate docker-compose.yml for linux-docker backend
-  - `out` (string)
-
 ### `xenoid_runtime_build_image`
 Build or dry-run custom redroid Docker image
   - `image` (string)
@@ -80,6 +76,35 @@ _No parameters._
 ### `xenoid_daemon_install`
 Install and start daemon APK
   - `apk` (string) **(required)**
+
+## Global proxy
+
+MCP intentionally exposes redacted lifecycle operations only. Configure or import credential-bearing sources through the Android Xenoid settings screen or the CLI's private stdin/file inputs.
+
+### `xenoid_proxy_status`
+Show redacted desired state, generation, selected node, capabilities, and packet counters for the fixed instance.
+_No parameters._
+
+### `xenoid_proxy_check`
+Request and wait for a fresh check bound to the fixed instance, current generation, and runtime epoch.
+_No parameters._
+
+### `xenoid_proxy_on`
+Enable and converge the configured source.
+_No parameters._
+
+### `xenoid_proxy_off`
+Disable proxying while preserving the configured source.
+_No parameters._
+
+### `xenoid_proxy_clear`
+Disable proxying and erase the configured source.
+_No parameters._
+
+### `xenoid_proxy_select`
+Select one node already present in the redacted agent observation.
+  - `name` (string) **(required)**
+
 
 ### `xenoid_root_status`
 Check daemon root/su helper status

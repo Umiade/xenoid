@@ -119,6 +119,42 @@ Linux 主机必须向 redroid 暴露 binderfs 设备。ARM64 主机必须使用 
 ./xenoid adb shell getprop ro.product.model
 ```
 
+## 全局代理
+
+可以在 Android 的 Xenoid 设置界面中保存代理来源，也可以使用宿主 CLI。来源内容和凭据不得放入命令行参数：
+
+```bash
+# SOCKS5、HTTP 或 HTTPS 端点；输入过程不回显。
+./xenoid proxy set --prompt
+
+# 直接 HTTP 端点无法转发 UDP。
+./xenoid proxy set --prompt --no-udp
+
+# Clash YAML/JSON、URI 列表或 base64 URI 订阅。
+chmod 600 /path/to/proxy-source
+./xenoid proxy import /path/to/proxy-source
+
+# 在线配置链接；默认只允许 HTTPS。
+./xenoid proxy subscribe --prompt
+```
+
+编译器支持 SOCKS5、HTTP/HTTPS、Shadowsocks、ShadowsocksR、Trojan、VMess、VLESS、Hysteria 1/2、TUIC、AnyTLS、Mieru 和 Snell 节点。Clash `proxy-providers` 会被下载并合并；不支持的规则、监听器、分组与 provider 设置不会透传到代理引擎。
+
+管理代理并查看经过脱敏的就绪证据：
+
+```bash
+./xenoid proxy status --check
+./xenoid proxy list
+./xenoid proxy select NAME
+./xenoid proxy off
+./xenoid proxy on
+./xenoid proxy export --out /path/to/private-backup
+./xenoid proxy clear
+```
+
+代理默认全局生效。Docker 引擎宿主会在 Android 容器流量离开网桥前透明接管 IPv4/IPv6 DNS、TCP 以及策略允许的 UDP，因此 Java 客户端、native 库和原始 socket 统一走代理；Android 网络命名空间中无需设置代理属性、VPN transport 或 TUN 设备。启用过程默认封闭：只有绑定到当前实例和运行时的普通应用检查证明所需数据面后才放行流量。`./xenoid up` 会恢复并验证已保存的期望状态。
+
+
 ## Root
 
 root 通过 daemon 与 token-gated rootd 提供，用户无需进入 Android root shell。

@@ -44,18 +44,31 @@ echo "[ci] static: python compile"
 run_cmd "compileall-src" python3 -m compileall -q src
 echo "[ci] static: prospective sensitive-content audit"
 run_py audit-sensitive-data.py
+echo "[ci] static: instance identity and lease contracts"
+run_py test-proxy.py
+echo "[ci] static: proxy compiler and authenticated control contracts"
+run_py test-proxy-compiler.py
 
+CI_INSTANCE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/xenoid-ci-instance.XXXXXX")"
+trap 'rm -rf "$CI_INSTANCE_ROOT"' EXIT
+CI_INSTANCE_PROJECT="$CI_INSTANCE_ROOT/project"
+CI_INSTANCE_HOME="$CI_INSTANCE_ROOT/home"
+mkdir -p "$CI_INSTANCE_PROJECT/src/xenoid" "$CI_INSTANCE_HOME"
+env HOME="$CI_INSTANCE_HOME" XENOID_PROJECT="$CI_INSTANCE_PROJECT" \
+  ./xenoid --instance verify init >/tmp/ci-instance-init.json 2>&1
 echo "[ci] static: MCP tool surface"
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  | ./xenoid-mcp >/tmp/ci-mcp.jsonl 2>&1
+  | env HOME="$CI_INSTANCE_HOME" XENOID_PROJECT="$CI_INSTANCE_PROJECT" \
+      XENOID_INSTANCE=verify ./xenoid-mcp >/tmp/ci-mcp.jsonl 2>&1
 if python3 - <<'PY'
 import json,sys
 lines=[json.loads(x) for x in open('/tmp/ci-mcp.jsonl') if x.strip()]
 tools={t['name'] for t in lines[1]['result']['tools']}
 need={'xenoid_doctor','xenoid_start','xenoid_up_plan','xenoid_device_apply','xenoid_hide_apply','xenoid_ebpf_status','xenoid_frida_load_script','xenoid_verify_release'}
 need.add('xenoid_frida_install')
+need.update({'xenoid_proxy_status','xenoid_proxy_check','xenoid_proxy_on','xenoid_proxy_off','xenoid_proxy_clear','xenoid_proxy_select'})
 missing=sorted(need-tools)
 if missing: print('missing MCP tools: '+', '.join(missing)); sys.exit(1)
 print(f'mcp tools ok ({len(tools)})')

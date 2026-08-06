@@ -85,14 +85,18 @@ fi
 LIBCUTILS="$HAL/libcutils.so"
 if [[ ! -f "$LIBCUTILS" ]]; then
   SELECTED_DOCKER_CONTEXT="${XENOID_DOCKER_CONTEXT:-${DOCKER_CONTEXT:-}}"
-  if [[ -z "$SELECTED_DOCKER_CONTEXT" && -f "$ROOT/.xenoid/config.json" ]]; then
-    SELECTED_DOCKER_CONTEXT="$(PYTHONPATH="$ROOT/src" python3 -c 'from xenoid.backend import RuntimeManager; from xenoid.config import load_config; print(RuntimeManager(load_config()).effective_docker_context())')"
-  fi
+  INSTANCE_RUNTIME=()
+  while IFS= read -r value; do INSTANCE_RUNTIME+=("$value"); done < <(
+    PYTHONPATH="$ROOT/src" python3 -c 'from pathlib import Path; from xenoid.backend import RuntimeManager; from xenoid.config import resolve_instance; c,g,l=resolve_instance(project_root=Path.cwd()); r=RuntimeManager(c,g,l); print(r.effective_docker_context()); print(l.container_name)'
+  )
+  [[ ${#INSTANCE_RUNTIME[@]} -eq 2 ]] || { printf 'failed to resolve Xenoid instance runtime\n' >&2; exit 1; }
+  [[ -n "$SELECTED_DOCKER_CONTEXT" ]] || SELECTED_DOCKER_CONTEXT="${INSTANCE_RUNTIME[0]}"
+  CONTAINER_NAME="${INSTANCE_RUNTIME[1]}"
   DOCKER=(docker)
   if [[ -n "$SELECTED_DOCKER_CONTEXT" ]]; then
     DOCKER+=(--context "$SELECTED_DOCKER_CONTEXT")
   fi
-  if ! "${DOCKER[@]}" cp "xenoid-android:/system/lib64/libcutils.so" "$LIBCUTILS" >/dev/null 2>&1; then
+  if ! "${DOCKER[@]}" cp "$CONTAINER_NAME:/system/lib64/libcutils.so" "$LIBCUTILS" >/dev/null 2>&1; then
     IMAGE="${XENOID_BASE_IMAGE:-redroid/redroid:13.0.0_64only-latest}"
     CID="$("${DOCKER[@]}" create "$IMAGE")"
     if ! "${DOCKER[@]}" cp "$CID:/system/lib64/libcutils.so" "$LIBCUTILS"; then

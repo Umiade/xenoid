@@ -4,7 +4,7 @@ Xenoid is split into three layers:
 
 1. **Host layer** (`src/xenoid`) — CLI and MCP server for local agents/users.
 2. **Runtime layer** — Android container backend through Docker/Colima on Apple Silicon macOS or Docker on Linux ARM.
-3. **Android control layer** (`daemon`) — daemon APK exposing JSON APIs for root, camera media, Frida, profiles, automation, and OTA.
+3. **Android control layer** (`daemon`) — daemon APK exposing authenticated JSON APIs for root, global proxy desired state, camera media, Frida, profiles, automation, and OTA.
 
 ## Why a Linux VM on macOS
 
@@ -23,6 +23,7 @@ xenoid device collect --out .xenoid/device.json
 xenoid device apply examples/fingerprints/sample-profile.json
 xenoid automation run examples/automation/tap-home.js
 xenoid camera status --check
+xenoid proxy status --check
 xenoid ota check
 xenoid mcp-config
 ```
@@ -46,6 +47,13 @@ xenoid mcp-config
 - `POST /camera/apply`
 - `POST /camera/self-test/start`
 - `GET /camera/self-test/status`
+- `GET /proxy/status`
+- `POST /proxy/source`
+- `POST /proxy/enabled`
+- `POST /proxy/select`
+- `POST /proxy/clear`
+- `POST /proxy/check`
+- `GET /proxy/export`
 
 ## Camera data plane
 
@@ -54,6 +62,15 @@ The host streams camera media to a random, mode-`0600` ADB staging file and send
 The stable-AIDL camera provider snapshots one published generation when a camera opens. Its ordered worker writes preview, YUV, and JPEG buffers, emits a monotonic shutter timestamp, and then returns matching result metadata, including coherent AE/AWB lock state used by legacy camera clients. The runtime supplies matching framework camcorder profiles for both cameras. The image-matched legacy allocator remains the sole graphics allocator; its camera-only handle extension supports flexible YUV and JPEG BLOB buffers while retaining the original RGB/framebuffer handle layout.
 
 Photo requests fall back to the first video frame, video requests fall back to the photo, and a source-free runtime uses a generated sensor-like scene. Source changes therefore never invalidate an active session and become visible only on the next open.
+
+## Global proxy data plane
+
+The daemon owns encrypted desired state and exposes only redacted status. The host controller compiles endpoint, URI-list, subscription, or Clash input into a deterministic Mihomo configuration. Compilation uses a strict protocol/key allowlist and replaces source routing with one fixed `MATCH,GLOBAL` route; source rules, listeners, controller settings, and direct fallbacks do not cross the boundary. Remote subscriptions and Clash providers use bounded HTTPS fetches with public-address pinning, TLS verification, redirect revalidation, media-type checks, and a private cache.
+
+Each Android instance has one root-owned reconciliation agent on the Docker engine host. The engine binds the manifest to the current container ID, runtime epoch, bridge, IPv4/IPv6 addresses, and MAC address. It creates the transparent proxy listener in a separate host network namespace and captures only that container's bridge traffic with per-instance netfilter chains. Android keeps its ordinary `eth0`, route, DNS configuration, proxy properties, and network capabilities; no proxy process, TUN device, VPN transport, listening port, or proxy routing rule is added to the Android namespace.
+
+The engine installs a quarantine before configuration or lifecycle changes and opens the data plane only after the daemon's ordinary-app probe proves every requested IPv4/IPv6 DNS, TCP, and UDP capability for the exact instance, generation, check ID, and runtime epoch. A stale report cannot release a newer generation. Disable and clear operations remove owned rules and namespaces; failures remain fail-closed. Root/agent messages use direction-bound authenticated encryption with replay rejection, and unprivileged compiler/fetch workers run under separate bounded service accounts.
+
 
 ## Environment hiding
 
@@ -99,7 +116,3 @@ When `auto_build_runtime_image=true`, `xenoid start` plans to use `runtime_image
 - ADB availability
 
 This makes startup failures actionable before trying to boot Android.
-
-## Docker Compose for Linux ARM
-
-`xenoid runtime-compose` generates a compose file with privileged redroid container, ADB/daemon ports, persistent data volume, binderfs mount, and `androidboot.use_memfd=true`.

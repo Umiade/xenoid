@@ -8,6 +8,19 @@ No external Python dependencies are required.
 ./xenoid doctor
 ```
 
+## Global proxy runtime
+
+Proxy source compilation and authenticated control contracts are runtime-free:
+
+```bash
+python3 scripts/test-proxy-compiler.py
+```
+
+The transparent data plane runs on the selected Docker engine host. On first `proxy prepare`, `proxy set`, or enabled-state convergence, Xenoid installs the root engine helper, per-instance systemd agent, unprivileged compiler/fetch workers, and required distro packages. It downloads Mihomo `v1.19.29` only from the pinned release URL and verifies both the compressed archive and extracted ARM64 binary SHA-256 digests. The binary is host state under `/usr/lib/xenoid/proxy`; it is not a tracked or packaged build artifact.
+
+The daemon APK contains the encrypted desired-state manager and ordinary-app IPv4/IPv6 DNS, TCP, and UDP probes. Host Python modules and the engine/agent scripts are included in release bundles.
+
+
 ## Daemon APK
 
 Preferred:
@@ -114,6 +127,7 @@ dist/runtime-context/Dockerfile
 - Python compilation
 - CLI dry-run and MCP tool exposure
 - mock daemon API contract
+- deterministic proxy source compilation, bounded subscription fetching, authenticated/replay-safe engine protocol, and fixed-instance controller race contracts
 - ADB/boot/daemon/root state when Android is running
 
 `./xenoid doctor --full --require-runtime` additionally rebuilds artifacts and

@@ -8,31 +8,33 @@ rm -rf "$REL"
 mkdir -p "$REL" "$REL/bin" "$REL/artifacts" "$REL/config" "$REL/docs" "$REL/skills" "$REL/examples"
 cd "$ROOT"
 ./xenoid build all >/tmp/xenoid-release-build.json
-./xenoid ota make --version "$VERSION" >/tmp/xenoid-release-ota.json
-./xenoid runtime-context >/tmp/xenoid-release-runtime-context.json
-./xenoid runtime-compose --out dist/docker-compose.yml >/tmp/xenoid-release-compose.json
-./xenoid doctor --out "$REL/doctor.json" >/tmp/xenoid-release-doctor.json || true
-ROOT_PATH="$ROOT" DOCTOR_PATH="$REL/doctor.json" python3 - <<'PY'
+OTA_BUNDLE="$("$ROOT/scripts/make-ota-bundle.sh" "$VERSION")"
+DOCTOR_PATH="$REL/doctor.json" python3 - <<'PY'
 import json, os, pathlib
-p = pathlib.Path(os.environ["DOCTOR_PATH"])
-root = os.environ["ROOT_PATH"]
-home = os.path.expanduser("~")
-def scrub(value):
-    if isinstance(value, dict):
-        return {k: scrub(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [scrub(v) for v in value]
-    if isinstance(value, str):
-        return value.replace(root, "<repo>").replace(home, "~")
-    return value
-p.write_text(json.dumps(scrub(json.loads(p.read_text())), indent=2) + "\n")
+path = pathlib.Path(os.environ["DOCTOR_PATH"])
+path.write_text(json.dumps({
+    "schema": "dev.xenoid.doctor/v1",
+    "ok": True,
+    "complete": False,
+    "full": False,
+    "runtimeRequired": False,
+    "runtimeAvailable": False,
+    "checks": [{"name": "releaseBuild", "ok": True, "skipped": False}],
+    "sections": {
+        "releaseBuild": {
+            "ok": True,
+            "reason": "offline release packaging; no runtime was inspected",
+        }
+    },
+    "nextActions": [],
+}, indent=2) + "\n")
 PY
 REL="$REL" ROOT="$ROOT" python3 - <<'PY'
 import os, pathlib, shutil, subprocess
 root = pathlib.Path(os.environ["ROOT"])
 release = pathlib.Path(os.environ["REL"])
 raw = subprocess.check_output(
-    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    ["git", "ls-files", "--cached", "-z"],
     cwd=root,
 )
 for item in raw.split(b"\0"):
@@ -67,6 +69,7 @@ cp native/xenoid-gralloc/gralloc.redroid.so "$REL/artifacts/gralloc.redroid.so"
 cp native/xenoid-hide/xenoid-overlay "$REL/artifacts/xenoid-overlay-helper"
 cp native/xenoid-hide/xenoid-prop-area "$REL/artifacts/xenoid-prop-area"
 cp native/xenoid-hide/xenoid-ssaid "$REL/artifacts/xenoid-ssaid"
+cp native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/artifacts/xenoid-proxy-sandbox"
 cp native/xenoid-input/xenoid-input "$REL/native/xenoid-input/xenoid-input"
 cp native/xenoid-hide/xenoid-hide "$REL/native/xenoid-hide/xenoid-hide"
 cp native/xenoid-hide/xenoid-overlay "$REL/native/xenoid-hide/xenoid-overlay"
@@ -82,9 +85,11 @@ cp native/xenoid-sensorshal/xenoid-sensorshal "$REL/native/xenoid-sensorshal/xen
 cp native/xenoid-camerahal/android.hardware.camera.provider-service-aidl "$REL/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
 cp native/xenoid-camerahal/media_profiles_V1_0.xml "$REL/native/xenoid-camerahal/media_profiles_V1_0.xml"
 cp native/xenoid-gralloc/gralloc.redroid.so "$REL/native/xenoid-gralloc/gralloc.redroid.so"
-cp "$(python3 -c 'import json;print(json.load(open("/tmp/xenoid-release-ota.json"))["bundle"])')" "$REL/artifacts/"
+mkdir -p "$REL/native/xenoid-proxy-sandbox"
+cp native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/native/xenoid-proxy-sandbox/xenoid-proxy-sandbox"
+cp native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/scripts/xenoid-proxy-sandbox"
+cp "$OTA_BUNDLE" "$REL/artifacts/"
 cp examples/config-macos-colima.json examples/config-linux-arm.json "$REL/config/"
-cp dist/docker-compose.yml "$REL/config/"
 cat > "$REL/RUNBOOK.md" <<'RUNBOOK'
 # Xenoid Release Runbook
 

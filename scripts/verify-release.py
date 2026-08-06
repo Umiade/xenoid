@@ -52,11 +52,18 @@ REQUIRED = [
   'bin/xenoid', 'bin/xenoid-mcp',
   'src/xenoid/__init__.py', 'src/xenoid/cli.py', 'src/xenoid/backend.py',
   'src/xenoid/config.py', 'src/xenoid/util.py', 'src/xenoid/daemon_client.py',
+  'src/xenoid/proxy_controller.py', 'src/xenoid/proxy_protocol.py',
+  'src/xenoid/proxy_source.py', 'src/xenoid/mcp_server.py',
   'src/xenoid/doctor.py', 'scripts/xenoid-up.sh',
   'scripts/make-runtime-context.sh', 'scripts/make-rootfs-image.sh',
   'scripts/redroid-preflight.sh', 'scripts/build-kmod.sh',
   'scripts/build-ebpf.sh', 'scripts/load-ebpf.sh',
   'examples/fingerprints/sample-profile.json', 'examples/hide/default-policy.json',
+  'scripts/build-proxy-sandbox.sh', 'scripts/xenoid-proxy-engine.py',
+  'scripts/xenoid-proxy-agent.py', 'scripts/xenoid-proxy-compile-worker.py',
+  'scripts/xenoid-proxy-fetch-worker.py',
+  'scripts/xenoid-proxy-agent@.service', 'scripts/proxy-engine-assets.json',
+  'scripts/xenoid-proxy-sandbox',
   'daemon/app/build/outputs/apk/debug/app-debug.apk',
   'native/xenoid-input/xenoid-input', 'native/xenoid-hide/xenoid-hide',
   'native/xenoid-hide/xenoid-overlay', 'native/xenoid-hide/xenoid-prop-area',
@@ -67,6 +74,9 @@ REQUIRED = [
   'native/xenoid-pivot/xenoid-pivot',
   'native/xenoid-sensorshal/xenoid-sensorshal',
   'native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml',
+  'native/xenoid-proxy-sandbox/Makefile',
+  'native/xenoid-proxy-sandbox/xenoid_proxy_sandbox.c',
+  'native/xenoid-proxy-sandbox/xenoid-proxy-sandbox',
   *GENERIC_CAMERA_PATHS[:3],
   'artifacts/xenoid-daemon.apk', 'artifacts/xenoid-input',
   'artifacts/xenoid-hide-helper', 'artifacts/xenoid-profile-helper',
@@ -77,13 +87,16 @@ REQUIRED = [
   *GENERIC_CAMERA_PATHS[3:],
   'artifacts/xenoid-overlay-helper', 'artifacts/xenoid-prop-area',
   'artifacts/xenoid-ssaid', 'config/config-macos-colima.json',
-  'config/config-linux-arm.json', 'config/docker-compose.yml',
+  'artifacts/xenoid-proxy-sandbox',
+  'config/config-linux-arm.json',
   'skills/xenoid/SKILL.md',
   'scripts/smoke-camera-runtime.sh',
   'tests/camera-runtime-probe/AndroidManifest.xml',
   'tests/camera-runtime-probe/build.sh',
   'tests/camera-runtime-probe/native/ndk_probe.cpp',
   *CAMERA_HARNESS_JAVA_PATHS,
+  'daemon/app/src/main/java/dev/xenoid/daemon/ProxyManager.java',
+  'daemon/app/src/main/java/dev/xenoid/daemon/ProxyAgentChannel.java',
 ]
 def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
 def main():
@@ -130,6 +143,55 @@ def main():
             listed=req == 'manifest.json' or req in files
             ok=p.is_file() and listed
             out['checks'].append({'name':'required:'+req,'ok':ok,'detail':str(p),'listed':listed})
+        sandbox = root/'native/xenoid-proxy-sandbox/xenoid-proxy-sandbox'
+        try:
+            sandbox_data = sandbox.read_bytes()
+            sandbox_mode = sandbox.stat().st_mode
+        except OSError:
+            sandbox_data = b''
+            sandbox_mode = 0
+        program_offset = int.from_bytes(sandbox_data[32:40], 'little')
+        program_size = int.from_bytes(sandbox_data[54:56], 'little')
+        program_count = int.from_bytes(sandbox_data[56:58], 'little')
+        sandbox_static = (
+            len(sandbox_data) >= 64
+            and program_size >= 4
+            and program_offset + program_size * program_count <= len(sandbox_data)
+            and all(
+                int.from_bytes(
+                    sandbox_data[
+                        program_offset + index * program_size:
+                        program_offset + index * program_size + 4
+                    ],
+                    'little',
+                ) != 3
+                for index in range(program_count)
+            )
+        )
+        sandbox_linux_arm64 = (
+            len(sandbox_data) >= 64
+            and sandbox_data[:6] == b'\x7fELF\x02\x01'
+            and int.from_bytes(sandbox_data[18:20], 'little') == 183
+            and sandbox_static
+            and b'/system/bin/linker64' not in sandbox_data
+            and bool(sandbox_mode & 0o111)
+        )
+        out['checks'].append({
+            'name':'linux-arm64-proxy-sandbox',
+            'ok':sandbox_linux_arm64,
+            'detail':str(sandbox),
+        })
+        artifact_sandbox = root/'artifacts/xenoid-proxy-sandbox'
+        staged_sandbox = root/'scripts/xenoid-proxy-sandbox'
+        out['checks'].append({
+            'name':'proxy-sandbox-artifact-match',
+            'ok':artifact_sandbox.is_file()
+                 and staged_sandbox.is_file()
+                 and sandbox.is_file()
+                 and sha(artifact_sandbox) == sha(sandbox)
+                 and sha(staged_sandbox) == sha(sandbox),
+            'detail':str(artifact_sandbox),
+        })
         runtime_context_path = root/'scripts/make-runtime-context.sh'
         try:
             runtime_context = runtime_context_path.read_text()

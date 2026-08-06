@@ -1,14 +1,48 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .backend import RuntimeManager
-from .config import load_config
+from .config import (
+    InstanceContext,
+    InstanceError,
+    InstanceLease,
+    XenoidConfig,
+    resolve_instance,
+)
 from .daemon_client import DaemonClient
 from .doctor import build_doctor_report
+from .proxy_controller import ProxyController
 from .util import read_json_file
+@dataclass(frozen=True)
+class MCPRuntime:
+    context: InstanceContext
+    config: XenoidConfig
+    lease: InstanceLease
+    manager: RuntimeManager
+    daemon: DaemonClient
+
+    @classmethod
+    def resolve(cls) -> "MCPRuntime":
+        context, config, lease = resolve_instance()
+        manager = RuntimeManager(context, config, lease)
+        daemon = DaemonClient(context, lease, manager.docker_base_cmd())
+        return cls(context, config, lease, manager, daemon)
+
+    @property
+    def subprocess_env(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "XENOID_PROJECT": str(self.context.project_root),
+            "XENOID_INSTANCE": self.context.instance_name,
+        }
+
+
 
 
 def respond(id_: Any, result: Any = None, error: Any = None) -> None:
@@ -38,7 +72,6 @@ def tools() -> list[dict[str, Any]]:
         tool("xenoid_verify_release", "Verify a Xenoid release bundle", {"archive": {"type": "string"}}, ["archive"]),
         tool("xenoid_package_release", "Package transferable Xenoid release bundle", {"version": {"type": "string"}}),
         tool("xenoid_runtime_context", "Create custom redroid Docker build context with Xenoid payloads", {"image": {"type": "string"}}),
-        tool("xenoid_runtime_compose", "Generate docker-compose.yml for linux-docker backend", {"out": {"type": "string"}}),
         tool("xenoid_linux_binderfs", "Run/dry-run Linux binderfs setup", {"dryRun": {"type": "boolean"}}),
         tool("xenoid_runtime_build_image", "Build or dry-run custom redroid Docker image", {"image": {"type": "string"}, "tag": {"type": "string"}, "dryRun": {"type": "boolean"}}),
         tool("xenoid_config_show", "Show Xenoid config"),
@@ -52,6 +85,17 @@ def tools() -> list[dict[str, Any]]:
         tool("xenoid_daemon_health", "Check Android daemon health"),
         tool("xenoid_daemon_ensure", "Ensure Android daemon API is reachable"),
         tool("xenoid_daemon_install", "Install and start daemon APK", {"apk": {"type": "string"}}, ["apk"]),
+        tool("xenoid_proxy_status", "Show redacted proxy status for the fixed instance"),
+        tool("xenoid_proxy_check", "Run a fresh instance/runtime-bound proxy check"),
+        tool("xenoid_proxy_on", "Enable the fixed instance configured proxy source"),
+        tool("xenoid_proxy_off", "Disable proxying while preserving the fixed instance source"),
+        tool("xenoid_proxy_clear", "Disable and clear the fixed instance proxy source"),
+        tool(
+            "xenoid_proxy_select",
+            "Select a proxy node for the fixed instance",
+            {"name": {"type": "string"}},
+            ["name"],
+        ),
         tool("xenoid_root_status", "Check daemon root/su helper status"),
         tool("xenoid_root_exec", "Run command through daemon root helper", {"command": {"type": "string"}}, ["command"]),
         tool("xenoid_frida_install", "Download and deploy frida-server", {"version": {"type": "string"}, "arch": {"type": "string"}, "outDir": {"type": "string"}, "remotePath": {"type": "string"}}),
@@ -75,7 +119,7 @@ def tools() -> list[dict[str, Any]]:
         tool("xenoid_device_generate_service_frida", "Generate service/system Frida spoof script from fingerprint profile", {"profilePath": {"type": "string"}, "out": {"type": "string"}, "keepUnique": {"type": "boolean"}}, ["profilePath"]),
         tool("xenoid_device_set", "Set one fingerprint field through daemon", {"field": {"type": "string"}, "value": {}}, ["field", "value"]),
         tool("xenoid_automation_plan", "Parse Xenoid JS automation task into ordered calls", {"scriptPath": {"type": "string"}}, ["scriptPath"]),
-        tool("xenoid_automation_run_host", "Run/plan Xenoid JS automation task with host JS runner", {"scriptPath": {"type": "string"}, "execute": {"type": "boolean"}, "endpoint": {"type": "string"}}, ["scriptPath"]),
+        tool("xenoid_automation_run_host", "Run/plan Xenoid JS automation task with host JS runner", {"scriptPath": {"type": "string"}, "execute": {"type": "boolean"}}, ["scriptPath"]),
         tool("xenoid_automation_run", "Run Xenoid JS automation task", {"scriptPath": {"type": "string"}}, ["scriptPath"]),
         tool("xenoid_app_install", "Install APK by Android-side path through daemon", {"path": {"type": "string"}}, ["path"]),
         tool("xenoid_app_uninstall", "Uninstall package through daemon", {"package": {"type": "string"}}, ["package"]),
@@ -101,19 +145,133 @@ def tools() -> list[dict[str, Any]]:
 
 def text_result(data: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2, default=lambda o: getattr(o, "__dict__", str(o)))}]}
+_PROXY_PRIVATE_KEYS = {
+    "authorization",
+    "ciphertext",
+    "cookie",
+    "header",
+    "headers",
+    "key",
+    "masterkey",
+    "password",
+    "path",
+    "privatekey",
+    "source",
+    "sourcevalue",
+    "stagingpath",
+    "subscription",
+    "token",
+    "uri",
+    "url",
+    "userinfo",
+    "value",
+}
+def _is_stable_proxy_code(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 64
+        and "a" <= value[0] <= "z"
+        and all(("a" <= ch <= "z") or ch.isdigit() or ch == "_" for ch in value)
+    )
+def _is_sensitive_proxy_text(value: str) -> bool:
+    lowered = value.lower()
+    if "://" in lowered or value.startswith(("/", "~/")):
+        return True
+    if "@" in value:
+        userinfo = value.split("@", 1)[0]
+        if ":" in userinfo and not any(ch.isspace() for ch in userinfo):
+            return True
+    return False
 
 
-def call_tool(name: str, args: dict[str, Any]) -> Any:
-    cfg = load_config()
-    mgr = RuntimeManager(cfg)
-    dc = DaemonClient(port=cfg.daemon_port)
+
+
+
+
+def _sanitize_proxy_result(value: Any) -> Any:
+    if isinstance(value, dict):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _is_sensitive_proxy_text(name):
+                continue
+            normalized = "".join(ch for ch in name.lower() if ch.isalnum())
+            private = (
+                normalized in _PROXY_PRIVATE_KEYS
+                or normalized.endswith(
+                    (
+                        "authorization",
+                        "ciphertext",
+                        "cookie",
+                        "headers",
+                        "masterkey",
+                        "password",
+                        "privatekey",
+                        "sourcevalue",
+                        "stagingpath",
+                        "token",
+                        "userinfo",
+                    )
+                )
+            )
+            if private:
+                continue
+            if normalized in ("error", "message") and not _is_stable_proxy_code(item):
+                clean[name] = "proxy_request_failed"
+            else:
+                clean[name] = _sanitize_proxy_result(item)
+        return clean
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_proxy_result(item) for item in value]
+    if isinstance(value, str) and _is_sensitive_proxy_text(value):
+        return "[redacted]"
+    return value
+
+
+def proxy_text_result(call: Any) -> dict[str, Any]:
+    try:
+        result = call()
+    except InstanceError as exc:
+        result = {"ok": False, "code": exc.code, "error": exc.code}
+    except Exception:
+        result = {
+            "ok": False,
+            "code": "daemon_unreachable",
+            "error": "daemon_unreachable",
+        }
+    if not isinstance(result, dict):
+        result = {
+            "ok": False,
+            "code": "daemon_response_invalid",
+            "error": "daemon_response_invalid",
+        }
+    return text_result(_sanitize_proxy_result(result))
+
+
+def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
+    context = runtime.context
+    cfg = runtime.config
+    mgr = runtime.manager
+    dc = runtime.daemon
+
     def edc() -> DaemonClient:
         mgr.ensure_daemon()
         return dc
+
+    def epc() -> ProxyController:
+        ensured = mgr.ensure_daemon()
+        if not isinstance(ensured, dict) or ensured.get("ok") is not True:
+            raise RuntimeError("daemon_unreachable")
+        return ProxyController(context, cfg, runtime.lease, mgr, dc)
     if name == "xenoid_verify_release":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "verify-release.py"
-        proc = subprocess.run([str(script), str(args["archive"])], text=True, capture_output=True, cwd=str(script.parents[1]))
+        script = context.project_root / "scripts" / "verify-release.py"
+        proc = subprocess.run(
+            [str(script), str(args["archive"])],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
         try:
             data = json.loads(proc.stdout)
         except Exception:
@@ -121,48 +279,96 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
         data["returncode"] = proc.returncode
         return text_result(data)
     if name == "xenoid_package_release":
-        import subprocess, os
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "package-release.sh"
-        proc = subprocess.run([str(script), str(args.get("version") or "dev")], text=True, capture_output=True, cwd=str(script.parents[1]), env={**os.environ, "REL": ""})
+        script = context.project_root / "scripts" / "package-release.sh"
+        proc = subprocess.run(
+            [str(script), str(args.get("version") or "dev")],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env={**runtime.subprocess_env, "REL": ""},
+        )
         return text_result({"ok": proc.returncode == 0, "stdout": proc.stdout, "stderr": proc.stderr, "returncode": proc.returncode, "archive": proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else None})
     if name == "xenoid_doctor":
         return text_result(build_doctor_report(
+            context,
             cfg,
+            runtime.lease,
             full=bool(args.get("full", False)),
             require_runtime=bool(args.get("requireRuntime", False)),
         ))
     if name == "xenoid_runtime_context":
         return text_result(mgr.make_runtime_context(args.get("image")))
-    if name == "xenoid_runtime_compose":
-        return text_result(mgr.make_compose(str(args.get("out") or "dist/docker-compose.yml")))
     if name == "xenoid_linux_binderfs":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "setup-linux-binderfs.sh"
+        script = context.project_root / "scripts" / "setup-linux-binderfs.sh"
         cmd = [str(script)] + (["--dry-run"] if bool(args.get("dryRun", True)) else [])
-        proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(script.parents[1]))
-        return text_result({"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr})
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
+        return text_result({
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        })
     if name == "xenoid_runtime_build_image":
         ctx = mgr.make_runtime_context(args.get("image"))
         tag = str(args.get("tag") or "xenoid/redroid:local")
         if bool(args.get("dryRun", True)):
-            return text_result({"ok": ctx.get("ok"), "dryRun": True, "context": ctx.get("context"), "command": [*mgr.docker_base_cmd(), "build", "-t", tag, ctx.get("context")]})
-        import subprocess
-        proc = subprocess.run([*mgr.docker_base_cmd(), "build", "-t", tag, ctx.get("context")], text=True, capture_output=True)
-        return text_result({"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "tag": tag})
+            return text_result({
+                "ok": ctx.get("ok"),
+                "dryRun": True,
+                "context": ctx.get("context"),
+                "command": [
+                    *mgr.docker_base_cmd(),
+                    "build",
+                    "-t",
+                    tag,
+                    ctx.get("context"),
+                ],
+            })
+        proc = subprocess.run(
+            [*mgr.docker_base_cmd(), "build", "-t", tag, ctx.get("context")],
+            text=True,
+            capture_output=True,
+        )
+        return text_result({
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "tag": tag,
+        })
     if name == "xenoid_config_show":
-        return text_result(cfg)
+        return text_result({
+            "instance": context.public_dict(),
+            "config": cfg,
+        })
     if name == "xenoid_install_runtime_plan":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "install-macos-runtime.sh"
-        proc = subprocess.run([str(script), "--dry-run"], text=True, capture_output=True, cwd=str(script.parents[1]))
+        script = context.project_root / "scripts" / "install-macos-runtime.sh"
+        proc = subprocess.run(
+            [str(script), "--dry-run"],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
         try: data = json.loads(proc.stdout)
         except Exception: data = {"ok": False, "stdout": proc.stdout, "stderr": proc.stderr}
         data["returncode"] = proc.returncode
         return text_result(data)
     if name == "xenoid_up_plan":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "xenoid-up.sh"
-        proc = subprocess.run([str(script), "--dry-run"], text=True, capture_output=True, cwd=str(script.parents[1]))
+        script = context.project_root / "scripts" / "xenoid-up.sh"
+        proc = subprocess.run(
+            [str(script), "--instance", context.instance_name, "--dry-run"],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
         try: data = json.loads(proc.stdout)
         except Exception: data = {"ok": False, "stdout": proc.stdout, "stderr": proc.stderr}
         data["returncode"] = proc.returncode
@@ -172,7 +378,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_stop":
         return text_result(mgr.stop())
     if name == "xenoid_logs":
-        return text_result(mgr.runtime_logs(str(args.get("outDir") or ".xenoid/logs")))
+        return text_result(mgr.runtime_logs(args.get("outDir")))
     if name == "xenoid_view":
         return text_result(mgr.view())
     if name == "xenoid_status":
@@ -180,23 +386,88 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_daemon_health":
         return text_result(dc.health())
     if name == "xenoid_daemon_ensure":
-        return text_result(mgr.ensure_daemon())
+        daemon_result = mgr.ensure_daemon()
+        proxy = (
+            mgr.reconcile_proxy_desired()
+            if daemon_result.get("ok") else {"ok": False, "skipped": True}
+        )
+        return text_result({
+            "ok": bool(daemon_result.get("ok") and proxy.get("ok")),
+            "daemon": daemon_result,
+            "proxyConverged": proxy,
+        })
     if name == "xenoid_daemon_install":
         install = mgr.install_daemon(str(args["apk"]))
-        return text_result({"install": install, "start": mgr.start_daemon_service() if install.get("ok") else None, "forward": mgr.forward_daemon_port() if install.get("ok") else None})
+        start = (
+            mgr.start_daemon_service()
+            if install.get("ok") else {"ok": False, "skipped": True}
+        )
+        forward = (
+            mgr.forward_daemon_port()
+            if start.get("ok") else {"ok": False, "skipped": True}
+        )
+        rootd = (
+            mgr.ensure_rootd_root()
+            if forward.get("ok") else {"ok": False, "skipped": True}
+        )
+        ready = (
+            mgr.ensure_daemon()
+            if rootd.get("ok") else {"ok": False, "skipped": True}
+        )
+        proxy = (
+            mgr.reconcile_proxy_desired()
+            if ready.get("ok") else {"ok": False, "skipped": True}
+        )
+        return text_result({
+            "ok": all(
+                bool(step.get("ok"))
+                for step in (install, start, forward, rootd, ready, proxy)
+            ),
+            "install": install,
+            "start": start,
+            "forward": forward,
+            "rootd": rootd,
+            "ready": ready,
+            "proxyConverged": proxy,
+        })
+    if name == "xenoid_proxy_status":
+        return proxy_text_result(lambda: epc().status())
+    if name == "xenoid_proxy_check":
+        return proxy_text_result(lambda: epc().status(check=True))
+    if name == "xenoid_proxy_on":
+        return proxy_text_result(lambda: epc().set_enabled(True))
+    if name == "xenoid_proxy_off":
+        return proxy_text_result(lambda: epc().set_enabled(False))
+    if name == "xenoid_proxy_clear":
+        return proxy_text_result(lambda: epc().clear())
+    if name == "xenoid_proxy_select":
+        selected_name = args.get("name")
+        if not isinstance(selected_name, str) or not selected_name:
+            return proxy_text_result(
+                lambda: {
+                    "ok": False,
+                    "code": "invalid_request_schema",
+                    "error": "invalid_request_schema",
+                }
+            )
+        return proxy_text_result(lambda: epc().select(selected_name))
     if name == "xenoid_root_status":
         return text_result(edc().root_status())
     if name == "xenoid_root_exec":
         return text_result(edc().root_exec(str(args["command"])))
     if name == "xenoid_frida_install":
         return text_result(mgr.install_frida(
-            str(args.get("version") or "latest"),
-            str(args.get("arch") or "android-arm64"),
-            str(args.get("outDir") or ".xenoid/frida"),
-            str(args.get("remotePath") or "/data/system/.core/svc.bin"),
+            version=str(args.get("version") or "latest"),
+            arch=str(args.get("arch") or "android-arm64"),
+            out_dir=str(args["outDir"]) if args.get("outDir") else None,
+            remote_path=str(args.get("remotePath") or "/data/system/.core/svc.bin"),
         ))
     if name == "xenoid_frida_fetch":
-        return text_result(mgr.fetch_frida(str(args.get("version") or "latest"), str(args.get("arch") or "android-arm64"), str(args.get("outDir") or ".xenoid/frida")))
+        return text_result(mgr.fetch_frida(
+            version=str(args.get("version") or "latest"),
+            arch=str(args.get("arch") or "android-arm64"),
+            out_dir=str(args["outDir"]) if args.get("outDir") else None,
+        ))
     if name == "xenoid_frida_deploy":
         return text_result(mgr.deploy_frida(str(args["path"]), str(args.get("remotePath") or "/data/system/.core/svc.bin")))
     if name == "xenoid_frida_deploy_scripts":
@@ -228,15 +499,27 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_device_apply":
         return text_result(edc().apply_fingerprint(read_json_file(str(args["profilePath"])), bool(args.get("regenerateUnique", True))))
     if name == "xenoid_device_generate_frida":
-        return text_result(mgr.generate_profile_frida(str(args["profilePath"]), str(args.get("out") or ".xenoid/frida/generated-profile.js"), bool(args.get("keepUnique", False))))
+        return text_result(mgr.generate_profile_frida(
+            str(args["profilePath"]),
+            str(args["out"]) if args.get("out") else None,
+            bool(args.get("keepUnique", False)),
+        ))
     if name == "xenoid_device_generate_service_frida":
-        return text_result(mgr.generate_service_frida(str(args["profilePath"]), str(args.get("out") or ".xenoid/frida/generated-service-profile.js"), bool(args.get("keepUnique", False))))
+        return text_result(mgr.generate_service_frida(
+            str(args["profilePath"]),
+            str(args["out"]) if args.get("out") else None,
+            bool(args.get("keepUnique", False)),
+        ))
     if name == "xenoid_device_set":
         return text_result(edc().set_fingerprint_field(str(args["field"]), args["value"]))
     if name == "xenoid_automation_plan":
         return text_result(mgr.automation_plan(str(args["scriptPath"])))
     if name == "xenoid_automation_run_host":
-        return text_result(mgr.automation_run_host(str(args["scriptPath"]), bool(args.get("execute", False)), str(args.get("endpoint") or "http://127.0.0.1:18765")))
+        return text_result(mgr.automation_run_host(
+            str(args["scriptPath"]),
+            bool(args.get("execute", False)),
+            dc.base,
+        ))
     if name == "xenoid_automation_run":
         return text_result(edc().run_automation(str(args["scriptPath"])))
     if name == "xenoid_app_install":
@@ -257,9 +540,14 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
         policy = read_json_file(str(args["policyPath"])) if args.get("policyPath") else None
         return text_result(edc().hide_apply(policy))
     if name == "xenoid_ebpf_build":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "build-ebpf.sh"
-        proc = subprocess.run([str(script)], text=True, capture_output=True)
+        script = context.project_root / "scripts" / "build-ebpf.sh"
+        proc = subprocess.run(
+            [str(script)],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
         data = {"ok": proc.returncode == 0, "stdout": proc.stdout, "stderr": proc.stderr}
         for line in reversed((proc.stdout or "").splitlines()):
             if line.strip().startswith("{"):
@@ -270,9 +558,14 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
                 break
         return text_result(data)
     if name == "xenoid_ebpf_load":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "load-ebpf.sh"
-        proc = subprocess.run([str(script), "load"], text=True, capture_output=True)
+        script = context.project_root / "scripts" / "load-ebpf.sh"
+        proc = subprocess.run(
+            [str(script), "load"],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
         data = {"ok": proc.returncode == 0, "stdout": proc.stdout, "stderr": proc.stderr}
         for line in reversed((proc.stdout or "").splitlines()):
             if line.strip().startswith("{"):
@@ -283,9 +576,14 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
                 break
         return text_result(data)
     if name == "xenoid_ebpf_status":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "load-ebpf.sh"
-        proc = subprocess.run([str(script), "status"], text=True, capture_output=True)
+        script = context.project_root / "scripts" / "load-ebpf.sh"
+        proc = subprocess.run(
+            [str(script), "status"],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
         data = {"ok": proc.returncode == 0, "stdout": proc.stdout, "stderr": proc.stderr}
         for line in reversed((proc.stdout or "").splitlines()):
             if line.strip().startswith("{"):
@@ -296,9 +594,14 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
                 break
         return text_result(data)
     if name == "xenoid_ebpf_unload":
-        import subprocess
-        script = __import__("pathlib").Path(__file__).resolve().parents[2] / "scripts" / "load-ebpf.sh"
-        proc = subprocess.run([str(script), "unload"], text=True, capture_output=True)
+        script = context.project_root / "scripts" / "load-ebpf.sh"
+        proc = subprocess.run(
+            [str(script), "unload"],
+            text=True,
+            capture_output=True,
+            cwd=context.project_root,
+            env=runtime.subprocess_env,
+        )
         data = {"ok": proc.returncode == 0, "stdout": proc.stdout, "stderr": proc.stderr}
         for line in reversed((proc.stdout or "").splitlines()):
             if line.strip().startswith("{"):
@@ -319,7 +622,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     raise ValueError(f"unknown tool: {name}")
 
 
-def handle(req: dict[str, Any]) -> None:
+def handle(runtime: MCPRuntime, req: dict[str, Any]) -> None:
     method = req.get("method")
     id_ = req.get("id")
     if method == "initialize":
@@ -331,21 +634,28 @@ def handle(req: dict[str, Any]) -> None:
     elif method == "tools/call":
         params = req.get("params", {})
         try:
-            respond(id_, call_tool(params.get("name"), params.get("arguments") or {}))
-        except Exception as e:
-            respond(id_, error={"code": -32000, "message": str(e)})
+            respond(id_, call_tool(runtime, params.get("name"), params.get("arguments") or {}))
+        except InstanceError as exc:
+            respond(id_, error={"code": -32000, "message": exc.code, "data": exc.as_dict()})
+        except Exception as exc:
+            respond(id_, error={"code": -32000, "message": str(exc)})
     else:
         respond(id_, error={"code": -32601, "message": f"method not found: {method}"})
 
 
 def main() -> int:
+    try:
+        runtime = MCPRuntime.resolve()
+    except InstanceError as exc:
+        respond(None, error={"code": -32000, "message": exc.code, "data": exc.as_dict()})
+        return 1
     for line in sys.stdin:
         if not line.strip():
             continue
         try:
-            handle(json.loads(line))
-        except Exception as e:
-            respond(None, error={"code": -32700, "message": str(e)})
+            handle(runtime, json.loads(line))
+        except Exception as exc:
+            respond(None, error={"code": -32700, "message": str(exc)})
     return 0
 
 

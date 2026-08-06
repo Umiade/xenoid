@@ -8,18 +8,45 @@ from pathlib import Path
 from typing import Any
 
 from .backend import RuntimeManager
-from .config import XenoidConfig
+from .config import InstanceContext, InstanceLease, XenoidConfig
 from .daemon_client import DaemonClient
 
-ROOT = Path(__file__).resolve().parents[2]
-XENOID = ROOT / "xenoid" if (ROOT / "xenoid").exists() else ROOT / "bin" / "xenoid"
 
 
-def _run(command: list[str], *, timeout: int = 180, env: dict[str, str] | None = None) -> dict[str, Any]:
+_PROXY_CAPABILITY_KEYS = {
+    "v4DnsProxy",
+    "v4TcpProxy",
+    "v4UdpProxy",
+    "v6DnsProxy",
+    "v6TcpProxy",
+    "v6UdpProxy",
+}
+
+
+def _proxy_capabilities_ready(value: Any, udp_allowed: bool) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == _PROXY_CAPABILITY_KEYS
+        and value.get("v4DnsProxy") is True
+        and value.get("v6DnsProxy") is True
+        and value.get("v4TcpProxy") is True
+        and value.get("v6TcpProxy") is True
+        and value.get("v4UdpProxy") is udp_allowed
+        and value.get("v6UdpProxy") is udp_allowed
+    )
+
+
+def _run(
+    command: list[str],
+    *,
+    timeout: int = 180,
+    env: dict[str, str] | None = None,
+    cwd: Path,
+) -> dict[str, Any]:
     try:
         proc = subprocess.run(
             command,
-            cwd=ROOT,
+            cwd=cwd,
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -55,12 +82,14 @@ def _summary(name: str, section: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_doctor_report(
+    context: InstanceContext,
     cfg: XenoidConfig,
+    lease: InstanceLease,
     *,
     full: bool = False,
     require_runtime: bool = False,
 ) -> dict[str, Any]:
-    manager = RuntimeManager(cfg)
+    manager = RuntimeManager(context, cfg, lease)
     host_checks = [asdict(check) for check in manager.doctor()]
     host_ok = all(check["ok"] or check["name"] == "scrcpy" for check in host_checks)
     host = {"ok": host_ok, "checks": host_checks}
@@ -68,9 +97,18 @@ def build_doctor_report(
     preflight = manager.runtime_preflight()
     preflight["ok"] = bool(preflight.get("ok"))
 
-    verify_env = dict(os.environ)
-    verify_env["XENOID_SKIP_AUDIT"] = "1"
-    verification = _run([str(ROOT / "scripts" / "verify.sh")], timeout=180, env=verify_env)
+    instance_env = {
+        **os.environ,
+        "XENOID_PROJECT": str(context.project_root),
+        "XENOID_INSTANCE": context.instance_name,
+    }
+    verify_env = {**instance_env, "XENOID_SKIP_AUDIT": "1"}
+    verification = _run(
+        [str(context.project_root / "scripts" / "verify.sh")],
+        timeout=180,
+        env=verify_env,
+        cwd=context.project_root,
+    )
 
     status = manager.status()
     running = bool(status.get("ok") and status.get("running"))
@@ -85,7 +123,11 @@ def build_doctor_report(
         boot = manager.adb(["shell", "getprop", "sys.boot_completed"])
         boot_ok = bool(boot.get("ok") and "1" in str(boot.get("stdout") or ""))
         forward = manager.forward_daemon_port()
-        daemon = DaemonClient(port=cfg.daemon_port)
+        daemon = DaemonClient(
+            context,
+            lease,
+            manager.docker_base_cmd(),
+        )
         health = daemon.health()
         root = daemon.root_status() if health.get("ok") else {"ok": False, "skipped": True}
         runtime_ready = bool(connect.get("ok") and boot_ok and forward.get("ok") and health.get("ok") and root.get("ok"))
@@ -109,7 +151,7 @@ def build_doctor_report(
         kernel_module = manager.kernel_module_status()
         ebpf = manager.ebpf_status()
         image = manager.image_protection_status()
-        hide = DaemonClient(port=cfg.daemon_port).hide_status()
+        hide = daemon.hide_status()
         protection = {
             "ok": all(bool(step.get("ok")) for step in (kernel_module, ebpf, image, hide)),
             "kernelModule": kernel_module,
@@ -117,6 +159,72 @@ def build_doctor_report(
             "image": image,
             "android": hide,
         }
+    proxy: dict[str, Any] = {
+        "ok": not require_runtime,
+        "skipped": True,
+        "reason": "Android runtime is not ready",
+    }
+    if runtime_ready:
+        daemon_proxy = daemon.proxy_status()
+        engine_proxy = manager.proxy_engine_status()
+        enabled = daemon_proxy.get("enabled")
+        generation = daemon_proxy.get("generation")
+        check_id = daemon_proxy.get("checkId")
+        epoch = daemon_proxy.get("runtimeEpoch")
+        udp_allowed = daemon_proxy.get("udpAllowed")
+        identity_ok = (
+            daemon_proxy.get("ok") is True
+            and isinstance(enabled, bool)
+            and isinstance(generation, int)
+            and not isinstance(generation, bool)
+            and generation >= 0
+            and isinstance(epoch, str)
+            and bool(epoch)
+            and isinstance(udp_allowed, bool)
+            and daemon_proxy.get("instanceId") == context.instance_id
+            and engine_proxy.get("ok") is True
+            and engine_proxy.get("instanceId") == context.instance_id
+            and engine_proxy.get("resourceTag") == context.resource_tag
+            and engine_proxy.get("runtimeEpoch") == epoch
+            and engine_proxy.get("generation") == generation
+        )
+        if enabled is True:
+            report = daemon_proxy.get("report")
+            probe = daemon_proxy.get("probe")
+            ready = (
+                identity_ok
+                and isinstance(check_id, int)
+                and not isinstance(check_id, bool)
+                and check_id > 0
+                and isinstance(report, dict)
+                and report.get("generation") == generation
+                and report.get("checkId") == check_id
+                and report.get("phase") == "active"
+                and report.get("structuralApplied") is True
+                and report.get("dataPlaneVerified") is True
+                and report.get("errorCode", "") == ""
+                and _proxy_capabilities_ready(report.get("capabilities"), udp_allowed)
+                and isinstance(probe, dict)
+                and probe.get("checkId") == check_id
+                and probe.get("errorCode") == ""
+                and _proxy_capabilities_ready(probe.get("capabilities"), udp_allowed)
+                and engine_proxy.get("phase") == "active"
+                and engine_proxy.get("structuralApplied") is True
+            )
+        else:
+            ready = (
+                identity_ok
+                and engine_proxy.get("phase") == "off"
+                and engine_proxy.get("structuralApplied") is True
+                and engine_proxy.get("dataPlaneVerified") is True
+            )
+        proxy = {
+            "ok": bool(ready),
+            "enabled": enabled,
+            "daemon": daemon_proxy,
+            "engine": engine_proxy,
+        }
+
 
     sections: dict[str, dict[str, Any]] = {
         "host": host,
@@ -124,17 +232,44 @@ def build_doctor_report(
         "verification": verification,
         "runtime": runtime,
         "protection": protection,
+        "proxy": proxy,
     }
 
     if full:
-        sections["build"] = _run([str(XENOID), "build", "all"], timeout=900)
-        sections["ota"] = _run([str(XENOID), "ota", "make", "--version", "doctor"], timeout=300)
-        sections["runtimeContext"] = _run([str(XENOID), "runtime-context"], timeout=300)
-        sections["hookSurfaces"] = _run(["python3", "scripts/smoke-hook-surfaces.py"], timeout=180)
+        xenoid = context.project_root / "xenoid"
+        if not xenoid.exists():
+            xenoid = context.project_root / "bin" / "xenoid"
+        selected_cli = [str(xenoid), "--instance", context.instance_name]
+        sections["build"] = _run(
+            [*selected_cli, "build", "all"],
+            timeout=900,
+            env=instance_env,
+            cwd=context.project_root,
+        )
+        sections["ota"] = _run(
+            [*selected_cli, "ota", "make", "--version", "doctor"],
+            timeout=300,
+            env=instance_env,
+            cwd=context.project_root,
+        )
+        sections["runtimeContext"] = _run(
+            [*selected_cli, "runtime-context"],
+            timeout=300,
+            env=instance_env,
+            cwd=context.project_root,
+        )
+        sections["hookSurfaces"] = _run(
+            ["python3", "scripts/smoke-hook-surfaces.py"],
+            timeout=180,
+            env=instance_env,
+            cwd=context.project_root,
+        )
         if runtime_ready:
             sections["runtimeSmoke"] = _run(
-                [str(ROOT / "scripts" / "smoke-runtime.sh"), "/tmp/xenoid-doctor-runtime.json"],
+                [str(context.project_root / "scripts" / "smoke-runtime.sh"), "/tmp/xenoid-doctor-runtime.json"],
                 timeout=360,
+                env=instance_env,
+                cwd=context.project_root,
             )
         else:
             sections["runtimeSmoke"] = {
@@ -147,21 +282,27 @@ def build_doctor_report(
     ok = all(check["ok"] for check in checks)
     complete = bool(ok and runtime_ready and (not full or sections["runtimeSmoke"].get("ok")))
     next_actions: list[str] = []
+    selected = f"./xenoid --instance {context.instance_name}"
     if not host_ok or not preflight.get("ok"):
-        next_actions.append("./xenoid install-runtime")
+        next_actions.append(f"{selected} install-runtime")
     if not running:
-        next_actions.append("./xenoid up")
+        next_actions.append(f"{selected} up")
     elif not runtime_ready:
-        next_actions.extend(["./xenoid logs", "./xenoid daemon health"])
+        next_actions.extend([f"{selected} logs", f"{selected} daemon health"])
     if not protection.get("ok") and running:
-        next_actions.append("./xenoid up")
+        next_actions.append(f"{selected} up")
     if full and not sections["runtimeSmoke"].get("ok"):
-        next_actions.append("./xenoid doctor --full --require-runtime")
+        next_actions.append(f"{selected} doctor --full --require-runtime")
 
     if not ok and not next_actions:
-        next_actions.append("./xenoid doctor --full" if full else "./xenoid doctor")
+        next_actions.append(f"{selected} doctor {'--full' if full else ''}".rstrip())
 
     return {
+        "instance": {
+            **context.public_dict(),
+            "slot": lease.slot,
+            "leaseState": lease.state,
+        },
         "schema": "dev.xenoid.doctor/v1",
         "ok": ok,
         "complete": complete,

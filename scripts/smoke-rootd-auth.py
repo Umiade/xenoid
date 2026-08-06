@@ -125,10 +125,10 @@ def live_container_checks() -> dict:
         return {"ok": True, "skipped": True, "reason": "docker not found"}
     try:
         sys.path.insert(0, str(ROOT / "src"))
-        from xenoid.config import load_config
         from xenoid.backend import RuntimeManager
-        cfg = load_config()
-        rm = RuntimeManager(cfg)
+        from xenoid.config import resolve_instance
+        context, cfg, lease = resolve_instance(project_root=ROOT)
+        rm = RuntimeManager(context, cfg, lease)
         prov = rm.ensure_rootd_root()
         if not prov.get("ok"):
             return {"ok": False, "error": "ensure_rootd_root failed", "prov": prov}

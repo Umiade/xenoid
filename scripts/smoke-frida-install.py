@@ -13,11 +13,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from xenoid.backend import RuntimeManager
-from xenoid.config import XenoidConfig
+from xenoid.config import initialize_instance
+
+_INSTANCE_ROOT = tempfile.TemporaryDirectory(prefix="xenoid-frida-contract-")
+_PROJECT_ROOT = Path(_INSTANCE_ROOT.name) / "project"
+(_PROJECT_ROOT / "src" / "xenoid").mkdir(parents=True)
+_CONTEXT, _CONFIG, _LEASE = initialize_instance(
+    "frida-contract",
+    project_root=_PROJECT_ROOT,
+    state_home=Path(_INSTANCE_ROOT.name) / "state",
+)
 
 
 def manager() -> RuntimeManager:
-    return RuntimeManager(XenoidConfig())
+    return RuntimeManager(_CONTEXT, _CONFIG, _LEASE)
 
 
 def success_case() -> dict[str, Any]:
@@ -111,20 +120,20 @@ def deploy_failure_case() -> dict[str, Any]:
 
 def cached_fetch_case() -> dict[str, Any]:
     payload = b"cached-frida-server"
-    with tempfile.TemporaryDirectory() as directory:
-        cache = Path(directory)
-        asset = cache / "frida-server-17.2.1-android-arm64.xz"
-        asset.write_bytes(lzma.compress(payload))
-        result = manager().fetch_frida("17.2.1", "android-arm64", directory)
-        server = cache / "frida-server"
-        return {
-            "ok": result.get("ok") is True
-            and result.get("cached") is True
-            and result.get("path") == str(server.resolve())
-            and server.read_bytes() == payload
-            and bool(server.stat().st_mode & 0o100),
-            "result": result,
-        }
+    cache = _CONTEXT.state_root / "frida" / "cached-fetch"
+    cache.mkdir(parents=True)
+    asset = cache / "frida-server-17.2.1-android-arm64.xz"
+    asset.write_bytes(lzma.compress(payload))
+    result = manager().fetch_frida("17.2.1", "android-arm64", str(cache))
+    server = cache / "frida-server"
+    return {
+        "ok": result.get("ok") is True
+        and result.get("cached") is True
+        and result.get("path") == str(server.resolve())
+        and server.read_bytes() == payload
+        and bool(server.stat().st_mode & 0o100),
+        "result": result,
+    }
 
 
 

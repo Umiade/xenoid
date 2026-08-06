@@ -3,9 +3,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 python3 -m compileall src
+python3 scripts/test-proxy.py >/tmp/xenoid-test-proxy.json
 python3 scripts/audit-sensitive-data.py
 ./xenoid --help >/tmp/xenoid-help.txt
-./xenoid start --dry-run >/tmp/xenoid-start-dry-run.json
+VERIFY_INSTANCE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/xenoid-verify-instance.XXXXXX")"
+trap 'rm -rf "$VERIFY_INSTANCE_ROOT"' EXIT
+VERIFY_INSTANCE_PROJECT="$VERIFY_INSTANCE_ROOT/project"
+VERIFY_INSTANCE_HOME="$VERIFY_INSTANCE_ROOT/home"
+mkdir -p "$VERIFY_INSTANCE_PROJECT/src/xenoid" "$VERIFY_INSTANCE_HOME"
+env HOME="$VERIFY_INSTANCE_HOME" XENOID_PROJECT="$VERIFY_INSTANCE_PROJECT" \
+  ./xenoid --instance verify init >/tmp/xenoid-verify-init.json
+env HOME="$VERIFY_INSTANCE_HOME" XENOID_PROJECT="$VERIFY_INSTANCE_PROJECT" \
+  ./xenoid --instance verify start --dry-run --skip-preflight >/tmp/xenoid-start-dry-run.json
 ./xenoid frida install --help >/tmp/xenoid-frida-install-help.txt
 scripts/smoke-daemon-api.sh --mock >/tmp/xenoid-smoke-daemon-mock.json
 ./xenoid hide --help >/tmp/xenoid-hide-help.txt
@@ -14,12 +23,13 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"xenoid_start","arguments":{"dryRun":true}}}' \
-  | ./xenoid-mcp >/tmp/xenoid-mcp-verify.jsonl
+  | env HOME="$VERIFY_INSTANCE_HOME" XENOID_PROJECT="$VERIFY_INSTANCE_PROJECT" \
+      XENOID_INSTANCE=verify ./xenoid-mcp >/tmp/xenoid-mcp-verify.jsonl
 python3 - <<'PY'
 import json
 lines=[json.loads(x) for x in open('/tmp/xenoid-mcp-verify.jsonl') if x.strip()]
 tools={t['name'] for t in lines[1]['result']['tools']}
-required={'xenoid_doctor','xenoid_start','xenoid_install_runtime_plan','xenoid_up_plan','xenoid_logs','xenoid_view','xenoid_verify_release','xenoid_package_release','xenoid_ebpf_build','xenoid_ebpf_load','xenoid_ebpf_status','xenoid_profile_deploy_helper','xenoid_profile_helper_status','xenoid_runtime_compose','xenoid_linux_binderfs','xenoid_runtime_build_image','xenoid_config_show','xenoid_frida_fetch','xenoid_frida_deploy_scripts','xenoid_frida_load_script','xenoid_input_tap','xenoid_hide_apply','xenoid_device_apply','xenoid_device_generate_frida','xenoid_device_generate_service_frida','xenoid_automation_plan','xenoid_automation_run_host','xenoid_automation_run','xenoid_netctl_deploy','xenoid_netctl_status','xenoid_netctl_set_mac'}
+required={'xenoid_doctor','xenoid_start','xenoid_install_runtime_plan','xenoid_up_plan','xenoid_logs','xenoid_view','xenoid_verify_release','xenoid_package_release','xenoid_ebpf_build','xenoid_ebpf_load','xenoid_ebpf_status','xenoid_profile_deploy_helper','xenoid_profile_helper_status','xenoid_linux_binderfs','xenoid_runtime_build_image','xenoid_config_show','xenoid_frida_fetch','xenoid_frida_deploy_scripts','xenoid_frida_load_script','xenoid_input_tap','xenoid_hide_apply','xenoid_device_apply','xenoid_device_generate_frida','xenoid_device_generate_service_frida','xenoid_automation_plan','xenoid_automation_run_host','xenoid_automation_run','xenoid_netctl_deploy','xenoid_netctl_status','xenoid_netctl_set_mac'}
 required.add('xenoid_frida_install')
 missing=sorted(required-tools)
 if missing:

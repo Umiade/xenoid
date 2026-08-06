@@ -6,7 +6,11 @@ DOCKER=(docker)
 if [[ -n "${XENOID_DOCKER_CONTEXT:-}" ]]; then
   DOCKER+=(--context "$XENOID_DOCKER_CONTEXT")
 fi
-OUT="$ROOT/dist/runtime-context"
+OUT="${2:-$ROOT/dist/runtime-context}"
+if [[ -z "$OUT" || "$OUT" == "/" ]]; then
+  echo "unsafe runtime context output path" >&2
+  exit 2
+fi
 DAEMON="$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
 INPUT="$ROOT/native/xenoid-input/xenoid-input"
 HIDE="$ROOT/native/xenoid-hide/xenoid-hide"

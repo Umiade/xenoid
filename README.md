@@ -2,7 +2,7 @@
 
 [Chinese version](README_CN.md)
 
-Xenoid orchestrates an Android cloud-phone runtime on Apple Silicon macOS and Linux ARM hosts. It is based on 64-bit redroid Android 13 and provides one control surface for startup, device profiles, environment hiding, controlled root, Frida, eBPF, automation, OTA, CLI, and MCP operations.
+Xenoid orchestrates an Android cloud-phone runtime on Apple Silicon macOS and Linux ARM hosts. It is based on 64-bit redroid Android 13 and provides one control surface for startup, device profiles, a transparent global proxy, environment hiding, controlled root, Frida, eBPF, automation, OTA, CLI, and MCP operations.
 
 The production path is:
 
@@ -118,6 +118,42 @@ Common operations:
 # Run an ADB command directly.
 ./xenoid adb shell getprop ro.product.model
 ```
+
+## Global proxy
+
+Configure the saved proxy source in the Android Xenoid settings screen or through the host CLI. Source values and credentials never belong in command arguments:
+
+```bash
+# SOCKS5, HTTP, or HTTPS endpoint; input is read without terminal echo.
+./xenoid proxy set --prompt
+
+# A direct HTTP endpoint cannot relay UDP.
+./xenoid proxy set --prompt --no-udp
+
+# Clash YAML/JSON, URI lists, and base64 URI subscriptions.
+chmod 600 /path/to/proxy-source
+./xenoid proxy import /path/to/proxy-source
+
+# Online configuration URL; HTTPS is required by default.
+./xenoid proxy subscribe --prompt
+```
+
+The compiler accepts SOCKS5, HTTP/HTTPS, Shadowsocks, ShadowsocksR, Trojan, VMess, VLESS, Hysteria 1/2, TUIC, AnyTLS, Mieru, and Snell nodes. Clash `proxy-providers` are fetched and merged; unsupported rules, listeners, groups, and provider settings are discarded rather than passed through to the engine.
+
+Manage the active source and inspect redacted readiness evidence:
+
+```bash
+./xenoid proxy status --check
+./xenoid proxy list
+./xenoid proxy select NAME
+./xenoid proxy off
+./xenoid proxy on
+./xenoid proxy export --out /path/to/private-backup
+./xenoid proxy clear
+```
+
+Proxying is global by default. The Docker engine host transparently captures the Android container's IPv4/IPv6 DNS, TCP, and permitted UDP flows before they leave the bridge, so Java clients, native libraries, and raw sockets use the same path without Android proxy properties, a VPN transport, or a TUN device in the Android network namespace. Activation is fail-closed: traffic remains quarantined until an instance/runtime-bound ordinary-app check proves the requested data plane. `./xenoid up` restores and validates the saved desired state.
+
 
 ## Root
 

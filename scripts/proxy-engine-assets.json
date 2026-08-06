@@ -1,0 +1,69 @@
+{
+  "schema": "dev.xenoid.proxy-engine.assets/v1",
+  "mihomo": {
+    "version": "v1.19.29",
+    "os": "linux",
+    "arch": "arm64",
+    "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.29/mihomo-linux-arm64-v1.19.29.gz",
+    "compressedSha256": "9a868b5e4e0ad91d9d71e1b41b0cfce78aaba44360c30df74a723f8e3926a86c",
+    "binarySha256": "8e02308f672e89c076bfc2fa1b03379bd54e58b0bafa81ffb01113fcf6da348d",
+    "compression": "gzip",
+    "member": "mihomo-linux-arm64-v1.19.29",
+    "sourceUrl": "https://github.com/MetaCubeX/mihomo/tree/v1.19.29",
+    "license": {
+      "spdx": "GPL-3.0-only",
+      "url": "https://raw.githubusercontent.com/MetaCubeX/mihomo/v1.19.29/LICENSE"
+    }
+  },
+  "dependencies": {
+    "debian": [
+      "ca-certificates",
+      "conntrack",
+      "curl",
+      "gcc",
+      "iproute2",
+      "iptables",
+      "libc6-dev",
+      "libcap2-bin",
+      "passwd",
+      "procps",
+      "python3",
+      "python3-cryptography",
+      "python3-yaml",
+      "systemd",
+      "util-linux"
+    ],
+    "rpm": [
+      "ca-certificates",
+      "conntrack-tools",
+      "curl",
+      "gcc",
+      "glibc-devel",
+      "iproute",
+      "iptables",
+      "libcap",
+      "procps-ng",
+      "python3",
+      "python3-cryptography",
+      "python3-pyyaml",
+      "shadow-utils",
+      "systemd",
+      "util-linux"
+    ],
+    "alpine": [
+      "build-base",
+      "ca-certificates",
+      "conntrack-tools",
+      "curl",
+      "iproute2",
+      "iptables",
+      "libcap",
+      "procps",
+      "py3-cryptography",
+      "py3-yaml",
+      "python3",
+      "shadow",
+      "util-linux"
+    ]
+  }
+}

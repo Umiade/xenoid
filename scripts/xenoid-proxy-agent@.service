@@ -1,0 +1,44 @@
+[Unit]
+Description=Xenoid per-instance transparent proxy agent (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/xenoid-proxy-engine.py service --manifest /run/xenoid/proxy/%i/manifest.json
+Restart=always
+RestartSec=2s
+TimeoutStartSec=45s
+TimeoutStopSec=20s
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectHostname=yes
+RestrictNamespaces=mnt net
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH CAP_KILL CAP_NET_ADMIN CAP_NET_RAW CAP_SETGID CAP_SETPCAP CAP_SETUID CAP_SYS_ADMIN CAP_SYS_PTRACE
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io @privileged
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/run/xenoid/proxy/%i /var/lib/xenoid/proxy/instances
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
