@@ -1270,6 +1270,17 @@ def _location_failure(code: str) -> dict[str, Any]:
     return {"ok": False, "code": code, "error": code}
 
 
+# Daemon failures that mean the rootd/publish control plane is down; the
+# converge loop may repair it once or twice before giving up.
+_LOCATION_REPAIRABLE_CODES = frozenset({
+    "daemon_unreachable",
+    "location_profile_publish_failed",
+    "location_state_publish_failed",
+    "location_property_publish_failed",
+    "location_apn_publish_failed",
+})
+
+
 def _location_daemon_apk(args: argparse.Namespace) -> Optional[str]:
     apk = args.project_root / "daemon" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
     return str(apk) if apk.is_file() else None
@@ -1296,8 +1307,14 @@ def _location_error_code(result: Any, fallback: str) -> str:
     if isinstance(result, dict):
         for key in ("code", "error"):
             candidate = result.get(key)
-            if isinstance(candidate, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate):
-                return candidate
+            if isinstance(candidate, str):
+                if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate):
+                    return candidate
+                # Daemon exceptions arrive as "java.lang.IllegalStateException:
+                # location_<code>"; recover the stable code token.
+                embedded = re.search(r"location_[a-z0-9_]{1,63}", candidate)
+                if embedded:
+                    return embedded.group(0)
     return fallback
 
 
@@ -1336,7 +1353,17 @@ def _location_converge(
     """Drive the persisted location transaction to a verified steady state."""
     recreated = False
     verify_failures = 0
+    repairs = 0
     verified_payload: Optional[dict[str, Any]] = None
+
+    def repair_if_possible() -> bool:
+        nonlocal repairs
+        if repairs >= 2:
+            return False
+        repairs += 1
+        repaired = manager.repair_control_plane()
+        return bool(isinstance(repaired, dict) and repaired.get("ok") is True)
+
     for _ in range(12):
         state = store.load()
         if state is None:
@@ -1346,6 +1373,12 @@ def _location_converge(
         android: Optional[dict[str, Any]] = None
         if epoch:
             ensured = manager.ensure_daemon(readiness_timeout=90.0)
+            if not (isinstance(ensured, dict) and ensured.get("ok") is True):
+                # A fresh container can lose the adb lease or the exec'd rootd
+                # right after start reports success; repair instead of failing
+                # the whole transaction on the transient.
+                repair_if_possible()
+                ensured = manager.ensure_daemon(readiness_timeout=60.0)
             if isinstance(ensured, dict) and ensured.get("ok") is True:
                 client = daemon(args, manager)
                 android = _location_android_status(client)
@@ -1369,7 +1402,12 @@ def _location_converge(
         if step == "stage":
             if not epoch or client is None:
                 raise LocationError("daemon_unreachable")
-            _location_stage(store, client, state, epoch, mark=True)
+            try:
+                _location_stage(store, client, state, epoch, mark=True)
+            except LocationError as failure:
+                if failure.code in _LOCATION_REPAIRABLE_CODES and repair_if_possible():
+                    continue
+                raise
             if action.get("recreate"):
                 store.arm_restart()
             continue
@@ -1394,7 +1432,12 @@ def _location_converge(
             if not epoch or client is None:
                 raise LocationError("daemon_unreachable")
             if action.get("restage"):
-                _location_stage(store, client, state, epoch, mark=False)
+                try:
+                    _location_stage(store, client, state, epoch, mark=False)
+                except LocationError as failure:
+                    if failure.code in _LOCATION_REPAIRABLE_CODES and repair_if_possible():
+                        continue
+                    raise
                 state = store.load()
                 if state is None:
                     raise LocationError("location_state_missing")
@@ -1420,12 +1463,15 @@ def _location_converge(
                     raise LocationError(_location_error_code(verified, "location_identity_unverified"))
                 store.set_desired(str(active["country"]))
                 continue
+            verify_code = _location_error_code(verified, "location_identity_unverified")
+            if verify_code in _LOCATION_REPAIRABLE_CODES and repair_if_possible():
+                continue
             # A fresh container can outlast one verify budget while the data
             # call comes up after the app-data wipe; allow exactly one retry.
             verify_failures += 1
             if verify_failures < 2:
                 continue
-            raise LocationError(_location_error_code(verified, "location_identity_unverified"))
+            raise LocationError(verify_code)
         raise LocationError("location_phase_invalid")
     else:
         raise LocationError("location_convergence_failed")

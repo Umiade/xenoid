@@ -1773,6 +1773,33 @@ class RuntimeManager:
             timeout=timeout,
         )
 
+    def repair_control_plane(self) -> dict[str, Any]:
+        """Re-establish the adb lease, daemon, and rootd after a recreate.
+
+        A freshly recreated container can lose the leased adb port switch or
+        the docker-exec'd rootd in the first minute after boot; convergence
+        callers use this bounded repair instead of failing on the transient.
+        """
+        result: dict[str, Any] = {}
+        if self.lease.android_adb_port != 5555:
+            result["adbPort"] = self.switch_adbd_port_via_docker()
+        result["adbConnect"] = self.adb_connect()
+        result["adbWait"] = self.adb_wait(timeout_sec=60)
+        result["rootd"] = (
+            self.ensure_rootd_root() if result["adbWait"].get("ok") else {"ok": False, "skipped": True}
+        )
+        result["daemon"] = (
+            self.ensure_daemon(readiness_timeout=120.0)
+            if result["rootd"].get("ok")
+            else {"ok": False, "skipped": True}
+        )
+        result["ok"] = bool(
+            result["adbWait"].get("ok")
+            and result["rootd"].get("ok")
+            and result["daemon"].get("ok")
+        )
+        return result
+
     def ensure_daemon(self, readiness_timeout: float = 30.0) -> dict[str, Any]:
         steps: dict[str, Any] = {}
         steps["forward"] = self.forward_daemon_port()
