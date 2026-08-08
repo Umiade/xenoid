@@ -67,7 +67,7 @@ Choose evidence that exercises the real contract:
 - **CLI or daemon behavior**: invoke the real command and inspect structured output and failure semantics.
 - **Image-bound component**: rebuild the component, rebuild or refresh the runtime context, start through `./xenoid up`, and verify the deployed artifact.
 - **UI or application behavior**: cold-start the original application, wait for terminal state, collect machine-readable UI or backing-store evidence, and inspect fatal/ANR logs.
-- **Kernel-visible behavior**: test libc and raw syscall paths from an unprivileged app context; include isolated processes when access rules differ.
+- **Kernel-visible behavior**: test libc and raw syscall paths from an unprivileged app context; include isolated processes when access rules differ. For Android 13 route netlink, the expected matrix is ordinary app socket creation succeeds but `RTM_GETLINK` send returns `EACCES`; ordinary `RTM_GETADDR`/`RTM_GETROUTE`, TCP/UDP, Bionic `getifaddrs`, and Java interface enumeration succeed; isolated process non-Unix socket creation returns `EACCES` while AF_UNIX/Binder/inherited descriptors remain usable; UID-below-10000 control paths such as `xenoid-netctl` keep rtnetlink access. Never use a broad app-UID socket denial to satisfy this matrix.
 - **Production acceptance**: no probes or inspection servers, a fresh runtime restart, repeated cold starts, and `./xenoid doctor --require-runtime`.
 
 Repository checks:
@@ -106,6 +106,7 @@ Keep the following ignored and local:
 - device dumps, logs, screenshots, maps, memory captures, and identifiers;
 - assessment-target names, versions, predicates, offsets, and result matrices;
 - workstation paths, credentials, tokens, private endpoints, and account metadata;
+- per-instance location identity state (master seed, full SIM/MSISDN values); only masked location views belong in outputs;
 - internal articles, cached references, and session-specific continuation notes.
 
 Use `.skills/` for local agent handoff, `.doc/` for local references, `.tmp/` for disposable evidence, and `.xenoid/` for runtime state. These directories must remain ignored.

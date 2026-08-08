@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${1:-redroid/redroid:13.0.0-latest}"
+IMAGE="${1:-redroid/redroid:13.0.0_64only-latest}"
 DOCKER=(docker)
 if [[ -n "${XENOID_DOCKER_CONTEXT:-}" ]]; then
   DOCKER+=(--context "$XENOID_DOCKER_CONTEXT")
@@ -25,6 +25,8 @@ SENSORSHAL="$ROOT/native/xenoid-sensorshal/xenoid-sensorshal"
 CAMERA_PROVIDER="$ROOT/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
 GRALLOC="$ROOT/native/xenoid-gralloc/gralloc.redroid.so"
 MEDIA_PROFILES="$ROOT/native/xenoid-camerahal/media_profiles_V1_0.xml"
+RIL="$ROOT/native/xenoid-ril/libxenoid-ril.so"
+RADIO_CONFIG="$ROOT/native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"
 [[ -f "$DAEMON" ]] || "$ROOT/scripts/build-daemon.sh" >/dev/null
 [[ -f "$INPUT" ]] || "$ROOT/scripts/build-native-input.sh" >/dev/null
 [[ -f "$HIDE" ]] || "$ROOT/scripts/build-native-hide.sh" >/dev/null
@@ -38,9 +40,15 @@ MEDIA_PROFILES="$ROOT/native/xenoid-camerahal/media_profiles_V1_0.xml"
 [[ -f "$SENSORSHAL" ]] || "$ROOT/scripts/build-sensors-hal.sh" arm64 >/dev/null
 [[ -f "$GRALLOC" ]] || "$ROOT/scripts/build-gralloc.sh" arm64 >/dev/null
 [[ -f "$CAMERA_PROVIDER" ]] || "$ROOT/scripts/build-camera-hal.sh" arm64 >/dev/null
+[[ -f "$RIL" ]] || "$ROOT/scripts/build-ril.sh" arm64 >/dev/null
+[[ -f "$RADIO_CONFIG" ]] || "$ROOT/scripts/build-radio-config.sh" arm64 >/dev/null
 rm -rf "$OUT"
 mkdir -p "$OUT/payload"
 cp "$DAEMON" "$OUT/payload/xenoid-daemon.apk"
+mkdir -p "$OUT/payload/XenoidDaemon"
+cp "$DAEMON" "$OUT/payload/XenoidDaemon/XenoidDaemon.apk"
+chmod 0755 "$OUT/payload/XenoidDaemon"
+chmod 0644 "$OUT/payload/XenoidDaemon/XenoidDaemon.apk"
 cp "$INPUT" "$OUT/payload/xenoid-input"
 cp "$HIDE" "$OUT/payload/xenoid-hide-helper"
 cp "$OVERLAY" "$OUT/payload/xenoid-overlay-helper"
@@ -54,8 +62,15 @@ cp "$CAMERA_PROVIDER" "$OUT/payload/android.hardware.camera.provider-service-aid
 cp "$GRALLOC" "$OUT/payload/gralloc.redroid.so"
 cp "$ROOT/native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml" "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml" || { echo "missing native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
 cp "$MEDIA_PROFILES" "$OUT/payload/media_profiles_V1_0.xml" || { echo "missing native/xenoid-camerahal/media_profiles_V1_0.xml (required by Dockerfile camera profile COPY)" >&2; exit 1; }
-if [[ "${XENOID_ZYGOTE_PRELOAD:-0}" == "0" ]]; then
-  # Omit the zygote preload payload when this optional layer is disabled.
+cp "$RIL" "$OUT/payload/libxenoid-ril.so"
+cp "$ROOT/native/xenoid-ril/android.hardware.radio.IRadio.xml" "$OUT/payload/android.hardware.radio.IRadio.xml"
+cp "$RADIO_CONFIG" "$OUT/payload/android.hardware.radio.config-service.xenoid"
+cp "$ROOT/native/xenoid-radio-config/android.hardware.radio.config.IRadioConfig.xml" "$OUT/payload/android.hardware.radio.config.IRadioConfig.xml"
+cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/apns-conf.xml" "$OUT/payload/apns-conf.xml"
+cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/xenoid-cellular-features.xml" "$OUT/payload/xenoid-cellular-features.xml"
+cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/privapp-permissions-xenoid.xml" "$OUT/payload/privapp-permissions-xenoid.xml"
+if [[ "${XENOID_ZYGOTE_PRELOAD:-1}" == "0" ]]; then
+  # Explicit source experiments may disable the preload; production acceptance requires it.
   rm -f "$OUT/payload/libpiex_shim.so"
 else
   cp "$ZYGOTE" "$OUT/payload/libpiex_shim.so"
@@ -91,6 +106,7 @@ if command -v docker >/dev/null 2>&1; then
     # This library is patched below only to report a locked, verified
     # SoftKeymaster RootOfTrust; it does not provide hardware-backed KeyMint.
     "${DOCKER[@]}" cp "$_cid:/system/framework/services.jar" "$OUT/payload/services.jar" >/dev/null || _required_extract_ok=0
+    "${DOCKER[@]}" cp "$_cid:/system/framework/telephony-common.jar" "$OUT/payload/telephony-common.base.jar" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/libpuresoftkeymasterdevice.so" "$OUT/payload/libpuresoftkeymasterdevice.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" rm "$_cid" >/dev/null 2>&1 || true
     if [[ "$_required_extract_ok" != "1" ]]; then
@@ -99,6 +115,8 @@ if command -v docker >/dev/null 2>&1; then
     fi
     python3 "$ROOT/scripts/patch-runtime-props.py" "$_stock" "$OUT/payload/props"
     python3 "$ROOT/scripts/patch-runtime-libselinux.py" "$OUT/payload/libselinux.so"
+    python3 "$ROOT/scripts/patch-telephony-legacy-lte-band.py"       "$OUT/payload/telephony-common.base.jar" "$OUT/payload/telephony-common.jar"
+    rm -f "$OUT/payload/telephony-common.base.jar"
     python3 "$ROOT/scripts/patch-services-isolated-owner.py" \
       "$OUT/payload/services.jar" "$OUT/payload/services.isolated-owner.jar"
     mv "$OUT/payload/services.isolated-owner.jar" "$OUT/payload/services.jar"
@@ -209,7 +227,7 @@ else
   echo "docker is required to extract runtime payloads from $IMAGE" >&2
   exit 1
 fi
-if [[ "${XENOID_ZYGOTE_PRELOAD:-0}" == "1" ]] && [[ -s "$OUT/payload/init.zygote64.rc" ]]; then
+if [[ "${XENOID_ZYGOTE_PRELOAD:-1}" == "1" ]] && [[ -s "$OUT/payload/init.zygote64.rc" ]]; then
   python3 - "$OUT/payload/init.zygote64.rc" <<'PY'
 from pathlib import Path
 import sys
@@ -232,8 +250,22 @@ path.write_text("".join(lines))
 PY
 fi
 cat > "$OUT/payload/xenoid.rc" <<'RC'
+on early-init
+    start xenoid-cellular-watch
+
+# Preserve Docker's lease-owned dual-stack link before netd starts, then restore
+# addresses, gateways, and control-plane rules after Android boot completes.
+service xenoid-cellular-watch /system/bin/xenoid-netctl cellular-watch
+    class core
+    user root
+    group root inet net_admin net_raw
+    capabilities NET_ADMIN NET_RAW
+    oneshot
+    disabled
+
 on init
     start xenoid-sensorshal
+    start vendor.radio-config-xenoid
 
 # Bind identity proc/sysfs files in init's mount namespace before zygote and
 # system_server fork. Post-boot docker/rootd mounts live in a different mount
@@ -251,6 +283,7 @@ service xenoid-overlay /system/bin/xenoid-overlay-helper apply
 # Property-area identity must run after /dev/__properties__ is mounted and writable.
 # Starting too early on `on init` leaves ro.hardware=redroid until hide apply re-runs it.
 on property:sys.boot_completed=1
+    start xenoid-cellular-ready
     start xenoid-props
 
 service xenoid-props /system/bin/xenoid-prop-area --identity
@@ -266,6 +299,12 @@ service xenoid-sensorshal /system/bin/xenoid-sensorshal
     class main
     user root
     group root
+
+service vendor.radio-config-xenoid /vendor/bin/hw/android.hardware.radio.config-service.xenoid
+    class hal
+    user radio
+    group radio system
+    interface aidl android.hardware.radio.config.IRadioConfig/default
 
 RC
 cat > "$OUT/payload/android.hardware.camera.provider-service-aidl.rc" <<'RC'
@@ -314,7 +353,15 @@ COPY payload/xenoid-netctl /data/local/tmp/xenoid-netctl
 # across rebuilds). The post-boot adb-deployed helpers stay in /data/local/tmp.
 COPY payload/xenoid-prop-area /system/bin/xenoid-prop-area
 COPY payload/xenoid-overlay-helper /system/bin/xenoid-overlay-helper
+COPY --chmod=755 payload/xenoid-netctl /system/bin/xenoid-netctl
 COPY payload/xenoid-sensorshal /system/bin/xenoid-sensorshal
+COPY --chmod=644 payload/libxenoid-ril.so /vendor/lib64/libxenoid-ril.so
+COPY --chmod=755 payload/android.hardware.radio.config-service.xenoid /vendor/bin/hw/android.hardware.radio.config-service.xenoid
+COPY payload/android.hardware.radio.IRadio.xml /vendor/etc/vintf/manifest/android.hardware.radio.IRadio.xml
+COPY payload/android.hardware.radio.config.IRadioConfig.xml /vendor/etc/vintf/manifest/android.hardware.radio.config.IRadioConfig.xml
+COPY --chmod=644 payload/apns-conf.xml /system/etc/apns-conf.xml
+COPY --chmod=644 payload/xenoid-cellular-features.xml /system/etc/permissions/xenoid-cellular-features.xml
+COPY --chmod=644 payload/privapp-permissions-xenoid.xml /system/etc/permissions/privapp-permissions-xenoid.xml
 COPY payload/android.hardware.sensors.ISensors.xml /vendor/etc/vintf/manifest/android.hardware.sensors.ISensors.xml
 COPY payload/android.hardware.camera.provider-service-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl
 COPY payload/android.hardware.camera.provider.ICameraProvider.xml /vendor/etc/vintf/manifest/android.hardware.camera.provider.ICameraProvider.xml
@@ -336,6 +383,8 @@ COPY --chmod=644 payload/media_profiles_V1_0.xml /vendor/etc/media_profiles_V1_0
 COPY --chmod=644 payload/libpuresoftkeymasterdevice.so /vendor/lib64/libpuresoftkeymasterdevice.so
 # Preserve the owning package for isolated UIDs in PackageManager queries.
 COPY --chmod=644 payload/services.jar /system/framework/services.jar
+# Legacy HIDL LTE identities derive bands from EARFCN and use profile bandwidth.
+COPY --chmod=644 payload/telephony-common.jar /system/framework/telephony-common.jar
 __PRELOAD_COPY__
 __CORE_COPY__
 COPY payload/props/system_build.prop /system/build.prop
@@ -346,9 +395,10 @@ COPY payload/props/system_dlkm_build.prop /system/system_dlkm/etc/build.prop
 COPY payload/props/odm_build.prop /vendor/odm/etc/build.prop
 COPY payload/props/vendor_dlkm_build.prop /vendor/vendor_dlkm/etc/build.prop
 COPY payload/props/odm_dlkm_build.prop /vendor/odm_dlkm/etc/build.prop
+COPY payload/XenoidDaemon /system/priv-app/XenoidDaemon
 COPY payload/xenoid-daemon.apk /data/local/tmp/xenoid-daemon.apk
 DOCKER
-python3 - "$OUT/Dockerfile" "${XENOID_ZYGOTE_PRELOAD:-0}" <<'PY'
+python3 - "$OUT/Dockerfile" "${XENOID_ZYGOTE_PRELOAD:-1}" <<'PY'
 from pathlib import Path
 import sys
 

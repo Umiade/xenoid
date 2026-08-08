@@ -133,6 +133,34 @@ dist/runtime-context/Dockerfile
 `./xenoid doctor --full --require-runtime` additionally rebuilds artifacts and
 checks OTA, runtime context, hook surfaces, and the live runtime smoke path.
 
+Kernel module builds are transactional. `scripts/build-kmod.sh` compiles in a staging directory, preserves the previous module as a last-known-good copy, replaces the loaded module only after compilation succeeds, and attempts to restore the previous module if `insmod` or a required probe registration fails. The required permission probes are `security_socket_create` and `security_netlink_send`; a vendor kernel that does not expose them fails the load before Android startup. The cellular runtime probe uses schema v2 and must show ordinary-app `RTM_GETLINK` `sendto` as `EACCES`, ordinary GETADDR/GETROUTE success, isolated non-Unix socket `EACCES`, and privileged `xenoid-netctl` success.
+
+## Location cellular runtime (RIL / RadioConfig)
+
+The cellular identity stack is a version-15 legacy vendor RIL plus an AIDL RadioConfig service; both are built from the pinned Android NDK:
+
+```bash
+scripts/build-ril.sh arm64
+scripts/build-radio-config.sh arm64
+```
+
+Outputs:
+
+```text
+native/xenoid-ril/libxenoid-ril.so
+native/xenoid-radio-config/android.hardware.radio.config-service.xenoid
+```
+
+Runtime-free contracts for the location identity layer:
+
+```bash
+python3 scripts/test-cellular-profile.py   # seven-country profiles, MSISDN templates, crash-safe state machine
+python3 scripts/test-ril-source.py         # canonical binary profile and RIL/SIM-file source contracts
+python3 scripts/test-proxy-control.py      # generation/check-bound proxy data-plane proof (no region evidence)
+```
+
+`test-cellular-profile.py` pins the libphonenumber-derived per-country MSISDN templates, the 3GPP EARFCN/band round-trip used by the image's telephony band bridge (`scripts/patch-telephony-legacy-lte-band.py`), profile digest stability, and the stage/arm/recreate/verify/promote transaction including crash resume. `scripts/smoke-cellular-runtime.sh` is the live counterpart: an ordinary + isolated-process probe APK checks SIM/subscription/LTE cell/MSISDN, the single `rmnet_data0` cellular network, and the raw-syscall interface views.
+
 ## Native profile helper
 
 ```bash

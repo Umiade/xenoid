@@ -19,7 +19,7 @@ CAMERA_MUTATION_TIMEOUT_SECONDS = 3605.0
 PROXY_MAX_REQUEST_BYTES = 6 * 1024 * 1024 + 4096
 PROXY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 PROXY_MAX_SOURCE_BYTES = 1024 * 1024
-PROXY_CHECK_TIMEOUT_SECONDS = 120.0
+PROXY_CHECK_TIMEOUT_SECONDS = 300.0
 _PROXY_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROXY_CAPABILITY_KEYS = (
     "v4DnsProxy",
@@ -127,10 +127,7 @@ def wait_for_proxy_check(
             return _proxy_failure("proxy_disabled")
         if status.get("runtimeEpoch") != runtime_epoch:
             return _proxy_failure("runtime_epoch_mismatch")
-        if (
-            status.get("generation") != generation
-            or status.get("checkId") != check_id
-        ):
+        if status.get("generation") != generation or status.get("checkId") != check_id:
             return _proxy_failure("agent_stale")
 
         probe = status.get("probe")
@@ -144,8 +141,7 @@ def wait_for_proxy_check(
             report_error = report.get("errorCode")
             if isinstance(report_error, str) and report_error:
                 return _proxy_failure(
-                    report_error
-                    if _PROXY_ERROR_CODE.fullmatch(report_error)
+                    report_error if _PROXY_ERROR_CODE.fullmatch(report_error)
                     else "data_plane_unverified"
                 )
 
@@ -154,8 +150,7 @@ def wait_for_proxy_check(
             probe_error = probe.get("errorCode")
             if isinstance(probe_error, str) and probe_error:
                 return _proxy_failure(
-                    probe_error
-                    if _PROXY_ERROR_CODE.fullmatch(probe_error)
+                    probe_error if _PROXY_ERROR_CODE.fullmatch(probe_error)
                     else "data_plane_unverified"
                 )
             elapsed_ms = probe.get("elapsedMs")
@@ -169,7 +164,7 @@ def wait_for_proxy_check(
             ):
                 return _proxy_failure("data_plane_unverified")
 
-        if (
+        core_ready = (
             matching_report
             and matching_probe
             and report.get("phase") == "active"
@@ -178,7 +173,8 @@ def wait_for_proxy_check(
             and _proxy_capabilities_match(
                 report.get("capabilities"), status.get("udpAllowed")
             )
-        ):
+        )
+        if core_ready:
             result = dict(status)
             result["checkCompleted"] = True
             return result
@@ -476,6 +472,20 @@ class DaemonClient:
 
     def health(self) -> dict[str, Any]:
         return self.request("GET", "/health")
+
+    def location_status(self) -> dict[str, Any]:
+        return self.request("GET", "/location/status")
+
+    def location_stage(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/location/stage", request, timeout=120)
+
+    def location_verify(self, profile_digest: str, runtime_epoch: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/location/verify",
+            {"profileDigest": profile_digest, "runtimeEpoch": runtime_epoch},
+            timeout=150,
+        )
 
     def camera_status(self) -> dict[str, Any]:
         return self.request(

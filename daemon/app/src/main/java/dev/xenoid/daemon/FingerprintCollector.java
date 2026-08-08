@@ -44,9 +44,9 @@ final class FingerprintCollector {
     private static String macBytes(byte[] b) { if (b == null || b.length < 6) return null; StringBuilder sb = new StringBuilder(); for (int i=0;i<6;i++) { if (i>0) sb.append(':'); sb.append(String.format(Locale.US, "%02x", b[i] & 0xff)); } return sb.toString(); }
     private static Map<String,Object> network() {
         Map<String,Object> n = new LinkedHashMap<>();
-        n.put("mac", readFirst("/sys/class/net/eth0/address"));
+        n.put("mac", readFirst("/sys/class/net/rmnet_data0/address"));
         try {
-            NetworkInterface ni = NetworkInterface.getByName("eth0");
+            NetworkInterface ni = NetworkInterface.getByName("rmnet_data0");
             if (ni != null) { n.put("netif_mac", macBytes(ni.getHardwareAddress())); n.put("mtu", ni.getMTU()); n.put("virtual", ni.isVirtual()); n.put("up", ni.isUp()); }
         } catch (Exception ignored) {}
         return n;

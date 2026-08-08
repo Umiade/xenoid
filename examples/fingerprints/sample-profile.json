@@ -41,12 +41,6 @@
   "input_product": 26720,
   "input_vendor": 1256,
   "input_version": 256,
-  "locale": "en-US",
-  "network": {
-    "ifname": "eth0",
-    "ip": "192.168.1.100/24",
-    "mtu": 1500
-  },
   "pressure_max": 255,
   "schema": "dev.xenoid.fingerprint/v1",
   "thermal": {
@@ -81,7 +75,6 @@
   "thermal_zone3_type": "cpu-1",
   "thermal_zone4_temp": 34000,
   "thermal_zone4_type": "gpu",
-  "timezone": "America/Los_Angeles",
   "tracking_max": 65535,
   "usb": {
     "manufacturer": "Google",

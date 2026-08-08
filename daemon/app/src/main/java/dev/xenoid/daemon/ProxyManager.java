@@ -141,8 +141,22 @@ public final class ProxyManager {
                 commitState(state);
             }
             quarantineInstalled = state.enabled;
+            applyPrivateDnsPolicy(state.enabled);
         } catch (Throwable ignored) {
             throw new InitializationException();
+        }
+    }
+
+    /** The transparent engine hijacks UDP/TCP 53; opportunistic DNS-over-TLS
+     * (853) bypasses that channel and can stall behind exits that cannot carry
+     * it, so the resolver must stay on plain DNS while the proxy is enabled. */
+    private static void applyPrivateDnsPolicy(boolean enabled) {
+        try {
+            RootHelper.execRootd(enabled
+                    ? "settings put global private_dns_mode off"
+                    : "settings delete global private_dns_mode");
+        } catch (Throwable ignored) {
+            android.util.Log.e("xenoid-daemon", "private DNS policy application failed");
         }
     }
 
@@ -339,11 +353,12 @@ public final class ProxyManager {
         }
 
         ProbeResult result = executeAndroidProbe(requestedCheck, udpAllowed);
+        String errorCode = probeErrorCode(result, udpAllowed);
         Map<String, Object> observation = map(
                 "checkId", requestedCheck,
                 "capabilities", probeCapabilities(result),
                 "elapsedMs", result.elapsedMs,
-                "errorCode", probeErrorCode(result, udpAllowed));
+                "errorCode", errorCode);
         synchronized (this) {
             requireCurrentRuntime(instanceId, epoch);
             if (requestedCheck != checkId || expectedGeneration != state.generation) {
@@ -694,6 +709,7 @@ public final class ProxyManager {
         } catch (Throwable ignored) {
             throw new ProxyException("state_commit_failed");
         }
+        applyPrivateDnsPolicy(next.enabled);
     }
 
     private Map<String, Object> validateReport(Map<String, Object> report) throws ProxyException {

@@ -1,6 +1,6 @@
 {
   "backend": "colima-docker",
-  "image": "redroid/redroid:13.0.0-latest",
+  "image": "redroid/redroid:13.0.0_64only-latest",
   "runtime_image_tag": "xenoid/redroid:local",
   "auto_build_runtime_image": true,
   "container_name": "xenoid-android",

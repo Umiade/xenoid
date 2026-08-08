@@ -1073,6 +1073,7 @@ public class MainActivity extends Activity {
         String kind = ok ? string(status.get("sourceKind")) : "";
         long generation = ok ? positiveLong(status.get("generation")) : 0L;
         long checkId = ok ? positiveLong(status.get("checkId")) : 0L;
+        String runtimeEpoch = ok ? string(status.get("runtimeEpoch")) : "";
         String node = ok
                 ? sanitizeProxyNodeDisplay(string(status.get("selectedNode"))) : "";
         boolean structural = false;
@@ -1091,6 +1092,7 @@ public class MainActivity extends Activity {
                 phase = reportedPhase;
             }
         }
+        Object probe = ok ? status.get("probe") : null;
         boolean phaseActive = "active".equals(phase);
         boolean phaseOff = "off".equals(phase);
         boolean phaseQuarantine = "quarantined".equals(phase);

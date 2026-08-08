@@ -6,11 +6,13 @@ cd "$ROOT"
 export XENOID_ZYGOTE_PRELOAD=1
 DRY=0
 SKIP_BUILD=0
+REUSE_RUNTIME=0
 INSTANCE="${XENOID_INSTANCE:-default}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --reuse-runtime) REUSE_RUNTIME=1; shift ;;
     --instance)
       [[ $# -ge 2 ]] || { echo "--instance requires a name" >&2; exit 2; }
       INSTANCE="$2"
@@ -46,8 +48,12 @@ if [[ "$SKIP_BUILD" == 1 ]]; then
 else
   cmds+=("./xenoid --instance $INSTANCE build all" "./scripts/build-native-shim.sh arm64 prop")
 fi
+if [[ "$REUSE_RUNTIME" == 1 ]]; then
+  cmds+=("reuse the running owned runtime without recreation")
+else
+  cmds+=("./xenoid --instance $INSTANCE start ${START_COLIMA[*]} --recreate --no-adb-root --defer-proxy --install-daemon $ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk")
+fi
 cmds+=(
-  "./xenoid --instance $INSTANCE start ${START_COLIMA[*]} --recreate --no-adb-root --install-daemon $ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
   "./xenoid --instance $INSTANCE input deploy <runtime-abi input helper>"
   "./xenoid --instance $INSTANCE hide deploy <runtime-abi hide helper>"
   "./xenoid --instance $INSTANCE hide deploy-overlay <runtime-abi overlay helper>"
@@ -55,6 +61,10 @@ cmds+=(
   "./xenoid --instance $INSTANCE adb push <runtime-abi SSAID helper> /data/local/tmp/xenoid-ssaid"
   "./xenoid --instance $INSTANCE profile deploy-helper <runtime-abi profile helper>"
   "./xenoid --instance $INSTANCE device apply $ROOT/examples/fingerprints/sample-profile.json --keep-unique"
+  "./xenoid --instance $INSTANCE adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_FINE_LOCATION"
+  "./xenoid --instance $INSTANCE adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_BACKGROUND_LOCATION"
+  "./xenoid --instance $INSTANCE location apply --default SG <explicit location identity; one-time recreate on change>"
+  "./xenoid --instance $INSTANCE proxy reconcile <strict desired-state convergence after location>"
   "./xenoid --instance $INSTANCE root exec <remove stale Frida state>"
   "./xenoid --instance $INSTANCE hide apply $ROOT/examples/hide/default-policy.json"
   "./xenoid --instance $INSTANCE root exec <restart health HAL and reset battery state>"
@@ -69,7 +79,9 @@ cmds+=(
   "./xenoid --instance $INSTANCE doctor --require-runtime"
 )
 if [[ "$DRY" == 1 ]]; then
-  printf '{"ok":true,"dryRun":true,"skipBuild":%s,"commands":[' "$([[ $SKIP_BUILD == 1 ]] && echo true || echo false)"
+  printf '{"ok":true,"dryRun":true,"skipBuild":%s,"reuseRuntime":%s,"commands":[' \
+    "$([[ $SKIP_BUILD == 1 ]] && echo true || echo false)" \
+    "$([[ $REUSE_RUNTIME == 1 ]] && echo true || echo false)"
   first=1
   for c in "${cmds[@]}"; do [[ $first -eq 0 ]] && printf ','; first=0; python3 -c 'import json,sys; print(json.dumps(sys.argv[1]), end="")' "$c"; done
   printf ']}\n'
@@ -152,7 +164,9 @@ else
   xenoid_cli build all
   ./scripts/build-native-shim.sh arm64 prop >/dev/null
 fi
-xenoid_cli start "${START_COLIMA[@]}" --recreate --no-adb-root --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
+if [[ "$REUSE_RUNTIME" != 1 ]]; then
+  xenoid_cli start "${START_COLIMA[@]}" --recreate --no-adb-root --defer-proxy --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
+fi
 # Full startup uses rootd and avoids restarting adbd as root. Another adbd
 # restart could expose port 5555 again after the internal port was hidden.
 # Pick helper binaries for the runtime ABI: arm64-v8a uses unsuffixed arm64
@@ -201,6 +215,18 @@ xenoid_cli profile deploy-helper "$PROFILE_BIN"
 # identifiers. Rotation is an explicit `xenoid device apply` operation; doing it
 # implicitly on every `up` makes boot/property/profile views race and diverge.
 xenoid_cli device apply "$ROOT/examples/fingerprints/sample-profile.json" --keep-unique
+# The daemon reads cell info from a background UID during location verify, so
+# both location permissions must land before any location apply; on a fresh
+# instance anything later deadlocks the first up.
+xenoid_cli adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_FINE_LOCATION
+xenoid_cli adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_BACKGROUND_LOCATION
+# Location identity is applied after the generic profile and before runtime
+# protection mounts. It recreates the owned container at most once, only when
+# the selected country changed, and never consults proxy egress.
+xenoid_cli location apply --default SG
+# Proxy desired state converges strictly after location so a broken proxy can
+# never block identity convergence, and proxy egress never changes identity.
+xenoid_cli proxy reconcile
 # Production startup contains no Frida process or payload. Dynamic instrumentation
 # remains an explicit analysis command and never mutates the zygote by default.
 xenoid_cli frida stop >/dev/null 2>&1 || true

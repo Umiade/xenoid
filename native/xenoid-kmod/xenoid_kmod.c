@@ -32,7 +32,13 @@
 #include <linux/un.h>
 #include <linux/magic.h>
 #include <linux/net.h>
+#include <linux/netdevice.h>
 #include <linux/netlink.h>
+#include <linux/nsproxy.h>
+#include <linux/rtnetlink.h>
+#include <linux/skbuff.h>
+#include <net/net_namespace.h>
+#include <net/sock.h>
 #include <uapi/linux/android/binder.h>
 
 MODULE_LICENSE("GPL");
@@ -98,6 +104,32 @@ static bool current_is_isolated_android_app(void)
     return appid >= 90000 && appid < 100000;
 }
 
+static bool current_is_android_app(void)
+{
+    uid_t appid = current_android_appid();
+    return appid >= 10000 && appid < 100000;
+}
+
+/* Scope the compatibility permission gates to the Android runtime's network
+ * namespace. Host init_net and unrelated containers do not own rmnet_data0. */
+static bool net_is_xenoid_android_runtime(struct net *net)
+{
+    bool present;
+
+    if (!net)
+        return false;
+    rcu_read_lock();
+    present = dev_get_by_name_rcu(net, "rmnet_data0") != NULL;
+    rcu_read_unlock();
+    return present;
+}
+
+static bool current_net_is_xenoid_android_runtime(void)
+{
+    if (!current->nsproxy)
+        return false;
+    return net_is_xenoid_android_runtime(current->nsproxy->net_ns);
+}
 
 
 static bool path_hidden(const char *path)
@@ -725,44 +757,97 @@ static struct kretprobe tiocsti_kp = {
 	.maxactive = 32,
 };
 
-/* Android's appdomain policy never allows route-netlink sockets. The Ubuntu
- * host policy has no equivalent domain, so reproduce the SELinux denial for
- * Android application UIDs while leaving system and Bluetooth UIDs alone. */
-struct route_netlink_ctx { bool deny; };
-static int route_netlink_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
+/* Android's SELinux policy prevents isolated processes from creating network
+ * sockets. The generic Linux kernel permits them, so normalize successful
+ * socket creation at the LSM hook that owns the decision. Unix-domain sockets
+ * remain available for Binder and local IPC; kernel-originated sockets and
+ * pre-existing LSM errors are unchanged. */
+struct socket_create_ctx { bool deny; };
+static int socket_create_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct route_netlink_ctx *c = (void *)ri->data;
-	struct pt_regs *syscall_regs = (struct pt_regs *)regs->regs[0];
-	uid_t uid = from_kuid_munged(current_user_ns(), current_euid());
-	int domain, type, protocol;
+	struct socket_create_ctx *c = (void *)ri->data;
+	int family = (int)regs->regs[0];
+	int kern = (int)regs->regs[3];
+
+	c->deny = !kern && family != AF_UNIX &&
+		  current_is_isolated_android_app() &&
+		  current_net_is_xenoid_android_runtime();
+	return 0;
+}
+static int socket_create_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct socket_create_ctx *c = (void *)ri->data;
+
+	if (c->deny && (long)regs_return_value(regs) == 0)
+		regs_set_return_value(regs, -EACCES);
+	return 0;
+}
+static struct kretprobe socket_create_kp = {
+	.handler = socket_create_post,
+	.entry_handler = socket_create_pre,
+	.data_size = sizeof(struct socket_create_ctx),
+	.kp = { .symbol_name = "security_socket_create" },
+	.maxactive = 32,
+};
+
+/* Ordinary apps may create route-netlink sockets, but privileged RTM_GETLINK
+ * requires the Android nlmsg_readpriv permission. Deny only that message at
+ * security_netlink_send(); permitted GETADDR/GETROUTE requests and privileged
+ * control paths continue to the real rtnetlink producer. */
+struct netlink_send_ctx { bool deny; };
+static bool skb_requests_rtm_getlink(struct sk_buff *skb)
+{
+	unsigned int data_len;
+	unsigned char *data;
+
+	if (!skb)
+		return false;
+	data_len = skb->len;
+	data = skb->data;
+	while (data_len >= nlmsg_total_size(0)) {
+		struct nlmsghdr *nlh = (struct nlmsghdr *)data;
+		unsigned int msg_len;
+
+		if (nlh->nlmsg_len < NLMSG_HDRLEN || nlh->nlmsg_len > data_len)
+			return false;
+		if (nlh->nlmsg_type == RTM_GETLINK)
+			return true;
+		msg_len = NLMSG_ALIGN(nlh->nlmsg_len);
+		if (msg_len >= data_len)
+			return false;
+		data_len -= msg_len;
+		data += msg_len;
+	}
+	return false;
+}
+static int netlink_send_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct netlink_send_ctx *c = (void *)ri->data;
+	struct sock *sk = (struct sock *)regs->regs[0];
+	struct sk_buff *skb = (struct sk_buff *)regs->regs[1];
 
 	c->deny = false;
-	if (!syscall_regs || uid < 10000 || uid >= 100000)
+	if (!sk || !current_is_android_app() ||
+	    sk->sk_family != AF_NETLINK || sk->sk_protocol != NETLINK_ROUTE)
 		return 0;
-	domain = (int)syscall_regs->regs[0];
-	type = (int)syscall_regs->regs[1];
-	protocol = (int)syscall_regs->regs[2];
-	c->deny = domain == AF_NETLINK && (type & 0xf) == SOCK_RAW &&
-		  protocol == NETLINK_ROUTE;
+	if (!net_is_xenoid_android_runtime(sock_net(sk)))
+		return 0;
+	c->deny = skb_requests_rtm_getlink(skb);
 	return 0;
 }
-static int route_netlink_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int netlink_send_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct route_netlink_ctx *c = (void *)ri->data;
-	long ret = (long)regs_return_value(regs);
+	struct netlink_send_ctx *c = (void *)ri->data;
 
-	if (!c->deny)
-		return 0;
-	if (ret >= 0)
-		close_fd((unsigned int)ret);
-	regs_set_return_value(regs, -EACCES);
+	if (c->deny && (long)regs_return_value(regs) == 0)
+		regs_set_return_value(regs, -EACCES);
 	return 0;
 }
-static struct kretprobe route_netlink_kp = {
-	.handler = route_netlink_post,
-	.entry_handler = route_netlink_pre,
-	.data_size = sizeof(struct route_netlink_ctx),
-	.kp = { .symbol_name = "__arm64_sys_socket" },
+static struct kretprobe netlink_send_kp = {
+	.handler = netlink_send_post,
+	.entry_handler = netlink_send_pre,
+	.data_size = sizeof(struct netlink_send_ctx),
+	.kp = { .symbol_name = "security_netlink_send" },
 	.maxactive = 32,
 };
 
@@ -863,7 +948,8 @@ static struct kretprobe *rprobes[] = {
     &faccessat_kp, &unlinkat_kp, &readlink_kp, &maps_seq_kp, &smaps_seq_kp,
 };
 static struct kretprobe *seclabel_rprobes[] = {
-    &igs_kp, &vfs_xattr_kp, &gpa_kp, &aa_gpa_kp, &tiocsti_kp, &route_netlink_kp,
+    &igs_kp, &vfs_xattr_kp, &gpa_kp, &aa_gpa_kp, &tiocsti_kp,
+    &socket_create_kp, &netlink_send_kp,
 };
 static unsigned int rprobes_registered;
 static unsigned int seclabel_rprobes_registered;

@@ -421,6 +421,12 @@ public final class ProxyAgentChannel {
         } else if (value instanceof Boolean || value instanceof Byte
                 || value instanceof Short || value instanceof Integer || value instanceof Long) {
             output.append(value);
+        } else if (value instanceof Double || value instanceof Float) {
+            double number = ((Number) value).doubleValue();
+            if (Double.isNaN(number) || Double.isInfinite(number)) {
+                throw new IllegalArgumentException("unsupported JSON value");
+            }
+            output.append(value);
         } else if (value instanceof String) {
             appendString(output, (String) value);
         } else if (value instanceof Map) {

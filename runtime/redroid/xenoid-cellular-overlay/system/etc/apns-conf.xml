@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<apns version="8">
+    <apn carrier="Android Test"
+         mcc="001"
+         mnc="01"
+         apn="internet"
+         type="default,supl"
+         protocol="IPV4V6"
+         roaming_protocol="IPV4V6"
+         carrier_enabled="true" />
+</apns>

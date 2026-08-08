@@ -21,12 +21,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import (
-    DEFAULT_IMAGE,
     InstanceContext,
     InstanceError,
     InstanceLease,
     XenoidConfig,
-    default_image_for_host,
 )
 from .daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS, PROXY_MAX_SOURCE_BYTES, DaemonClient
 from .util import host_info, run, which
@@ -151,9 +149,6 @@ class RuntimeManager:
             return self.cfg.runtime_image_tag
         # Auto-upgrade the stock default to the 64only variant on arm64 hosts
         # (Apple Silicon / ARM ECS): those CPUs have no AArch32, and the stock
-        # image dies in boringssl_self_test32. A user-customized image wins.
-        if self.cfg.image == DEFAULT_IMAGE:
-            return default_image_for_host(host_info().get("machine"))
         return self.cfg.image
 
     def docker_endpoint_host(self) -> str:
@@ -892,6 +887,22 @@ class RuntimeManager:
         container, error = self._owned_container_record()
         return container is not None, error
 
+    def location_runtime_container_id(self) -> Optional[str]:
+        """Owned running container ID used to derive the location runtime epoch."""
+        try:
+            container, _ = self._owned_container_record()
+        except Exception:
+            return None
+        if container is None:
+            return None
+        state = container.get("State")
+        if not isinstance(state, dict) or state.get("Running") is not True:
+            return None
+        container_id = container.get("Id")
+        if not isinstance(container_id, str) or re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            return None
+        return container_id
+
     def _capture_proxy_desired_for_update(self) -> dict[str, Any]:
         """Keep credential-bearing desired state only in memory across an APK update."""
         if self._pending_proxy_restore is not None:
@@ -1019,7 +1030,7 @@ class RuntimeManager:
             code = "engine_unavailable"
         return {"ok": False, "code": code, "error": code}
 
-    def start(self, dry_run: bool = False, wait: bool = True, install_daemon_apk: Optional[str] = None, start_colima: bool = False, adb_root: bool = True, skip_preflight: bool = False, recreate: bool = False) -> dict[str, Any]:
+    def start(self, dry_run: bool = False, wait: bool = True, install_daemon_apk: Optional[str] = None, start_colima: bool = False, adb_root: bool = True, skip_preflight: bool = False, recreate: bool = False, defer_proxy: bool = False) -> dict[str, Any]:
         self.ensure_instance_lease()
         plan: dict[str, Any] = {
             "backend": self.cfg.backend,
@@ -1028,7 +1039,7 @@ class RuntimeManager:
             "adbTarget": self.adb_target,
             "daemonPort": self.lease.host_daemon_port,
             "recreate": recreate,
-            "proxyDesiredConvergence": True,
+            "proxyDesiredConvergence": not defer_proxy,
         }
         if dry_run:
             plan["dockerCommand"] = self.docker_create_command()
@@ -1327,19 +1338,26 @@ class RuntimeManager:
             else {"ok": False, "skipped": True}
         )
         required.append(result["daemonReady"])
-        result["proxyConverged"] = (
-            self.reconcile_proxy_desired()
-            if result["daemonReady"].get("ok")
-            else {
-                "ok": False,
-                "code": "daemon_unreachable",
-                "error": "daemon_unreachable",
-            }
-        )
+        if defer_proxy:
+            # Internal location-refresh path: proxy desired state is reconciled by
+            # the caller after the location identity converges, so a broken proxy
+            # never blocks location staging or the one-time recreate.
+            result["proxyConverged"] = {"ok": True, "skipped": True, "deferred": True}
+        else:
+            result["proxyConverged"] = (
+                self.reconcile_proxy_desired()
+                if result["daemonReady"].get("ok")
+                else {
+                    "ok": False,
+                    "code": "daemon_unreachable",
+                    "error": "daemon_unreachable",
+                }
+            )
         required.append(result["proxyConverged"])
         result["imageProtectionStatus"] = self.image_protection_status()
         required.append(result["imageProtectionStatus"])
         result["ok"] = all(bool(step.get("ok")) for step in required)
+        result["ready"] = bool(result["ok"] and result["proxyConverged"].get("ok"))
         if not result["ok"]:
             result["error"] = "one or more required runtime startup steps failed"
         return result
@@ -1479,6 +1497,16 @@ class RuntimeManager:
         return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": stdout, "stderr": proc.stderr, "command": cmd}
 
     def adb_connect(self) -> dict[str, Any]:
+        adb_bin = which("adb")
+        if adb_bin is None:
+            return {"ok": False, "error": "adb not found"}
+        try:
+            state = run([adb_bin, "-s", self.adb_target, "get-state"], timeout=5)
+            state_text = ((state.stdout or "") + (state.stderr or "")).lower()
+            if "offline" in state_text:
+                run([adb_bin, "disconnect", self.adb_target], timeout=5)
+        except Exception:
+            pass
         return self.adb(["connect"])
 
     def adb_wait(self, timeout_sec: int = 90) -> dict[str, Any]:
@@ -1944,9 +1972,7 @@ class RuntimeManager:
 
 
     def base_image_for_build(self) -> str:
-        """Base image for runtime-context builds: host-appropriate stock image."""
-        if self.cfg.image == DEFAULT_IMAGE:
-            return default_image_for_host(host_info().get("machine"))
+        """Return the configured 64-bit Android 13 base image."""
         return self.cfg.image
 
     def make_runtime_context(self, image: Optional[str] = None) -> dict[str, Any]:
@@ -2124,8 +2150,8 @@ class RuntimeManager:
         chmod = self.adb(["shell", "chmod", "755", remote_path]) if push.get("ok") else {"ok": False, "skipped": True}
         return {"ok": bool(push.get("ok") and chmod.get("ok")), "push": push, "chmod": chmod, "remotePath": remote_path}
 
-    def netctl_status(self, ifname: str = "eth0") -> dict[str, Any]:
-        safe_ifname = "".join(c for c in ifname if c.isalnum() or c in "_.:-") or "eth0"
+    def netctl_status(self, ifname: str = "rmnet_data0") -> dict[str, Any]:
+        safe_ifname = "".join(c for c in ifname if c.isalnum() or c in "_.:-") or "rmnet_data0"
         cmd = "test -x /data/local/tmp/xenoid-netctl && /data/local/tmp/xenoid-netctl status " + safe_ifname + " || echo '{\"ok\":false,\"error\":\"netctl-helper-missing\"}'"
         r = self.adb(["shell", cmd])
         out: dict[str, Any] = {"ok": bool(r.get("ok")), "adb": r}
@@ -2136,8 +2162,8 @@ class RuntimeManager:
             out["ok"] = False; out["error"] = str(e)
         return out
 
-    def netctl_set_mac(self, mac: str, ifname: str = "eth0") -> dict[str, Any]:
-        safe_ifname = "".join(c for c in ifname if c.isalnum() or c in "_.:-") or "eth0"
+    def netctl_set_mac(self, mac: str, ifname: str = "rmnet_data0") -> dict[str, Any]:
+        safe_ifname = "".join(c for c in ifname if c.isalnum() or c in "_.:-") or "rmnet_data0"
         safe_mac = "".join(c for c in mac.lower() if c in "0123456789abcdef:")
         cmd = "test -x /data/local/tmp/xenoid-netctl && /data/local/tmp/xenoid-netctl set-mac " + safe_ifname + " " + safe_mac + " || echo '{\"ok\":false,\"error\":\"netctl-helper-missing\"}'"
         r = self.adb(["shell", cmd])

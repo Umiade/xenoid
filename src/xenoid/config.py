@@ -17,11 +17,8 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Union
 
 
-DEFAULT_IMAGE = "redroid/redroid:13.0.0-latest"
-# Apple Silicon (and other arm64 hosts like ARM ECS/Graviton) lack AArch32, so the
-# stock redroid image fails at boringssl_self_test32 (Exec format error). The
-# 64only variant is the only viable base on arm64 hosts.
-DEFAULT_IMAGE_64ONLY = "redroid/redroid:13.0.0_64only-latest"
+DEFAULT_IMAGE = "redroid/redroid:13.0.0_64only-latest"
+_OBSOLETE_DEFAULT_IMAGES = frozenset({"redroid/redroid:13.0.0-latest"})
 DEFAULT_ANDROID_ADB_PORT = 62111
 DEFAULT_ANDROID_DAEMON_PORT = 18765
 DEFAULT_ROOTD_PORT = 18767
@@ -90,17 +87,6 @@ class InstanceError(RuntimeError):
 
     def as_dict(self) -> dict[str, Any]:
         return {"ok": False, "error": self.code, "message": str(self)}
-
-
-def default_image_for_host(machine: str | None = None) -> str:
-    """Pick the stock image appropriate for the host CPU."""
-    if machine is None:
-        import platform
-
-        machine = platform.machine()
-    if machine in {"arm64", "aarch64"}:
-        return DEFAULT_IMAGE_64ONLY
-    return DEFAULT_IMAGE
 
 
 def _resource_tag(instance_id: str) -> str:
@@ -652,12 +638,15 @@ def _allocate_lease_locked(
 
 
 def _config_from_dict(data: Mapping[str, Any]) -> XenoidConfig:
+    normalized = dict(data)
+    if normalized.get("image") in _OBSOLETE_DEFAULT_IMAGES:
+        normalized["image"] = DEFAULT_IMAGE
     allowed = set(XenoidConfig.__dataclass_fields__)
-    unknown = set(data) - allowed
+    unknown = set(normalized) - allowed
     if unknown:
         raise InstanceError("instance_identity_mismatch", "unknown instance config field")
     try:
-        cfg = XenoidConfig(**dict(data))
+        cfg = XenoidConfig(**normalized)
     except TypeError as exc:
         raise InstanceError("instance_identity_mismatch", "invalid instance config") from exc
     _validate_config(cfg)

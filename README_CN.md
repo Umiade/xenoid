@@ -119,6 +119,24 @@ Linux 主机必须向 redroid 暴露 binderfs 设备。ARM64 主机必须使用 
 ./xenoid adb shell getprop ro.product.model
 ```
 
+## 位置身份
+
+设备位置是一套显式、与代理完全解耦的身份：国家、系统 locale、时区、单卡 USIM、运营商、APN 和已注册的 LTE 小区都来自同一份按实例持久化的 profile。新实例首次 `./xenoid up` 默认应用新加坡；之后的运行保留已选择的国家。
+
+```bash
+# 列出支持的国家（不访问运行时；AU DE GB HK JP SG US）。
+./xenoid location list
+
+# 查看脱敏后的宿主与 Android 位置状态。
+./xenoid location status
+./xenoid location status --check
+
+# 选择国家并收敛身份。
+./xenoid location set US
+```
+
+重复选择当前国家是幂等操作。切换国家会对受管理的 Android 容器执行恰好一次重建；硬件标识（IMEI、serial、Android ID、MAC/IP 租约）保持不变，切回曾经使用过的国家会恢复该国原来的 SIM、手机号和小区身份。`./xenoid location set` 切换国家时会自行完成这次容器重建，之后请再运行 `./xenoid up` 重新验证完整生产状态。手机号是按冻结的 libphonenumber 国家元数据生成的稳定合成身份，不是真实分配的号码，也不提供电话/SMS 能力。全局代理不读取也不修改这套身份，代理变更永远不会重启运行时。
+
 ## 全局代理
 
 可以在 Android 的 Xenoid 设置界面中保存代理来源，也可以使用宿主 CLI。来源内容和凭据不得放入命令行参数：
@@ -258,8 +276,8 @@ Frida 适合应用进程动态分析与 app-layer hook。文件系统、mount、
 ## 网络身份
 
 ```bash
-./xenoid netctl status --ifname eth0
-./xenoid netctl set-mac 02:00:00:00:00:01 --ifname eth0
+./xenoid netctl status --ifname rmnet_data0
+./xenoid netctl set-mac 02:00:00:00:00:01 --ifname rmnet_data0
 ```
 
 一致的网络画像包括接口、route、namespace、MAC 地址和 framework 可见值，只修改一个属性是不够的。

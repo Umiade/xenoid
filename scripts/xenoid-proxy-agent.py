@@ -748,7 +748,9 @@ class DaemonChannel:
         except ProxyProtocolError as exc:
             raise ChannelAuthenticationFailure("agent_channel_auth_failed") from exc
         encoded = _canonical(envelope)
-        timeout = 60.0 if operation == "probe" else 20.0
+        # The Android probe endpoint runs ordinary-app capability probes with a
+        # 45s budget through the fresh data path; keep channel headroom above it.
+        timeout = 70.0 if operation == "probe" else 20.0
         connection = http.client.HTTPConnection(self._manifest["daemon"]["ip"], self._manifest["daemon"]["port"], timeout=timeout)
         try:
             connection.request("POST", "/proxy/agent", body=encoded, headers={
@@ -1328,6 +1330,7 @@ def _probe_data_plane(
     if set(result) != {"checkId", "capabilities", "elapsedMs", "errorCode"}:
         raise ChannelAuthenticationFailure("agent_channel_auth_failed")
     capabilities = result["capabilities"]
+    error_code = result["errorCode"]
     if (
         not isinstance(result["checkId"], int)
         or isinstance(result["checkId"], bool)
@@ -1338,10 +1341,12 @@ def _probe_data_plane(
         or not isinstance(result["elapsedMs"], int)
         or isinstance(result["elapsedMs"], bool)
         or not 0 <= result["elapsedMs"] <= ANDROID_PROBE_TIMEOUT_MS
-        or not isinstance(result["errorCode"], str)
-        or result["errorCode"] not in {"", "probe_failed", "probe_timeout", "stale_probe"}
+        or not isinstance(error_code, str)
+        or (error_code != "" and not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code))
     ):
         raise ChannelAuthenticationFailure("agent_channel_auth_failed")
+    if error_code:
+        raise AgentFailure(error_code)
     udp_allowed = desired["source"]["udpAllowed"]
     policy_matches = (
         capabilities["v4DnsProxy"]
@@ -1350,7 +1355,7 @@ def _probe_data_plane(
         and capabilities["v4UdpProxy"] == udp_allowed
         and (udp_allowed or not capabilities["v6UdpProxy"])
     )
-    if result["errorCode"] != "" or not policy_matches:
+    if not policy_matches:
         raise AgentFailure("data_plane_unverified")
 
     after = _live_status(manifest, manifest_path)

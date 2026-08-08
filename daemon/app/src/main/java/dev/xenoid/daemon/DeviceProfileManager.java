@@ -71,8 +71,8 @@ final class DeviceProfileManager {
                 String tags = build.optString("tags", "release-keys");
                 String type = build.optString("type", "user");
                 String abi = build.optString("abi", "arm64-v8a");
-                String abilist = build.optString("abilist", "arm64-v8a,armeabi-v7a,armeabi");
-                String abilist32 = build.optString("abilist32", "armeabi-v7a,armeabi");
+                String abilist = build.optString("abilist", "arm64-v8a");
+                String abilist32 = build.optString("abilist32", "");
                 String abilist64 = build.optString("abilist64", "arm64-v8a");
                 for (String part : new String[]{"", "product", "system", "system_ext", "vendor", "odm", "vendor_dlkm", "odm_dlkm", "system_dlkm"}) {
                     String prefix = part.length() == 0 ? "ro.product" : "ro.product." + part;
@@ -99,20 +99,10 @@ final class DeviceProfileManager {
             }
 
             JSONObject network = profile.optJSONObject("network");
-            if (network != null) {
-                String mac = network.optString("mac", network.optString("mac_address", null));
-                if (mac != null && mac.length() > 0) actions.add(applyField("network.mac", mac));
-                String ip = network.optString("ip", null);
-                if (ip != null && ip.length() > 0) actions.add(applyField("network.ip", ip));
-                String mtu = network.optString("mtu", null);
-                if (mtu != null && mtu.length() > 0) actions.add(applyField("network.mtu", mtu));
-                String ifname = network.optString("ifname", null);
-                if (ifname != null && ifname.length() > 0) actions.add(applyField("network.ifname", ifname));
-            }
             JSONObject hardware = profile.optJSONObject("hardware_profile");
-            if (hardware != null) {
-                String mac = hardware.optString("mac", hardware.optString("wifi_mac", null));
-                if (mac != null && mac.length() > 0) actions.add(applyField("network.mac", mac));
+            if (network != null || profile.has("locale") || profile.has("timezone")
+                    || (hardware != null && (hardware.has("mac") || hardware.has("wifi_mac")))) {
+                throw new IllegalArgumentException("location_identity_owned");
             }
 
             JSONObject usb = profile.optJSONObject("usb");
@@ -157,8 +147,6 @@ final class DeviceProfileManager {
             }
             if (profile.has("display_width")) actions.add(applyField("display.width", String.valueOf(profile.opt("display_width"))));
             if (profile.has("display_height")) actions.add(applyField("display.height", String.valueOf(profile.opt("display_height"))));
-            if (profile.has("locale")) actions.add(applyField("locale", profile.optString("locale")));
-            if (profile.has("timezone")) actions.add(applyField("timezone", profile.optString("timezone")));
 
             actions.addAll(stageEffectiveProfile(rawJson == null ? "{}" : rawJson));
             actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
@@ -225,36 +213,15 @@ final class DeviceProfileManager {
             String outName = "usb_" + key;
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/" + outName));
             actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
-        } else if ("network.mac".equals(field) || "mac".equals(field) || "mac_address".equals(field) || "wifi_mac".equals(field)) {
-            String mac = value.trim().toLowerCase(Locale.ROOT);
-            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(mac + "\n") + " > /data/local/tmp/xenoid-profile/mac_address"));
-            // The real MAC change breaks the docker-proxy control channel (drops this HTTP conn
-            // and would abort the rest of apply). Stage for perception now; apply the interface
-            // change detached+delayed so apply completes and responds first.
-            String mutate = "test -x /data/local/tmp/xenoid-netctl && /data/local/tmp/xenoid-netctl set-mac eth0 " + RootHelper.shellQuote(mac) + " >/data/local/tmp/xenoid-netctl.log 2>&1; "
-                + "ip link set dev eth0 address " + RootHelper.shellQuote(mac) + " 2>/dev/null; "
-                + "test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1";
-            actions.add(RootHelper.exec("nohup sh -c " + RootHelper.shellQuote("sleep 3; " + mutate) + " >/data/local/tmp/xenoid-mac-apply.log 2>&1 &"));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
-        } else if ("network.ip".equals(field) || "ip".equals(field) || "ip_address".equals(field)) {
-            String ip = value.trim();
-            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(ip + "\n") + " > /data/local/tmp/xenoid-profile/ip_address"));
-            // Do NOT actually re-IP eth0: flushing eth0 removes the docker-network address and
-            // drops the adb/daemon control channel mid-apply (RemoteDisconnected) and can abort
-            // the remaining actions. The spoofed IP is staged for the perception layer
-            // (shim/netlink/overlay); actual interface re-IP is a P2/P3 gap.
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
-        } else if ("network.mtu".equals(field) || "mtu".equals(field)) {
-            String mtu = value.trim().replaceAll("[^0-9]", "");
-            if (mtu.length() == 0) mtu = "1500";
-            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(mtu + "\n") + " > /data/local/tmp/xenoid-profile/network_mtu"));
-            actions.add(RootHelper.exec("ip link set dev eth0 mtu " + RootHelper.shellQuote(mtu) + " 2>/dev/null || true"));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
-        } else if ("network.ifname".equals(field) || "ifname".equals(field)) {
-            String ifname = value.trim().replaceAll("[^A-Za-z0-9_.:-]", "");
-            if (ifname.length() == 0) ifname = "eth0";
-            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(ifname + "\n") + " > /data/local/tmp/xenoid-profile/network_ifname"));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+        } else if (field.startsWith("network.") || "mac".equals(field)
+                || "mac_address".equals(field) || "wifi_mac".equals(field)
+                || "ip".equals(field) || "ip_address".equals(field)
+                || "mtu".equals(field) || "ifname".equals(field)) {
+            out.put("actions", actions);
+            out.put("ok", false);
+            out.put("applied", false);
+            out.put("error", "network_identity_location_owned");
+            return out;
         } else if (field.startsWith("battery.")) {
             actions.add(RootHelper.exec("setprop " + RootHelper.shellQuote("persist.xenoid." + field.replace(".", "_")) + " " + RootHelper.shellQuote(value)));
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile/battery && printf %s " + RootHelper.shellQuote(value) + " > " + RootHelper.shellQuote("/data/local/tmp/xenoid-profile/" + field.replace("/", "_").replace(".", "_"))));
@@ -290,12 +257,11 @@ final class DeviceProfileManager {
             String outName = ("name".equals(key) || "device_name".equals(key)) ? "input_name" : "input_" + key;
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/" + outName));
             actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
-        } else if ("locale".equals(field)) {
-            actions.add(RootHelper.exec("setprop persist.sys.locale " + RootHelper.shellQuote(value)));
-            actions.add(RootHelper.exec("setprop persist.xenoid.locale " + RootHelper.shellQuote(value)));
-        } else if ("timezone".equals(field)) {
-            actions.add(RootHelper.exec("setprop persist.sys.timezone " + RootHelper.shellQuote(value)));
-            actions.add(RootHelper.exec("setprop persist.xenoid.timezone " + RootHelper.shellQuote(value)));
+        } else if ("locale".equals(field) || "timezone".equals(field)) {
+            out.put("ok", false);
+            out.put("applied", false);
+            out.put("error", "location_identity_owned");
+            return out;
         } else {
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile/fields && printf %s " + RootHelper.shellQuote(value) + " > /data/local/tmp/xenoid-profile/fields/" + RootHelper.shellQuote(field.replace('/', '_'))));
         }

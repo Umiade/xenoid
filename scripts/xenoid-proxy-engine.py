@@ -396,7 +396,7 @@ def install_sandbox(m):
  atomic(SANDBOX,data,0o555);output.unlink();build.rmdir()
 def control_paths():
  package=PYTHON_ROOT/"xenoid"
- return {ENGINE_HELPER:0o555,AGENT_SERVICE:0o644,SANDBOX:0o555,Path("/usr/libexec/xenoid-proxy-agent.py"):0o555,Path("/usr/libexec/xenoid-proxy-compile-worker.py"):0o555,Path("/usr/libexec/xenoid-proxy-fetch-worker.py"):0o555,package/"__init__.py":0o444,package/"proxy_source.py":0o444,package/"proxy_protocol.py":0o444}
+ return {ENGINE_HELPER:0o555,AGENT_SERVICE:0o644,SANDBOX:0o555,Path("/usr/libexec/xenoid-proxy-agent.py"):0o555,Path("/usr/libexec/xenoid-proxy-compile-worker.py"):0o555,Path("/usr/libexec/xenoid-proxy-fetch-worker.py"):0o555,package/"__init__.py":0o444,package/"proxy_source.py":0o444,package/"proxy_protocol.py":0o444,}
 def control_digest(files):return hashlib.sha256(json.dumps(files,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 def install_control(m):
  require_systemd();install_deps();install_prerequisites();validate_accounts(m,True);mkdir(ASSETS,0o711);install_sandbox(m)
@@ -833,18 +833,34 @@ def container_netns(m):
  except Exception as exc:raise Error("runtime_identity_mismatch") from exc
  if runtime_inspect(m).get("State",{}).get("Pid")!=pid:raise Error("runtime_identity_mismatch")
  return pid,start,inode
+def android_data_interface(base):
+ try: lines=run([*base,"-o","-4","address","show","scope","global"],capture=True,code="ipv6_unsupported").stdout.decode("ascii","strict").splitlines()
+ except UnicodeError as exc:raise Error("ipv6_unsupported") from exc
+ interfaces=set()
+ for line in lines:
+  tokens=line.split()
+  if len(tokens)<2:raise Error("ipv6_unsupported")
+  candidate=tokens[1].split("@",1)[0]
+  if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}",candidate):raise Error("ipv6_unsupported")
+  interfaces.add(candidate)
+ if len(interfaces)!=1:raise Error("ipv6_unsupported")
+ return next(iter(interfaces))
 def android_ipv6(m,pid,repair=False):
- base=[tool("nsenter"),"--target",str(pid),"--net",tool("ip")];address=m["android"]["ipv6"];network=ipaddress.ip_network(address+"/64",strict=False);gateway=str(network.network_address+1);interface="eth0"
+ base=[tool("nsenter"),"--target",str(pid),"--net",tool("ip")];address=m["android"]["ipv6"];network=ipaddress.ip_network(address+"/64",strict=False);gateway=str(network.network_address+1);interface="rmnet_data0"
+ # The runtime renames the container data link to rmnet_data0 before Android
+ # boots; the dynamic resolver only cross-checks that single-interface invariant.
+ if android_data_interface(base)!=interface:raise Error("ipv6_unsupported")
  try:
   interface_index=integer(int(run([*base,"-o","link","show","dev",interface],capture=True,code="ipv6_unsupported").stdout.decode("ascii","strict").split(":",1)[0]),1,(1<<31)-1)
  except (ValueError,IndexError,UnicodeError) as exc:raise Error("ipv6_unsupported") from exc
  table=str(1000+interface_index)
  if repair:
   run([*base,"-6","address","replace",address+"/64","dev",interface,"nodad"],code="ipv6_unsupported")
+  run([*base,"-6","route","replace","table",table,str(network),"dev",interface,"proto","static"],code="ipv6_unsupported")
   run([*base,"-6","route","replace","table",table,"default","via",gateway,"dev",interface,"proto","static"],code="ipv6_unsupported")
  assigned=run([*base,"-6","address","show","dev",interface,"to",address+"/128"],capture=True,code="ipv6_unsupported").stdout.decode("ascii","strict").split()
- routed=run([*base,"-6","route","show","table",table,"default"],capture=True,code="ipv6_unsupported").stdout.decode("ascii","strict").split()
- if address+"/64" not in assigned or not all(token in routed for token in ("default","via",gateway,"dev",interface)):raise Error("ipv6_unsupported")
+ routed=run([*base,"-6","route","show","table",table],capture=True,code="ipv6_unsupported").stdout.decode("ascii","strict").split()
+ if address+"/64" not in assigned or not all(token in routed for token in (str(network),"default","via",gateway,"dev",interface)):raise Error("ipv6_unsupported")
 def proc_path(m,name):
  if name not in ("process","pending-process"):raise Error("internal_contract_error")
  return RUN/m["resourceTag"]/(name+".json")

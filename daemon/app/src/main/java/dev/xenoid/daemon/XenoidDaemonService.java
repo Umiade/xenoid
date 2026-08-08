@@ -25,6 +25,7 @@ public class XenoidDaemonService extends Service {
     private volatile CameraMediaManager cameraMediaManager;
     private volatile ProxyManager proxyManager;
     private volatile ProxyAgentChannel proxyAgentChannel;
+    private volatile LocationIdentityManager locationIdentityManager;
     public IBinder onBind(Intent intent) { return null; }
     public int onStartCommand(Intent intent, int flags, int startId) { enterForeground(); startServer(); return START_STICKY; }
     public void onDestroy() {
@@ -77,12 +78,34 @@ public class XenoidDaemonService extends Service {
                 android.util.Log.e("xenoid-daemon", "proxy control initialization failed");
             }
             try {
+                LocationIdentityManager location = new LocationIdentityManager(this);
+                locationIdentityManager = location;
+                try {
+                    location.restoreDataPlane();
+                } catch (Throwable ignored) {
+                    android.util.Log.e("xenoid-daemon", "location data-plane restoration failed");
+                }
+            } catch (Throwable ignored) {
+                android.util.Log.e("xenoid-daemon", "location identity initialization failed");
+            }
+            try {
                 cameraMediaManager = CameraMediaManager.get(this);
             } catch (Throwable ignored) {
                 android.util.Log.e("xenoid-daemon", "camera manager initialization failed");
             }
             listener = new ServerSocket(18765, 50, InetAddress.getByName("0.0.0.0"));
             server = listener;
+            LocationIdentityManager location = locationIdentityManager;
+            if (location != null) {
+                workers.submit(() -> {
+                    try {
+                        Thread.sleep(2000);
+                        location.restoreDataPlane();
+                    } catch (Throwable ignored) {
+                        android.util.Log.e("xenoid-daemon", "delayed location data-plane restoration failed");
+                    }
+                });
+            }
             final ServerSocket activeListener = listener;
             workers.submit(() -> acceptClients(activeListener, workers));
         } catch(Exception e) {
@@ -273,6 +296,10 @@ public class XenoidDaemonService extends Service {
                     && "GET".equals(method)) return 0;
             return "POST".equals(method) ? 4096 : 0;
         }
+        if (path.startsWith("/location/")) {
+            if ("/location/status".equals(path) && "GET".equals(method)) return 0;
+            return "POST".equals(method) ? 128 * 1024 : 0;
+        }
         if (path.startsWith("/camera/")) return 2048;
         return MAX_DEFAULT_BODY_BYTES;
     }
@@ -346,13 +373,14 @@ public class XenoidDaemonService extends Service {
                     return map("ok", false, "error", "invalid_request");
                 }
                 if (cameraMediaManager == null || proxyManager == null
-                        || proxyAgentChannel == null) {
+                        || proxyAgentChannel == null || locationIdentityManager == null) {
                     return map("ok", false, "service", "xenoid-daemon",
                             "version", "0.1.0", "error", "service not ready");
                 }
                 return map("ok", true, "service", "xenoid-daemon", "version", "0.1.0");
             }
             if (path.startsWith("/proxy/")) return routeProxy(method, path, body);
+            if (path.startsWith("/location/")) return routeLocation(method, path, body);
             if (path.startsWith("/camera/")) return routeCamera(method, path, body);
             if (path.equals("/root/status")) return RootHelper.status();
             if (path.equals("/root/exec")) return RootHelper.exec(SimpleJson.stringValue(body, "command", "id"));
@@ -377,6 +405,25 @@ public class XenoidDaemonService extends Service {
             if (path.equals("/ota/apply")) return OtaManager.apply(SimpleJson.stringValue(body, "channel", "stable"));
             return map("ok", false, "error", "not found", "path", path);
         } catch(Exception e) { return map("ok", false, "error", e.toString()); }
+    }
+
+    private Map<String, Object> routeLocation(String method, String path, String body) throws Exception {
+        LocationIdentityManager manager = locationIdentityManager;
+        if (manager == null) throw new IllegalStateException("location_unavailable");
+        if ("/location/status".equals(path)) {
+            requireProxyMethod(method, "GET");
+            ProxyManager.requireEmptyBody(body);
+            return manager.status();
+        }
+        if ("/location/stage".equals(path)) {
+            requireProxyMethod(method, "POST");
+            return manager.stage(ProxyManager.parseObject(body, 128 * 1024));
+        }
+        if ("/location/verify".equals(path)) {
+            requireProxyMethod(method, "POST");
+            return manager.verify(ProxyManager.parseObject(body, 4096));
+        }
+        return map("ok", false, "error", "not_found");
     }
 
     private Map<String, Object> routeProxy(String method, String path, String body) {
@@ -441,7 +488,8 @@ public class XenoidDaemonService extends Service {
             return map("ok", false, "error", failure.code);
         } catch (ProxyAgentChannel.AgentRejected ignored) {
             return map("ok", false, "error", "agent_rejected");
-        } catch (Throwable ignored) {
+        } catch (Throwable failure) {
+            android.util.Log.e("xenoid-daemon", "proxy route failed", failure);
             return map("ok", false, "error", "proxy_request_failed");
         }
     }

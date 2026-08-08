@@ -59,21 +59,30 @@ def _valid_secret(value: Any) -> bool:
 def _completed_check(status: dict[str, Any]) -> bool:
     generation = status.get("generation")
     check_id = status.get("checkId")
+    runtime_epoch = status.get("runtimeEpoch")
+    instance_id = status.get("instanceId")
     report = status.get("report")
     probe = status.get("probe")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or not isinstance(check_id, int)
+        or isinstance(check_id, bool)
+        or check_id <= 0
+        or not isinstance(runtime_epoch, str)
+        or not runtime_epoch
+        or not isinstance(instance_id, str)
+        or not instance_id
+        or not isinstance(report, dict)
+        or not isinstance(probe, dict)
+    ):
+        return False
     return (
-        isinstance(generation, int)
-        and not isinstance(generation, bool)
-        and isinstance(check_id, int)
-        and not isinstance(check_id, bool)
-        and check_id > 0
-        and isinstance(report, dict)
-        and report.get("generation") == generation
+        report.get("generation") == generation
         and report.get("checkId") == check_id
         and report.get("phase") == "active"
         and report.get("structuralApplied") is True
         and report.get("dataPlaneVerified") is True
-        and isinstance(probe, dict)
         and probe.get("checkId") == check_id
         and probe.get("errorCode") == ""
     )
@@ -214,7 +223,13 @@ class ProxyController:
                 if isinstance(code, str) and code:
                     return _failure(code if _SAFE_CODE.fullmatch(code) else "proxy_reconcile_failed")
                 if (
-                    report.get("phase") in {"active", "off"}
+                    report.get("phase") == "active"
+                    and report.get("structuralApplied") is True
+                    and report.get("dataPlaneVerified") is True
+                ):
+                    return status if _completed_check(status) else _failure("data_plane_unverified")
+                if (
+                    report.get("phase") == "off"
                     and report.get("structuralApplied") is True
                     and report.get("dataPlaneVerified") is True
                 ):
@@ -266,6 +281,7 @@ class ProxyController:
                 checked = wait_for_proxy_check(self._daemon)
             if checked.get("ok") is not True:
                 self._manager_call("proxy_quarantine", generation)
+                checked.setdefault("generation", generation)
             return checked
         settled = self._wait_generation(generation, runtime_epoch)
         if settled.get("ok") is not True:

@@ -34,7 +34,7 @@ import os, pathlib, shutil, subprocess
 root = pathlib.Path(os.environ["ROOT"])
 release = pathlib.Path(os.environ["REL"])
 raw = subprocess.check_output(
-    ["git", "ls-files", "--cached", "-z"],
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
     cwd=root,
 )
 for item in raw.split(b"\0"):
@@ -70,6 +70,8 @@ cp native/xenoid-hide/xenoid-overlay "$REL/artifacts/xenoid-overlay-helper"
 cp native/xenoid-hide/xenoid-prop-area "$REL/artifacts/xenoid-prop-area"
 cp native/xenoid-hide/xenoid-ssaid "$REL/artifacts/xenoid-ssaid"
 cp native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/artifacts/xenoid-proxy-sandbox"
+cp native/xenoid-ril/libxenoid-ril.so "$REL/artifacts/libxenoid-ril.so"
+cp native/xenoid-radio-config/android.hardware.radio.config-service.xenoid "$REL/artifacts/android.hardware.radio.config-service.xenoid"
 cp native/xenoid-input/xenoid-input "$REL/native/xenoid-input/xenoid-input"
 cp native/xenoid-hide/xenoid-hide "$REL/native/xenoid-hide/xenoid-hide"
 cp native/xenoid-hide/xenoid-overlay "$REL/native/xenoid-hide/xenoid-overlay"
@@ -86,8 +88,11 @@ cp native/xenoid-camerahal/android.hardware.camera.provider-service-aidl "$REL/n
 cp native/xenoid-camerahal/media_profiles_V1_0.xml "$REL/native/xenoid-camerahal/media_profiles_V1_0.xml"
 cp native/xenoid-gralloc/gralloc.redroid.so "$REL/native/xenoid-gralloc/gralloc.redroid.so"
 mkdir -p "$REL/native/xenoid-proxy-sandbox"
-cp native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/native/xenoid-proxy-sandbox/xenoid-proxy-sandbox"
-cp native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/scripts/xenoid-proxy-sandbox"
+cp -f native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/native/xenoid-proxy-sandbox/xenoid-proxy-sandbox"
+mkdir -p "$REL/native/xenoid-ril" "$REL/native/xenoid-radio-config"
+cp native/xenoid-ril/libxenoid-ril.so "$REL/native/xenoid-ril/libxenoid-ril.so"
+cp native/xenoid-radio-config/android.hardware.radio.config-service.xenoid "$REL/native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"
+cp -f native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/scripts/xenoid-proxy-sandbox"
 cp "$OTA_BUNDLE" "$REL/artifacts/"
 cp examples/config-macos-colima.json examples/config-linux-arm.json "$REL/config/"
 cat > "$REL/RUNBOOK.md" <<'RUNBOOK'

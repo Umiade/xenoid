@@ -94,7 +94,7 @@ add("install runtime plan", proc.returncode == 0 and "colima start" in proc.stdo
 proc = subprocess.run([str(ROOT / "xenoid"), "up", "--dry-run"], text=True, capture_output=True, cwd=ROOT)
 add("up plan", proc.returncode == 0 and "doctor" in proc.stdout, proc.stdout + proc.stderr)
 
-proc = subprocess.run([str(ROOT / "xenoid"), "logs", "--out-dir", "/tmp/xenoid-audit-logs"], text=True, capture_output=True, cwd=ROOT)
+proc = subprocess.run([str(ROOT / "xenoid"), "logs"], text=True, capture_output=True, cwd=ROOT)
 add("runtime logs", proc.returncode == 0 and "outDir" in proc.stdout, proc.stdout + proc.stderr)
 
 # Runtime context
@@ -165,8 +165,12 @@ try:
     bundle = pathlib.Path(data["bundle"])
     with tarfile.open(bundle, "r:gz") as tf:
         names = tf.getnames()
-    needed = ["manifest.json", "payload/xenoid-daemon.apk", "payload/xenoid-input", "payload/xenoid-hide-helper", "payload/xenoid-profile-helper", "payload/xenoid-netctl", "payload/frida-scripts/xenoid-default.js", "payload/frida-scripts/xenoid-profile.js", "payload/frida-scripts/generated-sample-profile.js", "payload/frida-scripts/generated-service-sample-profile.js"]
-    ota_ok = all(any(n.endswith(x) for n in names) for x in needed)
+    needed = ["manifest.json", "payload/xenoid-daemon.apk", "payload/xenoid-input", "payload/xenoid-hide-helper", "payload/xenoid-profile-helper", "payload/xenoid-netctl"]
+    # Frida scripts are an explicit inspection capability and are intentionally
+    # absent from production OTA payloads; reject any unexpected AppleDouble or
+    # metadata residue as well.
+    apple = [n for n in names if "/._" in n or n.startswith("._") or ".DS_Store" in n]
+    ota_ok = all(any(n.endswith(x) for n in names) for x in needed) and not apple
     evidence += "\n" + "\n".join(names)
 except Exception as e:
     evidence += "\nERR " + repr(e)
@@ -179,13 +183,20 @@ proc = subprocess.run([str(ROOT / "xenoid"), "automation", "run-host", "examples
 add("automation run-host", proc.returncode == 0 and ("node not found" in proc.stdout or "\"mode\": " in proc.stdout), proc.stdout + proc.stderr)
 
 # Service Frida generation
-proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-service-frida", "examples/fingerprints/sample-profile.json", "--out", "/tmp/xenoid-audit-service-profile.js"], text=True, capture_output=True, cwd=ROOT)
-service_js = pathlib.Path("/tmp/xenoid-audit-service-profile.js")
+proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-service-frida", "examples/fingerprints/sample-profile.json"], text=True, capture_output=True, cwd=ROOT)
+service_js = None
+try:
+    service_js = pathlib.Path(json.loads(proc.stdout)["out"])
+except Exception:
+    service_js = pathlib.Path("/nonexistent")
 add("service frida generation", proc.returncode == 0 and service_js.exists() and "SensorManager" in service_js.read_text() and "BufferedReader" in service_js.read_text(), proc.stdout + proc.stderr)
 
 # Profile Frida generation
-proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-frida", "examples/fingerprints/sample-profile.json", "--out", "/tmp/xenoid-audit-profile.js"], text=True, capture_output=True, cwd=ROOT)
-profile_js = pathlib.Path("/tmp/xenoid-audit-profile.js")
+proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-frida", "examples/fingerprints/sample-profile.json"], text=True, capture_output=True, cwd=ROOT)
+try:
+    profile_js = pathlib.Path(json.loads(proc.stdout)["out"])
+except Exception:
+    profile_js = pathlib.Path("/nonexistent")
 add("profile frida generation", proc.returncode == 0 and profile_js.exists() and "Settings$Secure" in profile_js.read_text(), proc.stdout + proc.stderr)
 
 bridge = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/JsBridgeAutomationEngine.java").read_text()
@@ -194,9 +205,9 @@ add("js bridge automation", "JavascriptInterface" in bridge and "evaluateJavascr
 # Static API coverage
 cli = (ROOT / "src/xenoid/cli.py").read_text()
 daemon = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/XenoidDaemonService.java").read_text()
-for token in ["docker-context", "install-runtime", "up", "doctor", "logs", "view", "linux-binderfs", "verify-release", "package-release", "ebpf", "netctl", "root", "profile", "deploy-helper", "config", "runtime-build-image", "frida", "deploy-scripts", "load-script", "generate-frida", "generate-service-frida", "hide", "device", "automation", "run-host", "plan", "input", "app", "camera", "ota", "runtime-context"]:
+for token in ["docker-context", "install-runtime", "up", "doctor", "logs", "view", "linux-binderfs", "verify-release", "package-release", "ebpf", "netctl", "root", "profile", "deploy-helper", "config", "runtime-build-image", "frida", "deploy-scripts", "load-script", "generate-frida", "generate-service-frida", "hide", "device", "automation", "run-host", "plan", "input", "app", "camera", "ota", "runtime-context", "location"]:
     add("cli token:" + token, token in cli, "src/xenoid/cli.py")
-for route in ["/root/status", "/frida/start", "/hide/apply", "/fingerprint/apply", "/automation/run", "/input/tap", "/app/install", "/camera/status", "/camera/source", "/camera/settings", "/camera/clear", "/camera/apply", "/camera/self-test/start", "/camera/self-test/status", "/ota/apply"]:
+for route in ["/root/status", "/frida/start", "/hide/apply", "/fingerprint/apply", "/automation/run", "/input/tap", "/app/install", "/camera/status", "/camera/source", "/camera/settings", "/camera/clear", "/camera/apply", "/camera/self-test/start", "/camera/self-test/status", "/ota/apply", "/location/status", "/location/stage", "/location/verify"]:
     add("daemon route:" + route, route in daemon, "XenoidDaemonService.java")
 
 ok = all(c["ok"] for c in checks)

@@ -38,16 +38,11 @@
 #include <sys/vfs.h>
 #include <sched.h>
 #endif
-#ifdef XENOID_ENABLE_IOCTL
-#include <sys/ioctl.h>
-#include <net/if.h>
-#endif
+
 
 #define XENOID_DEFAULT_PROFILE_DIR "/data/local/tmp/xenoid-profile"
 #define XENOID_DEFAULT_BOOT_ID "b9b36666-6eb6-4613-9ad6-edc7bb5630f9\n"
-#define XENOID_DEFAULT_MAC "02:33:44:55:66:77\n"
 static char *cached_boot_id;
-static char *cached_mac_text;
 static int zygote_identity_scope;
 #ifndef AT_PLATFORM
 #define AT_PLATFORM 15
@@ -151,28 +146,9 @@ static char *load_boot_id(void) {
   join_profile_path(p, sizeof(p), "boot_id");
   return read_first_or_default(p, XENOID_DEFAULT_BOOT_ID);
 }
-static char *load_mac_text(void) {
-  char p[512];
-  const char *env = getenv("XENOID_MAC");
-  if (env && env[0]) {
-    size_t n = strlen(env);
-    char *out = calloc(1, n + 2);
-    memcpy(out, env, n);
-    if (n == 0 || env[n - 1] != '\n') out[n++] = '\n';
-    out[n] = 0;
-    return out;
-  }
-  join_profile_path(p, sizeof(p), "mac_address");
-  return read_first_or_default(p, XENOID_DEFAULT_MAC);
-}
 static char *fake_boot_id(void) {
   return cached_boot_id ? strdup(cached_boot_id) : load_boot_id();
 }
-static char *fake_mac_text(void) {
-  return cached_mac_text ? strdup(cached_mac_text) : load_mac_text();
-}
-__attribute__((unused)) static void fake_mac_bytes(unsigned char mac[6]) { char *s=fake_mac_text(); unsigned int b[6]={2,0xaa,0xbb,0xcc,0xdd,0xee}; sscanf(s,"%x:%x:%x:%x:%x:%x",&b[0],&b[1],&b[2],&b[3],&b[4],&b[5]); for(int i=0;i<6;i++) mac[i]=(unsigned char)b[i]; free(s); }
-
 
 static int line_hidden(const char *l) {
   static const char *tcp_ports[]={":15B3",":69A2",":69A3",":494D",":494E",":494F",":90ED",":9999",NULL};
@@ -347,7 +323,6 @@ static int is_proc_filter_file(const char*p){
 static int proc_pid_from_path(const char *path);
 static int hidden_proc_pid(int pid);
 static int is_fdinfo_file(const char *p){ return p && strncmp(p,"/proc/",6)==0 && strstr(p,"/fdinfo/"); }
-static int is_mac_addr_path(const char *p){ return p && strstr(p,"/sys/class/net/") && strstr(p,"/address"); }
 
 static int fake_cpufreq_fd(const char *path) {
   /* Provide profile-consistent per-CPU frequency nodes when the base runtime
@@ -391,7 +366,6 @@ static int open_virtual(const char *path) {
   if (is_environ_file(path)) return make_fake("");
   if (is_limits_file(path)) return make_fake(fake_limits_text());
   if (path_eq(path,test_path("XENOID_TEST_BOOT_ID_PATH","/proc/sys/kernel/random/boot_id"))) { char *d=fake_boot_id(); int fd=make_fake(d); free(d); return fd; }
-  if (is_mac_addr_path(path) || path_eq(path,test_path("XENOID_TEST_MAC_PATH","/sys/class/net/__unused__/address"))) { char *d=fake_mac_text(); int fd=make_fake(d); free(d); return fd; }
   if (is_kernel_text(path)) return make_fake(fake_kernel_text(path));
   if (is_tcp(path) || is_proc_net_file(path) || is_proc_filter_file(path) || path_eq(path,test_path("XENOID_TEST_TCP_PATH","/proc/net/__unused_tcp")) || path_eq(path,test_path("XENOID_TEST_MAPS_PATH","/proc/self/__unused_maps"))) { char*d=filter_lines(path); int fd=make_fake(d); free(d); return fd; }
   return -2;
@@ -777,7 +751,6 @@ __attribute__((constructor)) static void xenoid_shim_scrub_preload(void) {
   zygote_identity_scope = getenv("ANDROID_SOCKET_zygote") != NULL;
   if (zygote_identity_scope) {
     cached_boot_id = load_boot_id();
-    cached_mac_text = load_mac_text();
   }
   for (char **e = environ; e && *e; ++e) {
     if (strncmp(*e, "LD_PRELOAD=", 11) == 0) {
@@ -827,48 +800,5 @@ void __system_property_read_callback(const void *pi, xenoid_prop_cb_t cb, void *
   if (!real || !cb) { if (real) real(pi, cb, cookie); return; }
   struct xenoid_prop_cb_wrap w = {cb, cookie};
   real(pi, xenoid_prop_cb_wrap_call, &w);
-}
-#endif
-
-#ifdef XENOID_ENABLE_IOCTL
-typedef int (*ioctl_t)(int, int, ...);
-int ioctl(int fd, int req, ...) {
-  va_list ap; va_start(ap, req); void *arg = va_arg(ap, void*); va_end(ap);
-  if (req == SIOCGIFHWADDR && arg) { struct ifreq *ifr=(struct ifreq*)arg; unsigned char mac[6]; fake_mac_bytes(mac); memcpy(ifr->ifr_hwaddr.sa_data,mac,6); return 0; }
-  ioctl_t real=(ioctl_t)dlsym(RTLD_NEXT,"ioctl"); return real ? real(fd,req,arg) : -1;
-}
-#endif
-
-#ifdef XENOID_ENABLE_NETLINK_SAFE
-#include <sys/socket.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
-static int nl_fds[128];
-static int nl_count = 0;
-typedef int (*socket_t)(int,int,int);
-int socket(int domain, int type, int protocol) {
-  socket_t real=(socket_t)dlsym(RTLD_NEXT,"socket");
-  int fd=real?real(domain,type,protocol):-1;
-  if(fd>=0 && domain==AF_NETLINK && protocol==NETLINK_ROUTE && nl_count<128) nl_fds[nl_count++]=fd;
-  return fd;
-}
-static int is_nl(int fd){ for(int i=0;i<nl_count;i++) if(nl_fds[i]==fd) return 1; return 0; }
-static void patch_netlink_mac_safe(void *buf, ssize_t len) {
-  unsigned char mac[6]; fake_mac_bytes(mac);
-  for (struct nlmsghdr *nlh=(struct nlmsghdr*)buf; NLMSG_OK(nlh,(unsigned int)len); nlh=NLMSG_NEXT(nlh,len)) {
-    if(nlh->nlmsg_type!=RTM_NEWLINK) continue;
-    struct ifinfomsg *ifi=(struct ifinfomsg*)NLMSG_DATA(nlh);
-    int attrlen=nlh->nlmsg_len-NLMSG_LENGTH(sizeof(*ifi));
-    for(struct rtattr *rta=IFLA_RTA(ifi); RTA_OK(rta,attrlen); rta=RTA_NEXT(rta,attrlen)) {
-      if((rta->rta_type==IFLA_ADDRESS || rta->rta_type==IFLA_BROADCAST) && RTA_PAYLOAD(rta)>=6) memcpy(RTA_DATA(rta),mac,6);
-    }
-  }
-}
-typedef ssize_t (*recvmsg_t)(int, struct msghdr*, int);
-ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
-  recvmsg_t real=(recvmsg_t)dlsym(RTLD_NEXT,"recvmsg");
-  ssize_t r=real?real(fd,msg,flags):-1;
-  if(r>0 && is_nl(fd) && msg && msg->msg_iov && msg->msg_iovlen>0) patch_netlink_mac_safe(msg->msg_iov[0].iov_base,r);
-  return r;
 }
 #endif

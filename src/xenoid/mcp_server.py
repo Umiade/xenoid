@@ -96,6 +96,14 @@ def tools() -> list[dict[str, Any]]:
             {"name": {"type": "string"}},
             ["name"],
         ),
+        tool("xenoid_location_list", "List supported device location countries without contacting the runtime"),
+        tool("xenoid_location_status", "Show masked host and Android location identity state", {"check": {"type": "boolean"}}),
+        tool(
+            "xenoid_location_set",
+            "Select the device location country and converge SIM, carrier, LTE cell, locale, and timezone",
+            {"countryCode": {"type": "string"}},
+            ["countryCode"],
+        ),
         tool("xenoid_root_status", "Check daemon root/su helper status"),
         tool("xenoid_root_exec", "Run command through daemon root helper", {"command": {"type": "string"}}, ["command"]),
         tool("xenoid_frida_install", "Download and deploy frida-server", {"version": {"type": "string"}, "arch": {"type": "string"}, "outDir": {"type": "string"}, "remotePath": {"type": "string"}}),
@@ -248,6 +256,38 @@ def proxy_text_result(call: Any) -> dict[str, Any]:
     return text_result(_sanitize_proxy_result(result))
 
 
+def _location_cli_result(runtime: MCPRuntime, command: list[str]) -> dict[str, Any]:
+    """Run one location CLI command and surface its JSON result as tool output."""
+    cli = runtime.context.project_root / "xenoid"
+    try:
+        proc = subprocess.run(
+            [str(cli), "--instance", runtime.context.instance_name, *command],
+            text=True,
+            capture_output=True,
+            cwd=runtime.context.project_root,
+            env=runtime.subprocess_env,
+            timeout=3600,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return text_result({
+            "ok": False,
+            "code": "location_command_failed",
+            "error": "location_command_failed",
+        })
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        data = {
+            "ok": False,
+            "code": "location_command_failed",
+            "error": "location_command_failed",
+            "stderr": proc.stderr[-2000:],
+        }
+    if isinstance(data, dict):
+        data["returncode"] = proc.returncode
+    return text_result(data)
+
+
 def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     context = runtime.context
     cfg = runtime.config
@@ -263,6 +303,7 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
         if not isinstance(ensured, dict) or ensured.get("ok") is not True:
             raise RuntimeError("daemon_unreachable")
         return ProxyController(context, cfg, runtime.lease, mgr, dc)
+
     if name == "xenoid_verify_release":
         script = context.project_root / "scripts" / "verify-release.py"
         proc = subprocess.run(
@@ -451,6 +492,22 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
                 }
             )
         return proxy_text_result(lambda: epc().select(selected_name))
+    if name == "xenoid_location_list":
+        return _location_cli_result(runtime, ["location", "list"])
+    if name == "xenoid_location_status":
+        command = ["location", "status"]
+        if args.get("check"):
+            command.append("--check")
+        return _location_cli_result(runtime, command)
+    if name == "xenoid_location_set":
+        country = args.get("countryCode")
+        if not isinstance(country, str) or not country.strip():
+            return text_result({
+                "ok": False,
+                "code": "location_country_invalid",
+                "error": "location_country_invalid",
+            })
+        return _location_cli_result(runtime, ["location", "set", country.strip()])
     if name == "xenoid_root_status":
         return text_result(edc().root_status())
     if name == "xenoid_root_exec":

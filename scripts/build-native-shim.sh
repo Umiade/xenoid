@@ -11,6 +11,6 @@ BIN=""
 for ndk in "$SDK"/ndk/*; do for pre in darwin-x86_64 darwin-arm64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
 [[ -n "$BIN" ]] || { echo "$TOOL not found" >&2; exit 127; }
 CFLAGS="-shared -fPIC -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2"
-case "$MODE" in stable) ;; ioctl) CFLAGS="$CFLAGS -DXENOID_ENABLE_IOCTL";; prop) CFLAGS="$CFLAGS -DXENOID_ENABLE_PROPERTY_GET";; ioctl-prop) CFLAGS="$CFLAGS -DXENOID_ENABLE_IOCTL -DXENOID_ENABLE_PROPERTY_GET";; netlink) CFLAGS="$CFLAGS -DXENOID_ENABLE_NETLINK_SAFE";; full) CFLAGS="$CFLAGS -DXENOID_ENABLE_IOCTL -DXENOID_ENABLE_PROPERTY_GET -DXENOID_ENABLE_NETLINK_SAFE";; *) echo bad mode >&2; exit 2;; esac
+case "$MODE" in stable) ;; prop) CFLAGS="$CFLAGS -DXENOID_ENABLE_PROPERTY_GET";; *) echo bad mode >&2; exit 2;; esac
 "$BIN" $CFLAGS -o "$OUT" "$ROOT/native/xenoid-shim/xenoid_shim.c" -ldl
 echo "$OUT"

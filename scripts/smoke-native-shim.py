@@ -64,7 +64,6 @@ with tempfile.TemporaryDirectory() as td:
     (t/'probe.c').write_text(source)
     prof = t/'profile'; prof.mkdir()
     (prof/'boot_id').write_text('profile-boot-id\n')
-    (prof/'mac_address').write_text('02:11:22:33:44:55\n')
     (t/'real_boot').write_text('real-boot-id\n')
     (t/'tcp').write_text('  sl  local_address rem_address st\n   0: 00000000:15B3 00000000:0000 0A\n   1: 00000000:1234 00000000:0000 0A\n')
     (t/'maps').write_text('1000-2000 r-xp /data/local/tmp/frida-server\n3000-4000 r-xp /system/lib64/libc.so\n')
@@ -96,7 +95,7 @@ with tempfile.TemporaryDirectory() as td:
     checks = {
         'boot_profile': 'boot=profile-boot-id|' in out,
         'tcp_filtered': ':15B3' not in next((l for l in out.splitlines() if l.startswith('tcp=')), ''),
-        'mac_profile': 'mac=02:11:22:33:44:55|' in out,
+        'mac_real': 'mac=de:ad:be:ef:00:01|' in out,
         'frida_access_hidden': 'access_frida=-1:2' in out,
         'fortified_open': 'open2=0:0' in out,
         'dirent_hidden': 'frida-server' not in out and 'normal' in out,
@@ -112,7 +111,7 @@ with tempfile.TemporaryDirectory() as td:
     zygote_checks = {
         'zygote_uname_fake': 'uname=5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab8977058' in zygote_run.stdout,
         'zygote_boot_cached': 'boot=profile-boot-id|' in zygote_run.stdout,
-        'zygote_mac_cached': 'mac=02:11:22:33:44:55|' in zygote_run.stdout,
+        'zygote_mac_real': 'mac=de:ad:be:ef:00:01|' in zygote_run.stdout,
     }
     ok = run.returncode == 0 and all(checks.values()) and zygote_run.returncode == 0 and all(zygote_checks.values())
     print(json.dumps({'ok': ok, 'checks': checks, 'zygoteChecks': zygote_checks, 'stdout': out, 'zygoteStdout': zygote_run.stdout, 'stderr': run.stderr + zygote_run.stderr}, indent=2))

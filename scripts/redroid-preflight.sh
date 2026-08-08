@@ -43,7 +43,7 @@ else
 fi
 
 if [[ "$OS" == Darwin && -n "${DOCKER_BIN:-}" && -z "${COLIMA_BIN:-}" ]]; then
-  if "$DOCKER_BIN" image inspect redroid/redroid:13.0.0-latest >/dev/null 2>&1; then
+  if "$DOCKER_BIN" image inspect redroid/redroid:13.0.0_64only-latest >/dev/null 2>&1; then
     PROBE_JSON="$(./scripts/probe-redroid-docker.sh 2>/dev/null || true)"
     if echo "$PROBE_JSON" | grep -q '"ExitCode": 129'; then
       add_check redroid_docker_desktop false "redroid exits 129 under Docker Desktop; use Colima/Linux binderfs backend" "brew install colima && colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8"

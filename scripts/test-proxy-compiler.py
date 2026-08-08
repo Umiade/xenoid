@@ -304,10 +304,11 @@ def completed_proxy_status(check_id: int = 9) -> Dict[str, Any]:
     }
     return {
         "ok": True,
+        "instanceId": INSTANCE,
         "enabled": True,
         "generation": 7,
         "checkId": check_id,
-        "runtimeEpoch": "v1-resource-epoch",
+        "runtimeEpoch": EPOCH,
         "udpAllowed": False,
         "probe": {
             "checkId": check_id,
@@ -376,7 +377,7 @@ def daemon_check_capability_schema() -> None:
         timeout=0,
         expected_check_id=9,
         expected_generation=7,
-        expected_runtime_epoch="v1-resource-epoch",
+        expected_runtime_epoch=EPOCH,
     ).get("checkCompleted") is True)
     legacy = completed_proxy_status()
     legacy["probe"] = {
@@ -392,7 +393,7 @@ def daemon_check_capability_schema() -> None:
         timeout=0,
         expected_check_id=9,
         expected_generation=7,
-        expected_runtime_epoch="v1-resource-epoch",
+        expected_runtime_epoch=EPOCH,
     )
     require(result.get("code") == "data_plane_unverified")
 
@@ -785,6 +786,44 @@ def aead_session_cap() -> None:
     envelope = seal_request(c2s, INSTANCE, EPOCH, session, 1, request_id,
                             "desired", 1700000033, {})
     protocol_error(lambda: open_request(c2s, envelope, INSTANCE, EPOCH, replay))
+
+
+@case("exactCheckWithoutRegionEvidence")
+def exact_check_without_region_evidence() -> None:
+    valid = completed_proxy_status()
+    require("egressRegion" not in valid["probe"] and "egressRegion" not in valid["report"])
+    daemon = PendingCheckDaemon()
+    daemon.proxy_status = lambda: copy.deepcopy(valid)
+    require(wait_for_proxy_check(
+        daemon, timeout=0, expected_check_id=9, expected_generation=7,
+        expected_runtime_epoch=EPOCH,
+    ).get("checkCompleted") is True)
+    broken = copy.deepcopy(valid)
+    broken["probe"]["capabilities"]["v4TcpProxy"] = False
+    daemon.proxy_status = lambda: copy.deepcopy(broken)
+    require(wait_for_proxy_check(
+        daemon, timeout=0, expected_check_id=9, expected_generation=7,
+        expected_runtime_epoch=EPOCH,
+    ).get("code") == "data_plane_unverified")
+    stale = copy.deepcopy(valid)
+    stale["probe"]["checkId"] = 8
+    daemon.proxy_status = lambda: copy.deepcopy(stale)
+    require(wait_for_proxy_check(
+        daemon, timeout=0, expected_check_id=9, expected_generation=7,
+        expected_runtime_epoch=EPOCH,
+    ).get("code") == "proxy_check_timeout")
+
+
+@case("bindIdentityOperationRemoved")
+def bind_identity_operation_removed() -> None:
+    if not dependency_or_continue():
+        return
+    c2s, _ = keys()
+    protocol_error(lambda: seal_request(
+        c2s, INSTANCE, EPOCH, SESSION, 11, REQUEST, "bindIdentity", 1700000003,
+        {"generation": 7, "checkId": 9, "regionKey": "SG/Asia/Singapore",
+         "evidenceDigest": "a" * 64, "profileDigest": "b" * 64},
+    ))
 
 
 def main() -> int:

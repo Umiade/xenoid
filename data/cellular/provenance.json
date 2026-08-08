@@ -1,0 +1,77 @@
+{
+  "derivedArtifact": {
+    "path": "data/cellular/carriers.json",
+    "sha256": "3aa19173c09f91921b51ebb78b5a46a2319573d06cb68b2918e83ef1b84df8f1"
+  },
+  "policy": "Only country/operator/APN/LTE combinations present in the maintained intersection are selectable; missing countries fail closed.",
+  "schema": "dev.xenoid.cellular-data-provenance/v1",
+  "snapshotDate": "2026-08-08",
+  "sources": [
+    {
+      "fields": [
+        "countryCode",
+        "callingCode",
+        "mcc",
+        "mnc",
+        "operatorName"
+      ],
+      "license": "MIT",
+      "licenseUrl": "https://raw.githubusercontent.com/musalbas/mcc-mnc-table/master/LICENSE",
+      "name": "mcc-mnc-table",
+      "sha256": "8a09618ef23ef1f7018ef256f5e889a61098e2024fb9e9016381155e6f7ad03b",
+      "url": "https://raw.githubusercontent.com/musalbas/mcc-mnc-table/master/mcc-mnc-table.json"
+    },
+    {
+      "fields": [
+        "mcc",
+        "mnc",
+        "apn"
+      ],
+      "license": "Apache-2.0",
+      "licenseUrl": "https://source.android.com/docs/setup/about/licenses",
+      "name": "AOSP Android 13 APN configuration",
+      "sha256": "3f056e0c57a54a8bef6cb269274b8fd7d03e61771ac14bea0afc1a57465ef7ad",
+      "url": "https://android.googlesource.com/device/sample/+/refs/heads/android13-s3-release/etc/apns-full-conf.xml"
+    },
+    {
+      "fields": [
+        "localeCandidates",
+        "callingCode"
+      ],
+      "license": "Unicode-3.0",
+      "licenseUrl": "https://www.unicode.org/license.txt",
+      "name": "Unicode CLDR supplemental territory data",
+      "url": "https://github.com/unicode-org/cldr"
+    },
+    {
+      "fields": [
+        "ianaTimezones"
+      ],
+      "license": "Public-domain and permissive component notices",
+      "licenseUrl": "https://data.iana.org/time-zones/tzdb/README",
+      "name": "IANA Time Zone Database",
+      "url": "https://www.iana.org/time-zones"
+    },
+    {
+      "fields": [
+        "lteBands",
+        "earfcnRanges"
+      ],
+      "license": "Standards facts used as an interoperable numeric subset",
+      "name": "3GPP TS 36.101 LTE band tables",
+      "url": "https://www.3gpp.org/dynareport/36101.htm"
+    },
+    {
+      "fields": [
+        "msisdnTemplate",
+        "msisdnNationalLengths",
+        "msisdnNationalPattern"
+      ],
+      "license": "Apache-2.0",
+      "licenseUrl": "https://github.com/google/libphonenumber/blob/master/LICENSE",
+      "name": "libphonenumber PhoneNumberMetadata.xml",
+      "sha256": "9d93b18cbaffe4c996abe5ca63763385301ec899be5d2821d7ed53828447fc0e",
+      "url": "https://raw.githubusercontent.com/google/libphonenumber/master/resources/PhoneNumberMetadata.xml"
+    }
+  ]
+}

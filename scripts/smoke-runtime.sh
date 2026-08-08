@@ -308,7 +308,7 @@ PY
 else add hide_root_surfaces false "$(cat /tmp/xenoid-smoke-hide-files.out)"; fi
 
 
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'test -x /data/local/tmp/xenoid-netctl && /data/local/tmp/xenoid-netctl status eth0' >/tmp/xenoid-smoke-netctl.out 2>&1; then
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'test -x /system/bin/xenoid-netctl && /system/bin/xenoid-netctl status rmnet_data0' >/tmp/xenoid-smoke-netctl.out 2>&1; then
   netctl_summary=$(python3 - <<'PY2'
 import json
 try:
@@ -322,18 +322,22 @@ PY2
 else
   add netctl_identity false "$(cat /tmp/xenoid-smoke-netctl.out)"
 fi
-"$XENOID_BIN" device set network.mtu 1500 >/tmp/xenoid-smoke-network-mtu.out 2>&1 || true
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /proc/net/dev ]; then grep -q "eth0:" /proc/net/dev && grep -q "eth0" /proc/net/route && { [ ! -e /sys/class/net/eth0/mtu ] || test "$(cat /sys/class/net/eth0/mtu 2>/dev/null)" = 1500; } && { [ ! -e /sys/class/net/eth0/operstate ] || test "$(cat /sys/class/net/eth0/operstate 2>/dev/null)" = up; } && { [ ! -e /sys/class/net/eth0/addr_assign_type ] || test "$(cat /sys/class/net/eth0/addr_assign_type 2>/dev/null)" = 0; }; else exit 77; fi' >/tmp/xenoid-smoke-network-overlay.out 2>&1; then add network_overlay true "proc/net dev+route and eth0 sysfs sanitized"; else rc=$?; if [ "$rc" = 77 ]; then add network_overlay true "no /proc/net/dev on this runtime; skip"; else add network_overlay false "$(cat /tmp/xenoid-smoke-network-overlay.out)"; fi; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /proc/net/dev ]; then grep -q "rmnet_data0:" /proc/net/dev && ! grep -q "eth0:" /proc/net/dev && grep -q "rmnet_data0" /proc/net/route && { [ ! -e /sys/class/net/rmnet_data0/mtu ] || test "$(cat /sys/class/net/rmnet_data0/mtu 2>/dev/null)" = 1500; } && { [ ! -e /sys/class/net/rmnet_data0/operstate ] || test "$(cat /sys/class/net/rmnet_data0/operstate 2>/dev/null)" = up; } && { [ ! -e /sys/class/net/rmnet_data0/addr_assign_type ] || test "$(cat /sys/class/net/rmnet_data0/addr_assign_type 2>/dev/null)" = 3; }; else exit 77; fi' >/tmp/xenoid-smoke-network-overlay.out 2>&1; then add network_overlay true "rmnet_data0 is the only data interface across procfs and sysfs"; else rc=$?; if [ "$rc" = 77 ]; then add network_overlay true "no /proc/net/dev on this runtime; skip"; else add network_overlay false "$(cat /tmp/xenoid-smoke-network-overlay.out)"; fi; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'ip rule show | grep -Eq "^999:.*to .*lookup main[[:space:]]*$" && ip -6 rule show | grep -Eq "^999:.*to .*lookup main[[:space:]]*$"' >/tmp/xenoid-smoke-cellular-control-routes.out 2>&1; then add cellular_control_routes true "IPv4/IPv6 connected-prefix rules preserve host control before netd ownership"; else add cellular_control_routes false "$(cat /tmp/xenoid-smoke-cellular-control-routes.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="frida|xenoid|magisk|zygisk|lsposed|riru|27042|15B3|69A2|69A3"; ! grep -Eiq "$bad" /proc/net/unix /proc/net/udp /proc/net/udp6 /proc/net/raw /proc/net/raw6 2>/dev/null' >/tmp/xenoid-smoke-proc-net.out 2>&1; then add proc_net_tables true "unix/udp/raw tables sanitized"; else add proc_net_tables false "$(cat /tmp/xenoid-smoke-proc-net.out)"; fi
 
 if ./scripts/smoke-prop-files.sh >/tmp/xenoid-smoke-prop-files.out 2>&1; then add prop_files true "$(cat /tmp/xenoid-smoke-prop-files.out)"; else add prop_files false "$(cat /tmp/xenoid-smoke-prop-files.out)"; fi
 
 # Summarize missing or duplicate overlay targets.
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper status-json' >/tmp/xenoid-smoke-overlay-status.out 2>&1; then
+if as_root 'test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper status-json' >/tmp/xenoid-smoke-overlay-status.out 2>&1; then
   overlay_summary=$(python3 - <<'PY2'
 import json
 try:
     j=json.load(open('/tmp/xenoid-smoke-overlay-status.out'))
+    for _ in range(3):
+        if not isinstance(j, dict) or not isinstance(j.get('stdout'), str):
+            break
+        j=json.loads(j['stdout'])
     targets=j.get('targets',[])
     missing=[t['target'] for t in targets if t.get('expected') and not t.get('overlay')]
     dup=[t['target'] for t in targets if t.get('mountCount',0)>1]

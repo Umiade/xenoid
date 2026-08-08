@@ -42,6 +42,12 @@ SYSTEM_EXTRA = {
     "ro.build.display.id": "TP1A.221005.002",
     "ro.build.description": "raven-user 13 TP1A.221005.002 8977058 release-keys",
     "ro.bootmode": "normal",
+    "ro.telephony.default_network": "9",
+    "ro.telephony.sim.count": "1",
+}
+VENDOR_EXTRA = {
+    "ro.radio.noril": "no",
+    "vendor.rild.libpath": "/vendor/lib64/libxenoid-ril.so",
 }
 SKIP_APPEND_KEYS = set()  # ro.hardware=tensor is baked into vendor/build.prop
 
@@ -84,6 +90,8 @@ def main() -> int:
         append = [l for l in texts[var] if l.split("=", 1)[0] not in SKIP_APPEND_KEYS]
         if name == "system_build.prop":
             append += [f"{k}={v}" for k, v in SYSTEM_EXTRA.items()]
+        elif name == "vendor_build.prop":
+            append += [f"{k}={v}" for k, v in VENDOR_EXTRA.items()]
         drop_keys = {l.split("=", 1)[0] for l in append}
         kept = [l for l in stock.splitlines()
                 if not l.strip().startswith("#") and l.split("=", 1)[0] not in drop_keys]

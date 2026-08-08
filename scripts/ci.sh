@@ -69,6 +69,7 @@ tools={t['name'] for t in lines[1]['result']['tools']}
 need={'xenoid_doctor','xenoid_start','xenoid_up_plan','xenoid_device_apply','xenoid_hide_apply','xenoid_ebpf_status','xenoid_frida_load_script','xenoid_verify_release'}
 need.add('xenoid_frida_install')
 need.update({'xenoid_proxy_status','xenoid_proxy_check','xenoid_proxy_on','xenoid_proxy_off','xenoid_proxy_clear','xenoid_proxy_select'})
+need.update({'xenoid_location_list','xenoid_location_status','xenoid_location_set'})
 missing=sorted(need-tools)
 if missing: print('missing MCP tools: '+', '.join(missing)); sys.exit(1)
 print(f'mcp tools ok ({len(tools)})')

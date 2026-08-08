@@ -42,6 +42,66 @@ final class RootHelper {
         return execRootd(command, 20000);
     }
 
+    static boolean persistLocationState(File source, int appUid) {
+        if (source == null || !source.getName().equals("location-identity.json")
+                || source.getParentFile() == null || !source.getParentFile().getName().equals("no_backup")
+                || appUid <= 0 || !source.isFile() || source.length() <= 0 || source.length() > 64 * 1024) {
+            return false;
+        }
+        String command = "set -eu;s=" + shellQuote(source.getAbsolutePath())
+                + ";d=/data/vendor/radio/xenoid;u=" + appUid + ";"
+                + "[ -f $s ];[ ! -L $s ];[ $(stat -c %u $s) = $u ];"
+                + "if [ -e $d ];then [ -d $d ];[ ! -L $d ];else mkdir -p $d;fi;"
+                + "chown 1001:1001 $d;chmod 750 $d;umask 077;"
+                + "rm -f $d/.location-state.v1.tmp;cp -- $s $d/.location-state.v1.tmp;"
+                + "chown 0:1001 $d/.location-state.v1.tmp;chmod 640 $d/.location-state.v1.tmp;"
+                + "sync -f $d/.location-state.v1.tmp;mv -f $d/.location-state.v1.tmp $d/location-state.v1;sync -f $d;"
+                + "[ $(stat -c %u:%g:%a $d/location-state.v1) = 0:1001:640 ]";
+        return Boolean.TRUE.equals(execRootd(command, 20000).get("ok"));
+    }
+
+    static boolean restoreLocationState(File destination, int appUid) {
+        if (destination == null || !destination.getName().equals("location-identity.json")
+                || destination.getParentFile() == null
+                || !destination.getParentFile().getName().equals("no_backup") || appUid <= 0) {
+            return false;
+        }
+        String command = "set -eu;s=/data/vendor/radio/xenoid/location-state.v1;d="
+                + shellQuote(destination.getAbsolutePath()) + ";u=" + appUid + ";"
+                + "[ -f $s ];[ ! -L $s ];n=$(stat -c %s $s);[ $n -gt 0 ];[ $n -le 65536 ];"
+                + "p=${d%/*};[ -d $p ];[ ! -L $p ];rm -f $p/.location-identity.restore;"
+                + "cp -- $s $p/.location-identity.restore;chown $u:$u $p/.location-identity.restore;"
+                + "chmod 600 $p/.location-identity.restore;sync -f $p/.location-identity.restore;"
+                + "mv -f $p/.location-identity.restore $d;sync -f $p;"
+                + "[ $(stat -c %u:%g:%a:%s $d) = $u:$u:600:$n ]";
+        return Boolean.TRUE.equals(execRootd(command, 20000).get("ok"));
+    }
+
+    static boolean publishLocationProfile(File source, String destination, long size, String sha256) {
+        if (source == null || !source.getName().equals("location-profile.stage")
+                || !source.getParentFile().getName().equals("no_backup")
+                || !"/data/vendor/radio/xenoid/profile.v1".equals(destination)
+                || size <= 0 || size > 64 * 1024
+                || sha256 == null || !sha256.matches("[0-9a-f]{64}")) return false;
+        String command = "set -eu;s=" + shellQuote(source.getAbsolutePath())
+                + ";d=/data/vendor/radio/xenoid;n=" + size + ";h=" + sha256 + ";"
+                + "[ -f $s ];[ ! -L $s ];[ $(stat -c %s $s) = $n ];"
+                + "x=$(sha256sum $s);x=${x%% *};[ $x = $h ];"
+                + "if [ -e $d ];then [ -d $d ];[ ! -L $d ];else mkdir -p $d;fi;"
+                + "chown 1001:1001 $d;chmod 750 $d;umask 077;"
+                + "rm -f $d/.profile.v1.tmp;cp -- $s $d/.profile.v1.tmp;"
+                + "chown 1001:1001 $d/.profile.v1.tmp;chmod 640 $d/.profile.v1.tmp;"
+                + "sync -f $d/.profile.v1.tmp;mv -f $d/.profile.v1.tmp $d/profile.v1;sync -f $d;"
+                + "[ $(stat -c %u:%g:%a:%s $d/profile.v1) = 1001:1001:640:$n ];"
+                + "x=$(sha256sum $d/profile.v1);x=${x%% *};[ $x = $h ]";
+        return Boolean.TRUE.equals(execRootd(command, 20000).get("ok"));
+    }
+
+    /** Removes the abandoned pre-location regional state copies owned by rootd. */
+    static void purgeLegacyRegionalState() {
+        execRootd("rm -f /data/vendor/radio/xenoid/state.v1", 20000);
+    }
+
     private static Map<String,Object> execRootd(String command, int readTimeoutMs) {
         Map<String,Object> out = new LinkedHashMap<>();
         HttpURLConnection c = null;

@@ -7,16 +7,18 @@ import hashlib
 import getpass
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
 from .backend import RuntimeManager
+from .cellular import CellularError, encode_profile_v1
 from .config import (
     InstanceError,
     initialize_instance,
@@ -33,6 +35,18 @@ from .daemon_client import (
     DaemonClient,
 )
 from .doctor import build_doctor_report
+from .location import (
+    DEFAULT_COUNTRY,
+    LocationError,
+    LocationStateStore,
+    STAGE_SCHEMA,
+    convergence_action,
+    location_runtime_epoch,
+    masked_android_status,
+    normalize_country,
+    public_summary,
+    supported_countries,
+)
 from .proxy_controller import ProxyController
 from .util import json_dumps, read_json_file, write_json_file
 
@@ -196,6 +210,18 @@ def cmd_build_gralloc(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_build_ril(args: argparse.Namespace) -> int:
+    result = run_script(args, "build-ril.sh")
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_build_radio_config(args: argparse.Namespace) -> int:
+    result = run_script(args, "build-radio-config.sh")
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
 def cmd_verify_release(args: argparse.Namespace) -> int:
     script = args.project_root / "scripts" / "verify-release.py"
     proc = subprocess.run(
@@ -239,6 +265,8 @@ def cmd_build_all(args: argparse.Namespace) -> int:
         ("sensorsHal", [root / "scripts" / "build-sensors-hal.sh", "arm64"]),
         ("gralloc", [root / "scripts" / "build-gralloc.sh", "arm64"]),
         ("cameraProvider", [root / "scripts" / "build-camera-hal.sh", "arm64"]),
+        ("ril", [root / "scripts" / "build-ril.sh", "arm64"]),
+        ("radioConfig", [root / "scripts" / "build-radio-config.sh", "arm64"]),
         ("shimArm64", [root / "scripts" / "build-native-shim.sh", "arm64", "prop"]),
         ("pivot", [root / "scripts" / "build-native-for-arch.sh", "xenoid-pivot", root / "native" / "xenoid-pivot" / "xenoid_pivot.c", root / "native" / "xenoid-pivot" / "xenoid-pivot", "arm64", "static"]),
         ("propArea", [root / "scripts" / "build-native-for-arch.sh", "xenoid-prop-area", root / "native" / "xenoid-hide" / "xenoid_prop_area.c", root / "native" / "xenoid-hide" / "xenoid-prop-area", "arm64"]),
@@ -324,12 +352,15 @@ def cmd_config_set(args: argparse.Namespace) -> int:
 
 def cmd_runtime_build_image(args: argparse.Namespace) -> int:
     mgr = runtime(args)
+    if args.dry_run:
+        # A dry-run is a plan: it must not contact the Docker engine, so it
+        # also works with an unconfigured or unreachable docker context.
+        planned_context = str(mgr.context.state_root / "runtime-context" / "<pending>")
+        print_json({"ok": True, "dryRun": True, "context": planned_context, "command": [*mgr.docker_base_cmd(), "build", "-t", args.tag, planned_context]})
+        return 0
     ctx = mgr.make_runtime_context(args.image)
     if not ctx.get("ok"):
         print_json(ctx); return 1
-    if args.dry_run:
-        print_json({"ok": True, "dryRun": True, "context": ctx.get("context"), "command": [*(runtime(args).docker_base_cmd()), "build", "-t", args.tag, ctx.get("context")]})
-        return 0
     proc = subprocess.run([*(runtime(args).docker_base_cmd()), "build", "-t", args.tag, ctx.get("context")], text=True, capture_output=True)
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "tag": args.tag, "context": ctx.get("context")}
     print_json(result)
@@ -340,7 +371,7 @@ def cmd_runtime_build_image(args: argparse.Namespace) -> int:
 
 def cmd_start(args: argparse.Namespace) -> int:
     mgr = runtime(args)
-    result = mgr.start(dry_run=args.dry_run, wait=not args.no_wait, install_daemon_apk=args.install_daemon, start_colima=args.start_colima, adb_root=not args.no_adb_root, skip_preflight=args.skip_preflight, recreate=args.recreate)
+    result = mgr.start(dry_run=args.dry_run, wait=not args.no_wait, install_daemon_apk=args.install_daemon, start_colima=args.start_colima, adb_root=not args.no_adb_root, skip_preflight=args.skip_preflight, recreate=args.recreate, defer_proxy=args.defer_proxy)
     print_json(result)
     return 0 if result.get("ok") or args.dry_run else 1
 
@@ -956,6 +987,12 @@ def cmd_proxy_clear(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_proxy_reconcile(args: argparse.Namespace) -> int:
+    return _emit_proxy_result(
+        _call_proxy_controller(args, lambda controller: controller.reconcile_desired())
+    )
+
+
 def cmd_proxy_list(args: argparse.Namespace) -> int:
     status_result = _call_proxy_controller(
         args,
@@ -992,10 +1029,7 @@ def cmd_proxy_list(args: argparse.Namespace) -> int:
 
 def cmd_proxy_select(args: argparse.Namespace) -> int:
     return _emit_proxy_result(
-        _call_proxy_controller(
-            args,
-            lambda controller: controller.select(args.name),
-        )
+        _call_proxy_controller(args, lambda controller: controller.select(args.name))
     )
 
 
@@ -1230,6 +1264,316 @@ def cmd_camera_apply(args: argparse.Namespace) -> int:
     if client is None:
         return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
     return _emit_camera_result(_camera_request(client.camera_apply))
+
+
+def _location_failure(code: str) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": code}
+
+
+def _location_daemon_apk(args: argparse.Namespace) -> Optional[str]:
+    apk = args.project_root / "daemon" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
+    return str(apk) if apk.is_file() else None
+
+
+def _location_epoch(manager: RuntimeManager) -> str:
+    container_id = manager.location_runtime_container_id()
+    return location_runtime_epoch(container_id) if container_id else ""
+
+
+def _location_android_status(client: DaemonClient) -> Optional[dict[str, Any]]:
+    try:
+        status = client.location_status()
+    except Exception:
+        return None
+    if not isinstance(status, dict) or status.get("ok") is not True:
+        return None
+    if status.get("state") == "absent":
+        return None
+    return status
+
+
+def _location_error_code(result: Any, fallback: str) -> str:
+    if isinstance(result, dict):
+        for key in ("code", "error"):
+            candidate = result.get(key)
+            if isinstance(candidate, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate):
+                return candidate
+    return fallback
+
+
+def _location_stage(
+    store: LocationStateStore,
+    client: DaemonClient,
+    state: Mapping[str, Any],
+    runtime_epoch: str,
+    *,
+    mark: bool,
+) -> None:
+    profile = store.target_profile(state)
+    encoded = encode_profile_v1(profile)
+    request = {
+        "schema": STAGE_SCHEMA,
+        "profile": profile,
+        "encodedProfile": base64.b64encode(encoded).decode("ascii"),
+        "profileDigest": profile["identityDigest"],
+        "locationKey": profile["locationKey"],
+        "runtimeEpoch": runtime_epoch,
+    }
+    result = client.location_stage(request)
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise LocationError(_location_error_code(result, "location_stage_failed"))
+    if mark:
+        store.mark_staged(runtime_epoch)
+
+
+def _location_converge(
+    args: argparse.Namespace,
+    manager: RuntimeManager,
+    store: LocationStateStore,
+    *,
+    rebind_proxy: bool,
+) -> dict[str, Any]:
+    """Drive the persisted location transaction to a verified steady state."""
+    recreated = False
+    verify_failures = 0
+    verified_payload: Optional[dict[str, Any]] = None
+    for _ in range(12):
+        state = store.load()
+        if state is None:
+            raise LocationError("location_state_missing")
+        epoch = _location_epoch(manager)
+        client: Optional[DaemonClient] = None
+        android: Optional[dict[str, Any]] = None
+        if epoch:
+            ensured = manager.ensure_daemon(readiness_timeout=90.0)
+            if isinstance(ensured, dict) and ensured.get("ok") is True:
+                client = daemon(args, manager)
+                android = _location_android_status(client)
+        action = convergence_action(state, android, epoch)
+        step = action.get("step")
+        if step == "noop":
+            break
+        if step == "bootstrap":
+            started = manager.start(
+                wait=True,
+                install_daemon_apk=_location_daemon_apk(args),
+                start_colima=manager.should_use_colima(),
+                adb_root=False,
+                skip_preflight=True,
+                recreate=False,
+                defer_proxy=True,
+            )
+            if not isinstance(started, dict) or started.get("ok") is not True:
+                raise LocationError("location_runtime_start_failed")
+            continue
+        if step == "stage":
+            if not epoch or client is None:
+                raise LocationError("daemon_unreachable")
+            _location_stage(store, client, state, epoch, mark=True)
+            if action.get("recreate"):
+                store.arm_restart()
+            continue
+        if step == "recreate":
+            started = manager.start(
+                wait=True,
+                install_daemon_apk=_location_daemon_apk(args),
+                start_colima=manager.should_use_colima(),
+                adb_root=False,
+                skip_preflight=True,
+                recreate=True,
+                defer_proxy=True,
+            )
+            if not isinstance(started, dict) or started.get("ok") is not True:
+                raise LocationError("location_recreate_failed")
+            recreated = True
+            continue
+        if step == "resume":
+            store.mark_restarted(str(action["runtimeEpoch"]))
+            continue
+        if step == "verify":
+            if not epoch or client is None:
+                raise LocationError("daemon_unreachable")
+            if action.get("restage"):
+                _location_stage(store, client, state, epoch, mark=False)
+                state = store.load()
+                if state is None:
+                    raise LocationError("location_state_missing")
+            digest = store.target_profile(state)["identityDigest"]
+            verified = client.location_verify(digest, epoch)
+            if (
+                isinstance(verified, dict)
+                and verified.get("ok") is True
+                and verified.get("verified") is True
+            ):
+                verified_payload = verified
+                if action.get("promote"):
+                    store.promote(epoch)
+                else:
+                    store.mark_validated(epoch)
+                continue
+            if not action.get("promote"):
+                # Active refresh failed read-back: escalate once into the pending
+                # restore transaction so the identity is restaged and the container
+                # epoch rotates exactly once through the same crash-safe path.
+                active = state.get("active")
+                if not isinstance(active, Mapping):
+                    raise LocationError(_location_error_code(verified, "location_identity_unverified"))
+                store.set_desired(str(active["country"]))
+                continue
+            # A fresh container can outlast one verify budget while the data
+            # call comes up after the app-data wipe; allow exactly one retry.
+            verify_failures += 1
+            if verify_failures < 2:
+                continue
+            raise LocationError(_location_error_code(verified, "location_identity_unverified"))
+        raise LocationError("location_phase_invalid")
+    else:
+        raise LocationError("location_convergence_failed")
+
+    legacy_cleaned = True
+    try:
+        store.drop_legacy()
+    except LocationError:
+        legacy_cleaned = False
+    proxy_rebind: dict[str, Any] = {"ok": True, "skipped": True}
+    if rebind_proxy:
+        try:
+            rebound = manager.reconcile_proxy_desired()
+            proxy_rebind = rebound if isinstance(rebound, dict) else _location_failure(
+                "proxy_reconcile_failed"
+            )
+        except Exception:
+            proxy_rebind = _location_failure("proxy_reconcile_failed")
+    state = store.load()
+    result: dict[str, Any] = {
+        "ok": True,
+        "recreated": recreated,
+        "identity": public_summary(state),
+        "android": masked_android_status(verified_payload),
+        "proxyRebind": proxy_rebind,
+    }
+    if not legacy_cleaned:
+        result["legacyCleanup"] = False
+    return result
+
+
+def cmd_location_list(args: argparse.Namespace) -> int:
+    try:
+        store = LocationStateStore(args.context.state_root)
+        try:
+            state = store.load()
+        except LocationError:
+            state = None
+        active = state.get("active") if isinstance(state, Mapping) else None
+        result = {
+            "ok": True,
+            "defaultCountry": DEFAULT_COUNTRY,
+            "desiredCountry": state.get("desiredCountry") if isinstance(state, Mapping) else None,
+            "activeCountry": active.get("country") if isinstance(active, Mapping) else None,
+            "countries": supported_countries(),
+        }
+    except (CellularError, LocationError) as exc:
+        result = _location_failure(exc.code)
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_location_status(args: argparse.Namespace) -> int:
+    try:
+        store = LocationStateStore(args.context.state_root)
+        state = store.load()
+        host = public_summary(state)
+        manager = runtime(args)
+        epoch = _location_epoch(manager)
+        android: dict[str, Any] = {"ok": False, "error": "runtime_not_running"}
+        if epoch:
+            try:
+                android = masked_android_status(daemon(args, manager).location_status())
+            except Exception:
+                android = {"ok": False, "error": "daemon_unreachable"}
+        checked = True
+        if args.check:
+            active = state.get("active") if isinstance(state, Mapping) else None
+            checked = bool(
+                isinstance(active, Mapping)
+                and android.get("ok") is True
+                and android.get("state") == "active"
+                and android.get("profileDigest") == active.get("profileDigest")
+                and epoch
+                and android.get("runtimeEpoch") == epoch
+            )
+        result = {"ok": bool(checked), "host": host, "android": android}
+    except (CellularError, LocationError, InstanceError) as exc:
+        result = _location_failure(exc.code)
+    except Exception:
+        result = _location_failure("location_status_failed")
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_location_set(args: argparse.Namespace) -> int:
+    try:
+        manager = runtime(args)
+        store = LocationStateStore(args.context.state_root)
+        target = normalize_country(args.country)
+        store.ensure(args.context.instance_id, target)
+        store.set_desired(target)
+        result = _location_converge(args, manager, store, rebind_proxy=True)
+    except (CellularError, LocationError, InstanceError) as exc:
+        result = _location_failure(exc.code)
+    except Exception:
+        result = _location_failure("location_convergence_failed")
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_location_apply(args: argparse.Namespace) -> int:
+    """Internal production path used by xenoid-up: converge the persisted location."""
+    try:
+        manager = runtime(args)
+        store = LocationStateStore(args.context.state_root)
+        default = normalize_country(args.default) if args.default else None
+        state, _ = store.ensure(args.context.instance_id, default)
+        store.set_desired(str(state["desiredCountry"]))
+        result = _location_converge(args, manager, store, rebind_proxy=False)
+    except (CellularError, LocationError, InstanceError) as exc:
+        result = _location_failure(exc.code)
+    except Exception:
+        result = _location_failure("location_convergence_failed")
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_cellular_status(args: argparse.Namespace) -> int:
+    """Low-level radio smoke view: daemon location state plus radio properties."""
+    try:
+        manager = runtime(args)
+        store = LocationStateStore(args.context.state_root)
+        try:
+            host = public_summary(store.load())
+        except LocationError:
+            host = {"state": "invalid"}
+        client = daemon_ensured(args)
+        location = masked_android_status(client.location_status())
+        props: dict[str, str] = {}
+        for name in (
+            "persist.xenoid.radio.profile_digest",
+            "persist.xenoid.radio.lte_band",
+            "persist.xenoid.radio.lte_bandwidth_khz",
+            "gsm.operator.numeric",
+            "gsm.sim.state",
+            "persist.sys.locale",
+            "persist.sys.timezone",
+        ):
+            out = manager.adb(["shell", "getprop", name])
+            props[name] = out.get("stdout", "").strip() if out.get("ok") else ""
+        result = {"ok": bool(location.get("ok")), "host": host, "radio": props, "location": location}
+    except (CellularError, LocationError, InstanceError) as exc:
+        result = _location_failure(exc.code)
+    except Exception:
+        result = _location_failure("cellular_status_failed")
+    print_json(result)
+    return 0 if result.get("ok") else 1
 
 
 def cmd_root_status(args: argparse.Namespace) -> int:
@@ -1652,6 +1996,10 @@ def build_parser() -> argparse.ArgumentParser:
     bn.set_defaults(func=cmd_build_netctl)
     bg = bsub.add_parser("gralloc")
     bg.set_defaults(func=cmd_build_gralloc)
+    br = bsub.add_parser("ril")
+    br.set_defaults(func=cmd_build_ril)
+    brc = bsub.add_parser("radio-config")
+    brc.set_defaults(func=cmd_build_radio_config)
     ba = bsub.add_parser("all")
     ba.set_defaults(func=cmd_build_all)
 
@@ -1701,6 +2049,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-adb-root", action="store_true", help="skip adb root after boot")
     s.add_argument("--skip-preflight", action="store_true", help="skip runtime preflight checks")
     s.add_argument("--recreate", action="store_true", help="replace an existing container so image and runtime arguments take effect")
+    s.add_argument("--defer-proxy", action="store_true", help="defer proxy convergence to the caller (internal up/location path)")
     s.set_defaults(func=cmd_start)
 
     s = sub.add_parser("stop", help="stop Android runtime")
@@ -1731,6 +2080,25 @@ def build_parser() -> argparse.ArgumentParser:
     ds.set_defaults(func=cmd_daemon_start)
     de = dsub.add_parser("ensure")
     de.set_defaults(func=cmd_daemon_ensure)
+    s = sub.add_parser("location", help="manage the explicit, proxy-independent device location identity")
+    location = s.add_subparsers(required=True)
+    location_list = location.add_parser("list", help="list supported countries without contacting the runtime")
+    location_list.set_defaults(func=cmd_location_list)
+    location_status = location.add_parser("status", help="show masked host and Android location identity state")
+    location_status.add_argument("--check", action="store_true", help="require matching active host and Android digests in the current runtime epoch")
+    location_status.set_defaults(func=cmd_location_status)
+    location_set = location.add_parser("set", help="select a country and converge SIM, carrier, LTE cell, locale, and timezone")
+    location_set.add_argument("country", help="ISO 3166-1 alpha-2 country code (see location list)")
+    location_set.set_defaults(func=cmd_location_set)
+    location_apply = location.add_parser("apply", help="converge the persisted location identity (internal up path)")
+    location_apply.add_argument("--default", help="country applied when no location state exists yet")
+    location_apply.set_defaults(func=cmd_location_apply)
+
+    s = sub.add_parser("cellular", help="low-level cellular radio smoke view")
+    cellular = s.add_subparsers(required=True)
+    cellular_status = cellular.add_parser("status", help="show masked location state and radio properties")
+    cellular_status.set_defaults(func=cmd_cellular_status)
+
     s = sub.add_parser(
         "proxy",
         help="manage the selected instance global proxy without putting credentials in argv",
@@ -1860,6 +2228,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     proxy_prepare.add_argument("--asset", metavar="FILE")
     proxy_prepare.set_defaults(func=cmd_proxy_prepare)
+    proxy_reconcile = proxy.add_parser(
+        "reconcile",
+        help="converge the persisted proxy desired state (internal up path)",
+    )
+    proxy_reconcile.set_defaults(func=cmd_proxy_reconcile)
 
     s = sub.add_parser("camera", help="configure Android-owned camera media")
     camera = s.add_subparsers(required=True)
@@ -2047,11 +2420,11 @@ def build_parser() -> argparse.ArgumentParser:
     nd.add_argument("--remote-path", default="/data/local/tmp/xenoid-netctl")
     nd.set_defaults(func=cmd_netctl_deploy)
     ns = net.add_parser("status")
-    ns.add_argument("--ifname", default="eth0")
+    ns.add_argument("--ifname", default="rmnet_data0")
     ns.set_defaults(func=cmd_netctl_status)
     nm = net.add_parser("set-mac")
     nm.add_argument("mac")
-    nm.add_argument("--ifname", default="eth0")
+    nm.add_argument("--ifname", default="rmnet_data0")
     nm.set_defaults(func=cmd_netctl_set_mac)
 
 

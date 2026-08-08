@@ -5,8 +5,8 @@
 Runtime commands:
 
 ```sh
-/data/local/tmp/xenoid-netctl status eth0
-/data/local/tmp/xenoid-netctl set-mac eth0 02:33:44:55:66:77
+/data/local/tmp/xenoid-netctl status rmnet_data0
+/data/local/tmp/xenoid-netctl set-mac rmnet_data0 02:33:44:55:66:77
 ```
 
 The daemon uses this helper before its shell fallback so rtnetlink, ioctl, and sysfs consumers observe one address.

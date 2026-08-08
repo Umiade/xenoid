@@ -97,6 +97,10 @@ def thermal_from_flat(flat: dict[str, Any], data: dict[str, Any]) -> dict[str, A
 def normalize(data: dict[str, Any], source_name: str) -> dict[str, Any]:
     if data.get("schema") == "dev.xenoid.fingerprint/v1":
         data = dict(data)
+        data.pop("network", None)
+        if isinstance(data.get("hardware_profile"), dict):
+            data["hardware_profile"] = {key: value for key, value in data["hardware_profile"].items()
+                                        if key not in {"mac", "wifi_mac"}}
         data.setdefault("source", {})
         if isinstance(data["source"], dict): data["source"].setdefault("importedFrom", source_name)
         flat_existing = flat_lookup(data)
@@ -127,12 +131,11 @@ def normalize(data: dict[str, Any], source_name: str) -> dict[str, Any]:
         "brand": "google", "manufacturer": "Google", "model": "Pixel 6 Pro", "device": "raven", "product": "raven",
         "hardware": "tensor", "board": "raven", "fingerprint": "google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys",
         "bootloader": "slider-1.2-8977058", "tags": "release-keys", "type": "user", "security_patch": "2022-10-05",
-        "first_api_level": "33", "sku": "G1MNW", "abi": "arm64-v8a", "abilist": "arm64-v8a,armeabi-v7a,armeabi",
-        "abilist32": "armeabi-v7a,armeabi", "abilist64": "arm64-v8a", "bionic_arch": "arm64", "dalvik_isa_arm64": "arm64", "dalvik_isa_arm": "arm",
+        "first_api_level": "33", "sku": "G1MNW", "abi": "arm64-v8a", "abilist": "arm64-v8a",
+        "abilist32": "", "abilist64": "arm64-v8a", "bionic_arch": "arm64", "dalvik_isa_arm64": "arm64", "dalvik_isa_arm": "",
     }
     for out_key, aliases in BUILD_ALIASES.items():
         build[out_key] = pick(flat, aliases, defaults.get(out_key))
-    mac = pick(flat, ["mac", "mac_address", "wifi_mac", "network.mac", "hardware_profile.wifi_mac"], "02:33:44:55:66:77")
     battery = {}
     for k, default in {"level":83,"scale":100,"voltage":4100,"temperature":310,"status":2,"plugged":0,"health":2,"present":1}.items():
         v = pick(flat, ["battery."+k, "battery_"+k, k], str(default))
@@ -164,7 +167,6 @@ def normalize(data: dict[str, Any], source_name: str) -> dict[str, Any]:
         "template": slug(str(data.get("name") or data.get("template") or source_name)),
         "build": build,
         "ids": {"android_id": "REGENERATE", "boot_id": "REGENERATE"},
-        "network": {"mac": mac},
         "battery": battery,
         "sensors": sensors,
         "input": dict(input_profile),

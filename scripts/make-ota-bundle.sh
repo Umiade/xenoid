@@ -63,5 +63,5 @@ cat > "$DIST/manifest.json" <<JSON
 }
 JSON
 rm -f "$BUNDLE"
-tar -C "$ROOT/dist/ota" -czf "$BUNDLE" "xenoid-$VERSION"
+COPYFILE_DISABLE=1 tar -C "$ROOT/dist/ota" -czf "$BUNDLE" "xenoid-$VERSION"
 printf '%s\n' "$BUNDLE"

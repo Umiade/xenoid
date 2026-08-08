@@ -119,6 +119,24 @@ Common operations:
 ./xenoid adb shell getprop ro.product.model
 ```
 
+## Location identity
+
+The device location is an explicit, proxy-independent identity: country, system locale, timezone, single USIM, carrier, APN, and the registered LTE cell all come from one persistent per-instance profile. A fresh instance defaults to Singapore on the first `./xenoid up`; later runs keep the selected country.
+
+```bash
+# List supported countries (no runtime access; AU DE GB HK JP SG US).
+./xenoid location list
+
+# Show the masked host and Android location state.
+./xenoid location status
+./xenoid location status --check
+
+# Select a country and converge the identity.
+./xenoid location set US
+```
+
+Re-selecting the current country is a no-op. Switching countries recreates the owned Android container exactly once; hardware identifiers (IMEI, serial, Android ID, MAC/IP lease) do not change, and switching back to a previously used country restores that country's original SIM, phone number, and cell identity. A `./xenoid location set` that rotates the country performs its own container recreate; run `./xenoid up` afterwards to re-validate the complete production state. Phone numbers are stable synthetic identities shaped from pinned libphonenumber country metadata; they are not real assigned numbers and carry no voice/SMS service. The global proxy never reads or changes this identity, and proxy mutations never restart the runtime.
+
 ## Global proxy
 
 Configure the saved proxy source in the Android Xenoid settings screen or through the host CLI. Source values and credentials never belong in command arguments:
@@ -258,8 +276,8 @@ Low-level input uses the `/dev/uinput` helper through the daemon. Automation sup
 ## Network identity
 
 ```bash
-./xenoid netctl status --ifname eth0
-./xenoid netctl set-mac 02:00:00:00:00:01 --ifname eth0
+./xenoid netctl status --ifname rmnet_data0
+./xenoid netctl set-mac 02:00:00:00:00:01 --ifname rmnet_data0
 ```
 
 A coherent network profile includes interfaces, routes, namespaces, MAC addresses, and framework-visible values; changing one property is insufficient.

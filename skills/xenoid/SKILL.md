@@ -51,6 +51,16 @@ Use `doctor --require-runtime` when an online Android instance is mandatory. Use
 
 Profile application regenerates unique identifiers unless `--keep-unique` is selected.
 
+## Location identity
+
+```bash
+./xenoid location list
+./xenoid location status --check
+./xenoid location set US
+```
+
+Location selects the device's country profile (locale, timezone, USIM, carrier, LTE cell) and is fully independent of the global proxy. A fresh instance defaults to Singapore on the first `up`. Re-selecting the current country is a no-op; changing it recreates the owned container exactly once and restores the original identity when switching back to a previously used country. After a standalone `location set`, run `up` again for full production validation. Proxy operations never change location, and location changes never inspect proxy egress.
+
 ## Camera media
 
 ```bash

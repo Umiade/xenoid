@@ -96,6 +96,19 @@ docker context create linux-arm --docker host=ssh://user@server
 
 With `backend=linux-docker`, Xenoid prepares binder and runtime protection on the selected Docker engine host and does not start local Colima.
 
+## Location identity
+
+One persistent per-instance profile owns the country, system locale list, IANA timezone, single USIM, carrier, APN, and registered LTE cell. The legacy vendor RIL and the RadioConfig HAL are the only producers of radio data; the daemon publishes the profile, converges provisioning and the APN, and verifies framework, subscription, cell, and connectivity surfaces before the identity counts as active.
+
+```bash
+./xenoid location list              # supported countries: AU DE GB HK JP SG US
+./xenoid location status            # masked host and Android state
+./xenoid location status --check    # require active digests to match in the current epoch
+./xenoid location set US            # select a country and converge
+```
+
+A new instance applies Singapore on the first `./xenoid up`; later runs keep the persisted selection. Re-selecting the current country is a no-op. Changing the country stages the new profile and recreates the owned container exactly once — the restart is atomic across crashes, so retrying a failed `location set` resumes the same pending identity instead of generating a new one or restarting twice. Each used country's identity is cached from the instance master seed, so returning to a previous country restores its original SIM, phone number, and cell. Hardware identifiers never change with location. Numbers follow pinned libphonenumber mobile metadata for shape and length; they are synthetic and cannot originate calls or SMS. A standalone `./xenoid location set` performs its own container recreate; run `./xenoid up` afterwards for a full production validation. Location never reads proxy egress, and proxy operations never read or mutate the location identity.
+
 ## Global proxy
 
 The Android Xenoid settings screen and host CLI modify the same daemon-owned desired state. Keep credentials out of argv, shell history, public configuration, and tracked files:
@@ -133,10 +146,11 @@ Node and lifecycle commands:
 
 `set`, `subscribe`, and `import` enable by default; add `--no-enable` to stage a source. `list`, `status`, MCP results, and daemon status never return source values, credentials, provider URLs, cache keys, paths, or configuration digests. `./xenoid up` converges any saved enabled source before declaring the runtime ready.
 
-The Docker engine host must provide root/sudo, systemd, Python 3, iproute2, and IPv4/IPv6 netfilter support. Xenoid installs missing supported distro packages and a digest-pinned Mihomo binary on first use. The proxy namespace and listener stay on that host, including with a remote Linux Docker context; Android retains its normal Ethernet interface and route.
+The Docker engine host must provide root/sudo, systemd, Python 3, iproute2, and IPv4/IPv6 netfilter support. Xenoid installs missing supported distro packages and a digest-pinned Mihomo binary on first use. The proxy namespace and listener stay on that host, including with a remote Linux Docker context; Android retains its normal cellular data interface (`rmnet_data0`) and route.
 
 If activation returns `data_plane_unverified`, inspect `./xenoid proxy status --check`. The per-instance quarantine intentionally remains closed until the exact current generation proves every requested IPv4/IPv6 DNS, TCP, and UDP capability. A stopped daemon, engine dependency failure, mismatched container identity, stale check, or inaccessible upstream cannot fall back to direct traffic. Use `./xenoid proxy off` to make an explicit fail-open operator decision, or fix the source/upstream and run `./xenoid proxy on`.
 
+Android application network checks treat raw route-netlink `RTM_GETLINK` `EACCES` as the expected Android 13 permission result, not as a network outage. Ordinary applications still use TCP/UDP, `RTM_GETADDR`, `RTM_GETROUTE`, Bionic `getifaddrs`, and Java `NetworkInterface`; isolated processes cannot create new non-Unix sockets. Privileged cellular verification belongs to `/system/bin/xenoid-netctl status rmnet_data0`, whose ioctl and rtnetlink results must remain successful and identical.
 
 ## Root control
 

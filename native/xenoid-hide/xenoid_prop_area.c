@@ -28,12 +28,12 @@ static char g_security_patch[PROP_VALUE_MAX] = "2022-10-05";
 static char g_first_api_level[PROP_VALUE_MAX] = "33";
 static char g_sku[PROP_VALUE_MAX] = "G1MNW";
 static char g_abi[PROP_VALUE_MAX] = "arm64-v8a";
-static char g_abilist[PROP_VALUE_MAX] = "arm64-v8a,armeabi-v7a,armeabi";
-static char g_abilist32[PROP_VALUE_MAX] = "armeabi-v7a,armeabi";
+static char g_abilist[PROP_VALUE_MAX] = "arm64-v8a";
+static char g_abilist32[PROP_VALUE_MAX] = "";
 static char g_abilist64[PROP_VALUE_MAX] = "arm64-v8a";
 static char g_bionic_arch[PROP_VALUE_MAX] = "arm64";
 static char g_dalvik_isa_arm64[PROP_VALUE_MAX] = "arm64";
-static char g_dalvik_isa_arm[PROP_VALUE_MAX] = "arm";
+static char g_dalvik_isa_arm[PROP_VALUE_MAX] = "";
 
 static char *read_text_file(const char *path){
   int fd=open(path,O_RDONLY|O_CLOEXEC); if(fd<0) return NULL;
@@ -199,8 +199,8 @@ static const char *desired_value(const char *full){
   if(!strcmp(full,"ro.boot.baseband")) return "msm";
   if(!strcmp(full,"ro.boot.hardware.sku")) return g_sku;
   if(strstr(full,"cpu.abilist64")) return g_abilist64;
-  if(strstr(full,"cpu.abilist32")) return NULL; /* handled specially: keep empty on AArch32-less hosts */
-  if(strstr(full,"cpu.abilist")) return NULL; /* handled specially: guarded per-host 32-bit support */
+  if(strstr(full,"cpu.abilist32")) return g_abilist32;
+  if(strstr(full,"cpu.abilist")) return g_abilist;
   if(!strcmp(full,"ro.product.cpu.abi")) return g_abi;
   if(!strcmp(full,"ro.bionic.arch")) return g_bionic_arch;
   if(!strcmp(full,"ro.dalvik.vm.isa.arm64")) return g_dalvik_isa_arm64;
@@ -245,16 +245,6 @@ static void traverse(area_t *a, uint32_t off, const char *prefix, int depth){
     char full[512];
     if(prefix && prefix[0]) snprintf(full,sizeof(full),"%s.%s",prefix,seg); else snprintf(full,sizeof(full),"%s",seg);
     const char *want=desired_value(full);
-    if(!want && strstr(full,"cpu.abilist")) {
-      /* On hosts without AArch32 (redroid 64only / Apple Silicon), claiming
-         32-bit support starts zygote32 + 32-bit services which hard-fail
-         boot (Exec format error + boringssl reboot_on_failure). Only patch
-         abi lists when the runtime already advertises 32-bit support. */
-      unsigned char *pi = prop_ptr(a, prop);
-      char cur[PROP_VALUE_MAX+1]; memset(cur,0,sizeof(cur));
-      if (pi) memcpy(cur, pi+4, PROP_VALUE_MAX);
-      if (strstr(cur,"armeabi")) want = strstr(full,"cpu.abilist32") ? g_abilist32 : g_abilist;
-    }
     if(want && prop) patch_propinfo(a,prop,full,want);
     if(child) traverse(a,child,full,depth+1);
   }

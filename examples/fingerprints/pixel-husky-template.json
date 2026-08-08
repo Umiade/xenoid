@@ -11,8 +11,8 @@
   },
   "build": {
     "abi": "arm64-v8a",
-    "abilist": "arm64-v8a,armeabi-v7a,armeabi",
-    "abilist32": "armeabi-v7a,armeabi",
+    "abilist": "arm64-v8a",
+    "abilist32": "",
     "abilist64": "arm64-v8a",
     "bionic_arch": "arm64",
     "board": "raven",
@@ -60,12 +60,6 @@
   "input_vendor": 1256,
   "input_version": 256,
   "locale": "en-US",
-  "network": {
-    "ifname": "eth0",
-    "ip": "192.168.1.100/24",
-    "mac": "02:33:44:55:66:77",
-    "mtu": 1500
-  },
   "pressure_max": 255,
   "schema": "dev.xenoid.fingerprint/v1",
   "sensors": [

@@ -7,7 +7,7 @@ fi
 NAME=xenoid-probe-redroid
 $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true
 set +e
-$DOCKER run --privileged --name "$NAME" redroid/redroid:13.0.0-latest androidboot.use_memfd=true >/tmp/xenoid-probe-redroid.out 2>/tmp/xenoid-probe-redroid.err
+$DOCKER run --privileged --name "$NAME" redroid/redroid:13.0.0_64only-latest androidboot.use_memfd=true >/tmp/xenoid-probe-redroid.out 2>/tmp/xenoid-probe-redroid.err
 RC=$?
 set -e
 STATE="{}"

@@ -81,8 +81,6 @@ static const char *overlay_targets[] = {
   "/proc/sys/kernel/kptr_restrict", "/proc/sys/kernel/dmesg_restrict", "/proc/sys/kernel/perf_event_paranoid",
   "/proc/sys/kernel/modules_disabled", "/proc/sys/kernel/unprivileged_bpf_disabled", "/proc/sys/kernel/yama/ptrace_scope",
   "/proc/cmdline", "/proc/version", "/proc/cpuinfo", "/proc/bus/input/devices", "/proc/fb",
-  "/sys/class/net/eth0/address", "/sys/class/net/eth0/type", "/sys/class/net/eth0/mtu", "/sys/class/net/eth0/operstate",
-  "/sys/class/net/eth0/carrier", "/sys/class/net/eth0/addr_assign_type", "/sys/class/net/eth0/iflink", "/sys/class/net/eth0/ifindex",
   "/proc/sys/kernel/random/boot_id",
   "/proc/sys/kernel/random/uuid", "/proc/sys/kernel/random/entropy_avail", "/proc/sys/kernel/random/poolsize", "/proc/sys/kernel/random/urandom_min_reseed_secs",
   "/sys/class/graphics/fb0/name", "/sys/class/graphics/fb0/virtual_size", "/sys/class/graphics/fb0/bits_per_pixel", "/sys/class/graphics/fb0/modes",
@@ -245,8 +243,8 @@ static void unmark_mounted(const char *target) {
 }
 
 static int bind_file(const char *fake, const char *target) {
-  /* Canonicalize symlinked sysfs targets (class/net/eth0 -> devices/virtual/net/eth0):
-     mountinfo records the resolved path. */
+  /* Canonicalize symlinked class paths to device paths; mountinfo records
+     the resolved target. */
   char resolved[PATH_MAX];
   const char *t = resolve_overlay_target(target, resolved, sizeof(resolved)) ? resolved : target;
   if (target_mounted(t)) {
@@ -316,7 +314,7 @@ static const char *system_build_prop_text(void) {
          "ro.product.system.manufacturer=Google\n"
          "ro.product.system.model=Pixel 6 Pro\n"
          "ro.product.system.name=raven\n"
-         "ro.system.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi\n"
+         "ro.system.product.cpu.abilist=arm64-v8a\n"
          "ro.system.product.cpu.abilist64=arm64-v8a\n"
          "ro.system.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\n"
          "ro.system.build.tags=release-keys\n"
@@ -341,7 +339,7 @@ static const char *vendor_build_prop_text(void) {
          "ro.product.vendor.manufacturer=Google\n"
          "ro.product.vendor.model=Pixel 6 Pro\n"
          "ro.product.vendor.name=raven\n"
-         "ro.vendor.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi\n"
+         "ro.vendor.product.cpu.abilist=arm64-v8a\n"
          "ro.vendor.product.cpu.abilist64=arm64-v8a\n"
          "ro.vendor.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\n"
          "ro.vendor.build.tags=release-keys\n"
@@ -372,7 +370,7 @@ static int overlay_extra_build_props(void) {
   const char *system_dlkm =
     "ro.product.system_dlkm.brand=google\nro.product.system_dlkm.device=raven\nro.product.system_dlkm.manufacturer=Google\nro.product.system_dlkm.model=Pixel 6 Pro\nro.product.system_dlkm.name=raven\nro.system_dlkm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.system_dlkm.build.tags=release-keys\nro.system_dlkm.build.type=user\n";
   const char *odm =
-    "ro.product.odm.brand=google\nro.product.odm.device=raven\nro.product.odm.manufacturer=Google\nro.product.odm.model=Pixel 6 Pro\nro.product.odm.name=raven\nro.odm.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi\nro.odm.product.cpu.abilist64=arm64-v8a\nro.odm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.odm.build.tags=release-keys\nro.odm.build.type=user\n";
+    "ro.product.odm.brand=google\nro.product.odm.device=raven\nro.product.odm.manufacturer=Google\nro.product.odm.model=Pixel 6 Pro\nro.product.odm.name=raven\nro.odm.product.cpu.abilist=arm64-v8a\nro.odm.product.cpu.abilist64=arm64-v8a\nro.odm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.odm.build.tags=release-keys\nro.odm.build.type=user\n";
   const char *vendor_dlkm =
     "ro.product.vendor_dlkm.brand=google\nro.product.vendor_dlkm.device=raven\nro.product.vendor_dlkm.manufacturer=Google\nro.product.vendor_dlkm.model=Pixel 6 Pro\nro.product.vendor_dlkm.name=raven\nro.vendor_dlkm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.vendor_dlkm.build.tags=release-keys\nro.vendor_dlkm.build.type=user\n";
   const char *odm_dlkm =
@@ -1062,28 +1060,6 @@ static int overlay_random_sysctls(void) {
 }
 
 
-static int overlay_network_interface(void) {
-  int fail = 0;
-  /* /proc/net is reader-relative; app-process interception handles it. */
-  long mtu = read_long_default(PROFILE_DIR "/network_mtu", 1500);
-  if (mtu < 576 || mtu > 9000) mtu = 1500;
-  char buf[1024];
-  long_line(buf, sizeof(buf), mtu); fail += overlay_text_optional("eth0_mtu", "/sys/class/net/eth0/mtu", buf) != 0;
-  fail += overlay_text_optional("eth0_type", "/sys/class/net/eth0/type", "1\n") != 0;
-  fail += overlay_text_optional("eth0_operstate", "/sys/class/net/eth0/operstate", "up\n") != 0;
-  fail += overlay_text_optional("eth0_carrier", "/sys/class/net/eth0/carrier", "1\n") != 0;
-  fail += overlay_text_optional("eth0_addr_assign_type", "/sys/class/net/eth0/addr_assign_type", "0\n") != 0;
-  fail += overlay_text_optional("eth0_ifindex", "/sys/class/net/eth0/ifindex", "2\n") != 0;
-  fail += overlay_text_optional("eth0_iflink", "/sys/class/net/eth0/iflink", "2\n") != 0;
-  return fail ? -1 : 0;
-}
-
-static int overlay_mac(void) {
-  char *mac = first_or_default(PROFILE_DIR "/mac_address", "02:33:44:55:66:77\n");
-  char fake[256]; snprintf(fake, sizeof(fake), "%s/eth0_address", OVERLAY_DIR);
-  int rc = write_text(fake, mac); free(mac); if (rc) return -1;
-  return bind_file(fake, "/sys/class/net/eth0/address");
-}
 static void status_one(const char *target) {
   char cmd[512]; snprintf(cmd, sizeof(cmd), "grep ' %s ' /proc/self/mountinfo >/dev/null 2>&1", target);
   printf("%s=%s\n", target, system(cmd) == 0 ? "overlay" : "real");
@@ -1109,8 +1085,6 @@ static int apply(void) {
   int fail = 0;
   if (overlay_boot_id()) { printf("boot_id=fail:%s\n", strerror(errno)); fail++; } else printf("boot_id=ok\n");
   if (overlay_random_sysctls()) { printf("random_sysctls=fail:%s\n", strerror(errno)); fail++; } else printf("random_sysctls=ok\n");
-  if (overlay_network_interface()) { printf("network_interface=fail:%s\n", strerror(errno)); fail++; } else printf("network_interface=ok\n");
-  if (overlay_mac()) { printf("eth0_address=fail:%s\n", strerror(errno)); fail++; } else printf("eth0_address=ok\n");
   if (overlay_cpuinfo()) { printf("cpuinfo=fail:%s\n", strerror(errno)); fail++; } else printf("cpuinfo=ok\n");
   if (overlay_version()) { printf("version=fail:%s\n", strerror(errno)); fail++; } else printf("version=ok\n");
   if (overlay_cmdline()) { printf("cmdline=fail:%s\n", strerror(errno)); fail++; } else printf("cmdline=ok\n");
@@ -1158,6 +1132,6 @@ int main(int argc, char **argv) {
   if (!strcmp(cmd, "cleanup")) return cleanup();
   if (!strcmp(cmd, "status-json")) return status_json();
   printf("xenoid-overlay status\n");
-  status_one("/proc/sys/kernel/random/boot_id"); status_one("/proc/sys/kernel/random/uuid"); status_one("/proc/sys/kernel/random/entropy_avail"); status_one("/sys/class/net/eth0/address"); status_one("/sys/class/net/eth0/mtu"); status_one("/sys/class/dmi/id/product_name"); status_one("/proc/device-tree/model"); status_one("/sys/firmware/devicetree/base/model"); status_one("/sys/fs/selinux/enforce"); status_one("/sys/fs/selinux/policyvers"); status_one("/sys/hypervisor/type"); status_one("/proc/cpuinfo"); status_one("/proc/bus/input/devices"); status_one("/proc/fb"); status_one("/sys/class/graphics/fb0/name"); status_one("/sys/class/power_supply/battery/capacity"); status_one("/sys/class/thermal/thermal_zone0/temp"); status_one("/sys/class/backlight/panel0-backlight/max_brightness");
+  status_one("/proc/sys/kernel/random/boot_id"); status_one("/proc/sys/kernel/random/uuid"); status_one("/proc/sys/kernel/random/entropy_avail"); status_one("/sys/class/dmi/id/product_name"); status_one("/proc/device-tree/model"); status_one("/sys/firmware/devicetree/base/model"); status_one("/sys/fs/selinux/enforce"); status_one("/sys/fs/selinux/policyvers"); status_one("/sys/hypervisor/type"); status_one("/proc/cpuinfo"); status_one("/proc/bus/input/devices"); status_one("/proc/fb"); status_one("/sys/class/graphics/fb0/name"); status_one("/sys/class/power_supply/battery/capacity"); status_one("/sys/class/thermal/thermal_zone0/temp"); status_one("/sys/class/backlight/panel0-backlight/max_brightness");
   return 0;
 }

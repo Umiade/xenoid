@@ -106,6 +106,23 @@ Select one node already present in the redacted agent observation.
   - `name` (string) **(required)**
 
 
+## Location identity
+
+Location tools manage the explicit, proxy-independent device identity (country, locale, timezone, USIM, carrier, LTE cell). Results never include raw IMSI/ICCID/MSISDN — only masked values.
+
+### `xenoid_location_list`
+List supported location countries without contacting the runtime.
+_No parameters._
+
+### `xenoid_location_status`
+Show masked host and Android location identity state.
+  - `check` (boolean): require active host/Android digests to match in the current runtime epoch
+
+### `xenoid_location_set`
+Select the device location country and converge SIM, carrier, LTE cell, locale, and timezone. A country change recreates the owned container exactly once; selecting the current country is a no-op.
+  - `countryCode` (string) **(required)**: ISO 3166-1 alpha-2 code from `xenoid_location_list`
+
+
 ### `xenoid_root_status`
 Check daemon root/su helper status
 _No parameters._
