@@ -4,10 +4,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 if [[ -x ./xenoid ]]; then XENOID_BIN=./xenoid; elif [[ -x ./bin/xenoid ]]; then XENOID_BIN=./bin/xenoid; else XENOID_BIN=xenoid; fi
 OUT="${1:-/tmp/xenoid-runtime-smoke.json}"
-ADB_TARGET="127.0.0.1:$(python3 - <<'PY'
-import json, pathlib
-p=pathlib.Path('.xenoid/config.json')
-print(json.loads(p.read_text()).get('adb_port',5555) if p.exists() else 5555)
+ADB_TARGET="$(python3 - <<'PY'
+import os, sys
+sys.path.insert(0, 'src')
+from pathlib import Path
+from xenoid.config import resolve_instance
+name = os.environ.get('XENOID_INSTANCE') or 'default'
+try:
+    context, cfg, lease = resolve_instance(name, project_root=Path.cwd(), env={})
+    print(f"127.0.0.1:{lease.host_adb_port}")
+except Exception:
+    print('127.0.0.1:5555')
 PY
 )"
 ADB_BIN="$(python3 - <<'PY'
@@ -22,9 +29,16 @@ OK=true
 # Production root access is token-gated through daemon/rootd. Prefer that path so
 # remote Docker contexts and non-debuggable adbd behave exactly like user commands.
 CONTAINER_NAME="$(python3 - <<'PY'
-import json, pathlib
-p=pathlib.Path('.xenoid/config.json')
-print(json.loads(p.read_text()).get('container_name','xenoid-android') if p.exists() else 'xenoid-android')
+import os, sys
+sys.path.insert(0, 'src')
+from pathlib import Path
+from xenoid.config import resolve_instance
+name = os.environ.get('XENOID_INSTANCE') or 'default'
+try:
+    context, cfg, lease = resolve_instance(name, project_root=Path.cwd(), env={})
+    print(lease.container_name)
+except Exception:
+    print('xenoid-android')
 PY
 )"
 ROOT_CH=adb
@@ -410,10 +424,9 @@ if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /proc/fb ]; then grep -q "msmfb" /
 "$XENOID_BIN" device set serial 3A4940E5EDFA >/tmp/xenoid-smoke-usb-serial.out 2>&1 || true
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'p=/config/usb_gadget/g1/strings/0x409/serialnumber; if [ -e "$p" ]; then test "$(cat "$p" 2>/dev/null)" = 3A4940E5EDFA && test "$(cat /config/usb_gadget/g1/strings/0x409/manufacturer 2>/dev/null)" = Google && grep -q "Pixel" /config/usb_gadget/g1/strings/0x409/product 2>/dev/null; else exit 77; fi' >/tmp/xenoid-smoke-usb.out 2>&1; then add usb_identity true "usb gadget serial/manufacturer/product sanitized"; else rc=$?; if [ "$rc" = 77 ]; then add usb_identity true "no usb gadget configfs on this runtime; skip"; else add usb_identity false "$(cat /tmp/xenoid-smoke-usb.out)"; fi; fi
 
-# ID store helper smoke: patch app-scoped SSAID and global secure android_id files. Full SettingsProvider reload is disruptive, so validate file-level state here.
-# ID store helper smoke: patch app-scoped SSAID and global secure android_id files. Both the
-# helper apply and the /data/system file read need uid=0, so route through the root channel.
-if as_root 'test -x /data/local/tmp/xenoid-ssaid && /data/local/tmp/xenoid-ssaid 1234567890abcdef >/data/local/tmp/xenoid-ssaid-smoke.log 2>&1 || true; strings /data/system/users/0/settings_ssaid.xml 2>/dev/null | grep -q 1234567890abcdef && strings /data/system/users/0/settings_secure.xml 2>/dev/null | grep -q 1234567890abcdef' >/tmp/xenoid-smoke-ssaid.out 2>&1; then add ssaid_file true "settings_ssaid.xml and settings_secure.xml contain 1234567890abcdef"; else add ssaid_file false "$(cat /tmp/xenoid-smoke-ssaid.out)"; fi
+# The profile helper updates the device-wide secure android_id without rewriting
+# Android's app-scoped SSAIDs. Both files require uid=0 access.
+if as_root 'test -x /data/local/tmp/xenoid-ssaid && before=$(sha256sum /data/system/users/0/settings_ssaid.xml | cut -c 1-64) && /data/local/tmp/xenoid-ssaid 1234567890abcdef >/data/local/tmp/xenoid-ssaid-smoke.log 2>&1 && after=$(sha256sum /data/system/users/0/settings_ssaid.xml | cut -c 1-64) && test "$before" = "$after" && strings /data/system/users/0/settings_secure.xml 2>/dev/null | grep -q 1234567890abcdef' >/tmp/xenoid-smoke-ssaid.out 2>&1; then add ssaid_file true "settings_ssaid.xml preserved; settings_secure.xml contains 1234567890abcdef"; else add ssaid_file false "$(cat /tmp/xenoid-smoke-ssaid.out)"; fi
 
 # Live Frida injection is opt-in because production `up` deliberately removes
 # frida-server and payloads. Static hook surfaces remain mandatory in full doctor.

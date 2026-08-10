@@ -209,7 +209,7 @@ def runtime_inspect(m,allow_absent=False,allow_stopped=False):
   if endpoint.get("NetworkID")!=m["networkId"] or (endpoint.get("IPAddress"),endpoint.get("GlobalIPv6Address"),endpoint.get("MacAddress"),endpoint.get("Gateway"),endpoint.get("IPv6Gateway"))!=(android["ipv4"],android["ipv6"],android["mac"],gateway4,gateway6):raise Error("runtime_identity_mismatch")
  elif allow_stopped:
   configured=endpoint.get("IPAMConfig")
-  if container_data.get("HostConfig",{}).get("NetworkMode")!=network_data.get("Name") or not isinstance(configured,dict) or (configured.get("IPv4Address"),configured.get("IPv6Address"),endpoint.get("MacAddress"))!=(android["ipv4"],android["ipv6"],android["mac"]) or endpoint.get("NetworkID") not in ("",m["networkId"]):raise Error("runtime_identity_mismatch")
+  if container_data.get("HostConfig",{}).get("NetworkMode")!=network_data.get("Name") or not isinstance(configured,dict) or (configured.get("IPv4Address"),configured.get("IPv6Address"))!=(android["ipv4"],android["ipv6"]) or endpoint.get("MacAddress") not in ("",android["mac"]) or endpoint.get("NetworkID") not in ("",m["networkId"]):raise Error("runtime_identity_mismatch")
  else:raise Error("runtime_identity_mismatch")
  return container_data
 def live(m,allow_absent=False,allow_stopped=False):return runtime_inspect(m,allow_absent,allow_stopped) is not None
@@ -992,6 +992,9 @@ def _iptables_absent(command):
   return run([*base,"-w","-t",table,"-S",chain_name],check=False).returncode!=0
  return False
 def _ip_absent(command):
+ if Path(command[0]).name=="nsenter":
+  net=next((arg.split("=",1)[1] for arg in command[1:] if arg.startswith("--net=")),None)
+  return isinstance(net,str) and not Path(net).exists()
  if Path(command[0]).name!="ip":return False
  if "netns" in command and "del" in command:
   return not (Path("/run/netns")/command[command.index("del")+1]).exists()

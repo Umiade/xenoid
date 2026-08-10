@@ -474,11 +474,12 @@ static void response_operator(RIL_Token token) {
     char *values[3]={profile.carrier,profile.carrier,numeric};complete(token,RIL_E_SUCCESS,values,sizeof(values));
 }
 
-static void response_device_identity(RIL_Token token,int array) {
+static void response_device_identity(RIL_Token token,int kind) {
     static char imei[PROP_VALUE_MAX],imeisv[PROP_VALUE_MAX];
     if(__system_property_get("persist.xenoid.radio.imei",imei)<=0)snprintf(imei,sizeof(imei),"356938035643809");
     if(__system_property_get("persist.xenoid.radio.imeisv",imeisv)<=0)snprintf(imeisv,sizeof(imeisv),"01");
-    if(array){char *values[4]={imei,imeisv,"",""};complete(token,RIL_E_SUCCESS,values,sizeof(values));}
+    if(kind==1){char *values[4]={imei,imeisv,"",""};complete(token,RIL_E_SUCCESS,values,sizeof(values));}
+    else if(kind==2)complete(token,RIL_E_SUCCESS,imeisv,strlen(imeisv)+1);
     else complete(token,RIL_E_SUCCESS,imei,strlen(imei)+1);
 }
 
@@ -534,7 +535,7 @@ static void on_request(int request,void *data,size_t length,RIL_Token token) {
         case RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE:if(data&&length>=sizeof(int))atomic_store(&preferred_network_type,*(int *)data);complete(token,RIL_E_SUCCESS,NULL,0);break;
         case RIL_REQUEST_SET_UNSOL_CELL_INFO_LIST_RATE:if(data&&length>=sizeof(int))atomic_store(&cell_info_rate,*(int *)data);complete(token,RIL_E_SUCCESS,NULL,0);break;
         case RIL_REQUEST_GET_IMEI:response_device_identity(token,0);break;
-        case RIL_REQUEST_GET_IMEISV:{static char version[]="01";complete(token,RIL_E_SUCCESS,version,sizeof(version));break;}
+        case RIL_REQUEST_GET_IMEISV:response_device_identity(token,2);break;
         case RIL_REQUEST_DEVICE_IDENTITY:response_device_identity(token,1);break;
         case RIL_REQUEST_BASEBAND_VERSION:{static char version[]="g5300g-230605-230621-B-10346107";complete(token,RIL_E_SUCCESS,version,sizeof(version));break;}
         case RIL_REQUEST_VOICE_RADIO_TECH:{static int technology=RADIO_TECH_LTE;complete(token,RIL_E_SUCCESS,&technology,sizeof(technology));break;}

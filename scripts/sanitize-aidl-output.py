@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
+import tempfile
 
 PROVENANCE_PREFIX = " * Using: "
 
@@ -18,7 +20,21 @@ def sanitize(path: Path) -> bool:
     filtered = [line for line in lines if not line.startswith(PROVENANCE_PREFIX)]
     if filtered == lines:
         return False
-    path.write_text("".join(filtered))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write("".join(filtered))
+        os.chmod(temporary_name, path.stat().st_mode)
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
     return True
 
 

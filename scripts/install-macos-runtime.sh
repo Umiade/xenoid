@@ -34,7 +34,7 @@ cmds=(
   "sdkmanager --sdk_root=$SDK_ROOT platform-tools platforms;android-35 build-tools;35.0.0 ndk;$NDK_VERSION"
   "colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8"
   "colima ssh -- sh -c '<ensure binder_linux and mount binderfs>'"
-  "create .xenoid/config.json from examples/config-macos-colima.json when absent"
+  "./xenoid init --config examples/config-macos-colima.json  (only when no default instance exists)"
 )
 if [[ "$DRY" == 1 ]]; then
   printf '{"ok":true,"dryRun":true,"commands":['
@@ -84,9 +84,9 @@ mkdir -p "$SDK_ROOT"
 colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8
 colima ssh -- sh -c "$BINDER_SETUP"
 
-mkdir -p .xenoid
-if [[ ! -f .xenoid/config.json ]]; then
-  cp examples/config-macos-colima.json .xenoid/config.json
+mkdir -p .xenoid/instances/default
+if [[ ! -f .xenoid/instances/default/config.json && ! -f .xenoid/config.json ]]; then
+  XENOID_INSTANCE=default ./xenoid init --config examples/config-macos-colima.json >/dev/null
 fi
 
 for command in docker colima adb scrcpy javac; do

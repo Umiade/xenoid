@@ -27,6 +27,19 @@ from .config import (
     XenoidConfig,
 )
 from .daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS, PROXY_MAX_SOURCE_BYTES, DaemonClient
+from .device_identity import (
+    DeviceIdentityStore,
+    IdentityError,
+    public_identity_state,
+)
+from .storage import (
+    DEFAULT_DATA_SIZE_BYTES,
+    StorageError,
+    StorageStateStore,
+    backup_image_name,
+    parse_storage_result,
+    public_storage_state,
+)
 from .util import host_info, run, which
 
 
@@ -146,7 +159,7 @@ class RuntimeManager:
 
     def effective_image(self) -> str:
         if self.cfg.auto_build_runtime_image:
-            return self.cfg.runtime_image_tag
+            return f"{self.cfg.runtime_image_tag}-{self.context.resource_tag}"
         # Auto-upgrade the stock default to the 64only variant on arm64 hosts
         # (Apple Silicon / ARM ECS): those CPUs have no AArch32, and the stock
         return self.cfg.image
@@ -562,16 +575,20 @@ class RuntimeManager:
             self.lease.volume_name,
         ]
 
+    def _volume_matches_lease(self, volume: dict[str, Any]) -> bool:
+        return (
+            volume.get("Name") == self.lease.volume_name
+            and volume.get("Driver") == "local"
+            and volume.get("Labels") == self.lease.owner_labels
+            and isinstance(volume.get("Mountpoint"), str)
+            and str(volume.get("Mountpoint")).startswith("/")
+        )
+
     def ensure_volume(self) -> dict[str, Any]:
         volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
         if volume is not None:
-            if (
-                volume
-                and volume.get("Name") == self.lease.volume_name
-                and volume.get("Driver") == "local"
-                and volume.get("Labels") == self.lease.owner_labels
-            ):
-                return {"ok": True, "exists": True}
+            if volume and self._volume_matches_lease(volume):
+                return {"ok": True, "exists": True, "volume": volume}
             return {
                 "ok": False,
                 "error": "resource_conflict",
@@ -590,15 +607,11 @@ class RuntimeManager:
                 "command": command,
             }
         created, _ = self._inspect_docker_object("volume", self.lease.volume_name)
-        verified = bool(
-            created
-            and created.get("Name") == self.lease.volume_name
-            and created.get("Driver") == "local"
-            and created.get("Labels") == self.lease.owner_labels
-        )
+        verified = bool(created and self._volume_matches_lease(created))
         return {
             "ok": verified,
             "created": True,
+            "volume": created,
             "returncode": proc.returncode,
             "stdout": proc.stdout,
             "stderr": proc.stderr,
@@ -611,6 +624,499 @@ class RuntimeManager:
                     "message": "created Docker volume identity is invalid",
                 }
             ),
+        }
+
+    def _engine_host_shell(self, script: str, *, timeout: int = 120) -> Any:
+        ssh_cmd = self.remote_docker_ssh_cmd()
+        if ssh_cmd:
+            command = [*ssh_cmd, "sudo", "-n", "sh", "-c", script]
+        elif self.should_use_colima():
+            command = ["colima", "ssh", "--", "sudo", "-n", "sh", "-c", script]
+        else:
+            command = ["sudo", "-n", "sh", "-c", script]
+        return run(command, timeout=timeout, env=self.docker_env())
+
+    def _inspect_volume_image(
+        self,
+        volume: dict[str, Any],
+        image_name: str = "xenoid-data.img",
+    ) -> dict[str, Any]:
+        mountpoint = volume.get("Mountpoint")
+        if (
+            volume.get("Driver") != "local"
+            or not isinstance(mountpoint, str)
+            or not mountpoint.startswith("/")
+            or "\n" in mountpoint
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", image_name) is None
+        ):
+            return {
+                "ok": False,
+                "error": "storage_image_invalid",
+                "message": "Docker volume mountpoint is invalid",
+            }
+        path = f"{mountpoint.rstrip('/')}/{image_name}"
+        quoted = shlex.quote(path)
+        command = (
+            f"set -eu; p={quoted}; "
+            "[ -f \"$p\" ] && [ ! -L \"$p\" ] && [ -s \"$p\" ]; "
+            "[ \"$(blkid -p -s TYPE -o value -- \"$p\" 2>/dev/null)\" = ext4 ]; "
+            "printf 'XENOID_DATA_UUID=%s\\n' \"$(blkid -p -s UUID -o value -- \"$p\" | tr A-F a-f)\"; "
+            "printf 'XENOID_DATA_SIZE=%s\\n' \"$(stat -c %s -- \"$p\")\""
+        )
+        proc = self._engine_host_shell(command)
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "error": "storage_image_invalid",
+                "message": "persistent data image is missing or invalid",
+                "returncode": proc.returncode,
+                "stderr": proc.stderr.strip()[-500:],
+            }
+        try:
+            filesystem_uuid, size_bytes = parse_storage_result(proc.stdout)
+        except StorageError as exc:
+            return exc.as_dict()
+        return {
+            "ok": True,
+            "filesystemUuid": filesystem_uuid,
+            "sizeBytes": size_bytes,
+            "image": image_name,
+        }
+
+    def _run_storage_image_action(
+        self,
+        action: str,
+        *,
+        expected_uuid: str = "",
+        transaction_id: str = "",
+        legacy_volume: str = "",
+        backup_image: str = "",
+        backup_uuid: str = "",
+    ) -> dict[str, Any]:
+        script = self.context.project_root / "scripts" / "make-rootfs-image.sh"
+        command = [
+            str(script),
+            self.effective_image(),
+            self.lease.volume_name,
+            "3072",
+            str(DEFAULT_DATA_SIZE_BYTES // (1024 * 1024)),
+            action,
+            expected_uuid or "-",
+            transaction_id or "-",
+            legacy_volume or "-",
+            backup_image or "-",
+            backup_uuid or "-",
+        ]
+        env = self.docker_env()
+        ssh_cmd = self.remote_docker_ssh_cmd()
+        if ssh_cmd:
+            env["XENOID_ENGINE_SSH"] = ssh_cmd[-1]
+            if "-p" in ssh_cmd:
+                env["XENOID_ENGINE_SSH_PORT"] = ssh_cmd[ssh_cmd.index("-p") + 1]
+        proc = run(command, timeout=1800, env=env)
+        result: dict[str, Any] = {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "command": command,
+            "stdout": proc.stdout.strip()[-2000:],
+            "stderr": proc.stderr.strip()[-2000:],
+        }
+        if proc.returncode != 0:
+            storage_failure = 41 <= proc.returncode <= 56
+            result.update({
+                "error": "storage_image_invalid" if storage_failure else "rootfs_image_build_failed",
+                "message": (
+                    "persistent data image operation failed"
+                    if storage_failure
+                    else "rootfs image preparation failed"
+                ),
+            })
+            return result
+        try:
+            filesystem_uuid, size_bytes = parse_storage_result(proc.stdout)
+        except StorageError as exc:
+            return {**result, **exc.as_dict(), "ok": False}
+        result.update({
+            "filesystemUuid": filesystem_uuid,
+            "sizeBytes": size_bytes,
+            "action": action,
+        })
+        return result
+
+    def _legacy_engine_record(self) -> Optional[dict[str, str]]:
+        path = self.context.state_root / "legacy-engine.json"
+        try:
+            info = path.lstat()
+            if not path.is_file() or info.st_mode & 0o077:
+                raise StorageError(
+                    "storage_legacy_invalid",
+                    "legacy engine state permissions are unsafe",
+                )
+            raw = json.loads(path.read_text())
+        except FileNotFoundError:
+            return None
+        except StorageError:
+            raise
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise StorageError(
+                "storage_legacy_invalid",
+                "legacy engine state is invalid",
+            ) from exc
+        if not isinstance(raw, dict):
+            raise StorageError("storage_legacy_invalid", "legacy engine state is invalid")
+        volume_name = raw.get("android_data_volume")
+        container_name = raw.get("container_name", "")
+        pattern = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+        if (
+            not isinstance(volume_name, str)
+            or re.fullmatch(pattern, volume_name) is None
+            or not isinstance(container_name, str)
+            or (container_name and re.fullmatch(pattern, container_name) is None)
+        ):
+            raise StorageError("storage_legacy_invalid", "legacy engine identity is invalid")
+        if volume_name == self.lease.volume_name:
+            return None
+        return {"volumeName": volume_name, "containerName": container_name}
+
+    def _legacy_volume_attachments(
+        self,
+        volume_name: str,
+    ) -> tuple[Optional[list[tuple[str, str]]], dict[str, Any]]:
+        proc = run(
+            [
+                *self.docker_base_cmd(),
+                "ps",
+                "-a",
+                "--filter",
+                f"volume={volume_name}",
+                "--format",
+                "{{.ID}}\t{{.Names}}",
+            ],
+            env=self.docker_env(),
+        )
+        if proc.returncode != 0:
+            return None, {
+                "ok": False,
+                "error": "engine_unavailable",
+                "message": "cannot inspect legacy volume attachments",
+            }
+        rows: list[tuple[str, str]] = []
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                return None, {
+                    "ok": False,
+                    "error": "storage_legacy_invalid",
+                    "message": "legacy volume attachment identity is invalid",
+                }
+            rows.append((parts[0], parts[1]))
+        return rows, {"ok": True}
+
+    def _storage_error(self, code: str, message: str, **details: Any) -> dict[str, Any]:
+        return {"ok": False, "error": code, "message": message, **details}
+
+    def ensure_instance_storage(self) -> dict[str, Any]:
+        """Converge rootfs plus the one persistent, never-silently-replaced data image."""
+        self.ensure_instance_lease()
+        store = StorageStateStore(self.context, self.lease)
+        try:
+            state = store.load()
+            legacy = self._legacy_engine_record()
+        except StorageError as exc:
+            return exc.as_dict()
+
+        volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
+        if volume == {}:
+            return self._storage_error(
+                "resource_conflict",
+                "Docker volume inspection returned invalid identity",
+            )
+        if volume is not None and not self._volume_matches_lease(volume):
+            return self._storage_error(
+                "resource_conflict",
+                "Docker volume is not owned by this instance",
+            )
+
+        if state is not None and state["state"] == "committed":
+            if volume is None:
+                return self._storage_error(
+                    "storage_volume_missing",
+                    "committed instance data volume is missing",
+                    storage=public_storage_state(state, healthy=False, error="storage_volume_missing"),
+                )
+            image = self._inspect_volume_image(volume)
+            if not image.get("ok"):
+                return self._storage_error(
+                    "storage_image_invalid",
+                    "committed instance data image is missing or invalid",
+                    storage=public_storage_state(state, healthy=False, error="storage_image_invalid"),
+                    image=image,
+                )
+            if (
+                image["filesystemUuid"] != state["filesystemUuid"]
+                or image["sizeBytes"] != state["sizeBytes"]
+            ):
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "committed data image identity changed",
+                    storage=public_storage_state(state, healthy=False, error="storage_identity_mismatch"),
+                    image=image,
+                )
+            action = self._run_storage_image_action(
+                "preserve",
+                expected_uuid=state["filesystemUuid"],
+                transaction_id=state["transactionId"],
+            )
+            if not action.get("ok"):
+                code = str(action.get("error") or "storage_image_invalid")
+                rootfs_failed = code == "rootfs_image_build_failed"
+                return self._storage_error(
+                    code,
+                    str(action.get("message") or "instance image preparation failed"),
+                    storage=public_storage_state(
+                        state,
+                        healthy=rootfs_failed,
+                        error="" if rootfs_failed else code,
+                    ),
+                    imageAction=action,
+                )
+            if action.get("sizeBytes") != state["sizeBytes"]:
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "persistent data image validation failed",
+                    storage=public_storage_state(state, healthy=False, error="storage_identity_mismatch"),
+                    imageAction=action,
+                )
+            return {
+                "ok": True,
+                "volume": {"ok": True, "exists": True},
+                "imageAction": action,
+                "storage": public_storage_state(state, healthy=True),
+            }
+
+        if state is None and legacy is not None:
+            legacy_volume, _ = self._inspect_docker_object("volume", legacy["volumeName"])
+            if (
+                legacy_volume is None
+                or not legacy_volume
+                or legacy_volume.get("Driver") != "local"
+            ):
+                return self._storage_error(
+                    "storage_legacy_invalid",
+                    "recorded legacy data volume is missing or not local",
+                )
+            attachments, attachment_status = self._legacy_volume_attachments(legacy["volumeName"])
+            if attachments is None:
+                return attachment_status
+            unexpected = [
+                {"id": container_id, "name": name}
+                for container_id, name in attachments
+                if not legacy["containerName"] or name != legacy["containerName"]
+            ]
+            if unexpected:
+                return self._storage_error(
+                    "storage_legacy_attached",
+                    "legacy data volume has an unknown container attachment",
+                    attachments=unexpected,
+                )
+            if attachments:
+                removed = self._remove_legacy_container(
+                    attachments[0][0],
+                    legacy["containerName"],
+                    legacy["volumeName"],
+                )
+                if not removed.get("ok"):
+                    return self._storage_error(
+                        "storage_legacy_attached",
+                        "legacy data container could not be stopped safely",
+                        removal=removed,
+                    )
+            source = self._inspect_volume_image(legacy_volume)
+            if not source.get("ok"):
+                return self._storage_error(
+                    "storage_legacy_invalid",
+                    "legacy data image is missing or invalid",
+                    source=source,
+                )
+            backup_image = ""
+            backup_uuid = ""
+            backup_size = 0
+            if volume is not None:
+                target = self._inspect_volume_image(volume)
+                if not target.get("ok"):
+                    return self._storage_error(
+                        "storage_image_invalid",
+                        "tagged data volume exists without a valid data image",
+                        target=target,
+                    )
+                if target["filesystemUuid"] != source["filesystemUuid"]:
+                    transaction = secrets.token_hex(16)
+                    backup_image = backup_image_name(transaction)
+                    backup_uuid = target["filesystemUuid"]
+                    backup_size = target["sizeBytes"]
+                    state = store.pending(
+                        "legacy",
+                        transaction_id=transaction,
+                        size_bytes=source["sizeBytes"],
+                        legacy_volume=legacy["volumeName"],
+                        legacy_filesystem_uuid=source["filesystemUuid"],
+                        backup_image=backup_image,
+                        backup_filesystem_uuid=backup_uuid,
+                        backup_size_bytes=backup_size,
+                    )
+            if state is None:
+                state = store.pending(
+                    "legacy",
+                    size_bytes=source["sizeBytes"],
+                    legacy_volume=legacy["volumeName"],
+                    legacy_filesystem_uuid=source["filesystemUuid"],
+                )
+
+        if state is None:
+            if volume is None:
+                state = store.pending("fresh")
+            else:
+                adopted = self._inspect_volume_image(volume)
+                if not adopted.get("ok"):
+                    return self._storage_error(
+                        "storage_uninitialized_volume",
+                        "existing instance volume has no valid data image",
+                        image=adopted,
+                    )
+                state = store.pending("adopted", size_bytes=adopted["sizeBytes"])
+
+        if state["source"] == "legacy":
+            source_volume, _ = self._inspect_docker_object(
+                "volume",
+                state["legacyVolume"],
+            )
+            if (
+                source_volume is None
+                or not source_volume
+                or source_volume.get("Driver") != "local"
+            ):
+                return self._storage_error(
+                    "storage_legacy_invalid",
+                    "pending legacy data volume is missing or not local",
+                )
+            attachments, attachment_status = self._legacy_volume_attachments(
+                state["legacyVolume"],
+            )
+            if attachments is None:
+                return attachment_status
+            expected_container = (
+                legacy["containerName"]
+                if legacy is not None
+                and legacy["volumeName"] == state["legacyVolume"]
+                else ""
+            )
+            if attachments:
+                if (
+                    not expected_container
+                    or len(attachments) != 1
+                    or attachments[0][1] != expected_container
+                ):
+                    return self._storage_error(
+                        "storage_legacy_attached",
+                        "pending legacy volume has an unknown container attachment",
+                    )
+                removed = self._remove_legacy_container(
+                    attachments[0][0],
+                    expected_container,
+                    state["legacyVolume"],
+                )
+                if not removed.get("ok"):
+                    return self._storage_error(
+                        "storage_legacy_attached",
+                        "pending legacy container could not be stopped safely",
+                        removal=removed,
+                    )
+            source_image = self._inspect_volume_image(source_volume)
+            if (
+                not source_image.get("ok")
+                or source_image.get("filesystemUuid")
+                != state["legacyFilesystemUuid"]
+                or source_image.get("sizeBytes") != state["sizeBytes"]
+            ):
+                return self._storage_error(
+                    "storage_legacy_invalid",
+                    "pending legacy data image identity changed",
+                    source=source_image,
+                )
+
+        if volume is None:
+            created = self.ensure_volume()
+            if not created.get("ok"):
+                return self._storage_error(
+                    "resource_conflict",
+                    "instance data volume creation failed",
+                    volume=created,
+                )
+            volume = created.get("volume")
+            if not isinstance(volume, dict) or not self._volume_matches_lease(volume):
+                return self._storage_error(
+                    "resource_conflict",
+                    "created instance data volume identity is invalid",
+                )
+
+        if state["source"] == "fresh":
+            action = self._run_storage_image_action(
+                "initialize",
+                transaction_id=state["transactionId"],
+            )
+        elif state["source"] == "adopted":
+            action = self._run_storage_image_action(
+                "preserve",
+                transaction_id=state["transactionId"],
+            )
+        else:
+            action = self._run_storage_image_action(
+                "migrate",
+                expected_uuid=state["legacyFilesystemUuid"],
+                transaction_id=state["transactionId"],
+                legacy_volume=state["legacyVolume"],
+                backup_image=state["backupImage"],
+                backup_uuid=state["backupFilesystemUuid"],
+            )
+        if not action.get("ok"):
+            code = str(action.get("error") or "storage_image_invalid")
+            return self._storage_error(
+                code,
+                str(action.get("message") or "instance image preparation failed"),
+                storage=public_storage_state(state, healthy=False, error=code),
+                imageAction=action,
+            )
+        if action.get("sizeBytes") != state["sizeBytes"]:
+            return self._storage_error(
+                "storage_identity_mismatch",
+                "instance data image size changed during transaction",
+                storage=public_storage_state(state, healthy=False, error="storage_identity_mismatch"),
+                imageAction=action,
+            )
+        if state["source"] == "legacy" and action.get("filesystemUuid") != state["legacyFilesystemUuid"]:
+            return self._storage_error(
+                "storage_identity_mismatch",
+                "legacy data image UUID changed during migration",
+                imageAction=action,
+            )
+        try:
+            committed = store.commit(
+                state,
+                str(action["filesystemUuid"]),
+                int(action["sizeBytes"]),
+            )
+        except (StorageError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, StorageError):
+                return exc.as_dict()
+            return self._storage_error(
+                "storage_state_invalid",
+                "cannot commit instance storage transaction",
+            )
+        return {
+            "ok": True,
+            "volume": {"ok": True, "exists": True},
+            "imageAction": action,
+            "storage": public_storage_state(committed, healthy=True),
         }
 
     def docker_create_command(self) -> list[str]:
@@ -785,6 +1291,21 @@ class RuntimeManager:
         data["returncode"] = proc.returncode
         return data
 
+    def _container_has_lease_owner(self, container: dict[str, Any]) -> bool:
+        config = container.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        return (
+            isinstance(container.get("Id"), str)
+            and bool(container["Id"])
+            and str(container.get("Name", "")).removeprefix("/")
+            == self.lease.container_name
+            and isinstance(labels, dict)
+            and all(
+                labels.get(key) == value
+                for key, value in self.lease.owner_labels.items()
+            )
+        )
+
     def _container_matches_lease(self, container: dict[str, Any]) -> bool:
         config = container.get("Config")
         host_config = container.get("HostConfig")
@@ -841,11 +1362,7 @@ class RuntimeManager:
             )
         ) if isinstance(endpoint, dict) else False
         return (
-            isinstance(container.get("Id"), str)
-            and bool(container["Id"])
-            and str(container.get("Name", "")).removeprefix("/") == self.lease.container_name
-            and isinstance(config.get("Labels"), dict)
-            and all(config["Labels"].get(key) == value for key, value in self.lease.owner_labels.items())
+            self._container_has_lease_owner(container)
             and config.get("Image") == self.effective_image()
             and host_config.get("AutoRemove") is False
             and host_config.get("Privileged") is True
@@ -874,18 +1391,42 @@ class RuntimeManager:
         )
         if container is None:
             return None, "instance container does not exist"
-        if (
-            not container
-            or not isinstance(container.get("Id"), str)
-            or not container["Id"]
-            or not self._container_matches_lease(container)
-        ):
+        if not container or not self._container_has_lease_owner(container):
             return None, "Docker container is not owned by this instance"
         return container, ""
 
     def _owned_container(self) -> tuple[bool, str]:
         container, error = self._owned_container_record()
         return container is not None, error
+
+    def collect_persisted_device_identity(self) -> dict[str, Any]:
+        """Read legacy stable identifiers from persistent Android state."""
+        command = (
+            "set +e; "
+            "printf 'androidId=%s\\n' \"$(settings --user 0 get secure android_id 2>/dev/null)\"; "
+            "serial=$(cat /data/local/tmp/xenoid-profile/serial 2>/dev/null); "
+            "[ -n \"$serial\" ] || serial=$(getprop ro.serialno); "
+            "printf 'serial=%s\\n' \"$serial\"; "
+            "printf 'imei=%s\\n' \"$(getprop persist.xenoid.radio.imei)\"; "
+            "printf 'imeisv=%s\\n' \"$(getprop persist.xenoid.radio.imeisv)\""
+        )
+        result = self.docker_exec(["sh", "-c", command], timeout=15)
+        if not result.get("ok"):
+            return {}
+        allowed = {"androidId", "serial", "imei", "imeisv"}
+        values: dict[str, str] = {}
+        for line in str(result.get("stdout", "")).splitlines():
+            key, separator, value = line.partition("=")
+            normalized = value.strip()
+            if (
+                separator
+                and key in allowed
+                and normalized
+                and normalized.lower() != "null"
+                and len(normalized) <= 64
+            ):
+                values[key] = normalized
+        return values
 
     def location_runtime_container_id(self) -> Optional[str]:
         """Owned running container ID used to derive the location runtime epoch."""
@@ -1030,6 +1571,137 @@ class RuntimeManager:
             code = "engine_unavailable"
         return {"ok": False, "code": code, "error": code}
 
+    def _remove_container_safely(
+        self,
+        container: dict[str, Any],
+        *,
+        ownership: str,
+    ) -> dict[str, Any]:
+        container_id = container.get("Id")
+        if not isinstance(container_id, str) or not container_id:
+            return self._storage_error(
+                "resource_conflict",
+                "container identity is invalid",
+            )
+        result: dict[str, Any] = {"ok": False, "ownership": ownership}
+        quarantine = self.quarantine_proxy_for_lifecycle()
+        result["proxyQuarantine"] = quarantine
+        if quarantine.get("ok") is not True:
+            result["error"] = quarantine.get("code", "engine_unavailable")
+            return result
+        state = container.get("State")
+        running = isinstance(state, dict) and state.get("Running") is True
+        if running:
+            synced = run(
+                [*self.docker_base_cmd(), "exec", container_id, "sync"],
+                timeout=30,
+                env=self.docker_env(),
+            )
+            result["sync"] = {
+                "ok": synced.returncode == 0,
+                "returncode": synced.returncode,
+                "stderr": synced.stderr.strip()[-500:],
+            }
+            if synced.returncode != 0:
+                result["error"] = "container_sync_failed"
+                return result
+            stopped = run(
+                [
+                    *self.docker_base_cmd(),
+                    "stop",
+                    "--time",
+                    "30",
+                    container_id,
+                ],
+                timeout=45,
+                env=self.docker_env(),
+            )
+            result["stop"] = {
+                "ok": stopped.returncode == 0,
+                "returncode": stopped.returncode,
+                "stderr": stopped.stderr.strip()[-500:],
+            }
+            if stopped.returncode != 0:
+                result["error"] = "container_stop_failed"
+                return result
+        removed = run(
+            [*self.docker_base_cmd(), "rm", container_id],
+            timeout=30,
+            env=self.docker_env(),
+        )
+        result["remove"] = {
+            "ok": removed.returncode == 0,
+            "returncode": removed.returncode,
+            "stderr": removed.stderr.strip()[-500:],
+        }
+        if removed.returncode != 0:
+            result["error"] = "container_remove_failed"
+            return result
+        try:
+            cleanup = self.proxy_cleanup()
+        except InstanceError as exc:
+            cleanup = {"ok": False, "code": exc.code, "error": exc.code}
+        except Exception:
+            cleanup = {
+                "ok": False,
+                "code": "engine_unavailable",
+                "error": "engine_unavailable",
+            }
+        result["proxyCleanup"] = cleanup
+        result["ok"] = isinstance(cleanup, dict) and cleanup.get("ok") is True
+        if not result["ok"]:
+            result["error"] = "proxy_cleanup_failed"
+        return result
+
+    def _remove_owned_container(self, container: dict[str, Any]) -> dict[str, Any]:
+        if not self._container_has_lease_owner(container):
+            return self._storage_error(
+                "resource_conflict",
+                "Docker container is not owned by this instance",
+            )
+        return self._remove_container_safely(container, ownership="lease")
+
+    def _remove_legacy_container(
+        self,
+        container_id: str,
+        expected_name: str,
+        expected_volume: str,
+    ) -> dict[str, Any]:
+        container, _ = self._inspect_docker_object("container", container_id)
+        if not container:
+            return self._storage_error(
+                "storage_legacy_attached",
+                "legacy container inspection failed",
+            )
+        config = container.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        mounts = container.get("Mounts")
+        name = str(container.get("Name", "")).removeprefix("/")
+        has_expected_mount = isinstance(mounts, list) and any(
+            isinstance(mount, dict)
+            and mount.get("Type") == "volume"
+            and mount.get("Name") == expected_volume
+            and mount.get("Destination") == "/data"
+            for mount in mounts
+        )
+        foreign_owner = (
+            isinstance(labels, dict)
+            and labels.get("dev.xenoid.owner") == "xenoid"
+            and labels.get("dev.xenoid.instance_id")
+            not in (None, self.context.instance_id)
+        )
+        if (
+            not expected_name
+            or name != expected_name
+            or not has_expected_mount
+            or foreign_owner
+        ):
+            return self._storage_error(
+                "storage_legacy_attached",
+                "legacy container ownership cannot be proven",
+            )
+        return self._remove_container_safely(container, ownership="legacy-record")
+
     def start(self, dry_run: bool = False, wait: bool = True, install_daemon_apk: Optional[str] = None, start_colima: bool = False, adb_root: bool = True, skip_preflight: bool = False, recreate: bool = False, defer_proxy: bool = False) -> dict[str, Any]:
         self.ensure_instance_lease()
         plan: dict[str, Any] = {
@@ -1079,7 +1751,7 @@ class RuntimeManager:
             if not context.get("ok") or not context.get("context"):
                 return {"ok": False, "error": "runtime context generation failed", "plan": plan}
             build = run(
-                [*self.docker_base_cmd(), "build", "-t", self.cfg.runtime_image_tag, context["context"]],
+                [*self.docker_base_cmd(), "build", "-t", self.effective_image(), context["context"]],
                 env=self.docker_env(),
             )
             plan["runtimeImageBuild"] = {
@@ -1095,9 +1767,6 @@ class RuntimeManager:
         plan["network"] = self.ensure_network()
         if not plan["network"].get("ok"):
             return {"ok": False, "error": "docker network setup failed", "plan": plan}
-        plan["volume"] = self.ensure_volume()
-        if not plan["volume"].get("ok"):
-            return {"ok": False, "error": "docker volume setup failed", "plan": plan}
 
         rootfs_images = self.ensure_rootfs_images()
         plan["rootfsImages"] = rootfs_images
@@ -1114,17 +1783,25 @@ class RuntimeManager:
         if not any("/dev/binder" in arg for arg in docker_cmd):
             return {"ok": False, "error": "binder device mounts unavailable after binder setup", "plan": plan}
 
-        kmod_cmd = self.build_kmod_command()
-        kmod = run(kmod_cmd, timeout=900, env=self.docker_env())
-        plan["kmod"] = {
-            "ok": kmod.returncode == 0,
-            "command": kmod_cmd,
-            "returncode": kmod.returncode,
-            "stdout": kmod.stdout.strip()[-300:],
-            "stderr": kmod.stderr.strip()[-300:],
-        }
-        if kmod.returncode != 0:
-            return {"ok": False, "error": "kernel protection build/load failed", "plan": plan}
+        loaded_kmod = self.kernel_module_status()
+        if loaded_kmod.get("ok"):
+            plan["kmod"] = {
+                "ok": True,
+                "reused": True,
+                "reason": "engine-host kernel protection is already loaded",
+            }
+        else:
+            kmod_cmd = self.build_kmod_command()
+            kmod = run(kmod_cmd, timeout=900, env=self.docker_env())
+            plan["kmod"] = {
+                "ok": kmod.returncode == 0,
+                "command": kmod_cmd,
+                "returncode": kmod.returncode,
+                "stdout": kmod.stdout.strip()[-300:],
+                "stderr": kmod.stderr.strip()[-300:],
+            }
+            if kmod.returncode != 0:
+                return {"ok": False, "error": "kernel protection build/load failed", "plan": plan}
         plan["kernelModuleStatus"] = self.kernel_module_status()
         if not plan["kernelModuleStatus"].get("ok"):
             return {"ok": False, "error": "kernel protection failed post-load verification", "plan": plan}
@@ -1145,11 +1822,22 @@ class RuntimeManager:
                 "plan": plan,
             }
         existing_present = existing_container is not None
-        if existing_present and not self._container_matches_lease(existing_container):
+        if existing_present and not self._container_has_lease_owner(existing_container):
             return {
                 "ok": False,
                 "error": "resource_conflict",
                 "message": "Docker container is not owned by this instance",
+                "plan": plan,
+            }
+        if (
+            existing_present
+            and not recreate
+            and not self._container_matches_lease(existing_container)
+        ):
+            return {
+                "ok": False,
+                "error": "runtime_spec_mismatch",
+                "message": "owned container requires explicit recreation",
                 "plan": plan,
             }
         if existing_present and recreate:
@@ -1162,30 +1850,14 @@ class RuntimeManager:
                     "plan": plan,
                 }
         if existing_present and recreate:
-            quarantine = self.quarantine_proxy_for_lifecycle()
-            plan["proxyQuarantineBeforeRecreate"] = quarantine
-            if quarantine.get("ok") is not True:
+            removal = self._remove_owned_container(existing_container)
+            plan["containerRecreate"] = removal
+            if removal.get("ok") is not True:
                 return {
                     "ok": False,
-                    "error": quarantine.get("code", "engine_unavailable"),
+                    "error": removal.get("error", "existing_container_removal_failed"),
                     "plan": plan,
                 }
-            remove = run(
-                [*self.docker_base_cmd(), "rm", "-f", existing_container["Id"]],
-                env=self.docker_env(),
-            )
-            plan["containerRecreate"] = {
-                "ok": remove.returncode == 0,
-                "returncode": remove.returncode,
-                "stdout": remove.stdout.strip(),
-                "stderr": remove.stderr.strip(),
-            }
-            if remove.returncode != 0:
-                return {"ok": False, "error": "existing container removal failed", "plan": plan}
-            cleanup = self.proxy_cleanup()
-            plan["proxyCleanupBeforeRecreate"] = cleanup
-            if cleanup.get("ok") is not True:
-                return {"ok": False, "error": "proxy_cleanup_failed", "plan": plan}
             existing_present = False
 
         created_new = False
@@ -1338,6 +2010,12 @@ class RuntimeManager:
             else {"ok": False, "skipped": True}
         )
         required.append(result["daemonReady"])
+        result["dataSentinel"] = (
+            self.data_sentinel(create=True)
+            if result["daemonReady"].get("ok")
+            else {"ok": False, "skipped": True}
+        )
+        required.append(result["dataSentinel"])
         if defer_proxy:
             # Internal location-refresh path: proxy desired state is reconciled by
             # the caller after the location identity converges, so a broken proxy
@@ -1390,72 +2068,234 @@ class RuntimeManager:
                     else {"error": "proxy_cleanup_failed"}
                 ),
             }
-        quarantine = self.quarantine_proxy_for_lifecycle()
-        if quarantine.get("ok") is not True:
-            return {
-                "ok": False,
-                "error": quarantine.get("code", "engine_unavailable"),
-                "proxyQuarantine": quarantine,
-            }
-        proc = run(
-            [*self.docker_base_cmd(), "rm", "-f", container["Id"]],
-            env=self.docker_env(),
-        )
-        if proc.returncode != 0:
-            return {
-                "ok": False,
-                "error": "container_stop_failed",
-                "returncode": proc.returncode,
-                "proxyQuarantine": quarantine,
-            }
+        return self._remove_owned_container(container)
+
+    def data_sentinel(self, *, create: bool = False) -> dict[str, Any]:
         try:
-            cleanup = self.proxy_cleanup()
-        except InstanceError as exc:
-            cleanup = {"ok": False, "code": exc.code, "error": exc.code}
+            state = StorageStateStore(self.context, self.lease).load()
+        except StorageError as exc:
+
+            return exc.as_dict()
+        if state is None or state.get("state") != "committed":
+            return self._storage_error(
+                "storage_not_initialized",
+                "instance storage is not committed",
+            )
+        expected = f"{self.context.instance_id} {state['filesystemUuid']}"
+        directory = "/data/local/tmp/runtime-state"
+        path = f"{directory}/storage-sentinel.v1"
+        quoted_expected = shlex.quote(expected)
+        expected_digest = hashlib.sha256(f"{expected}\n".encode("ascii")).hexdigest()
+        command = (
+            "set -eu; "
+            f"d={shlex.quote(directory)}; f={shlex.quote(path)}; "
+            + (
+                "if [ ! -e ${f} ]; then "
+                "umask 077; mkdir -p ${d}; chown 0:0 ${d}; chmod 700 ${d}; "
+                f"echo {quoted_expected} > ${{d}}/.storage-sentinel.new; "
+                "chown 0:0 ${d}/.storage-sentinel.new; "
+                "chmod 600 ${d}/.storage-sentinel.new; "
+                "sync; "
+                "mv -f ${d}/.storage-sentinel.new ${f}; sync; fi; "
+                if create
+                else ""
+            )
+            + "[ -d ${d} ] && [ ! -L ${d} ]; "
+            "[ $(stat -c %u:%g:%a ${d}) = 0:0:700 ]; "
+            "[ -f ${f} ] && [ ! -L ${f} ]; "
+            "actual=$(sha256sum ${f}); actual=${actual%% *}; "
+            f"[ ${{actual}} = {expected_digest} ]; "
+            "[ $(stat -c %u:%g:%a ${f}) = 0:0:600 ]"
+        )
+        try:
+            result = self.daemon_client(timeout=10.0).root_exec(command)
         except Exception:
-            cleanup = {
-                "ok": False,
-                "code": "engine_unavailable",
-                "error": "engine_unavailable",
-            }
+            return self._storage_error(
+                "storage_sentinel_unavailable",
+                "live data sentinel is unavailable",
+            )
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return self._storage_error(
+                "storage_sentinel_mismatch",
+                "live data sentinel does not match this instance",
+            )
         return {
-            "ok": isinstance(cleanup, dict) and cleanup.get("ok") is True,
-            "proxyQuarantine": quarantine,
-            "proxyCleanup": cleanup,
-            **(
-                {}
-                if isinstance(cleanup, dict) and cleanup.get("ok") is True
-                else {"error": "proxy_cleanup_failed"}
-            ),
+            "ok": True,
+            "path": path,
+            "instanceId": self.context.short_id,
+            "filesystemUuid": state["filesystemUuid"],
+            "createdIfMissing": create,
+        }
+
+    def device_identity_status(self) -> dict[str, Any]:
+        try:
+            state = DeviceIdentityStore(self.context).load()
+        except IdentityError as exc:
+            return exc.as_dict()
+        if state is None:
+            return {"ok": False, "initialized": False}
+        return {"ok": True, **public_identity_state(state)}
+
+    def storage_status(self) -> dict[str, Any]:
+        store = StorageStateStore(self.context, self.lease)
+        try:
+            state = store.load()
+        except StorageError as exc:
+            return exc.as_dict()
+        if state is None:
+            return {
+                "ok": False,
+                "volume": self.lease.volume_name,
+                **public_storage_state(
+                    None,
+                    healthy=False,
+                    error="storage_not_initialized",
+                ),
+            }
+        if state["state"] != "committed":
+            return {
+                "ok": False,
+                "volume": self.lease.volume_name,
+                **public_storage_state(
+                    state,
+                    healthy=False,
+                    error="storage_transaction_pending",
+                ),
+            }
+        volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
+        if volume is None:
+            return {
+                "ok": False,
+                "volume": self.lease.volume_name,
+                **public_storage_state(
+                    state,
+                    healthy=False,
+                    error="storage_volume_missing",
+                ),
+            }
+        if not volume or not self._volume_matches_lease(volume):
+            return {
+                "ok": False,
+                "volume": self.lease.volume_name,
+                **public_storage_state(
+                    state,
+                    healthy=False,
+                    error="resource_conflict",
+                ),
+            }
+        image = self._inspect_volume_image(volume)
+        if (
+            not image.get("ok")
+            or image.get("filesystemUuid") != state["filesystemUuid"]
+            or image.get("sizeBytes") != state["sizeBytes"]
+        ):
+            return {
+                "ok": False,
+                "volume": self.lease.volume_name,
+                "image": image,
+                **public_storage_state(
+                    state,
+                    healthy=False,
+                    error="storage_identity_mismatch",
+                ),
+            }
+        backup_status: Optional[dict[str, Any]] = None
+        if state["backupImage"]:
+            backup_status = self._inspect_volume_image(volume, state["backupImage"])
+            if (
+                not backup_status.get("ok")
+                or backup_status.get("filesystemUuid")
+                != state["backupFilesystemUuid"]
+                or backup_status.get("sizeBytes") != state["backupSizeBytes"]
+            ):
+                return {
+                    "ok": False,
+                    "volume": self.lease.volume_name,
+                    "image": image,
+                    "backupImage": backup_status,
+                    **public_storage_state(
+                        state,
+                        healthy=False,
+                        error="storage_backup_mismatch",
+                    ),
+                }
+        return {
+            "ok": True,
+            "volume": self.lease.volume_name,
+            "image": image,
+            "backupImage": backup_status,
+            **public_storage_state(state, healthy=True),
         }
 
     def status(self) -> dict[str, Any]:
         self.ensure_instance_lease()
+        selected = {
+            **self.context.public_dict(),
+            "container": self.lease.container_name,
+            "volume": self.lease.volume_name,
+            "adbTarget": self.adb_target,
+            "daemonPort": self.lease.host_daemon_port,
+        }
         if which("docker") is None:
-            return {"ok": False, "error": "docker not found"}
+            return {
+                "ok": False,
+                "error": "docker not found",
+                "instance": selected,
+            }
+        storage = self.storage_status()
+        identity = self.device_identity_status()
         container, _ = self._inspect_docker_object(
             "container",
             self.lease.container_name,
         )
+        adb_stopped = {"ok": False, "error": "container not running"}
         if container is None:
-            return {"ok": True, "running": False, "rows": [], "adb": {"ok": False, "error": "container not running"}}
-        if not container or not self._container_matches_lease(container):
+            return {
+                "ok": storage.get("ok") is True,
+                "running": False,
+                "rows": [],
+                "adb": adb_stopped,
+                "instance": selected,
+                "storage": storage,
+                "identity": identity,
+            }
+        if not container or not self._container_has_lease_owner(container):
             return {
                 "ok": False,
                 "error": "resource_conflict",
                 "message": "Docker container is not owned by this instance",
+                "instance": selected,
+                "storage": storage,
+                "identity": identity,
             }
         state = container.get("State")
         running = isinstance(state, dict) and state.get("Running") is True
         proc = run(
-            [*self.docker_base_cmd(), "ps", "--filter", f"id={container['Id']}", "--format", "{{json .}}"],
+            [
+                *self.docker_base_cmd(),
+                "ps",
+                "--filter",
+                f"id={container['Id']}",
+                "--format",
+                "{{json .}}",
+            ],
             env=self.docker_env(),
         )
         rows = [line for line in proc.stdout.splitlines() if line.strip()]
-        adb_state: dict[str, Any] = {"ok": False, "error": "container not running"}
+        adb_state: dict[str, Any] = adb_stopped
         if running and which("adb") is not None:
             adb_state = self.adb(["get-state"])
-        return {"ok": proc.returncode == 0, "running": running, "rows": rows, "adb": adb_state}
+        spec_matches = self._container_matches_lease(container)
+        return {
+            "ok": proc.returncode == 0 and storage.get("ok") is True,
+            "running": running,
+            "runtimeSpecMatches": spec_matches,
+            "rows": rows,
+            "adb": adb_state,
+            "instance": selected,
+            "storage": storage,
+            "identity": identity,
+        }
 
     def adb(self, args: list[str], timeout: Optional[float] = None) -> dict[str, Any]:
         adb_bin = which("adb")
@@ -2026,32 +2866,8 @@ class RuntimeManager:
         }
 
     def ensure_rootfs_images(self) -> dict[str, Any]:
-        """Build/refresh this instance's ext4 rootfs+data loop images."""
-        self.ensure_instance_lease()
-        volume = self.ensure_volume()
-        if not volume.get("ok"):
-            return {
-                "ok": False,
-                "error": "resource_conflict",
-                "message": "instance data volume is unavailable",
-                "volume": volume,
-            }
-        script = self.context.project_root / "scripts" / "make-rootfs-image.sh"
-        cmd = [str(script), self.effective_image(), self.lease.volume_name]
-        env = self.docker_env()
-        ssh_cmd = self.remote_docker_ssh_cmd()
-        if ssh_cmd:
-            env["XENOID_ENGINE_SSH"] = ssh_cmd[-1]
-            if "-p" in ssh_cmd:
-                env["XENOID_ENGINE_SSH_PORT"] = ssh_cmd[ssh_cmd.index("-p") + 1]
-        proc = run(cmd, timeout=1800, env=env)
-        return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "command": cmd,
-            "stdout": proc.stdout.strip()[-2000:],
-            "stderr": proc.stderr.strip()[-2000:],
-        }
+        """Converge rootfs while preserving the committed instance data image."""
+        return self.ensure_instance_storage()
 
     def make_ota_bundle(self, version: str = "0.1.0") -> dict[str, Any]:
         script = self.context.project_root / "scripts" / "make-ota-bundle.sh"
@@ -3231,6 +4047,70 @@ class RuntimeManager:
             raise InstanceError("manifest_invalid", "proxy manifest encoding is invalid")
         return validated
 
+    def _proxy_restore_manifest_from_ownership(
+        self,
+        *,
+        allow_stopped: bool,
+    ) -> dict[str, Any]:
+        """Restore volatile proxy manifest state after an engine-host reboot."""
+        owner_path = f"{self._proxy_state_path}/engine-ownership.json"
+        if not self._proxy_remote_regular_valid(owner_path, 0o600):
+            raise InstanceError("ownership_mismatch", "proxy ownership state is invalid")
+        returncode, output = self._proxy_root_process(
+            ["cat", "--", owner_path],
+            timeout=30,
+            output_limit=65536,
+        )
+        if returncode != 0 or not 3 <= len(output) <= 65536:
+            raise InstanceError("ownership_mismatch", "proxy ownership state could not be read")
+        try:
+            owner = self._proxy_json_document(output.decode("ascii", "strict"))
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            raise InstanceError("ownership_mismatch", "proxy ownership state is invalid") from exc
+        if (
+            not isinstance(owner, dict)
+            or set(owner)
+            != {
+                "schema", "instanceId", "resourceTag", "runtimeEpoch",
+                "manifestDigest", "leaseDigest", "manifestGeneration",
+                "appliedGeneration", "phase", "activeCandidate", "candidate",
+                "previous", "binarySha256", "pythonPath", "resources",
+            }
+            or owner.get("schema") != "dev.xenoid.proxy-engine.ownership/v1"
+            or owner.get("instanceId") != self.context.instance_id
+            or owner.get("resourceTag") != self.context.resource_tag
+            or not isinstance(owner.get("runtimeEpoch"), str)
+            or not isinstance(owner.get("manifestGeneration"), int)
+            or isinstance(owner.get("manifestGeneration"), bool)
+            or not isinstance(owner.get("manifestDigest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", owner["manifestDigest"]) is None
+        ):
+            raise InstanceError("ownership_mismatch", "proxy ownership state is invalid")
+        canonical = (
+            json.dumps(
+                owner,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            + b"\n"
+        )
+        if output != canonical:
+            raise InstanceError("ownership_mismatch", "proxy ownership encoding is invalid")
+        container_id, network_id = self._proxy_live_identity(
+            require_running=not allow_stopped
+        )
+        manifest = self._proxy_manifest_document(
+            owner["runtimeEpoch"],
+            owner["manifestGeneration"],
+            container_id,
+            network_id,
+        )
+        if manifest["manifestDigest"] != owner["manifestDigest"]:
+            raise InstanceError("ownership_mismatch", "proxy ownership runtime identity is stale")
+        self._proxy_stage_manifest(manifest)
+        return manifest
+
     def _proxy_stage_manifest(self, manifest: dict[str, Any]) -> None:
         self._proxy_install_directory("/run/xenoid", 0o755)
         self._proxy_install_directory("/run/xenoid/proxy", 0o755)
@@ -3386,18 +4266,22 @@ class RuntimeManager:
             allow_stopped=allow_stopped,
         )
         if existing is None:
-            if (
-                self._proxy_remote_exists(self._proxy_state_path)
-                or self._proxy_remote_exists(self._proxy_runtime_path)
-            ):
+            state_exists = self._proxy_remote_exists(self._proxy_state_path)
+            runtime_exists = self._proxy_remote_exists(self._proxy_runtime_path)
+            if state_exists:
+                existing = self._proxy_restore_manifest_from_ownership(
+                    allow_stopped=allow_stopped
+                )
+            elif runtime_exists:
                 raise InstanceError("ownership_mismatch", "partial proxy instance state exists")
-            existing = self._proxy_manifest_document(
-                f"control-{self.context.resource_tag}-{self.lease.transaction_id}",
-                0,
-                container_id,
-                network_id,
-            )
-            self._proxy_stage_manifest(existing)
+            else:
+                existing = self._proxy_manifest_document(
+                    f"control-{self.context.resource_tag}-{self.lease.transaction_id}",
+                    0,
+                    container_id,
+                    network_id,
+                )
+                self._proxy_stage_manifest(existing)
         expected_digest = self._proxy_local_control_digest()
         checked = self._proxy_root_json("check-control")
         if checked.get("ok") is True and checked.get("controlDigest") == expected_digest:
@@ -3410,14 +4294,29 @@ class RuntimeManager:
             ["systemctl", "is-active", "--quiet", self._proxy_systemd_unit()],
             timeout=15,
         )
+        staged: Optional[dict[str, str]] = None
+        staging = f"/var/lib/xenoid/proxy/control-{expected_digest}"
         if owns_engine_state or agent_service_active:
             quarantined = self._proxy_root_json("quarantine")
+            if (
+                quarantined.get("ok") is not True
+                and quarantined.get("code") == "runtime_identity_mismatch"
+            ):
+                # Repair an older installed control helper that rejected Docker's
+                # valid stopped-container representation. Staging is inert; the
+                # candidate still validates the existing signed manifest/owner.
+                staged = self._proxy_stage_control_bundle(expected_digest)
+                quarantined = self._proxy_root_json(
+                    "quarantine",
+                    helper=f"{staging}/xenoid-proxy-engine.py",
+                    timeout=180,
+                )
             if quarantined.get("ok") is not True:
                 return quarantined
             if not self._proxy_stop_agent():
                 return self._proxy_failure("agent_stop_failed")
-        staged = self._proxy_stage_control_bundle(expected_digest)
-        staging = f"/var/lib/xenoid/proxy/control-{expected_digest}"
+        if staged is None:
+            staged = self._proxy_stage_control_bundle(expected_digest)
         installed = self._proxy_root_json(
             "install-control",
             helper=f"{staging}/xenoid-proxy-engine.py",
@@ -3696,6 +4595,20 @@ class RuntimeManager:
             if not self._proxy_stop_agent():
                 return self._proxy_failure("agent_stop_failed")
             result = self._proxy_root_json("cleanup", timeout=180)
+            if (
+                result.get("ok") is not True
+                and result.get("code") == "cleanup_incomplete"
+            ):
+                expected_digest = self._proxy_local_control_digest()
+                self._proxy_stage_control_bundle(expected_digest)
+                result = self._proxy_root_json(
+                    "cleanup",
+                    helper=(
+                        f"/var/lib/xenoid/proxy/control-{expected_digest}"
+                        "/xenoid-proxy-engine.py"
+                    ),
+                    timeout=180,
+                )
         except InstanceError as exc:
             return self._proxy_failure(exc.code)
         if result.get("ok") is not True:

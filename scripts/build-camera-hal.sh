@@ -64,7 +64,9 @@ python3 "$ROOT/scripts/sanitize-aidl-output.py" "$GEN"
 pull_system_lib() {
   local name="$1"
   [[ -f "$HAL/$name" ]] && return
-  docker cp "xenoid-android:/system/lib64/$name" "$HAL/$name" >/dev/null 2>&1 || {
+  local container_name
+  container_name="$(PYTHONPATH="$ROOT/src" python3 -c 'import os; from pathlib import Path; from xenoid.config import resolve_instance; c,g,l=resolve_instance(project_root=Path.cwd(), env={}); print(l.container_name)' 2>/dev/null || echo xenoid-android)"
+  docker cp "${container_name}:/system/lib64/$name" "$HAL/$name" >/dev/null 2>&1 || {
     local image="${XENOID_BASE_IMAGE:-redroid/redroid:13.0.0_64only-latest}"
     local cid
     cid="$(docker create "$image")"

@@ -13,9 +13,37 @@ cd xenoid
 ./xenoid view
 ```
 
-`install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs and creates `.xenoid/config.json` when absent. It does not start Android.
+`install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs and initializes the `default` instance from `examples/config-macos-colima.json` when absent. It does not start Android.
 
 `up` builds the configured artifacts, starts Android, deploys the daemon and native helpers, applies the device profile and protection policy, activates system protection, and validates the live runtime. It returns nonzero if convergence or validation fails.
+
+## Instance lifecycle and data persistence
+
+Each instance is a logical device with three persistent components:
+
+1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
+2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
+3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 `xenoid-data.img` that is bind-mounted as the container's `/data`.
+
+`stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
+
+Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
+
+## Multi-instance operation
+
+Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Linux ARM). Each instance gets a unique container, volume, network, MAC, IPv4/IPv6, host ADB/daemon port, and proxy routing table from the operator registry.
+
+Source-based `up` operations for the same project wait on one build/convergence lock because they share generated native artifacts. Each instance still runs concurrently after convergence and uses its own auto-built runtime image tag. Rootfs preparation streams to the Docker engine host, so macOS does not need temporary space for a complete rootfs tar.
+
+```bash
+./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-b init --from phone-a
+./xenoid --instance phone-a up
+./xenoid --instance phone-b up
+./xenoid --instance phone-a stop
+```
+
+Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity.
 
 ## Linux ARM
 
@@ -23,9 +51,8 @@ Requirements: Ubuntu 22.04 or 24.04 ARM64, Python 3.9 or newer, Docker Engine, r
 
 ```bash
 cd xenoid
-mkdir -p .xenoid
-cp examples/config-linux-arm.json .xenoid/config.json
 sudo ./scripts/setup-linux-binderfs.sh
+./xenoid init --config examples/config-linux-arm.json
 ./xenoid up
 ```
 

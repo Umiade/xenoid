@@ -117,9 +117,9 @@ if command -v docker >/dev/null 2>&1; then
     python3 "$ROOT/scripts/patch-runtime-libselinux.py" "$OUT/payload/libselinux.so"
     python3 "$ROOT/scripts/patch-telephony-legacy-lte-band.py"       "$OUT/payload/telephony-common.base.jar" "$OUT/payload/telephony-common.jar"
     rm -f "$OUT/payload/telephony-common.base.jar"
-    python3 "$ROOT/scripts/patch-services-isolated-owner.py" \
-      "$OUT/payload/services.jar" "$OUT/payload/services.isolated-owner.jar"
-    mv "$OUT/payload/services.isolated-owner.jar" "$OUT/payload/services.jar"
+    python3 "$ROOT/scripts/patch-services-runtime.py" \
+      "$OUT/payload/services.jar" "$OUT/payload/services.runtime.jar"
+    mv "$OUT/payload/services.runtime.jar" "$OUT/payload/services.jar"
     python3 - \
       "$OUT/payload/gralloc.base.redroid.so" \
       "$OUT/payload/hwcomposer.redroid.so" \

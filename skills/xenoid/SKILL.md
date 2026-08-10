@@ -19,13 +19,41 @@ On Apple Silicon macOS:
 ./xenoid view
 ```
 
-On Linux ARM64, create `.xenoid/config.json` from `examples/config-linux-arm.json`, prepare binderfs, and then run:
+On Linux ARM64, prepare binderfs and initialize the default instance from the template:
 
 ```bash
+sudo ./scripts/setup-linux-binderfs.sh
+./xenoid init --config examples/config-linux-arm.json
 ./xenoid up
 ```
 
 `up` owns runtime preflight, build or artifact validation, Android startup, daemon deployment, device-profile application, production protection activation, and the final live-runtime check. A successful return means the complete configured runtime is ready.
+
+## Instance lifecycle and data persistence
+
+Each instance is a logical device with three persistent components:
+
+1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
+2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
+3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 `xenoid-data.img` that is bind-mounted as the container's `/data`.
+
+`stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
+
+Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
+
+## Multi-instance operation
+
+Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Linux ARM). Each instance gets a unique container, volume, network, MAC, IPv4/IPv6, host ADB/daemon port, and proxy routing table from the operator registry.
+
+```bash
+./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-b init --from phone-a
+./xenoid --instance phone-a up
+./xenoid --instance phone-b up
+./xenoid --instance phone-a stop
+```
+
+Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity.
 
 ## Runtime inspection
 

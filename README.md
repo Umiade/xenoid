@@ -28,7 +28,7 @@ cd xenoid
 ./xenoid view
 ```
 
-`install-runtime` installs and validates the macOS host toolchain, prepares Colima and binderfs, and creates `.xenoid/config.json` from the macOS template when no local configuration exists. It does not start Android.
+`install-runtime` installs and validates the macOS host toolchain, prepares Colima and binderfs, and initializes the `default` instance from `examples/config-macos-colima.json` when no instance exists. It does not start Android.
 
 `up` is the user-facing startup command. It builds and starts the complete runtime, deploys the daemon and native helpers, applies the device profile and hiding policy, loads eBPF, and finishes with the same live-runtime validation used by `doctor --require-runtime`. If startup fails, `up` collects the standalone doctor report before returning the original failure.
 
@@ -42,9 +42,8 @@ Clone this repository as `xenoid`, then:
 
 ```bash
 cd xenoid
-mkdir -p .xenoid
-cp examples/config-linux-arm.json .xenoid/config.json
 sudo ./scripts/setup-linux-binderfs.sh
+./xenoid init --config examples/config-linux-arm.json
 ./xenoid up
 ```
 
@@ -56,6 +55,43 @@ A remote Docker context can be selected before startup:
 ```
 
 Linux hosts must expose binderfs devices to redroid. ARM64 hosts must use the `64only` redroid image; an x86_64 image is not a substitute.
+
+### Instance lifecycle and data persistence
+
+Each Xenoid instance is a logical device with three persistent components:
+
+1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
+2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
+3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 `xenoid-data.img` that is bind-mounted as the container's `/data`.
+
+`stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
+
+Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
+
+### Multi-instance operation
+
+Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Linux ARM). Each instance gets a unique container, volume, network, MAC, IPv4/IPv6, host ADB/daemon port, and proxy routing table from the operator registry.
+
+```bash
+# Initialize two instances from the platform template
+./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-b init --from phone-a
+
+# Start both (shared protection is engine-host scoped; first up loads it)
+./xenoid --instance phone-a up
+./xenoid --instance phone-b up
+
+# Per-instance status and ADB
+./xenoid --instance phone-a status
+./xenoid --instance phone-b adb shell getprop ro.product.model
+
+# Stop one instance without affecting the other
+./xenoid --instance phone-a stop
+```
+
+Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity.
+
+The "equivalent to a unique real device" acceptance scope is Android user/data/keystore/account-facing state and instance identity/lifecycle. Xenoid does not simulate physical telephony, SMS, or hardware sensors that the host does not provide.
 
 ## Diagnostics
 

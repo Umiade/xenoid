@@ -2,10 +2,17 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-ADB_TARGET="127.0.0.1:$(python3 - <<'PY'
-import json, pathlib
-p=pathlib.Path('.xenoid/config.json')
-print(json.loads(p.read_text()).get('adb_port',5555) if p.exists() else 5555)
+ADB_TARGET="$(python3 - <<'PY'
+import os, sys
+sys.path.insert(0, 'src')
+from pathlib import Path
+from xenoid.config import resolve_instance
+name = os.environ.get('XENOID_INSTANCE') or 'default'
+try:
+    context, cfg, lease = resolve_instance(name, project_root=Path.cwd(), env={})
+    print(f"127.0.0.1:{lease.host_adb_port}")
+except Exception:
+    print('127.0.0.1:5555')
 PY
 )"
 ADB_BIN="$(python3 - <<'PY'

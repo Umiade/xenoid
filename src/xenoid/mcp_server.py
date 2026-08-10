@@ -17,6 +17,13 @@ from .config import (
 )
 from .daemon_client import DaemonClient
 from .doctor import build_doctor_report
+from .device_identity import (
+    DeviceIdentityStore,
+    converge_instance_identity,
+    identity_field_key,
+    public_identity_state,
+    validate_identity_value,
+)
 from .proxy_controller import ProxyController
 from .util import read_json_file
 @dataclass(frozen=True)
@@ -554,7 +561,14 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_device_collect":
         return text_result(edc().collect_fingerprint())
     if name == "xenoid_device_apply":
-        return text_result(edc().apply_fingerprint(read_json_file(str(args["profilePath"])), bool(args.get("regenerateUnique", True))))
+        client = edc()
+        return text_result(converge_instance_identity(
+            context,
+            mgr,
+            client,
+            read_json_file(str(args["profilePath"])),
+            rotate_stable=bool(args.get("regenerateUnique", True)),
+        ))
     if name == "xenoid_device_generate_frida":
         return text_result(mgr.generate_profile_frida(
             str(args["profilePath"]),
@@ -568,7 +582,20 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
             bool(args.get("keepUnique", False)),
         ))
     if name == "xenoid_device_set":
-        return text_result(edc().set_fingerprint_field(str(args["field"]), args["value"]))
+        field = str(args["field"])
+        value = args["value"]
+        key = identity_field_key(field)
+        if key is not None:
+            validate_identity_value(key, value)
+        changed = edc().set_fingerprint_field(field, value)
+        if key is not None and changed.get("ok") is True:
+            state = DeviceIdentityStore(context).update_field(field, value)
+            changed = {
+                "ok": True,
+                "daemon": changed,
+                "identity": public_identity_state(state),
+            }
+        return text_result(changed)
     if name == "xenoid_automation_plan":
         return text_result(mgr.automation_plan(str(args["scriptPath"])))
     if name == "xenoid_automation_run_host":

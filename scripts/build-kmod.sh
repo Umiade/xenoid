@@ -7,6 +7,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/native/xenoid-kmod"
+
+if [[ "${XENOID_SHARED_PROTECTION_LOCKED:-0}" != 1 ]]; then
+  exec python3 "$ROOT/scripts/with-shared-protection-lock.py" "$0" "$@"
+fi
 BUILD_DIR="/var/tmp/xenoid-kmod-build"
 LKG_DIR="/var/tmp/xenoid-kmod-lkg"
 DRY=0
@@ -32,6 +36,7 @@ if [[ -z "$MODE" ]]; then
     MODE=local
   fi
 fi
+
 
 refresh_android_battery() {
   local command='stop vendor.health-default >/dev/null 2>&1 || true; start vendor.health-default >/dev/null 2>&1 || true; sleep 1; dumpsys battery reset >/dev/null 2>&1 || true'

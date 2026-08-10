@@ -354,6 +354,12 @@ class DaemonClient:
                         return _proxy_failure("daemon_response_invalid")
                     if not isinstance(parsed, dict):
                         return _proxy_failure("daemon_response_invalid")
+                    if (
+                        parsed.get("ok") is not True
+                        and parsed.get("error") == "not found"
+                        and parsed.get("path") == path
+                    ):
+                        return _proxy_failure("proxy_api_unavailable", 404)
                     if parsed.get("ok") is not True:
                         return _proxy_failure(_proxy_error_from_response(parsed))
                     return parsed

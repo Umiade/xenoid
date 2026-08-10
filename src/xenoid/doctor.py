@@ -96,6 +96,9 @@ def build_doctor_report(
 
     preflight = manager.runtime_preflight()
     preflight["ok"] = bool(preflight.get("ok"))
+    storage = manager.storage_status()
+    storage["ok"] = bool(storage.get("ok"))
+
 
     instance_env = {
         **os.environ,
@@ -130,7 +133,19 @@ def build_doctor_report(
         )
         health = daemon.health()
         root = daemon.root_status() if health.get("ok") else {"ok": False, "skipped": True}
-        runtime_ready = bool(connect.get("ok") and boot_ok and forward.get("ok") and health.get("ok") and root.get("ok"))
+        sentinel = (
+            manager.data_sentinel(create=False)
+            if root.get("ok")
+            else {"ok": False, "skipped": True}
+        )
+        runtime_ready = bool(
+            connect.get("ok")
+            and boot_ok
+            and forward.get("ok")
+            and health.get("ok")
+            and root.get("ok")
+            and sentinel.get("ok")
+        )
         runtime.update({
             "ok": runtime_ready,
             "adbConnect": connect,
@@ -138,6 +153,7 @@ def build_doctor_report(
             "daemonForward": forward,
             "daemonHealth": health,
             "rootStatus": root,
+            "dataSentinel": sentinel,
         })
     else:
         runtime.update({"skipped": True, "reason": "Android runtime is not running"})
@@ -229,6 +245,7 @@ def build_doctor_report(
     sections: dict[str, dict[str, Any]] = {
         "host": host,
         "preflight": preflight,
+        "storage": storage,
         "verification": verification,
         "runtime": runtime,
         "protection": protection,

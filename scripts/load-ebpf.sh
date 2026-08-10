@@ -3,6 +3,10 @@
 # Usage: load-ebpf.sh [--colima|--local|--ssh user@host] [--ssh-port N] load|status|unload
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ "${XENOID_SHARED_PROTECTION_LOCKED:-0}" != 1 ]]; then
+  exec python3 "$ROOT/scripts/with-shared-protection-lock.py" "$0" "$@"
+fi
 BUILD_DIR="/var/tmp/xenoid-ebpf-build"
 SRC="$ROOT/native/xenoid-ebpf"
 DRY=0
@@ -32,6 +36,7 @@ if [[ -z "$MODE" ]]; then
     MODE=local
   fi
 fi
+
 
 if [[ "$MODE" == "colima" ]]; then
   command -v colima >/dev/null 2>&1 || { echo '{"ok":false,"error":"colima not found"}'; exit 1; }

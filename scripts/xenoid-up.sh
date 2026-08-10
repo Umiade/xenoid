@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${XENOID_UP_LOCKED:-0}" != 1 ]]; then
+  export XENOID_UP_LOCK="$ROOT/.xenoid/up.lock"
+  exec python3 "$ROOT/scripts/with-up-lock.py" "$0" "$@"
+fi
 cd "$ROOT"
 # Full startup requires the image-bound zygote preload layer.
 export XENOID_ZYGOTE_PRELOAD=1
@@ -60,10 +64,11 @@ cmds+=(
   "./xenoid --instance $INSTANCE adb push <runtime-abi prop-area helper> /data/local/tmp/xenoid-prop-area"
   "./xenoid --instance $INSTANCE adb push <runtime-abi SSAID helper> /data/local/tmp/xenoid-ssaid"
   "./xenoid --instance $INSTANCE profile deploy-helper <runtime-abi profile helper>"
-  "./xenoid --instance $INSTANCE device apply $ROOT/examples/fingerprints/sample-profile.json --keep-unique"
+  "./xenoid --instance $INSTANCE device apply $ROOT/examples/fingerprints/sample-profile.json --instance-identity"
   "./xenoid --instance $INSTANCE adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_FINE_LOCATION"
   "./xenoid --instance $INSTANCE adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_BACKGROUND_LOCATION"
   "./xenoid --instance $INSTANCE location apply --default SG <explicit location identity; one-time recreate on change>"
+  "./xenoid --instance $INSTANCE device apply $ROOT/examples/fingerprints/sample-profile.json --instance-identity <final container epoch>"
   "./xenoid --instance $INSTANCE proxy reconcile <strict desired-state convergence after location>"
   "./xenoid --instance $INSTANCE root exec <remove stale Frida state>"
   "./xenoid --instance $INSTANCE hide apply $ROOT/examples/hide/default-policy.json"
@@ -211,10 +216,9 @@ xenoid_cli adb shell chmod 755 /data/local/tmp/.ld/core.so
 xenoid_cli adb push "$SSAID_BIN" /data/local/tmp/xenoid-ssaid
 xenoid_cli adb shell chmod 755 /data/local/tmp/xenoid-ssaid
 xenoid_cli profile deploy-helper "$PROFILE_BIN"
-# Re-stage the effective fingerprint on every cold start without rotating stable
-# identifiers. Rotation is an explicit `xenoid device apply` operation; doing it
-# implicitly on every `up` makes boot/property/profile views race and diverge.
-xenoid_cli device apply "$ROOT/examples/fingerprints/sample-profile.json" --keep-unique
+# Stage the generic profile with host-owned stable and boot-scoped identity.
+# Retry within the same container epoch reuses the persisted pending values.
+xenoid_cli device apply "$ROOT/examples/fingerprints/sample-profile.json" --instance-identity
 # The daemon reads cell info from a background UID during location verify, so
 # both location permissions must land before any location apply; on a fresh
 # instance anything later deadlocks the first up.
@@ -224,6 +228,9 @@ xenoid_cli adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCE
 # protection mounts. It recreates the owned container at most once, only when
 # the selected country changed, and never consults proxy egress.
 xenoid_cli location apply --default SG
+# Location may have recreated the container. Converge once more so stable IDs
+# remain unchanged while boot_id/random_uuid bind to the final container epoch.
+xenoid_cli device apply "$ROOT/examples/fingerprints/sample-profile.json" --instance-identity
 # Proxy desired state converges strictly after location so a broken proxy can
 # never block identity convergence, and proxy egress never changes identity.
 xenoid_cli proxy reconcile

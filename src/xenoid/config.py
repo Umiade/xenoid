@@ -659,6 +659,8 @@ def _write_instance_transaction(
     lease: InstanceLease,
     registry: dict[str, Any],
     legacy: Optional[Mapping[str, Any]] = None,
+    *,
+    initialize_identity: bool = True,
 ) -> InstanceLease:
     context.state_root.mkdir(parents=True, exist_ok=True)
     context.state_root.chmod(0o700)
@@ -680,6 +682,10 @@ def _write_instance_transaction(
                 context.state_root / "legacy-engine.json",
                 {key: legacy[key] for key in sorted(_LEGACY_IDENTITY_FIELDS) if key in legacy},
             )
+        if initialize_identity:
+            from .device_identity import DeviceIdentityStore
+
+            DeviceIdentityStore(context).initialize()
         registry["leases"][context.instance_id] = asdict(committed)
         registry["pending"].pop(lease.transaction_id, None)
         _atomic_json(allocation_path, asdict(committed))
@@ -689,12 +695,37 @@ def _write_instance_transaction(
         registry["pending"].pop(lease.transaction_id, None)
         registry["leases"].pop(context.instance_id, None)
         _atomic_json(registry_path, registry)
-        for path in (allocation_path, context.config_path):
+        for path in (
+            allocation_path,
+            context.config_path,
+            context.state_root / "device-identity.json",
+        ):
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
         raise
+
+
+def _config_template_overrides(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise InstanceError("instance_identity_mismatch", "instance config template must be an object")
+    allowed = set(XenoidConfig.__dataclass_fields__) - {
+        "instance_name",
+        "instance_id",
+        "schema_version",
+        "android_adb_port",
+    }
+    unknown = set(raw) - allowed
+    if unknown:
+        raise InstanceError("instance_identity_mismatch", "unknown instance config template field")
+    return {key: raw[key] for key in allowed & set(raw)}
+
+
+def _clone_config_overrides(source: XenoidConfig) -> dict[str, Any]:
+    values = asdict(source)
+    excluded = {"instance_name", "instance_id", "schema_version", "android_adb_port"}
+    return {key: values[key] for key in values if key not in excluded}
 
 
 def initialize_instance(
@@ -703,12 +734,18 @@ def initialize_instance(
     project_root: Optional[Union[str, Path]] = None,
     state_home: Optional[Union[str, Path]] = None,
     overrides: Optional[Mapping[str, Any]] = None,
+    template_path: Optional[Union[str, Path]] = None,
+    from_instance: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
 ) -> tuple[InstanceContext, XenoidConfig, InstanceLease]:
     name = select_instance_name(instance_name, env)
     root = resolve_project_root(project_root, env)
     if name == "default" and (root / ".xenoid" / "config.json").is_file():
         return _migrate_legacy_default(root, state_home)
+    if template_path is not None and from_instance is not None:
+        raise InstanceError("resource_conflict", "init template and source instance are mutually exclusive")
+    if overrides and from_instance is not None:
+        raise InstanceError("resource_conflict", "init source and direct overrides are mutually exclusive")
     config_path = instance_config_path(root, name)
     registry_root = Path(state_home).expanduser().resolve() if state_home else default_state_home()
     with _registry_lock(registry_root):
@@ -716,7 +753,32 @@ def initialize_instance(
             raise InstanceError("resource_conflict", "instance is already initialized")
         instance_id = str(uuid.uuid4())
         context = _context(root, name, instance_id, registry_root)
-        cfg = new_instance_config(name, instance_id, overrides)
+        resolved_overrides: dict[str, Any] = {}
+        if template_path is not None:
+            template = _read_json_object(
+                Path(template_path).expanduser().resolve(),
+                "instance_identity_mismatch",
+            )
+            resolved_overrides = _config_template_overrides(template)
+            if overrides:
+                unknown_override = set(overrides) - resolved_overrides
+                if unknown_override:
+                    raise InstanceError("resource_conflict", "init overrides are not allowed with a template")
+                resolved_overrides.update(overrides)
+        elif from_instance is not None:
+            source_name = validate_instance_name(from_instance)
+            if source_name == name:
+                raise InstanceError("resource_conflict", "init source must be a different instance")
+            source_config_path = instance_config_path(root, source_name)
+            source_cfg = _config_from_dict(
+                _read_json_object(source_config_path, "instance_identity_mismatch")
+            )
+            if source_cfg.instance_name != source_name:
+                raise InstanceError("instance_identity_mismatch", "source instance config mismatch")
+            resolved_overrides = _clone_config_overrides(source_cfg)
+        elif overrides:
+            resolved_overrides = dict(overrides)
+        cfg = new_instance_config(name, instance_id, resolved_overrides)
         registry = _read_registry(registry_root)
         lease = _allocate_lease_locked(registry, name, instance_id, None, False)
         lease = _write_instance_transaction(context, cfg, lease, registry)
@@ -793,7 +855,14 @@ def _migrate_legacy_default(
             ):
                 raise InstanceError("resource_conflict", "legacy network identity conflicts with managed lease")
         _copy_legacy_state(project_root, context)
-        lease = _write_instance_transaction(context, cfg, lease, registry, identity)
+        lease = _write_instance_transaction(
+            context,
+            cfg,
+            lease,
+            registry,
+            identity,
+            initialize_identity=False,
+        )
         _atomic_json(
             context.state_root / "migration.json",
             {
@@ -864,6 +933,14 @@ def resolve_instance(
         registered = InstanceLease.from_dict(raw)
         if registered != lease:
             raise InstanceError("resource_conflict", "client registry and allocation disagree")
+    from .device_identity import DeviceIdentityStore
+
+    identity_store = DeviceIdentityStore(context)
+    if (context.state_root / "migration.json").is_file():
+        if identity_store.path.exists():
+            identity_store.load()
+    else:
+        identity_store.initialize()
     return context, cfg, lease
 
 

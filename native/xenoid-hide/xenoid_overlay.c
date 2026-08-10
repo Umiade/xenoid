@@ -1125,11 +1125,27 @@ static int revert(void) {
   for (int i=0; overlay_targets[i]; ++i) { if (umount2(overlay_targets[i], MNT_DETACH) && errno != EINVAL) { printf("%s=umount_fail:%s\n", overlay_targets[i], strerror(errno)); fail++; } else { unmark_mounted(overlay_targets[i]); printf("%s=umount_ok\n", overlay_targets[i]); } }
   return fail ? 1 : 0;
 }
+static int isolate_sysfs_mounts(void) {
+  /* Android keeps /sys in a shared peer group. Without isolating the parent,
+     per-instance identity bind mounts propagate into sibling containers. */
+  if (mount(NULL, "/sys", NULL, MS_REC | MS_PRIVATE, NULL) == 0) return 0;
+  fprintf(stderr, "make-private /sys: %s\n", strerror(errno));
+  return -1;
+}
 int main(int argc, char **argv) {
   const char *cmd = argc > 1 ? argv[1] : "status";
-  if (!strcmp(cmd, "apply")) return apply();
-  if (!strcmp(cmd, "revert")) return revert();
-  if (!strcmp(cmd, "cleanup")) return cleanup();
+  if (!strcmp(cmd, "apply")) {
+    if (isolate_sysfs_mounts()) return 2;
+    return apply();
+  }
+  if (!strcmp(cmd, "revert")) {
+    if (isolate_sysfs_mounts()) return 2;
+    return revert();
+  }
+  if (!strcmp(cmd, "cleanup")) {
+    if (isolate_sysfs_mounts()) return 2;
+    return cleanup();
+  }
   if (!strcmp(cmd, "status-json")) return status_json();
   printf("xenoid-overlay status\n");
   status_one("/proc/sys/kernel/random/boot_id"); status_one("/proc/sys/kernel/random/uuid"); status_one("/proc/sys/kernel/random/entropy_avail"); status_one("/sys/class/dmi/id/product_name"); status_one("/proc/device-tree/model"); status_one("/sys/firmware/devicetree/base/model"); status_one("/sys/fs/selinux/enforce"); status_one("/sys/fs/selinux/policyvers"); status_one("/sys/hypervisor/type"); status_one("/proc/cpuinfo"); status_one("/proc/bus/input/devices"); status_one("/proc/fb"); status_one("/sys/class/graphics/fb0/name"); status_one("/sys/class/power_supply/battery/capacity"); status_one("/sys/class/thermal/thermal_zone0/temp"); status_one("/sys/class/backlight/panel0-backlight/max_brightness");

@@ -28,11 +28,39 @@ cd xenoid
 ./xenoid view
 ```
 
-`install-runtime` 安装并验证 macOS 宿主工具链，准备 Colima 与 binderfs；本地配置不存在时，它会从 macOS 模板创建 `.xenoid/config.json`。该命令不会启动 Android。
+`install-runtime` 安装并验证 macOS 宿主工具链，准备 Colima 与 binderfs；本地配置不存在时，它会从 `examples/config-macos-colima.json` 初始化 `default` 实例。该命令不会启动 Android。
 
 `up` 是面向用户的启动命令。它构建并启动完整运行时，部署 daemon 与 native helper，应用设备画像和隐藏策略，加载 eBPF，最后执行与 `doctor --require-runtime` 相同的在线运行时验收。如果启动中途失败，`up` 会先采集独立 doctor 报告，再保留原始错误码退出。
 
 正常启动前后都不需要用户再单独执行 `doctor`。
+
+### 实例生命周期与数据持久化
+
+每个 Xenoid 实例是一台逻辑设备，由三个持久组件共同定义：
+
+1. **实例配置** `.xenoid/instances/<name>/config.json`（项目根目录）；
+2. **私有控制状态** `~/.xenoid/instances/<UUID>/`（操作者状态）；
+3. **Android 用户数据** Docker engine 命名卷（`xenoid-data-<tag>`），其中包含稀疏 ext4 `xenoid-data.img`，作为容器的 `/data` 挂载。
+
+`stop`、重复 `up`、容器重建以及 `colima stop/start` 都会保留数据卷。`colima delete`、外部删除/清理 volume，或丢失宿主实例状态，会在下次启动时导致 Xenoid 硬失败，而不是静默创建空盘。
+
+应用缓存和登录状态保存在同一 `/data` 分区，跨重启保留。Android 自身的存储压力和缓存清理语义仍然适用；Xenoid 不增加每次启动擦除的临时设备模式。
+
+### 多实例操作
+
+多个实例共享一个 Colima VM（macOS）或一个 Docker engine/binderfs（Linux ARM）。每个实例从操作者 registry 获得独立的 container、volume、network、MAC、IPv4/IPv6、宿主机 ADB/daemon 端口和 proxy 路由表。
+
+```bash
+./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-b init --from phone-a
+./xenoid --instance phone-a up
+./xenoid --instance phone-b up
+./xenoid --instance phone-a stop
+```
+
+设备标识（Android ID、serial、IMEI/IMEISV）每个实例生成一次，持久化在 `~/.xenoid/instances/<UUID>/device-identity.json`。容器重建时只轮换 boot-scoped 值（`boot_id`、`random_uuid`）。显式轮换通过 `device apply --keep-unique` 或 `device set` 更新同一宿主状态，避免下一次 `up` 回滚。
+
+本次“等同唯一真实设备”的验收范围是 Android 用户/数据/keystore/账户状态与实例标识/生命周期。Xenoid 不模拟宿主机不存在的物理电话、短信或硬件传感器能力。
 
 ### Linux ARM / ARM ECS
 
@@ -42,9 +70,8 @@ cd xenoid
 
 ```bash
 cd xenoid
-mkdir -p .xenoid
-cp examples/config-linux-arm.json .xenoid/config.json
 sudo ./scripts/setup-linux-binderfs.sh
+./xenoid init --config examples/config-linux-arm.json
 ./xenoid up
 ```
 

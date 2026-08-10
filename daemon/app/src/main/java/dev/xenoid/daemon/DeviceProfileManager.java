@@ -33,9 +33,21 @@ final class DeviceProfileManager {
             } else if (generated.containsKey("boot_id")) {
                 actions.add(applyField("boot_id", generated.get("boot_id")));
             }
+            String randomUuid = generated.containsKey("random_uuid") ? generated.get("random_uuid") : (ids == null ? null : ids.optString("random_uuid", null));
+            if (randomUuid != null && randomUuid.length() > 0 && !"REGENERATE".equals(randomUuid)) {
+                actions.add(applyField("random_uuid", randomUuid));
+            } else if (generated.containsKey("random_uuid")) {
+                actions.add(applyField("random_uuid", generated.get("random_uuid")));
+            }
             String serial = generated.containsKey("serial") ? generated.get("serial") : (ids == null ? null : ids.optString("serial", null));
             if (serial != null && serial.length() > 0 && !"REGENERATE".equals(serial)) actions.add(applyField("serial", serial));
             else if (generated.containsKey("serial")) actions.add(applyField("serial", generated.get("serial")));
+            String imei = generated.containsKey("imei") ? generated.get("imei") : (ids == null ? null : ids.optString("imei", null));
+            if (imei != null && imei.length() > 0 && !"REGENERATE".equals(imei)) actions.add(applyField("imei", imei));
+            else if (generated.containsKey("imei")) actions.add(applyField("imei", generated.get("imei")));
+            String imeisv = generated.containsKey("imeisv") ? generated.get("imeisv") : (ids == null ? null : ids.optString("imeisv", null));
+            if (imeisv != null && imeisv.length() > 0 && !"REGENERATE".equals(imeisv)) actions.add(applyField("imeisv", imeisv));
+            else if (generated.containsKey("imeisv")) actions.add(applyField("imeisv", generated.get("imeisv")));
 
             JSONObject build = profile.optJSONObject("build");
             if (build != null) {
@@ -107,7 +119,11 @@ final class DeviceProfileManager {
 
             JSONObject usb = profile.optJSONObject("usb");
             if (usb != null) {
-                if (usb.has("serial")) actions.add(applyField("serial", String.valueOf(usb.opt("serial"))));
+                if (usb.has("serial")) {
+                    String usbSerial = String.valueOf(usb.opt("serial"));
+                    if ("REGENERATE".equals(usbSerial) && generated.containsKey("serial")) usbSerial = generated.get("serial");
+                    if (!"REGENERATE".equals(usbSerial)) actions.add(applyField("serial", usbSerial));
+                }
                 if (usb.has("manufacturer")) actions.add(applyField("usb.manufacturer", String.valueOf(usb.opt("manufacturer"))));
                 if (usb.has("product")) actions.add(applyField("usb.product", String.valueOf(usb.opt("product"))));
                 if (usb.has("vendor_id")) actions.add(applyField("usb.vendor_id", String.valueOf(usb.opt("vendor_id"))));
@@ -197,10 +213,16 @@ final class DeviceProfileManager {
         } else if ("boot_id".equals(field)) {
             actions.add(RootHelper.exec("setprop persist.xenoid.boot_id " + RootHelper.shellQuote(value)));
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/boot_id"));
-            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(UUID.randomUUID().toString() + "\n") + " > /data/local/tmp/xenoid-profile/random_uuid"));
             actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
-        } else if (field.startsWith("ro.") || field.startsWith("persist.")) {
-            actions.add(RootHelper.exec("resetprop " + RootHelper.shellQuote(field) + " " + RootHelper.shellQuote(value) + " 2>/dev/null || setprop " + RootHelper.shellQuote(field) + " " + RootHelper.shellQuote(value) + " || true"));
+        } else if ("random_uuid".equals(field)) {
+            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/random_uuid"));
+            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+        } else if ("imei".equals(field) || "persist.xenoid.radio.imei".equals(field)) {
+            actions.add(RootHelper.exec("setprop persist.xenoid.radio.imei " + RootHelper.shellQuote(value)));
+            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/imei"));
+        } else if ("imeisv".equals(field) || "persist.xenoid.radio.imeisv".equals(field)) {
+            actions.add(RootHelper.exec("setprop persist.xenoid.radio.imeisv " + RootHelper.shellQuote(value)));
+            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/imeisv"));
         } else if ("serial".equals(field) || "ro.serialno".equals(field) || "ro.boot.serialno".equals(field)) {
             String serial = value.trim().replaceAll("[^A-Za-z0-9._-]", "");
             if (serial.length() == 0) serial = "3A4940E5EDFA";
@@ -208,6 +230,8 @@ final class DeviceProfileManager {
             actions.add(RootHelper.exec("resetprop ro.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || setprop ro.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || true"));
             actions.add(RootHelper.exec("resetprop ro.boot.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || setprop ro.boot.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || true"));
             actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+        } else if (field.startsWith("ro.") || field.startsWith("persist.")) {
+            actions.add(RootHelper.exec("resetprop " + RootHelper.shellQuote(field) + " " + RootHelper.shellQuote(value) + " 2>/dev/null || setprop " + RootHelper.shellQuote(field) + " " + RootHelper.shellQuote(value) + " || true"));
         } else if (field.startsWith("usb.")) {
             String key = field.substring("usb.".length()).replace('-', '_');
             String outName = "usb_" + key;
@@ -275,9 +299,26 @@ final class DeviceProfileManager {
         Map<String,String> g = new LinkedHashMap<>();
         g.put("android_id", hex(8));
         g.put("boot_id", UUID.randomUUID().toString());
+        g.put("random_uuid", UUID.randomUUID().toString());
         g.put("serial", pixelSerial());
+        g.put("imei", pixelImei());
+        g.put("imeisv", "01");
         return g;
     }
     private static String pixelSerial() { return "3A" + hex(5).toUpperCase(Locale.ROOT); }
+    private static String pixelImei() {
+        StringBuilder first = new StringBuilder("35693803");
+        while (first.length() < 14) first.append(RNG.nextInt(10));
+        int total = 0;
+        for (int i = 0; i < first.length(); i++) {
+            int digit = first.charAt(i) - '0';
+            if ((i & 1) == 1) {
+                digit *= 2;
+                digit = digit / 10 + digit % 10;
+            }
+            total += digit;
+        }
+        return first.toString() + ((10 - total % 10) % 10);
+    }
     private static String hex(int bytes) { byte[] b = new byte[bytes]; RNG.nextBytes(b); StringBuilder s = new StringBuilder(); for(byte x:b) s.append(String.format("%02x", x)); return s.toString(); }
 }

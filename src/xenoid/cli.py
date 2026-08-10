@@ -35,6 +35,13 @@ from .daemon_client import (
     DaemonClient,
 )
 from .doctor import build_doctor_report
+from .device_identity import (
+    DeviceIdentityStore,
+    converge_instance_identity,
+    identity_field_key,
+    public_identity_state,
+    validate_identity_value,
+)
 from .location import (
     DEFAULT_COUNTRY,
     LocationError,
@@ -302,7 +309,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     context, cfg, lease = initialize_instance(
         args.instance_name,
         project_root=args.project_root,
-        overrides={"image": args.image, "backend": args.backend},
+        overrides={k: v for k, v in {"image": args.image, "backend": args.backend}.items() if v is not None},
+        template_path=getattr(args, "config", None),
+        from_instance=getattr(args, "from_instance", None),
     )
     print_json({
         "ok": True,
@@ -1722,10 +1731,39 @@ def cmd_device_collect(args: argparse.Namespace) -> int:
 
 def cmd_device_apply(args: argparse.Namespace) -> int:
     profile = read_json_file(args.profile)
-    result = daemon_ensured(args).apply_fingerprint(profile, regenerate_unique=not args.keep_unique)
+    manager = runtime(args)
+    ensured = manager.ensure_daemon()
+    if not isinstance(ensured, dict) or ensured.get("ok") is not True:
+        result: dict[str, Any] = {
+            "ok": False,
+            "error": "daemon_unreachable",
+            "daemon": ensured,
+        }
+    else:
+        if args.keep_unique and not args.instance_identity:
+            # Legacy --keep-unique path: apply profile without host identity convergence.
+            result = daemon(args, manager).apply_fingerprint(profile, regenerate_unique=False)
+        else:
+            result = converge_instance_identity(
+                args.context,
+                manager,
+                daemon(args, manager),
+                profile,
+                rotate_stable=not args.keep_unique and not args.instance_identity,
+            )
     if args.generate_frida:
-        result = {"daemon": result, "fridaProfile": runtime(args).generate_profile_frida(args.profile, args.frida_out, args.keep_unique)}
-        result["ok"] = bool(result["daemon"].get("ok") and result["fridaProfile"].get("ok"))
+        result = {
+            "daemon": result,
+            "fridaProfile": manager.generate_profile_frida(
+                args.profile,
+                args.frida_out,
+                True,
+            ),
+        }
+        result["ok"] = bool(
+            result["daemon"].get("ok")
+            and result["fridaProfile"].get("ok")
+        )
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -1744,7 +1782,17 @@ def cmd_device_generate_frida(args: argparse.Namespace) -> int:
 
 def cmd_device_set(args: argparse.Namespace) -> int:
     value: Any = args.value
+    key = identity_field_key(args.field)
+    if key is not None:
+        validate_identity_value(key, value)
     result = daemon_ensured(args).set_fingerprint_field(args.field, value)
+    if key is not None and result.get("ok") is True:
+        state = DeviceIdentityStore(args.context).update_field(args.field, value)
+        result = {
+            "ok": True,
+            "daemon": result,
+            "identity": public_identity_state(state),
+        }
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2084,6 +2132,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("init", help="initialize the selected immutable instance")
     s.add_argument("--image")
     s.add_argument("--backend")
+    s.add_argument("--config", help="operational config template to merge (e.g. examples/config-macos-colima.json)")
+    s.add_argument("--from", dest="from_instance", help="clone operational config from an existing instance")
     s.set_defaults(func=cmd_init)
 
 
@@ -2361,7 +2411,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.set_defaults(func=cmd_device_collect)
     a = dev.add_parser("apply")
     a.add_argument("profile")
-    a.add_argument("--keep-unique", action="store_true")
+    identity_mode = a.add_mutually_exclusive_group()
+    identity_mode.add_argument("--keep-unique", action="store_true")
+    identity_mode.add_argument(
+        "--instance-identity",
+        action="store_true",
+        help="converge host-owned stable and boot-scoped instance identity",
+    )
     a.add_argument("--generate-frida", action="store_true", help="also generate a Frida profile spoof script")
     a.add_argument("--frida-out")
     a.set_defaults(func=cmd_device_apply)

@@ -23,7 +23,7 @@
   "ids": {
     "android_id": "REGENERATE",
     "boot_id": "REGENERATE",
-    "serial": "3A4940E5EDFA"
+    "serial": "REGENERATE"
   },
   "input": {
     "height": 1920,
@@ -80,7 +80,7 @@
     "manufacturer": "Google",
     "product": "Pixel 6 Pro",
     "product_id": "0x4ee7",
-    "serial": "3A4940E5EDFA",
+    "serial": "REGENERATE",
     "vendor_id": "0x18d1"
   }
 }

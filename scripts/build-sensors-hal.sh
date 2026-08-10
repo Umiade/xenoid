@@ -53,8 +53,9 @@ INC=( -I"$GEN" -I"$GEN/aidl" -I"$SYSROOT/usr/include" )
 # Service-side binder API (AServiceManager_addService, ABinderProcess_*) is not in the
 # NDK's libbinder_ndk stub; link the on-device libbinder_ndk.so (versioned symbols).
 if [[ ! -f "$HAL/libbinder_ndk.so" ]]; then
-  docker cp xenoid-android:/system/lib64/libbinder_ndk.so "$HAL/libbinder_ndk.so" >/dev/null 2>&1 \
-    || docker cp xenoid-android:/apex/com.android.runtime/lib64/bionic/libbinder_ndk.so "$HAL/libbinder_ndk.so" >/dev/null 2>&1 \
+  _container_name="$(PYTHONPATH="$ROOT/src" python3 -c 'import os; from pathlib import Path; from xenoid.config import resolve_instance; c,g,l=resolve_instance(project_root=Path.cwd(), env={}); print(l.container_name)' 2>/dev/null || echo xenoid-android)"
+  docker cp "${_container_name}:/system/lib64/libbinder_ndk.so" "$HAL/libbinder_ndk.so" >/dev/null 2>&1 \
+    || docker cp "${_container_name}:/apex/com.android.runtime/lib64/bionic/libbinder_ndk.so" "$HAL/libbinder_ndk.so" >/dev/null 2>&1 \
     || {
       _image="${XENOID_BASE_IMAGE:-redroid/redroid:13.0.0_64only-latest}"
       _cid="$(docker create "$_image")"

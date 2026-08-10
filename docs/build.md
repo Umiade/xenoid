@@ -8,6 +8,14 @@ No external Python dependencies are required.
 ./xenoid doctor
 ```
 
+## Instance storage contracts
+
+```bash
+python3 scripts/test-instance-storage.py
+```
+
+Covers fresh initialization, pending recovery, tagged adoption, committed hard-failure, legacy migration with backup, safe container removal order, and dual-instance isolation.
+
 ## Global proxy runtime
 
 Proxy source compilation and authenticated control contracts are runtime-free:

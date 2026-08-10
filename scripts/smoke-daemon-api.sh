@@ -41,7 +41,7 @@ SMOKE_STATE_ROOT="$(PYTHONPATH="$ROOT/src" python3 -c 'from xenoid.config import
 ./xenoid profile env
 ./xenoid profile dump
 ./xenoid device collect --out "$SMOKE_STATE_ROOT/smoke-fingerprint.json"
-./xenoid device apply examples/fingerprints/sample-profile.json --generate-frida --frida-out "$SMOKE_STATE_ROOT/smoke-profile.js"
+./xenoid device apply examples/fingerprints/sample-profile.json --keep-unique --generate-frida --frida-out "$SMOKE_STATE_ROOT/smoke-profile.js"
 ./xenoid device generate-frida examples/fingerprints/sample-profile.json --out "$SMOKE_STATE_ROOT/smoke-profile-2.js"
 ./xenoid device set android_id 0011223344556677
 ./xenoid input tap 10 20

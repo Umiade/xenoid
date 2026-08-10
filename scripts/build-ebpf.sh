@@ -7,6 +7,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/native/xenoid-ebpf"
+
+if [[ "${XENOID_SHARED_PROTECTION_LOCKED:-0}" != 1 ]]; then
+  exec python3 "$ROOT/scripts/with-shared-protection-lock.py" "$0" "$@"
+fi
 BUILD_DIR="/var/tmp/xenoid-ebpf-build"
 DIST="$ROOT/dist/ebpf"
 DRY=0
@@ -32,6 +36,7 @@ if [[ -z "$MODE" ]]; then
     MODE=local
   fi
 fi
+
 
 install_deps_cmd='sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang llvm libbpf-dev libelf-dev zlib1g-dev linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || true'
 build_cmd="cd $BUILD_DIR && make clean >/dev/null 2>&1 || true; make 2>&1 | tail -20"

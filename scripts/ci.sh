@@ -46,6 +46,8 @@ echo "[ci] static: prospective sensitive-content audit"
 run_py audit-sensitive-data.py
 echo "[ci] static: instance identity and lease contracts"
 run_py test-proxy.py
+echo "[ci] static: instance storage and lifecycle contracts"
+run_py test-instance-storage.py
 echo "[ci] static: proxy compiler and authenticated control contracts"
 run_py test-proxy-compiler.py
 
@@ -116,6 +118,12 @@ if [[ "$TIER" == "runtime" || "$TIER" == "full" ]]; then
     pass+=("doctor-full")
   else
     fail+=("doctor-full (rc=$?)")
+  fi
+  echo "[ci] runtime: persistence probe"
+  if with_timeout 900 ./scripts/smoke-persistence-runtime.sh >/tmp/ci-persistence-runtime.out 2>&1; then
+    pass+=("persistence-runtime")
+  else
+    fail+=("persistence-runtime (rc=$?)")
   fi
 fi
 

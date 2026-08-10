@@ -72,11 +72,17 @@ from xenoid.util import which
 print(which('adb') or 'adb')
 PY
 )"
-ADB_TARGET="127.0.0.1:$(python3 - <<'PY'
-import json
+ADB_TARGET="$(python3 - <<'PY'
+import os, sys
+sys.path.insert(0, 'src')
 from pathlib import Path
-path = Path('.xenoid/config.json')
-print(json.loads(path.read_text()).get('adb_port', 5555) if path.exists() else 5555)
+from xenoid.config import resolve_instance
+name = os.environ.get('XENOID_INSTANCE') or 'default'
+try:
+    context, cfg, lease = resolve_instance(name, project_root=Path.cwd(), env={})
+    print(f"127.0.0.1:{lease.host_adb_port}")
+except Exception:
+    print('127.0.0.1:5555')
 PY
 )"
 PACKAGE="org.example.cameraruntimeprobe"
@@ -461,20 +467,34 @@ assert_staging_clean() {
 
 snapshot_host_config() {
   python3 - "$TMP/host-config-before.bin" <<'PY' || return 1
+import os, sys
 from pathlib import Path
-import sys
-source = Path('.xenoid/config.json')
-payload = source.read_bytes() if source.exists() else b'ABSENT'
+sys.path.insert(0, 'src')
+from xenoid.config import resolve_instance, instance_config_path
+name = os.environ.get('XENOID_INSTANCE') or 'default'
+try:
+    path = instance_config_path(Path.cwd(), name)
+    payload = path.read_bytes() if path.exists() else b'ABSENT'
+except Exception:
+    legacy = Path('.xenoid/config.json')
+    payload = legacy.read_bytes() if legacy.exists() else b'ABSENT'
 Path(sys.argv[1]).write_bytes(payload)
 PY
 }
 
 assert_host_config_unchanged() {
   python3 - "$TMP/host-config-before.bin" <<'PY' || return 1
+import os, sys
 from pathlib import Path
-import sys
-source = Path('.xenoid/config.json')
-payload = source.read_bytes() if source.exists() else b'ABSENT'
+sys.path.insert(0, 'src')
+from xenoid.config import instance_config_path
+name = os.environ.get('XENOID_INSTANCE') or 'default'
+try:
+    path = instance_config_path(Path.cwd(), name)
+    payload = path.read_bytes() if path.exists() else b'ABSENT'
+except Exception:
+    legacy = Path('.xenoid/config.json')
+    payload = legacy.read_bytes() if legacy.exists() else b'ABSENT'
 if payload != Path(sys.argv[1]).read_bytes():
     raise SystemExit(1)
 PY

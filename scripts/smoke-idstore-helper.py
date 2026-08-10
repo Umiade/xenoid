@@ -5,10 +5,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 src = (ROOT / "native/xenoid-hide/xenoid_ssaid.c").read_text()
 daemon = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/DeviceProfileManager.java").read_text()
 checks = {
-    "ssaid_file": "settings_ssaid.xml" in src,
+    "ssaid_file_preserved": "settings_ssaid.xml" not in src and "patch_ssaid" not in src,
     "secure_file": "settings_secure.xml" in src,
     "patch_secure_xml": "patch_secure_xml" in src,
-    "patch_ssaid": "patch_ssaid" in src,
     "android_id_setting": "name=\\\"android_id\\\"" in src or "name='android_id'" in src,
     "daemon_calls_helper": "xenoid-ssaid" in daemon and "settings put secure android_id" in daemon,
     "lowercase_value": "lower16" in src,
