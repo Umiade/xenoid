@@ -64,7 +64,24 @@ MSG
   exit 127
 fi
 
-brew install docker colima android-platform-tools scrcpy
+if brew install docker colima android-platform-tools scrcpy; then
+  :
+else
+  brew_status=$?
+  if brew list --formula docker-completion >/dev/null 2>&1; then
+    cat >&2 <<'MSG'
+Xenoid detected the deprecated Homebrew docker-completion formula.
+Current Docker formulae provide the same shell-completion files. If Homebrew
+reported docker completion link conflicts above, migrate once and retry:
+  brew uninstall docker-completion
+  brew link docker
+  type -a docker
+  ./xenoid install-runtime
+Avoid `brew link --overwrite docker`; it leaves conflicting formula ownership.
+MSG
+  fi
+  exit "$brew_status"
+fi
 brew install --cask temurin@17 android-commandlinetools
 SDKMANAGER="$(sdkmanager_path)" || {
   echo "sdkmanager was not installed by the android-commandlinetools cask" >&2

@@ -90,6 +90,7 @@ STATIC_SMOKES=(
   smoke-rootd-auth.py
   smoke-hook-surfaces.py
   smoke-frida-install.py
+  smoke-install-runtime.py
   smoke-idstore-helper.py
   smoke-input-profile.py
   smoke-rtc-overlay.py
