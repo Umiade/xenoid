@@ -42,6 +42,15 @@ from .device_identity import (
     public_identity_state,
     validate_identity_value,
 )
+from .google_services import (
+    MINDTHEGAPPS_RELEASE,
+    PROVIDER_MINDTHEGAPPS,
+    PROVIDER_NONE,
+    import_mindthegapps,
+    load_release_spec,
+    quick_validate_assets,
+    registry_public,
+)
 from .location import (
     DEFAULT_COUNTRY,
     LocationError,
@@ -136,6 +145,8 @@ def cmd_up(args: argparse.Namespace) -> int:
         cmd.append("--dry-run")
     if args.skip_build:
         cmd.append("--skip-build")
+    if args.reuse_runtime:
+        cmd.append("--reuse-runtime")
     proc = subprocess.run(
         cmd,
         text=True,
@@ -357,6 +368,106 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         "config": cfg,
     })
     return 0
+
+def cmd_google_services_import(args: argparse.Namespace) -> int:
+    result = import_mindthegapps(
+        args.context.project_root,
+        Path(args.archive).expanduser(),
+        Path(args.certificate).expanduser(),
+    )
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_google_services_status(args: argparse.Namespace) -> int:
+    result = runtime(args).google_services_status(
+        require_runtime=bool(args.require_runtime),
+    )
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_google_services_enable(args: argparse.Namespace) -> int:
+    if (
+        args.config.google_services_provider == PROVIDER_MINDTHEGAPPS
+        and args.config.google_services_release == args.release
+    ):
+        result = runtime(args).google_services_status()
+        result["unchanged"] = True
+        result["runtimeReady"] = bool(result.get("ready"))
+        result["runtimeError"] = result.get("error")
+        result["ok"] = bool(result.get("configured") and result.get("hostReady"))
+        print_json(result)
+        return 0 if result["ok"] else 1
+    spec = load_release_spec(args.context.project_root, args.release)
+    quick_validate_assets(args.context.project_root, spec)
+    mutable = runtime(args).google_services_configuration_mutable()
+    if mutable.get("ok") is not True:
+        print_json(mutable)
+        return 1
+    cfg = merge_config(
+        args.context,
+        {
+            "google_services_provider": PROVIDER_MINDTHEGAPPS,
+            "google_services_release": args.release,
+            "auto_build_runtime_image": True,
+        },
+    )
+    save_config(args.context, cfg)
+    args.config = cfg
+    result = RuntimeManager(
+        args.context,
+        cfg,
+        args.lease,
+    ).google_services_status()
+    result["changed"] = True
+    result["runtimeReady"] = bool(result.get("ready"))
+    result["runtimeError"] = result.get("error")
+    result["error"] = None
+    result["ok"] = True
+    result["nextActions"] = [
+        f"./xenoid --instance {args.context.instance_name} up"
+    ]
+    print_json(result)
+    return 0
+
+
+def cmd_google_services_disable(args: argparse.Namespace) -> int:
+    if (
+        args.config.google_services_provider == PROVIDER_NONE
+        and args.config.google_services_release == PROVIDER_NONE
+    ):
+        result = runtime(args).google_services_status()
+        result["unchanged"] = True
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    mutable = runtime(args).google_services_configuration_mutable()
+    if mutable.get("ok") is not True:
+        print_json(mutable)
+        return 1
+    cfg = merge_config(
+        args.context,
+        {
+            "google_services_provider": PROVIDER_NONE,
+            "google_services_release": PROVIDER_NONE,
+        },
+    )
+    save_config(args.context, cfg)
+    args.config = cfg
+    result = RuntimeManager(
+        args.context,
+        cfg,
+        args.lease,
+    ).google_services_status()
+    result["changed"] = True
+    print_json(result)
+    return 0
+
+
+def cmd_google_services_registry(args: argparse.Namespace) -> int:
+    print_json({"ok": True, "releases": registry_public()})
+    return 0
+
 
 
 def cmd_runtime_build_image(args: argparse.Namespace) -> int:
@@ -2054,6 +2165,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("up", help="build and start full Xenoid stack")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--skip-build", action="store_true", help="use prebuilt artifacts (release target); fails if any required binary is missing")
+    s.add_argument("--reuse-runtime", action="store_true", help="reuse an already running, identity-matched runtime")
     s.set_defaults(func=cmd_up)
 
 
@@ -2128,6 +2240,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cset.add_argument("--auto-build-runtime-image", action=argparse.BooleanOptionalAction, default=None)
     cset.set_defaults(func=cmd_config_set)
+    s = sub.add_parser(
+        "google-services",
+        help="manage the optional pinned Google Mobile Services runtime",
+    )
+    google = s.add_subparsers(required=True)
+    google_import = google.add_parser(
+        "import-mindthegapps",
+        help="verify and import the pinned official MindTheGapps release",
+    )
+    google_import.add_argument("archive")
+    google_import.add_argument("certificate")
+    google_import.set_defaults(func=cmd_google_services_import)
+    google_releases = google.add_parser(
+        "releases",
+        help="list the pinned Google services release registry",
+    )
+    google_releases.set_defaults(func=cmd_google_services_registry)
+    google_status = google.add_parser(
+        "status",
+        help="show configured, bound, image, rootfs, and live runtime state",
+    )
+    google_status.add_argument("--require-runtime", action="store_true")
+    google_status.set_defaults(func=cmd_google_services_status)
+    google_enable = google.add_parser(
+        "enable",
+        help="enable the pinned release before first Android data creation",
+    )
+    google_enable.add_argument(
+        "--release",
+        default=MINDTHEGAPPS_RELEASE,
+        choices=[MINDTHEGAPPS_RELEASE],
+    )
+    google_enable.set_defaults(func=cmd_google_services_enable)
+    google_disable = google.add_parser(
+        "disable",
+        help="disable Google services before first Android data creation",
+    )
+    google_disable.set_defaults(func=cmd_google_services_disable)
+
 
     s = sub.add_parser("init", help="initialize the selected immutable instance")
     s.add_argument("--image")

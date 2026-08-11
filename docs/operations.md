@@ -113,6 +113,43 @@ Configuration examples:
 
 Local configuration and runtime state belong under `.xenoid/` and must not be committed.
 
+## Optional Google Play services
+
+The default provider/release pair is `none`/`none`. The only accepted enabled pair is `mindthegapps`/`MindTheGapps-13.0.0-arm64-20231025_200931`. The runtime must remain Android 13/API 33, `arm64-v8a`, and product `raven`; custom Docker arguments are rejected because they would make container identity ambiguous.
+
+Prerequisites:
+
+- the official `MindTheGapps-13.0.0-arm64-20231025_200931.zip`;
+- the `release.x509.pem` asset from the same [upstream GitHub release](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931);
+- JDK `keytool`/`jarsigner` and Android SDK `aapt2`/`apksigner` (installed and checked by `./xenoid install-runtime`);
+- a fresh initialized instance with no Docker data volume or Android storage state.
+
+```bash
+./xenoid --instance play init --config examples/config-macos-colima.json
+./xenoid --instance play google-services import-mindthegapps \
+  /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
+  /path/to/release.x509.pem
+./xenoid --instance play google-services enable
+./xenoid --instance play up
+./xenoid --instance play google-services status --require-runtime
+```
+
+Import is project-scoped and repeatable. It accepts only the exact pinned filenames and bytes, copies from regular non-symlink sources, performs no network access, uses `0700` directories and `0600` files, and publishes the final private asset directory atomically. Failure output uses stable error codes and never returns source or stored paths.
+
+`enable` also sets `auto_build_runtime_image=true`. The first `up` builds a specification-addressed image, writes the same provider/release/specification/data-compatibility identity to image and container labels, creates rootfs from that exact image, and commits the instance binding only after PackageManager reports GMS Core, Google Services Framework, and Play Store ready. A later provider/release mismatch fails without touching `/data`; create a new instance instead. `disable` has the same fresh-instance restriction.
+
+For ordinary convergence, use `up`. `up --reuse-runtime --skip-build` is an explicit no-build path and succeeds only when the owned running container, immutable binding, managed labels/command, image ID, rootfs source image ID, PackageManager state, and platform ABI already match.
+
+```bash
+./scripts/smoke-google-services-runtime.sh --instance play
+./scripts/smoke-google-services-convergence.sh --instance play
+./xenoid --instance play doctor --full --require-runtime
+```
+
+The focused smoke installs an ordinary non-debuggable app that verifies the three packages, discovers the framework `com.google` account authenticator, binds GMS Core through its exported service, and resolves the Play Store launcher. It does not submit account credentials; account login remains a manual acceptance step. Play Integrity verdicts and Google device certification are explicitly `unsupported`/`notEvaluated` until separately proven. If Google reports the device as uncertified, follow Google's [uncertified-device registration](https://www.google.com/android/uncertified/) process; Xenoid does not automate it.
+
+Xenoid publishes only the verification metadata needed for reproducibility. Google application binaries remain subject to their upstream terms and are never included in Xenoid source, release archives, or OTA bundles.
+
 ## Remote Linux Docker engine
 
 ```bash
@@ -267,7 +304,7 @@ Production protection combines image state, property-area normalization, mount o
 ./xenoid verify-release dist/release/xenoid-0.1.0.tar.gz
 ```
 
-Release bundles include the CLI, MCP server, runtime assets, daemon APK, native helpers, configuration examples, skill files, doctor metadata, and SHA-256 manifests.
+Release bundles include the CLI, MCP server, non-proprietary runtime assets, daemon APK, native helpers, configuration examples, public Google release metadata, skill files, doctor metadata, and SHA-256 manifests. Imported Google archives, certificates, and expanded payloads are excluded.
 
 ## OTA
 

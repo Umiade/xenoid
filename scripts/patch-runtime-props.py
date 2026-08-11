@@ -12,7 +12,7 @@ ro.hardware is baked as tensor into the vendor build.prop; the runtime image
 provides tensor-named HAL aliases so the redroid graphics implementation boots.
 """
 from __future__ import annotations
-import re, sys
+import argparse, re, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,7 +78,23 @@ def extract_overlay_texts() -> dict[str, list[str]]:
 
 
 def main() -> int:
-    stock_dir, out_dir = Path(sys.argv[1]), Path(sys.argv[2])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("stock_dir")
+    parser.add_argument("out_dir")
+    parser.add_argument("--expect-build-product")
+    parser.add_argument("--setupwizard-mode", choices=["DISABLED"])
+    args = parser.parse_args()
+    stock_dir, out_dir = Path(args.stock_dir), Path(args.out_dir)
+    if args.expect_build_product:
+        system_lines = extract_overlay_texts().get("system_build_prop_text", [])
+        expected = f"ro.build.product={args.expect_build_product}"
+        if system_lines.count(expected) != 1:
+            print(
+                "patch-runtime-props: generated build product does not match "
+                f"{args.expect_build_product}",
+                file=sys.stderr,
+            )
+            return 1
     texts = extract_overlay_texts()
     if len(texts) != len(PARTITIONS):
         missing = set(v[1] for v in PARTITIONS.values()) - set(texts)
@@ -90,6 +106,8 @@ def main() -> int:
         append = [l for l in texts[var] if l.split("=", 1)[0] not in SKIP_APPEND_KEYS]
         if name == "system_build.prop":
             append += [f"{k}={v}" for k, v in SYSTEM_EXTRA.items()]
+            if args.setupwizard_mode:
+                append.append(f"ro.setupwizard.mode={args.setupwizard_mode}")
         elif name == "vendor_build.prop":
             append += [f"{k}={v}" for k, v in VENDOR_EXTRA.items()]
         drop_keys = {l.split("=", 1)[0] for l in append}

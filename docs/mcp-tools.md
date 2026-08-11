@@ -1,6 +1,6 @@
 # Xenoid MCP tool contract
 
-The `xenoid-mcp` stdio server exposes these tools for agent/host use (67 total).
+The `xenoid-mcp` stdio server exposes these tools for agent/host use (73 total).
 Every tool returns a JSON object; `ok` indicates success. The daemon-backed tools
 require the runtime up and the daemon reachable (daemon control channel is
 authenticated with the per-instance `X-Xenoid-Token`).
@@ -61,6 +61,22 @@ Run/dry-run Linux binderfs setup
 
 ### `xenoid_config_show`
 Show Xenoid config
+_No parameters._
+
+## Optional Google services
+
+MCP exposes status and the fresh-instance provider transition, but intentionally does not accept host paths or proprietary import bytes. Import the pinned official release with the CLI before enabling it.
+
+### `xenoid_google_services_status`
+Show provider/release configuration, immutable binding, image/rootfs identity, live package readiness, and capability state.
+  - `requireRuntime` (boolean): fail unless the configured runtime is running and ready
+
+### `xenoid_google_services_enable`
+Enable the known pinned release on the fixed fresh instance.
+  - `release` (string): optional; only `MindTheGapps-13.0.0-arm64-20231025_200931` is accepted
+
+### `xenoid_google_services_disable`
+Disable Google services on the fixed fresh instance.
 _No parameters._
 
 ## Daemon & root

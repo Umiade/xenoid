@@ -39,6 +39,14 @@ Before editing:
 - Treat app, isolated, zygote, system-server, and privileged process views separately. A policy that is correct for an app may break Android initialization when applied globally.
 - Remove obsolete implementations during cutover. Do not leave aliases, fallback paths, or dead scaffolding.
 
+## Google runtime changes
+
+- Keep Google binaries, release certificates, expanded payloads, and captures in ignored `.xenoid/` state. Public files may contain only pinned hashes, signer identities, package/version/ABI inventory, reproducibility metadata, and operator guidance.
+- Do not add an automatic downloader, broad GApps version matcher, late APK installer, Magisk module, or MCP host-path import. The one registered release must remain an explicit local import.
+- Treat provider, release, specification fingerprint, data-compatibility fingerprint, image ID, rootfs source ID, container labels/command, and per-instance binding as one immutable identity. A transition after any Android data exists must fail without erasing or migrating data.
+- Verify importer boundary changes with `python3 scripts/test-google-services.py`. Verify image/runtime changes with `scripts/smoke-google-services-runtime.sh`, two-pass `scripts/smoke-google-services-convergence.sh`, and `./xenoid doctor --full --require-runtime` on an enabled fresh instance.
+- Package presence and a Play Store launcher prove only runtime bootstrap. Google account login is operator-driven; Play Integrity and device certification remain unsupported/not evaluated unless an independent capability probe proves them.
+
 ## Behavioral research workflow
 
 When compatibility depends on undocumented third-party behavior:

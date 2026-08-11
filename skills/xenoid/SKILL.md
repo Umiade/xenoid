@@ -67,6 +67,21 @@ Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance
 
 Use `doctor --require-runtime` when an online Android instance is mandatory. Use `doctor --full --require-runtime` only when exhaustive build and runtime evidence is required.
 
+## Optional Google services
+
+Google services are disabled by default and may be selected only before an instance has Android storage. The sole known release is `MindTheGapps-13.0.0-arm64-20231025_200931`. Import the official ZIP and matching `release.x509.pem` locally, then enable and converge:
+
+```bash
+./xenoid --instance play google-services import-mindthegapps \
+  /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
+  /path/to/release.x509.pem
+./xenoid --instance play google-services enable
+./xenoid --instance play up
+./xenoid --instance play google-services status --require-runtime
+```
+
+Never download the payload implicitly, pass import paths through MCP, copy private Google assets out of `.xenoid/`, or claim Play Integrity/device certification from package presence. A provider change after data creation requires a new instance. Account login remains manual.
+
 ## Device and application operations
 
 ```bash

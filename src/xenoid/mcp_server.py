@@ -82,6 +82,20 @@ def tools() -> list[dict[str, Any]]:
         tool("xenoid_linux_binderfs", "Run/dry-run Linux binderfs setup", {"dryRun": {"type": "boolean"}}),
         tool("xenoid_runtime_build_image", "Build or dry-run custom redroid Docker image", {"image": {"type": "string"}, "tag": {"type": "string"}, "dryRun": {"type": "boolean"}}),
         tool("xenoid_config_show", "Show Xenoid config"),
+        tool(
+            "xenoid_google_services_status",
+            "Show pinned Google services configuration, binding, image, rootfs, and live capability state",
+            {"requireRuntime": {"type": "boolean"}},
+        ),
+        tool(
+            "xenoid_google_services_enable",
+            "Enable the one known Google services release on a fresh selected instance",
+            {"release": {"type": "string"}},
+        ),
+        tool(
+            "xenoid_google_services_disable",
+            "Disable Google services on a fresh selected instance",
+        ),
         tool("xenoid_install_runtime_plan", "Dry-run macOS runtime dependency install plan"),
         tool("xenoid_up_plan", "Dry-run full Xenoid startup plan"),
         tool("xenoid_start", "Start the low-level Android runtime without full Xenoid state convergence", {"dryRun": {"type": "boolean"}, "startColima": {"type": "boolean"}, "installDaemonApk": {"type": "string"}, "adbRoot": {"type": "boolean"}, "recreate": {"type": "boolean"}}),
@@ -295,6 +309,45 @@ def _location_cli_result(runtime: MCPRuntime, command: list[str]) -> dict[str, A
     return text_result(data)
 
 
+def _google_services_cli_result(
+    runtime: MCPRuntime,
+    command: list[str],
+) -> dict[str, Any]:
+    cli = runtime.context.project_root / "xenoid"
+    try:
+        proc = subprocess.run(
+            [
+                str(cli),
+                "--instance",
+                runtime.context.instance_name,
+                "google-services",
+                *command,
+            ],
+            text=True,
+            capture_output=True,
+            cwd=runtime.context.project_root,
+            env=runtime.subprocess_env,
+            timeout=3600,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return text_result(
+            {
+                "ok": False,
+                "error": "google_services_runtime_not_ready",
+            }
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        data = {
+            "ok": False,
+            "error": "google_services_runtime_not_ready",
+        }
+    if isinstance(data, dict):
+        data["returncode"] = proc.returncode
+    return text_result(data)
+
+
 def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     context = runtime.context
     cfg = runtime.config
@@ -344,6 +397,20 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
             full=bool(args.get("full", False)),
             require_runtime=bool(args.get("requireRuntime", False)),
         ))
+    if name == "xenoid_google_services_status":
+        return text_result(
+            mgr.google_services_status(
+                require_runtime=bool(args.get("requireRuntime", False)),
+            )
+        )
+    if name == "xenoid_google_services_enable":
+        command = ["enable"]
+        release = args.get("release")
+        if isinstance(release, str) and release:
+            command.extend(["--release", release])
+        return _google_services_cli_result(runtime, command)
+    if name == "xenoid_google_services_disable":
+        return _google_services_cli_result(runtime, ["disable"])
     if name == "xenoid_runtime_context":
         return text_result(mgr.make_runtime_context(args.get("image")))
     if name == "xenoid_linux_binderfs":
@@ -363,25 +430,37 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
             "stderr": proc.stderr,
         })
     if name == "xenoid_runtime_build_image":
-        ctx = mgr.make_runtime_context(args.get("image"))
         tag = str(args.get("tag") or "xenoid/redroid:local")
         if bool(args.get("dryRun", True)):
+            planned = str(
+                context.state_root / "runtime-context" / "<pending>"
+            )
             return text_result({
-                "ok": ctx.get("ok"),
+                "ok": True,
                 "dryRun": True,
-                "context": ctx.get("context"),
+                "context": planned,
                 "command": [
                     *mgr.docker_base_cmd(),
                     "build",
                     "-t",
                     tag,
-                    ctx.get("context"),
+                    planned,
                 ],
             })
+        ctx = mgr.make_runtime_context(args.get("image"))
+        if ctx.get("ok") is not True:
+            return text_result(ctx)
         proc = subprocess.run(
-            [*mgr.docker_base_cmd(), "build", "-t", tag, ctx.get("context")],
+            [
+                *mgr.docker_base_cmd(),
+                "build",
+                "-t",
+                tag,
+                str(ctx["context"]),
+            ],
             text=True,
             capture_output=True,
+            env=runtime.subprocess_env,
         )
         return text_result({
             "ok": proc.returncode == 0,

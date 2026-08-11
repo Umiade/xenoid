@@ -56,6 +56,7 @@ REQUIRED = [
   'src/xenoid/proxy_controller.py', 'src/xenoid/proxy_protocol.py',
   'src/xenoid/proxy_source.py', 'src/xenoid/mcp_server.py',
   'src/xenoid/doctor.py', 'scripts/xenoid-up.sh',
+  'src/xenoid/google_services.py',
   'scripts/make-runtime-context.sh', 'scripts/make-rootfs-image.sh',
   'scripts/patch-services-runtime.py', 'scripts/redroid-preflight.sh',
   'scripts/build-kmod.sh', 'scripts/build-ebpf.sh', 'scripts/load-ebpf.sh',
@@ -97,6 +98,12 @@ REQUIRED = [
   'tests/persistence-runtime-probe/AndroidManifest.xml',
   'tests/persistence-runtime-probe/build.sh',
   'tests/persistence-runtime-probe/java/org/example/persistenceruntimeprobe/ProbeActivity.java',
+  'scripts/smoke-google-services-runtime.sh',
+  'scripts/smoke-google-services-convergence.sh',
+  'scripts/test-google-services.py',
+  'tests/google-services-runtime-probe/AndroidManifest.xml',
+  'tests/google-services-runtime-probe/build.sh',
+  'tests/google-services-runtime-probe/java/org/example/googleservicesruntimeprobe/ProbeActivity.java',
   'tests/camera-runtime-probe/AndroidManifest.xml',
   'tests/camera-runtime-probe/build.sh',
   'tests/camera-runtime-probe/native/ndk_probe.cpp',
@@ -130,6 +137,7 @@ REQUIRED = [
   'skills/xenoid-development/SKILL.md',
   'artifacts/libxenoid-ril.so',
   'artifacts/android.hardware.radio.config-service.xenoid',
+  'data/google-services/mindthegapps-13.0.0-arm64-20231025_200931.json',
 ]
 def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
 def main():
@@ -264,6 +272,36 @@ def main():
             for p in root.rglob('*')
             if p.is_file() and p.name != 'manifest.json'
         }
+        sys.path.insert(0, str(root/'src'))
+        from xenoid.google_services import registered_metadata_files
+        registered_google = registered_metadata_files()
+        for rel, expected_sha256 in sorted(registered_google.items()):
+            p = root/rel
+            metadata_ok = (
+                rel in files
+                and p.is_file()
+                and sha(p) == expected_sha256
+                and files[rel].get('sha256') == expected_sha256
+            )
+            out['checks'].append({
+                'name':'google-release-metadata:'+rel,
+                'ok':metadata_ok,
+                'detail':rel,
+            })
+        proprietary_paths = sorted(
+            rel for rel in set(files) | archive_files
+            if rel.startswith('.xenoid/')
+            or pathlib.PurePosixPath(rel).suffix.lower() in {'.zip', '.pem'}
+            or (
+                rel.startswith('data/google-services/')
+                and rel not in registered_google
+            )
+        )
+        out['checks'].append({
+            'name':'google-proprietary-payload-excluded',
+            'ok':not proprietary_paths,
+            'detail':proprietary_paths,
+        })
         retired_camera_paths = sorted(
             rel for rel in set(files) | archive_files
             if pathlib.PurePosixPath(rel).name in RETIRED_CAMERA_BASENAMES

@@ -89,7 +89,7 @@ if [[ ! -f .xenoid/instances/default/config.json && ! -f .xenoid/config.json ]];
   XENOID_INSTANCE=default ./xenoid init --config examples/config-macos-colima.json >/dev/null
 fi
 
-for command in docker colima adb scrcpy javac; do
+for command in docker colima adb scrcpy javac keytool jarsigner; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "required command is unavailable after installation: $command" >&2
     exit 127
@@ -97,6 +97,10 @@ for command in docker colima adb scrcpy javac; do
 done
 [[ -x "$SDK_ROOT/build-tools/35.0.0/aapt2" ]] || {
   echo "Android build-tools 35.0.0 are unavailable under $SDK_ROOT" >&2
+  exit 127
+}
+[[ -x "$SDK_ROOT/build-tools/35.0.0/apksigner" ]] || {
+  echo "Android apksigner 35.0.0 is unavailable under $SDK_ROOT" >&2
   exit 127
 }
 [[ -f "$SDK_ROOT/platforms/android-35/android.jar" ]] || {

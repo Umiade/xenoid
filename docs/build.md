@@ -127,6 +127,19 @@ native/xenoid-hide/xenoid-hide
 dist/runtime-context/Dockerfile
 ```
 
+## Optional Google runtime
+
+Google integration uses the host JDK (`keytool`, `jarsigner`) and Android SDK build tools (`aapt2`, `apksigner`). `scripts/test-google-services.py` exercises the public release pin, provider/release configuration, archive path and certificate boundaries, safe source copying, and immutable binding transitions without proprietary payloads:
+
+```bash
+python3 scripts/test-google-services.py
+tests/google-services-runtime-probe/build.sh
+```
+
+An operator-provided official archive is deeply verified during `google-services import-mindthegapps`. When the provider is enabled, runtime-context generation selects only the pinned production payload, preserves its mode/time/content manifest, injects it before Xenoid-owned files, and bakes `ro.setupwizard.mode=DISABLED`. Rootfs generation removes the base `Provision` package before `mkfs`. `verify_context_copy` re-walks the generated context and rejects missing, extra, symlink, mode, timestamp, digest, Dockerfile-order, label, or setup-wizard mismatches.
+
+The generated ZIP, PEM, expanded payload, probe APK, and runtime context are private or regenerable artifacts. Only `data/google-services/mindthegapps-13.0.0-arm64-20231025_200931.json` is tracked. Release packaging and verification reject `.xenoid/`, ZIP/PEM payloads, and unregistered Google metadata.
+
 ## Verification coverage
 
 `./xenoid doctor` checks:

@@ -23,6 +23,9 @@ DEFAULT_ANDROID_ADB_PORT = 62111
 DEFAULT_ANDROID_DAEMON_PORT = 18765
 DEFAULT_ROOTD_PORT = 18767
 DEFAULT_RUNTIME_TAG = "xenoid/redroid:local"
+DEFAULT_GOOGLE_SERVICES_PROVIDER = "none"
+DEFAULT_GOOGLE_SERVICES_RELEASE = "none"
+MINDTHEGAPPS_RELEASE = "MindTheGapps-13.0.0-arm64-20231025_200931"
 INSTANCE_SCHEMA_VERSION = 2
 LEASE_SCHEMA_VERSION = 1
 INSTANCE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -51,11 +54,13 @@ _CONTROLLED_DOCKER_ARGS = {
     "--dns",
     "--dns-option",
     "--dns-search",
+    "--entrypoint",
     "--hostname",
     "--ip",
     "--ip6",
     "--ipc",
     "--label",
+    "--label-file",
     "--link",
     "--mac-address",
     "--mount",
@@ -63,9 +68,11 @@ _CONTROLLED_DOCKER_ARGS = {
     "--net",
     "--network",
     "--network-alias",
+    "--platform",
     "--pid",
     "--privileged",
     "--publish",
+    "--pull",
     "--publish-all",
     "--restart",
     "--rm",
@@ -73,6 +80,7 @@ _CONTROLLED_DOCKER_ARGS = {
     "--uts",
     "--volume",
     "-P",
+    "-l",
     "-p",
     "-v",
 }
@@ -265,6 +273,8 @@ class XenoidConfig:
     runtime_image_tag: str = DEFAULT_RUNTIME_TAG
     auto_build_runtime_image: bool = False
     docker_context: str = ""
+    google_services_provider: str = DEFAULT_GOOGLE_SERVICES_PROVIDER
+    google_services_release: str = DEFAULT_GOOGLE_SERVICES_RELEASE
     network_dns_servers: list[str] = field(
         default_factory=lambda: ["1.1.1.1", "8.8.8.8"]
     )
@@ -292,6 +302,17 @@ def _validate_config(cfg: XenoidConfig) -> None:
         raise InstanceError("instance_identity_mismatch", "unsupported instance config schema")
     if cfg.backend not in {"colima-docker", "macos-colima", "linux-docker"}:
         raise InstanceError("resource_conflict", "unsupported backend")
+    if not isinstance(cfg.google_services_provider, str) or not isinstance(cfg.google_services_release, str):
+        raise InstanceError("google_services_spec_mismatch", "invalid Google services provider configuration")
+    valid_google_pair = (
+        cfg.google_services_provider == DEFAULT_GOOGLE_SERVICES_PROVIDER
+        and cfg.google_services_release == DEFAULT_GOOGLE_SERVICES_RELEASE
+    ) or (
+        cfg.google_services_provider == "mindthegapps"
+        and cfg.google_services_release == MINDTHEGAPPS_RELEASE
+    )
+    if not valid_google_pair:
+        raise InstanceError("google_services_spec_mismatch", "unsupported Google services provider or release")
     if not isinstance(cfg.android_adb_port, int) or not 1024 <= cfg.android_adb_port <= 65535:
         raise InstanceError("resource_conflict", "invalid Android ADB port")
     if not isinstance(cfg.extra_docker_args, list) or not all(
@@ -302,7 +323,7 @@ def _validate_config(cfg: XenoidConfig) -> None:
         option = argument.split("=", 1)[0]
         attached_short = any(
             argument.startswith(short) and argument != short
-            for short in ("-p", "-v")
+            for short in ("-l", "-p", "-v")
         )
         if option in _CONTROLLED_DOCKER_ARGS or attached_short:
             raise InstanceError("resource_conflict", "extra_docker_args overrides managed identity")

@@ -4,6 +4,8 @@
   "runtime_image_tag": "xenoid/redroid:local",
   "auto_build_runtime_image": true,
   "docker_context": "",
+  "google_services_provider": "none",
+  "google_services_release": "none",
   "network_dns_servers": ["1.1.1.1", "8.8.8.8"],
   "extra_docker_args": []
 }

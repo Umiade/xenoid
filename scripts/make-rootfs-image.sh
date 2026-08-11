@@ -3,7 +3,7 @@
 # persistent /data/xenoid-data.img. The caller owns the Docker volume and keeps
 # a crash-safe storage transaction in private instance state.
 #
-# Usage: make-rootfs-image.sh IMAGE VOLUME ROOTFS_MB DATA_MB ACTION EXPECTED_UUID TRANSACTION [LEGACY_VOLUME] [BACKUP_IMAGE] [BACKUP_UUID]
+# Usage: make-rootfs-image.sh IMAGE VOLUME ROOTFS_MB DATA_MB ACTION EXPECTED_UUID TRANSACTION [LEGACY_VOLUME] [BACKUP_IMAGE] [BACKUP_UUID] [GOOGLE_PROVIDER]
 # ACTION is initialize, preserve, or migrate. There is deliberately no implicit
 # "missing means mkfs" fallback.
 # Requires: docker, e2fsprogs (mkfs.ext4/blkid) on the Docker engine host.
@@ -19,12 +19,18 @@ STORAGE_TRANSACTION="${7:--}"
 LEGACY_VOLUME="${8:--}"
 BACKUP_IMAGE="${9:--}"
 BACKUP_UUID="${10:--}"
+GOOGLE_PROVIDER="${11:-none}"
 [[ "$DATA_ACTION" =~ ^(initialize|preserve|migrate)$ ]] || { echo "explicit data action required" >&2; exit 2; }
 [[ "$EXPECTED_UUID" == "-" || "$EXPECTED_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "invalid expected data UUID" >&2; exit 2; }
 [[ "$STORAGE_TRANSACTION" == "-" || "$STORAGE_TRANSACTION" =~ ^[0-9a-f]{32}$ ]] || { echo "invalid storage transaction" >&2; exit 2; }
 [[ "$LEGACY_VOLUME" == "-" || "$LEGACY_VOLUME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || { echo "invalid legacy volume" >&2; exit 2; }
 [[ "$BACKUP_IMAGE" == "-" || "$BACKUP_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo "invalid backup image" >&2; exit 2; }
 [[ "$BACKUP_UUID" == "-" || "$BACKUP_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "invalid backup UUID" >&2; exit 2; }
+[[ "$GOOGLE_PROVIDER" == "none" || "$GOOGLE_PROVIDER" == "mindthegapps" ]] || { echo "invalid Google services provider" >&2; exit 2; }
+[[ "$SIZE_MB" =~ ^[0-9]+$ ]] && (( SIZE_MB <= 3072 )) || {
+  echo "rootfs capacity exceeds the 3 GiB limit" >&2
+  exit 61
+}
 DOCKER=(docker)
 if [[ -n "${XENOID_DOCKER_CONTEXT:-}" ]]; then
   DOCKER+=(--context "$XENOID_DOCKER_CONTEXT")
@@ -91,7 +97,23 @@ rm -rf proc sys dev data mnt tmp run oldroot .dockerenv
 mkdir -p proc sys dev data mnt tmp oldroot xenoid
 # remove the setuid su binary: root lives exclusively in the token-gated rootd
 rm -f system/xbin/su
+if [ '$GOOGLE_PROVIDER' = mindthegapps ]; then
+  rm -rf system/system_ext/priv-app/Provision
+  [ ! -e system/system_ext/priv-app/Provision ] ||
+    { echo 'failed to remove conflicting AOSP Provision package' >&2; exit 61; }
+fi
 mkfs.ext4 -q -F -d '$work_dir' '$rootfs_new' ${SIZE_MB}M
+rootfs_stats="\$(tune2fs -l '$rootfs_new' 2>/dev/null | awk -F: '
+  /Block count:/ { gsub(/[[:space:]]/, "", \$2); blocks=\$2 }
+  /Free blocks:/ { gsub(/[[:space:]]/, "", \$2); free=\$2 }
+  /Block size:/ { gsub(/[[:space:]]/, "", \$2); size=\$2 }
+  END { print blocks, free, size }
+')"
+set -- \$rootfs_stats
+[ "\$#" -eq 3 ] || { echo 'cannot inspect generated rootfs capacity' >&2; exit 61; }
+free_bytes=\$((\$2 * \$3))
+[ "\$free_bytes" -ge \$((128 * 1024 * 1024)) ] ||
+  { echo 'generated rootfs has less than 128 MiB free' >&2; exit 61; }
 mv '$rootfs_new' '$VOL_PATH/xenoid-rootfs.img'
 printf '%s' '$digest' > '$VOL_PATH/xenoid-rootfs.img.sha256'
 rm -rf '$work_dir'

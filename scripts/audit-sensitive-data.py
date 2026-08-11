@@ -4,10 +4,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import re
 import subprocess
-
+import sys
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from xenoid.google_services import registered_metadata_files
+
+REGISTERED_GOOGLE_METADATA = registered_metadata_files()
 
 
 def joined(*parts: str) -> str:
@@ -120,6 +125,14 @@ def main() -> int:
     files = candidate_files()
     for path in files:
         relative = path.relative_to(ROOT).as_posix()
+        if relative.startswith(".xenoid/"):
+            findings.append((relative, 0, "private runtime state path"))
+        if Path(relative).suffix.lower() in {".zip", ".pem"}:
+            findings.append((relative, 0, "proprietary import payload"))
+        if relative.startswith("data/google-services/"):
+            expected = REGISTERED_GOOGLE_METADATA.get(relative)
+            if expected is None:
+                findings.append((relative, 0, "unregistered Google release metadata"))
         for label, pattern in FORBIDDEN_NAMES:
             if pattern.search(relative):
                 findings.append((relative, 0, label))
@@ -127,6 +140,11 @@ def main() -> int:
             data = path.read_bytes()
         except OSError:
             continue
+        if relative in REGISTERED_GOOGLE_METADATA and (
+            hashlib.sha256(data).hexdigest()
+            != REGISTERED_GOOGLE_METADATA[relative]
+        ):
+            findings.append((relative, 0, "Google release metadata hash mismatch"))
         try:
             text = data.decode("utf-8")
             is_text = True

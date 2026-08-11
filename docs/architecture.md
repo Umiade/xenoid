@@ -24,6 +24,14 @@ Cache and login state are stored in the same `/data` partition and persist acros
 
 The runtime preserves Android's per-app SSAID store instead of rewriting it during profile convergence; each signing identity therefore keeps the value Android generated for that device. Profile application updates only the device-wide secure Android ID. The runtime PackageManager patch tolerates only redroid's known unsupported SELinux `restorecon` result while recovering existing `/data` app directories; every other `installd` failure remains fatal.
 
+## Optional Google services runtime
+
+Google services are an image-bound, opt-in runtime capability rather than a post-boot APK installer. The sole registered release is `MindTheGapps-13.0.0-arm64-20231025_200931` for Android 13/API 33, ARM64, and the `raven` product profile. Its public registry contains only release metadata, archive/member hashes, package identities, signer histories, ABI inventory, and size limits. Proprietary ZIP, certificate, and expanded payload bytes remain under ignored `.xenoid/` state and never enter a release or OTA bundle.
+
+Import performs a bounded local verification before atomically publishing the private asset directory. Runtime-context generation expands only the pinned production members into invocation-owned temporary directories, copies the payload before Xenoid-owned files, and bakes `ro.setupwizard.mode=DISABLED`. Rootfs generation removes the conflicting AOSP `Provision` package before `mkfs`. Temporary payload and context sources are then destroyed.
+
+Each instance commits a two-phase Google binding containing the provider, release, specification fingerprint, and data-compatibility fingerprint. The same identity is carried by the managed image, container labels, rootfs source marker, status, and doctor output. The provider choice can change only while the instance has no storage state, Docker data volume, legacy record, or binding. A mismatch fails with `google_services_new_instance_required`; Xenoid never wipes or migrates `/data` across a provider transition.
+
 ## Multi-instance operation
 
 Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Linux ARM). Each instance gets a unique container, volume, network, MAC, IPv4/IPv6, host ADB/daemon port, and proxy routing table from the operator registry.

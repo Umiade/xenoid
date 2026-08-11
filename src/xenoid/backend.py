@@ -18,7 +18,7 @@ import time
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .config import (
     InstanceContext,
@@ -31,6 +31,32 @@ from .device_identity import (
     DeviceIdentityStore,
     IdentityError,
     public_identity_state,
+)
+from .google_services import (
+    GOOGLE_LABEL_DATA_COMPAT,
+    GOOGLE_LABEL_PROVIDER,
+    GOOGLE_LABEL_RELEASE,
+    GOOGLE_LABEL_SPEC,
+    PROVIDER_MINDTHEGAPPS,
+    PROVIDER_NONE,
+    GoogleBindingStore,
+    GoogleServicesError,
+    ReleaseSpec,
+    base_status,
+    binding_matches,
+    capability_model,
+    cleanup_runtime_context,
+    create_runtime_context_handle,
+    disabled_runtime_spec_fingerprint,
+    effective_google_image,
+    expected_binding_identity,
+    load_release_spec,
+    public_binding,
+    quick_validate_assets,
+    resolve_google_runtime_spec,
+    staged_google_payload,
+    transition_decision,
+    verify_context_copy,
 )
 from .storage import (
     DEFAULT_DATA_SIZE_BYTES,
@@ -152,17 +178,43 @@ class RuntimeManager:
         elif info["system"] == "Linux" and info["machine"] not in {"arm64", "aarch64"}:
             checks.append(Check("linux-arm", False, f"machine={info['machine']}", "Use a Linux ARM host"))
         checks.append(Check("backend", True, self.cfg.backend))
+        if self.cfg.google_services_provider == PROVIDER_MINDTHEGAPPS:
+            for command in ("keytool", "jarsigner", "aapt2", "apksigner"):
+                resolved = which(command)
+                checks.append(
+                    Check(
+                        f"google-{command}",
+                        resolved is not None,
+                        resolved or "not found",
+                        "run ./xenoid install-runtime",
+                    )
+                )
         return checks
 
     def colima_start_command(self) -> list[str]:
         return ["colima", "start", "--arch", "aarch64", "--vm-type", "vz", "--memory", "8", "--cpu", "8"]
 
+    def google_runtime_spec(
+        self,
+        purpose: str,
+        *,
+        require_assets: bool = True,
+    ) -> Optional[ReleaseSpec]:
+        return resolve_google_runtime_spec(
+            self.context,
+            self.cfg,
+            purpose,
+            require_assets=require_assets,
+        )
+
     def effective_image(self) -> str:
-        if self.cfg.auto_build_runtime_image:
-            return f"{self.cfg.runtime_image_tag}-{self.context.resource_tag}"
-        # Auto-upgrade the stock default to the 64only variant on arm64 hosts
-        # (Apple Silicon / ARM ECS): those CPUs have no AArch32, and the stock
-        return self.cfg.image
+        base = (
+            f"{self.cfg.runtime_image_tag}-{self.context.resource_tag}"
+            if self.cfg.auto_build_runtime_image
+            else self.cfg.image
+        )
+        spec = self.google_runtime_spec("effective-image", require_assets=False)
+        return effective_google_image(base, spec)
 
     def docker_endpoint_host(self) -> str:
         """Return the Docker engine Host endpoint for cfg.docker_context, if any."""
@@ -452,6 +504,35 @@ class RuntimeManager:
             for argument in ("--label", f"{key}={value}")
         ]
 
+    def _google_label_values(self) -> dict[str, str]:
+        spec = self.google_runtime_spec("container-labels", require_assets=False)
+        identity = expected_binding_identity(spec)
+        return {
+            GOOGLE_LABEL_PROVIDER: identity["provider"],
+            GOOGLE_LABEL_RELEASE: identity["release"],
+            GOOGLE_LABEL_SPEC: identity["specSha256"],
+            GOOGLE_LABEL_DATA_COMPAT: identity["dataCompatibilitySha256"],
+        }
+
+    def _google_label_args(self) -> list[str]:
+        return [
+            argument
+            for key, value in sorted(self._google_label_values().items())
+            for argument in ("--label", f"{key}={value}")
+        ]
+    def _managed_container_labels_match(self, labels: Any) -> bool:
+        if not isinstance(labels, dict):
+            return False
+        expected = {
+            **self.lease.owner_labels,
+            **self._google_label_values(),
+        }
+        return all(labels.get(key) == value for key, value in expected.items()) and not any(
+            key.startswith("dev.xenoid.google_") and key not in expected
+            for key in labels
+        )
+
+
     def _inspect_docker_object(
         self,
         object_type: str,
@@ -474,6 +555,27 @@ class RuntimeManager:
         ):
             return {}, proc
         return payload[0], proc
+
+    def _container_effective_image_identity(
+        self,
+        container: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        image, inspect = self._inspect_docker_object(
+            "image",
+            self.effective_image(),
+        )
+        desired_id = (
+            str(image.get("Id") or "")
+            if isinstance(image, dict)
+            else ""
+        )
+        container_id = str(container.get("Image") or "")
+        return {
+            "ok": bool(desired_id) and container_id == desired_id,
+            "containerImageSha256": container_id or None,
+            "desiredImageSha256": desired_id or None,
+            "returncode": inspect.returncode,
+        }
 
     def docker_network_command(self) -> list[str]:
         return [
@@ -706,6 +808,7 @@ class RuntimeManager:
             legacy_volume or "-",
             backup_image or "-",
             backup_uuid or "-",
+            self.cfg.google_services_provider,
         ]
         env = self.docker_env()
         ssh_cmd = self.remote_docker_ssh_cmd()
@@ -723,12 +826,25 @@ class RuntimeManager:
         }
         if proc.returncode != 0:
             storage_failure = 41 <= proc.returncode <= 56
+            capacity_failure = proc.returncode == 61
             result.update({
-                "error": "storage_image_invalid" if storage_failure else "rootfs_image_build_failed",
+                "error": (
+                    "storage_image_invalid"
+                    if storage_failure
+                    else (
+                        "rootfs_capacity_insufficient"
+                        if capacity_failure
+                        else "rootfs_image_build_failed"
+                    )
+                ),
                 "message": (
                     "persistent data image operation failed"
                     if storage_failure
-                    else "rootfs image preparation failed"
+                    else (
+                        "generated rootfs capacity is insufficient"
+                        if capacity_failure
+                        else "rootfs image preparation failed"
+                    )
                 ),
             })
             return result
@@ -1119,6 +1235,16 @@ class RuntimeManager:
             "storage": public_storage_state(committed, healthy=True),
         }
 
+    def _android_boot_command(self) -> list[str]:
+        return [
+            "androidboot.redroid_width=1080",
+            "androidboot.redroid_height=1920",
+            "androidboot.redroid_dpi=480",
+            f"service.adb.tcp.port={self.lease.android_adb_port}",
+            "androidboot.use_memfd=true",
+            "androidboot.mode=normal",
+        ]
+
     def docker_create_command(self) -> list[str]:
         dns_args = [
             argument
@@ -1133,6 +1259,7 @@ class RuntimeManager:
             "--name",
             self.lease.container_name,
             *self._owner_label_args(),
+            *self._google_label_args(),
             "-p",
             f"127.0.0.1:{self.lease.host_adb_port}:{self.lease.android_adb_port}",
             "-v",
@@ -1149,13 +1276,7 @@ class RuntimeManager:
             *self.cfg.extra_docker_args,
             *self.binder_volume_args(),
             self.effective_image(),
-            "androidboot.redroid_width=1080",
-            "androidboot.redroid_height=1920",
-            "androidboot.redroid_dpi=480",
-            f"service.adb.tcp.port={self.lease.android_adb_port}",
-            "androidboot.use_memfd=true",
-            # Import this immutable boot value before property areas are created.
-            "androidboot.mode=normal",
+            *self._android_boot_command(),
         ]
 
     def docker_exec(self, args: list[str], timeout: int = 15) -> dict[str, Any]:
@@ -1361,9 +1482,12 @@ class RuntimeManager:
                 and ipam_config.get("IPv6Address") == self.lease.ipv6_address
             )
         ) if isinstance(endpoint, dict) else False
+        labels = config.get("Labels")
         return (
             self._container_has_lease_owner(container)
             and config.get("Image") == self.effective_image()
+            and self._managed_container_labels_match(labels)
+            and config.get("Cmd") == self._android_boot_command()
             and host_config.get("AutoRemove") is False
             and host_config.get("Privileged") is True
             and isinstance(restart_policy, dict)
@@ -1702,6 +1826,251 @@ class RuntimeManager:
             )
         return self._remove_container_safely(container, ownership="legacy-record")
 
+    def _google_binding_preflight(
+        self,
+        spec: Optional[ReleaseSpec],
+    ) -> dict[str, Any]:
+        binding_store = GoogleBindingStore(self.context, self.lease)
+        binding = binding_store.load()
+        storage = StorageStateStore(self.context, self.lease).load()
+        legacy = self._legacy_engine_record()
+        volume, inspected = self._inspect_docker_object(
+            "volume",
+            self.lease.volume_name,
+        )
+        if volume == {}:
+            raise GoogleServicesError(
+                "google_services_freshness_unknown",
+                "cannot inspect the instance data volume identity",
+            )
+        missing = "no such volume" in str(inspected.stderr or "").lower()
+        freshness_known = volume is not None or missing
+        fresh = (
+            freshness_known
+            and volume is None
+            and storage is None
+            and legacy is None
+        )
+        legacy_actual_none = (
+            spec is None
+            and not fresh
+            and (volume is not None or storage is not None or legacy is not None)
+        )
+        decision = transition_decision(
+            spec,
+            binding,
+            freshness_known=freshness_known,
+            fresh=fresh,
+            legacy_actual_none=legacy_actual_none,
+        )
+        return {
+            **decision,
+            "binding": binding,
+            "storagePresent": storage is not None,
+            "volumePresent": volume is not None,
+            "legacyPresent": legacy is not None,
+        }
+
+    def google_services_configuration_mutable(self) -> dict[str, Any]:
+        current = GoogleBindingStore(self.context, self.lease).load()
+        storage = StorageStateStore(self.context, self.lease).load()
+        legacy = self._legacy_engine_record()
+        volume, inspected = self._inspect_docker_object(
+            "volume",
+            self.lease.volume_name,
+        )
+        missing = "no such volume" in str(inspected.stderr or "").lower()
+        known = volume is not None or missing
+        mutable = (
+            current is None
+            and storage is None
+            and legacy is None
+            and known
+            and volume is None
+        )
+        return {
+            "ok": mutable,
+            "mutable": mutable,
+            "binding": public_binding(current),
+            "storagePresent": storage is not None,
+            "volumePresent": volume is not None,
+            "legacyPresent": legacy is not None,
+            **(
+                {}
+                if mutable
+                else {
+                    "error": (
+                        "google_services_new_instance_required"
+                        if known
+                        else "google_services_freshness_unknown"
+                    ),
+                    "message": (
+                        "Google services configuration is immutable after Android data exists"
+                        if known
+                        else "cannot prove that this instance has no Android data"
+                    ),
+                }
+            ),
+        }
+
+    def _begin_google_binding(
+        self,
+        spec: Optional[ReleaseSpec],
+        preflight: dict[str, Any],
+    ) -> dict[str, Any]:
+        store = GoogleBindingStore(self.context, self.lease)
+        existing = preflight.get("binding")
+        if isinstance(existing, dict):
+            return existing
+        source = (
+            "legacy"
+            if preflight.get("transition") == "legacy-none"
+            else "fresh"
+        )
+        pending = store.pending(spec, source)
+        if preflight.get("transition") == "legacy-none":
+            return store.commit(pending)
+        return pending
+
+    def _commit_google_binding(
+        self,
+        binding: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return GoogleBindingStore(self.context, self.lease).commit(binding)
+
+    def google_services_bootstrap_gate(
+        self,
+        spec: Optional[ReleaseSpec],
+    ) -> dict[str, Any]:
+        packages: dict[str, Any] = {}
+        package_ok = True
+        for package in (
+            "com.google.android.gms",
+            "com.google.android.gsf",
+            "com.android.vending",
+        ):
+            path = self.adb(["shell", "pm", "path", package], timeout=20)
+            output = str(path.get("stdout") or "").strip()
+            present = path.get("ok") is True and "package:" in output
+            expected = spec is not None
+            packages[package] = {
+                "present": present,
+                "expected": expected,
+                "path": output if present else None,
+            }
+            package_ok = package_ok and present is expected
+        release = self.adb(["shell", "getprop", "ro.build.version.release"])
+        abilist = self.adb(["shell", "getprop", "ro.product.cpu.abilist"])
+        product = self.adb(["shell", "getprop", "ro.build.product"])
+        platform_ok = (
+            str(release.get("stdout") or "").strip() == "13"
+            and str(product.get("stdout") or "").strip() == "raven"
+            and str(abilist.get("stdout") or "").strip() == "arm64-v8a"
+        )
+        launcher: dict[str, Any] = {"ok": spec is None, "skipped": spec is None}
+        system_flags: dict[str, Any] = {
+            "ok": spec is None,
+            "skipped": spec is None,
+        }
+        provision: dict[str, Any] = {
+            "ok": True,
+            "skipped": spec is None,
+            "present": False,
+        }
+        if spec is not None:
+            resolved = self.adb(
+                [
+                    "shell",
+                    "cmd",
+                    "package",
+                    "resolve-activity",
+                    "--brief",
+                    "-a",
+                    "android.intent.action.MAIN",
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                    "com.android.vending",
+                ],
+                timeout=20,
+            )
+            resolved_lines = [
+                line.strip()
+                for line in str(resolved.get("stdout") or "").splitlines()
+                if line.strip()
+            ]
+            resolved_text = resolved_lines[-1] if resolved_lines else ""
+            launcher = {
+                "ok": resolved.get("ok") is True
+                and resolved_text.startswith("com.android.vending/"),
+                "component": resolved_text,
+            }
+            flags = self.adb(
+                [
+                    "shell",
+                    "dumpsys",
+                    "package",
+                    "com.google.android.gms",
+                ],
+                timeout=30,
+            )
+            flags_text = str(flags.get("stdout") or "")
+            system_flags = {
+                "ok": flags.get("ok") is True
+                and (
+                    "SYSTEM" in flags_text
+                    or "system_ext/priv-app/GmsCore" in flags_text
+                    or "product/priv-app/GmsCore" in flags_text
+                ),
+                "updatedSystemApp": "UPDATED_SYSTEM_APP" in flags_text,
+            }
+            provision_path = self.adb(
+                ["shell", "pm", "path", "com.android.provision"],
+                timeout=20,
+            )
+            provision_present = (
+                "package:" in str(provision_path.get("stdout") or "")
+            )
+            provision_absence_checked = (
+                provision_path.get("ok") is True
+                or (
+                    provision_path.get("returncode") == 1
+                    and not str(provision_path.get("stderr") or "").strip()
+                )
+            )
+            provision = {
+                "ok": provision_absence_checked and not provision_present,
+                "present": provision_present,
+            }
+        ok = bool(
+            package_ok
+            and platform_ok
+            and launcher.get("ok")
+            and system_flags.get("ok")
+            and provision.get("ok")
+        )
+        return {
+            "ok": ok,
+            "provider": spec.provider if spec is not None else PROVIDER_NONE,
+            "packages": packages,
+            "launcher": launcher,
+            "systemPackage": system_flags,
+            "provisionConflict": provision,
+            "platform": {
+                "release": str(release.get("stdout") or "").strip(),
+                "product": str(product.get("stdout") or "").strip(),
+                "abilist": str(abilist.get("stdout") or "").strip(),
+                "ok": platform_ok,
+            },
+            **(
+                {}
+                if ok
+                else {
+                    "error": "google_services_runtime_not_ready",
+                    "message": "Android PackageManager Google services bootstrap gate failed",
+                }
+            ),
+        }
+
     def start(self, dry_run: bool = False, wait: bool = True, install_daemon_apk: Optional[str] = None, start_colima: bool = False, adb_root: bool = True, skip_preflight: bool = False, recreate: bool = False, defer_proxy: bool = False) -> dict[str, Any]:
         self.ensure_instance_lease()
         plan: dict[str, Any] = {
@@ -1745,33 +2114,111 @@ class RuntimeManager:
             plan["preflight"] = preflight
             if not preflight.get("ok"):
                 return {"ok": False, "error": "runtime preflight failed", "plan": plan}
-        if self.cfg.auto_build_runtime_image:
-            plan["runtimeContext"] = self.make_runtime_context(self.base_image_for_build())
-            context = plan["runtimeContext"]
-            if not context.get("ok") or not context.get("context"):
-                return {"ok": False, "error": "runtime context generation failed", "plan": plan}
-            build = run(
-                [*self.docker_base_cmd(), "build", "-t", self.effective_image(), context["context"]],
-                env=self.docker_env(),
+        try:
+            google_spec = self.google_runtime_spec(
+                "start",
+                require_assets=True,
             )
-            plan["runtimeImageBuild"] = {
-                "ok": build.returncode == 0,
-                "returncode": build.returncode,
-                "stdout": build.stdout[-4000:],
-                "stderr": build.stderr[-4000:],
+            google_transition = self._google_binding_preflight(google_spec)
+        except (GoogleServicesError, StorageError) as exc:
+            code = getattr(exc, "code", "google_services_spec_mismatch")
+            return {
+                "ok": False,
+                "error": code,
+                "message": str(exc),
+                "plan": plan,
             }
-            if build.returncode != 0:
-                return {"ok": False, "error": "runtime image build failed", "plan": plan}
+        plan["googleServicesPreflight"] = {
+            "ok": True,
+            "provider": (
+                google_spec.provider
+                if google_spec is not None
+                else PROVIDER_NONE
+            ),
+            "release": (
+                google_spec.release
+                if google_spec is not None
+                else PROVIDER_NONE
+            ),
+            "specSha256": (
+                google_spec.fingerprint
+                if google_spec is not None
+                else disabled_runtime_spec_fingerprint()
+            ),
+            "transition": google_transition["transition"],
+        }
+        if self.cfg.auto_build_runtime_image:
+            image_build = self._build_effective_runtime_image(google_spec)
+            plan["runtimeImageBuild"] = image_build
+            if image_build.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": image_build.get(
+                        "error",
+                        "runtime_image_build_failed",
+                    ),
+                    "message": image_build.get(
+                        "message",
+                        "runtime image build failed",
+                    ),
+                    "plan": plan,
+                }
+        preexisting_container, _ = self._inspect_docker_object(
+            "container",
+            self.lease.container_name,
+        )
+        if (
+            isinstance(preexisting_container, dict)
+            and preexisting_container
+            and self._container_has_lease_owner(preexisting_container)
+        ):
+            image_identity = self._container_effective_image_identity(
+                preexisting_container,
+            )
+            plan["containerImageIdentity"] = image_identity
+            if image_identity.get("ok") is not True and not recreate:
+                return {
+                    "ok": False,
+                    "error": "runtime_spec_mismatch",
+                    "message": "owned container requires explicit recreation for the effective image",
+                    "plan": plan,
+                }
+
 
 
         plan["network"] = self.ensure_network()
         if not plan["network"].get("ok"):
             return {"ok": False, "error": "docker network setup failed", "plan": plan}
 
+        try:
+            google_binding = self._begin_google_binding(
+                google_spec,
+                google_transition,
+            )
+        except GoogleServicesError as exc:
+            return {
+                "ok": False,
+                "error": exc.code,
+                "message": str(exc),
+                "plan": plan,
+            }
+        plan["googleServicesBinding"] = public_binding(google_binding)
+
         rootfs_images = self.ensure_rootfs_images()
         plan["rootfsImages"] = rootfs_images
         if not rootfs_images.get("ok"):
-            return {"ok": False, "error": "rootfs/data image build failed", "plan": plan}
+            return {
+                "ok": False,
+                "error": rootfs_images.get(
+                    "error",
+                    "rootfs_image_build_failed",
+                ),
+                "message": rootfs_images.get(
+                    "message",
+                    "rootfs/data image build failed",
+                ),
+                "plan": plan,
+            }
 
         binder = self.ensure_binder()
         plan["binder"] = binder
@@ -1952,6 +2399,33 @@ class RuntimeManager:
                     required.extend([result["dockerAdbPortPostRoot"], result["adbWaitPostRoot"]])
             result["daemonForward"] = self.forward_daemon_port()
             required.append(result["daemonForward"])
+
+        if not wait:
+            result["googleServicesBootstrap"] = {
+                "ok": True,
+                "skipped": True,
+                "pending": True,
+                "reason": "Android boot wait was disabled",
+            }
+        elif result.get("adbWait", {}).get("ok") is True:
+            result["googleServicesBootstrap"] = (
+                self.google_services_bootstrap_gate(google_spec)
+            )
+        else:
+            result["googleServicesBootstrap"] = {
+                "ok": False,
+                "skipped": True,
+                "error": "google_services_runtime_not_ready",
+                "message": "Android boot is required before the Google services bootstrap gate",
+            }
+        required.append(result["googleServicesBootstrap"])
+        if wait and result["googleServicesBootstrap"].get("ok") is True:
+            try:
+                google_binding = self._commit_google_binding(google_binding)
+                result["googleServicesBinding"] = public_binding(google_binding)
+            except GoogleServicesError as exc:
+                result["googleServicesBinding"] = exc.as_dict()
+                required.append(result["googleServicesBinding"])
 
         daemon_package = self.adb(
             ["shell", "pm", "path", "dev.xenoid.daemon"],
@@ -2227,6 +2701,237 @@ class RuntimeManager:
             **public_storage_state(state, healthy=True),
         }
 
+    def google_services_status(
+        self,
+        *,
+        require_runtime: bool = False,
+    ) -> dict[str, Any]:
+        provider = self.cfg.google_services_provider
+        release = self.cfg.google_services_release
+        spec: Optional[ReleaseSpec] = None
+        host_ready = provider == PROVIDER_NONE
+        error: Optional[str] = None
+        try:
+            spec = self.google_runtime_spec("status", require_assets=False)
+            if spec is not None:
+                quick_validate_assets(self.context.project_root, spec)
+                host_ready = True
+        except GoogleServicesError as exc:
+            error = exc.code
+
+        status = base_status(provider, release, spec)
+        binding: Optional[dict[str, Any]] = None
+        try:
+            binding = GoogleBindingStore(self.context, self.lease).load()
+        except GoogleServicesError as exc:
+            error = error or exc.code
+        binding_ok = (
+            binding is not None
+            and spec is not None
+            and binding_matches(binding, spec)
+            and binding.get("state") == "committed"
+        ) if provider == PROVIDER_MINDTHEGAPPS else (
+            binding is None
+            or (
+                binding_matches(binding, None)
+                and binding.get("state") == "committed"
+            )
+        )
+
+        image, _ = self._inspect_docker_object(
+            "image",
+            self.effective_image(),
+        )
+        desired_image_id = (
+            str(image.get("Id") or "")
+            if isinstance(image, dict)
+            else ""
+        )
+        image_config = (
+            image.get("Config")
+            if isinstance(image, dict)
+            else None
+        )
+        image_labels = (
+            image_config.get("Labels")
+            if isinstance(image_config, dict)
+            else None
+        )
+        image_labels = image_labels if isinstance(image_labels, dict) else {}
+        if spec is not None:
+            image_labels_match: Optional[bool] = bool(
+                desired_image_id
+                and all(
+                    image_labels.get(key) == value
+                    for key, value in spec.labels.items()
+                )
+            )
+        elif desired_image_id:
+            image_labels_match = not any(
+                key in image_labels for key in self._google_label_values()
+            )
+        else:
+            image_labels_match = None
+
+        container, _ = self._inspect_docker_object(
+            "container",
+            self.lease.container_name,
+        )
+        owned_container = bool(
+            isinstance(container, dict)
+            and container
+            and self._container_has_lease_owner(container)
+        )
+        container_state = (
+            container.get("State")
+            if owned_container and isinstance(container, dict)
+            else None
+        )
+        running = bool(
+            isinstance(container_state, dict)
+            and container_state.get("Running") is True
+        )
+        container_config = (
+            container.get("Config")
+            if owned_container and isinstance(container, dict)
+            else None
+        )
+        container_labels = (
+            container_config.get("Labels")
+            if isinstance(container_config, dict)
+            else None
+        )
+        container_labels_match = (
+            self._managed_container_labels_match(container_labels)
+            if owned_container
+            else None
+        )
+        command_match = (
+            container_config.get("Cmd") == self._android_boot_command()
+            if isinstance(container_config, dict)
+            else None
+        )
+        container_image_id = (
+            str(container.get("Image") or "")
+            if owned_container and isinstance(container, dict)
+            else ""
+        )
+
+        rootfs_source_id = ""
+        volume, _ = self._inspect_docker_object(
+            "volume",
+            self.lease.volume_name,
+        )
+        if isinstance(volume, dict) and self._volume_matches_lease(volume):
+            mountpoint = str(volume["Mountpoint"])
+            marker = self._engine_host_shell(
+                "cat "
+                + shlex.quote(
+                    f"{mountpoint}/xenoid-rootfs.img.sha256"
+                )
+                + " 2>/dev/null",
+                timeout=30,
+            )
+            if marker.returncode == 0:
+                rootfs_source_id = str(marker.stdout or "").strip()
+
+        identity_ready = bool(
+            desired_image_id
+            and owned_container
+            and desired_image_id == container_image_id
+            and desired_image_id == rootfs_source_id
+            and image_labels_match is True
+            and container_labels_match is True
+            and command_match is True
+        )
+        live: dict[str, Any] = {
+            "ok": False,
+            "skipped": True,
+            "reason": "Android runtime is not running",
+        }
+        if running:
+            live = self.google_services_bootstrap_gate(spec)
+
+        configured = provider == PROVIDER_MINDTHEGAPPS
+        ready = bool(
+            configured
+            and host_ready
+            and binding_ok
+            and identity_ready
+            and running
+            and live.get("ok") is True
+        )
+        if configured:
+            runtime_state = "ready" if ready else (
+                "failed" if running or error else "configured"
+            )
+            state = runtime_state
+            ok = ready
+            if not ready and error is None:
+                error = "google_services_runtime_not_ready"
+        else:
+            clean = bool(
+                not running
+                or (
+                    live.get("ok") is True
+                    and (
+                        not desired_image_id
+                        or image_labels_match is True
+                    )
+                )
+            )
+            state = "running-clean" if running and clean else "disabled"
+            ready = clean
+            ok = clean
+            runtime_state = "absent" if clean else "failed"
+            if not clean:
+                error = error or "unexpected_google_payload"
+        if require_runtime and configured and not ready:
+            ok = False
+
+        model = capability_model(provider, runtime_state)
+        selected = f"./xenoid --instance {self.context.instance_name}"
+        next_actions: list[str] = []
+        if configured and not host_ready:
+            next_actions.append(
+                f"{selected} google-services import-mindthegapps "
+                f"<{release}.zip> <release.x509.pem>"
+            )
+        if configured and not running:
+            next_actions.append(f"{selected} up")
+        elif configured and not ready:
+            next_actions.append(
+                f"{selected} doctor --require-runtime"
+            )
+        return {
+            **status,
+            "ok": ok,
+            "state": state,
+            "hostReady": host_ready,
+            "runtimeRequired": configured,
+            "runtimeChecked": running,
+            "ready": ready,
+            "skipped": not running,
+            "binding": public_binding(binding),
+            "runtimeIdentity": {
+                "desiredImageSha256": desired_image_id or None,
+                "containerImageSha256": container_image_id or None,
+                "rootfsSourceImageSha256": rootfs_source_id or None,
+                "labelsMatch": (
+                    image_labels_match is True
+                    and container_labels_match is True
+                    if owned_container and desired_image_id
+                    else None
+                ),
+                "commandMatch": command_match,
+                "skipped": not owned_container,
+            },
+            "live": live,
+            **model,
+            "error": error,
+            "nextActions": next_actions,
+        }
+
     def status(self) -> dict[str, Any]:
         self.ensure_instance_lease()
         selected = {
@@ -2244,6 +2949,7 @@ class RuntimeManager:
             }
         storage = self.storage_status()
         identity = self.device_identity_status()
+        google_services = self.google_services_status()
         container, _ = self._inspect_docker_object(
             "container",
             self.lease.container_name,
@@ -2258,6 +2964,7 @@ class RuntimeManager:
                 "instance": selected,
                 "storage": storage,
                 "identity": identity,
+                "googleServices": google_services,
             }
         if not container or not self._container_has_lease_owner(container):
             return {
@@ -2267,6 +2974,7 @@ class RuntimeManager:
                 "instance": selected,
                 "storage": storage,
                 "identity": identity,
+                "googleServices": google_services,
             }
         state = container.get("State")
         running = isinstance(state, dict) and state.get("Running") is True
@@ -2295,6 +3003,7 @@ class RuntimeManager:
             "instance": selected,
             "storage": storage,
             "identity": identity,
+            "googleServices": google_services,
         }
 
     def adb(self, args: list[str], timeout: Optional[float] = None) -> dict[str, Any]:
@@ -2837,22 +3546,63 @@ class RuntimeManager:
         result["stage"] = "complete" if result["ok"] else "deploy"
         return result
 
-
     def base_image_for_build(self) -> str:
         """Return the configured 64-bit Android 13 base image."""
         return self.cfg.image
 
-    def make_runtime_context(self, image: Optional[str] = None) -> dict[str, Any]:
+    def make_runtime_context(
+        self,
+        image: Optional[str] = None,
+        *,
+        output: Optional[Path] = None,
+        spec: Optional[ReleaseSpec] = None,
+    ) -> dict[str, Any]:
         script = self.context.project_root / "scripts" / "make-runtime-context.sh"
-        output = (
+        selected_spec = (
+            self.google_runtime_spec("runtime-context", require_assets=True)
+            if spec is None
+            else spec
+        )
+        destination = output or (
             self.context.state_root
             / "runtime-context"
             / f"{self.lease.transaction_id}-{secrets.token_hex(8)}"
         )
-        proc = run(
-            [str(script), image or self.base_image_for_build(), str(output)],
-            env=self.docker_env(),
+        env = self.docker_env()
+        env["XENOID_EXPECT_BUILD_PRODUCT"] = (
+            str(selected_spec.android["targetProduct"])
+            if selected_spec is not None
+            else "raven"
         )
+
+        def generate() -> tuple[Any, Optional[dict[str, Any]]]:
+            proc = run(
+                [
+                    str(script),
+                    image or self.base_image_for_build(),
+                    str(destination),
+                ],
+                env=env,
+            )
+            verification: Optional[dict[str, Any]] = None
+            if proc.returncode == 0 and selected_spec is not None:
+                verification = verify_context_copy(destination, selected_spec, stage)
+            return proc, verification
+
+        if selected_spec is None:
+            proc, verification = generate()
+        else:
+            with staged_google_payload(self.context, selected_spec) as stage:
+                env.update(
+                    {
+                        "XENOID_GOOGLE_PAYLOAD": str(stage.tree),
+                        "XENOID_GOOGLE_PROVIDER": selected_spec.provider,
+                        "XENOID_GOOGLE_RELEASE": selected_spec.release,
+                        "XENOID_GOOGLE_SPEC_SHA256": selected_spec.fingerprint,
+                        "XENOID_GOOGLE_DATA_COMPAT_SHA256": selected_spec.data_compatibility_fingerprint,
+                    }
+                )
+                proc, verification = generate()
         return {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
@@ -2863,7 +3613,128 @@ class RuntimeManager:
                 if proc.stdout.strip()
                 else None
             ),
+            "googleServices": (
+                selected_spec.public_dict()
+                if selected_spec is not None
+                else {"provider": PROVIDER_NONE, "release": PROVIDER_NONE}
+            ),
+            "verification": verification,
         }
+
+    def _verify_effective_image(
+        self,
+        spec: Optional[ReleaseSpec],
+    ) -> dict[str, Any]:
+        image, inspect = self._inspect_docker_object("image", self.effective_image())
+        if image is None:
+            return {
+                "ok": False,
+                "error": "google_services_runtime_not_ready",
+                "message": "effective runtime image does not exist",
+                "returncode": inspect.returncode,
+            }
+        if not image:
+            return {
+                "ok": False,
+                "error": "google_services_spec_mismatch",
+                "message": "effective runtime image identity is invalid",
+            }
+        config = image.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        labels = labels if isinstance(labels, dict) else {}
+        expected = spec.labels if spec is not None else {}
+        labels_match = (
+            all(labels.get(key) == value for key, value in expected.items())
+            and (
+                spec is not None
+                or not any(key in labels for key in self._google_label_values())
+            )
+        )
+        architecture = str(image.get("Architecture") or "")
+        image_id = str(image.get("Id") or "")
+        ok = (
+            bool(image_id)
+            and architecture in {"arm64", "aarch64"}
+            and labels_match
+        )
+        return {
+            "ok": ok,
+            "image": self.effective_image(),
+            "imageSha256": image_id,
+            "architecture": architecture,
+            "labelsMatch": labels_match,
+            **(
+                {}
+                if ok
+                else {
+                    "error": "google_services_spec_mismatch",
+                    "message": "effective runtime image does not match the Google services specification",
+                }
+            ),
+        }
+
+    def _build_effective_runtime_image(
+        self,
+        spec: Optional[ReleaseSpec],
+    ) -> dict[str, Any]:
+        handle = create_runtime_context_handle()
+        result: dict[str, Any] = {"ok": False}
+        try:
+            context = self.make_runtime_context(
+                self.base_image_for_build(),
+                output=handle.output,
+                spec=spec,
+            )
+            result["runtimeContext"] = context
+            if not context.get("ok") or context.get("context") != str(handle.output):
+                result.update(
+                    {
+                        "error": "google_services_asset_invalid",
+                        "message": "runtime context generation failed",
+                    }
+                )
+                return result
+            build = run(
+                [
+                    *self.docker_base_cmd(),
+                    "build",
+                    "-t",
+                    self.effective_image(),
+                    str(handle.output),
+                ],
+                env=self.docker_env(),
+            )
+            result["build"] = {
+                "ok": build.returncode == 0,
+                "returncode": build.returncode,
+                "stdout": build.stdout[-4000:],
+                "stderr": build.stderr[-4000:],
+            }
+            if build.returncode != 0:
+                result.update(
+                    {
+                        "error": "runtime_image_build_failed",
+                        "message": "runtime image build failed",
+                    }
+                )
+                return result
+            verified = self._verify_effective_image(spec)
+            result["image"] = verified
+            result["ok"] = verified.get("ok") is True
+            if not result["ok"]:
+                result["error"] = verified.get(
+                    "error",
+                    "google_services_spec_mismatch",
+                )
+            return result
+        finally:
+            try:
+                result["cleanup"] = cleanup_runtime_context(handle)
+            except GoogleServicesError as exc:
+                result["ok"] = False
+                result["error"] = exc.code
+                result["message"] = str(exc)
+
 
     def ensure_rootfs_images(self) -> dict[str, Any]:
         """Converge rootfs while preserving the committed instance data image."""

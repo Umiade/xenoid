@@ -45,6 +45,28 @@ PY
 }
 START_COLIMA=()
 if start_colima_flag; then START_COLIMA=(--start-colima); fi
+reuse_runtime_preflight() {
+  local status_file
+  status_file="$(mktemp "${TMPDIR:-/tmp}/xenoid-reuse-status.XXXXXX")"
+  trap 'rm -f "$status_file"' RETURN
+  xenoid_cli status >"$status_file"
+  python3 - "$status_file" <<'PY'
+import json
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+google = status.get("googleServices")
+required = (
+    status.get("ok") is True,
+    status.get("running") is True,
+    status.get("runtimeSpecMatches") is True,
+    isinstance(google, dict),
+    isinstance(google, dict) and google.get("ok") is True,
+)
+if not all(required):
+    raise SystemExit("reuse runtime identity/readiness preflight failed")
+PY
+}
 
 cmds=()
 if [[ "$SKIP_BUILD" == 1 ]]; then
@@ -53,7 +75,9 @@ else
   cmds+=("./xenoid --instance $INSTANCE build all" "./scripts/build-native-shim.sh arm64 prop")
 fi
 if [[ "$REUSE_RUNTIME" == 1 ]]; then
-  cmds+=("reuse the running owned runtime without recreation")
+  cmds+=(
+    "./xenoid --instance $INSTANCE status <require owned matching runtime and Google identity>"
+  )
 else
   cmds+=("./xenoid --instance $INSTANCE start ${START_COLIMA[*]} --recreate --no-adb-root --defer-proxy --install-daemon $ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk")
 fi
@@ -171,6 +195,8 @@ else
 fi
 if [[ "$REUSE_RUNTIME" != 1 ]]; then
   xenoid_cli start "${START_COLIMA[@]}" --recreate --no-adb-root --defer-proxy --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
+else
+  reuse_runtime_preflight
 fi
 # Full startup uses rootd and avoids restarting adbd as root. Another adbd
 # restart could expose port 5555 again after the internal port was hidden.
@@ -183,6 +209,19 @@ pick() { # pick <dir> <base> — echo existing binary path for current ABI, pref
   local d="$ROOT/native/$1" b="$2"
   if [[ -f "$d/$b$SUF" ]]; then echo "$d/$b$SUF"; elif [[ -f "$d/$b" ]]; then echo "$d/$b"; elif [[ -f "$d/$b-x86_64" ]]; then echo "$d/$b-x86_64"; fi
 }
+GOOGLE_PROVIDER="$(python3 - <<PY
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path("$ROOT") / "src"))
+from xenoid.config import resolve_instance
+_, config, _ = resolve_instance("$INSTANCE", project_root=Path("$ROOT"))
+print(config.google_services_provider)
+PY
+)"
+if [[ "$GOOGLE_PROVIDER" != "none" && "$ABI" != "arm64-v8a" ]]; then
+  echo "google_services_requires_arm64: runtime ABI is $ABI" >&2
+  false
+fi
 # rootd is now started as uid=0 by `xenoid start` (ensure_rootd_root via docker exec) so the
 # daemon gets a real root channel. Do NOT relaunch it here via `adb shell` — that runs as
 # uid=2000 and would replace the root instance with a shell one that EPERMs on mounts.

@@ -48,6 +48,8 @@ echo "[ci] static: instance identity and lease contracts"
 run_py test-proxy.py
 echo "[ci] static: instance storage and lifecycle contracts"
 run_py test-instance-storage.py
+echo "[ci] static: pinned Google runtime contracts"
+run_py test-google-services.py
 echo "[ci] static: proxy compiler and authenticated control contracts"
 run_py test-proxy-compiler.py
 
@@ -72,6 +74,7 @@ need={'xenoid_doctor','xenoid_start','xenoid_up_plan','xenoid_device_apply','xen
 need.add('xenoid_frida_install')
 need.update({'xenoid_proxy_status','xenoid_proxy_check','xenoid_proxy_on','xenoid_proxy_off','xenoid_proxy_clear','xenoid_proxy_select'})
 need.update({'xenoid_location_list','xenoid_location_status','xenoid_location_set'})
+need.update({'xenoid_google_services_status','xenoid_google_services_enable','xenoid_google_services_disable'})
 missing=sorted(need-tools)
 if missing: print('missing MCP tools: '+', '.join(missing)); sys.exit(1)
 print(f'mcp tools ok ({len(tools)})')
@@ -124,6 +127,16 @@ if [[ "$TIER" == "runtime" || "$TIER" == "full" ]]; then
     pass+=("persistence-runtime")
   else
     fail+=("persistence-runtime (rc=$?)")
+  fi
+  if ./xenoid config show 2>/dev/null \
+    | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("config", {}).get("google_services_provider") != "none" else 1)'
+  then
+    echo "[ci] runtime: Google services reuse convergence"
+    if with_timeout 1200 ./scripts/smoke-google-services-convergence.sh >/tmp/ci-google-convergence.out 2>&1; then
+      pass+=("google-services-convergence")
+    else
+      fail+=("google-services-convergence (rc=$?)")
+    fi
   fi
 fi
 

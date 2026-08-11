@@ -284,6 +284,22 @@ Frida 适合应用进程动态分析与 app-layer hook。文件系统、mount、
 
 `device apply` 会同步 daemon profile、SettingsProvider、property-area 状态与重启后持久化的数据。换机后必须冷启动目标应用并重新采集完整画像，单个 `getprop` 值不能作为充分证据。
 
+## 可选 Google Play 运行时
+
+Google 移动服务默认关闭。Xenoid 仅支持一个显式固定的 Android 13 ARM64 版本：`MindTheGapps-13.0.0-arm64-20231025_200931`。从[上游 GitHub release](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931)获取官方 ZIP 与配套的 `release.x509.pem`，再配置一个全新实例：
+
+```bash
+./xenoid --instance play init --config examples/config-macos-colima.json
+./xenoid --instance play google-services import-mindthegapps \
+  /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
+  /path/to/release.x509.pem
+./xenoid --instance play google-services enable
+./xenoid --instance play up
+./xenoid --instance play google-services status --require-runtime
+```
+
+导入只保存在本机，并在接纳 payload 前校验固定的 release 证书、归档签名、完整归档清单、每个成员的摘要、APK 签名沿革、包/版本清单和 native ABI。Xenoid 不会自动下载、再分发 Google 二进制，也不会把它们放入源码、release 或 OTA bundle。Android data 一旦存在，Google 选择即不可变；启用或禁用必须在全新实例上完成。Google 账号登录仍由操作员执行。Play Integrity 与设备认证是 Google 独立控制的能力，本集成不声明支持。
+
 ## 应用、输入与自动化
 
 ```bash
@@ -339,6 +355,7 @@ OTA bundle 包含 daemon、native runtime helper 与 manifest/hash 元数据。F
 - `xenoid_doctor`，参数为 `full` 与 `requireRuntime`；
 - `xenoid_up_plan`，用于无副作用的完整启动计划；
 - `xenoid_stop` 与 `xenoid_status`，用于运行时生命周期控制；
+- `xenoid_google_services_status`、`xenoid_google_services_enable` 与 `xenoid_google_services_disable`；
 - `xenoid_root_status` 与 `xenoid_root_exec`；
 - `xenoid_frida_install` 与 `xenoid_frida_load_script`；
 - `xenoid_device_collect` 与 `xenoid_device_apply`；
@@ -380,7 +397,7 @@ MCP 不绕过 daemon token、backend 约束或运行时前置条件。向 agent 
 ./xenoid build netctl
 ```
 
-发布包包含 CLI、MCP server、运行时资源、daemon APK、native helper、配置示例、skill 文件、`doctor.json` 与 SHA-256 manifest。
+发布包包含 CLI、MCP server、非专有运行时资源、daemon APK、native helper、配置示例、公开 Google release 元数据、skill 文件、`doctor.json` 与 SHA-256 manifest。发布包绝不包含已导入的 Google ZIP、证书或展开后的 payload。
 
 ## 路线图
 

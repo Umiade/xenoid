@@ -115,6 +115,11 @@ def build_doctor_report(
 
     status = manager.status()
     running = bool(status.get("ok") and status.get("running"))
+    google_services = status.get("googleServices")
+    if not isinstance(google_services, dict):
+        google_services = manager.google_services_status(
+            require_runtime=require_runtime,
+        )
     runtime: dict[str, Any] = {
         "ok": not require_runtime,
         "running": running,
@@ -250,6 +255,7 @@ def build_doctor_report(
         "runtime": runtime,
         "protection": protection,
         "proxy": proxy,
+        "googleServices": google_services,
     }
 
     if full:
@@ -294,6 +300,29 @@ def build_doctor_report(
                 "skipped": True,
                 "reason": "Android runtime is not ready",
             }
+        if cfg.google_services_provider != "none":
+            sections["googleServicesSmoke"] = (
+                _run(
+                    [
+                        str(
+                            context.project_root
+                            / "scripts"
+                            / "smoke-google-services-runtime.sh"
+                        ),
+                        "--instance",
+                        context.instance_name,
+                    ],
+                    timeout=600,
+                    env=instance_env,
+                    cwd=context.project_root,
+                )
+                if runtime_ready
+                else {
+                    "ok": False,
+                    "skipped": True,
+                    "reason": "Android runtime is not ready",
+                }
+            )
 
     checks = [_summary(name, section) for name, section in sections.items()]
     ok = all(check["ok"] for check in checks)
@@ -310,6 +339,13 @@ def build_doctor_report(
         next_actions.append(f"{selected} up")
     if full and not sections["runtimeSmoke"].get("ok"):
         next_actions.append(f"{selected} doctor --full --require-runtime")
+    if (
+        cfg.google_services_provider != "none"
+        and not google_services.get("ok")
+    ):
+        next_actions.append(
+            f"{selected} google-services status --require-runtime"
+        )
 
     if not ok and not next_actions:
         next_actions.append(f"{selected} doctor {'--full' if full else ''}".rstrip())

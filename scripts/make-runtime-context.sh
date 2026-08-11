@@ -7,6 +7,11 @@ if [[ -n "${XENOID_DOCKER_CONTEXT:-}" ]]; then
   DOCKER+=(--context "$XENOID_DOCKER_CONTEXT")
 fi
 OUT="${2:-$ROOT/dist/runtime-context}"
+GOOGLE_PAYLOAD="${XENOID_GOOGLE_PAYLOAD:-}"
+GOOGLE_PROVIDER="${XENOID_GOOGLE_PROVIDER:-}"
+GOOGLE_RELEASE="${XENOID_GOOGLE_RELEASE:-}"
+GOOGLE_SPEC_SHA256="${XENOID_GOOGLE_SPEC_SHA256:-}"
+GOOGLE_DATA_COMPAT_SHA256="${XENOID_GOOGLE_DATA_COMPAT_SHA256:-}"
 if [[ -z "$OUT" || "$OUT" == "/" ]]; then
   echo "unsafe runtime context output path" >&2
   exit 2
@@ -44,6 +49,14 @@ RADIO_CONFIG="$ROOT/native/xenoid-radio-config/android.hardware.radio.config-ser
 [[ -f "$RADIO_CONFIG" ]] || "$ROOT/scripts/build-radio-config.sh" arm64 >/dev/null
 rm -rf "$OUT"
 mkdir -p "$OUT/payload"
+if [[ -n "$GOOGLE_PAYLOAD" ]]; then
+  [[ -d "$GOOGLE_PAYLOAD" && ! -L "$GOOGLE_PAYLOAD" ]] || {
+    echo "invalid staged Google services payload" >&2
+    exit 1
+  }
+  mkdir -p "$OUT/payload/google-services"
+  cp -pR "$GOOGLE_PAYLOAD"/. "$OUT/payload/google-services/"
+fi
 cp "$DAEMON" "$OUT/payload/xenoid-daemon.apk"
 mkdir -p "$OUT/payload/XenoidDaemon"
 cp "$DAEMON" "$OUT/payload/XenoidDaemon/XenoidDaemon.apk"
@@ -113,7 +126,14 @@ if command -v docker >/dev/null 2>&1; then
       echo "failed to extract required runtime library, framework jar, graphics HAL, or SoftKeymaster payload from $IMAGE" >&2
       exit 1
     fi
-    python3 "$ROOT/scripts/patch-runtime-props.py" "$_stock" "$OUT/payload/props"
+    _props_args=("$ROOT/scripts/patch-runtime-props.py" "$_stock" "$OUT/payload/props")
+    if [[ -n "${XENOID_EXPECT_BUILD_PRODUCT:-}" ]]; then
+      _props_args+=(--expect-build-product "$XENOID_EXPECT_BUILD_PRODUCT")
+    fi
+    if [[ "$GOOGLE_PROVIDER" == "mindthegapps" ]]; then
+      _props_args+=(--setupwizard-mode DISABLED)
+    fi
+    python3 "${_props_args[@]}"
     python3 "$ROOT/scripts/patch-runtime-libselinux.py" "$OUT/payload/libselinux.so"
     python3 "$ROOT/scripts/patch-telephony-legacy-lte-band.py"       "$OUT/payload/telephony-common.base.jar" "$OUT/payload/telephony-common.jar"
     rm -f "$OUT/payload/telephony-common.base.jar"
@@ -343,6 +363,8 @@ done
 chmod 755 "$OUT/payload/xenoid-input" "$OUT/payload/xenoid-hide-helper" "$OUT/payload/xenoid-overlay-helper" "$OUT/payload/xenoid-profile-helper" "$OUT/payload/xenoid-netctl"
 cat > "$OUT/Dockerfile" <<DOCKER
 FROM $IMAGE
+__GOOGLE_LABELS__
+__GOOGLE_COPY__
 COPY payload/xenoid-init /xenoid-init
 COPY payload/xenoid-input /data/local/tmp/xenoid-input
 COPY payload/xenoid-hide-helper /data/local/tmp/xenoid-hide-helper
@@ -398,20 +420,49 @@ COPY payload/props/odm_dlkm_build.prop /vendor/odm_dlkm/etc/build.prop
 COPY payload/XenoidDaemon /system/priv-app/XenoidDaemon
 COPY payload/xenoid-daemon.apk /data/local/tmp/xenoid-daemon.apk
 DOCKER
-python3 - "$OUT/Dockerfile" "${XENOID_ZYGOTE_PRELOAD:-1}" <<'PY'
+python3 - "$OUT/Dockerfile" "${XENOID_ZYGOTE_PRELOAD:-1}" "$GOOGLE_PROVIDER" "$GOOGLE_RELEASE" "$GOOGLE_SPEC_SHA256" "$GOOGLE_DATA_COMPAT_SHA256" <<'PY'
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
-enabled = sys.argv[2] == "1"
+preload_enabled = sys.argv[2] == "1"
+provider, release, spec_sha256, data_compat_sha256 = sys.argv[3:7]
+values = (provider, release, spec_sha256, data_compat_sha256)
+google_enabled = any(values)
+if google_enabled and (
+    provider != "mindthegapps"
+    or not release.startswith("MindTheGapps-13.0.0-arm64-")
+    or any(len(value) == 0 for value in values)
+    or len(spec_sha256) != 64
+    or len(data_compat_sha256) != 64
+):
+    raise SystemExit("invalid Google services runtime context identity")
+google_labels = ""
+google_copy = ""
+if google_enabled:
+    google_labels = "\n".join(
+        (
+            f'LABEL dev.xenoid.google_provider="{provider}"',
+            f'LABEL dev.xenoid.google_release="{release}"',
+            f'LABEL dev.xenoid.google_spec_sha256="{spec_sha256}"',
+            f'LABEL dev.xenoid.google_data_compat_sha256="{data_compat_sha256}"',
+        )
+    )
+    google_copy = "COPY --chown=0:0 payload/google-services/ /"
 text = path.read_text()
+text = text.replace("__GOOGLE_LABELS__", google_labels)
+text = text.replace("__GOOGLE_COPY__", google_copy)
 text = text.replace(
     "__PRELOAD_COPY__",
-    "COPY payload/libpiex_shim.so /system/lib64/libpiex_shim.so" if enabled else "",
+    "COPY payload/libpiex_shim.so /system/lib64/libpiex_shim.so"
+    if preload_enabled
+    else "",
 )
 text = text.replace(
     "__CORE_COPY__",
-    "COPY --chmod=755 payload/libxenoid_core.so /system/lib64/libxenoid_core.so" if enabled else "",
+    "COPY --chmod=755 payload/libxenoid_core.so /system/lib64/libxenoid_core.so"
+    if preload_enabled
+    else "",
 )
 path.write_text(text)
 PY

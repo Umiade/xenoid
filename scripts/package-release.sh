@@ -30,9 +30,13 @@ path.write_text(json.dumps({
 }, indent=2) + "\n")
 PY
 REL="$REL" ROOT="$ROOT" python3 - <<'PY'
-import os, pathlib, shutil, subprocess
+import os, pathlib, shutil, subprocess, sys
 root = pathlib.Path(os.environ["ROOT"])
 release = pathlib.Path(os.environ["REL"])
+sys.path.insert(0, str(root / "src"))
+from xenoid.google_services import registered_metadata_files
+
+registered_google = registered_metadata_files()
 raw = subprocess.check_output(
     ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
     cwd=root,
@@ -41,12 +45,35 @@ for item in raw.split(b"\0"):
     if not item:
         continue
     relative = pathlib.Path(item.decode())
+    normalized = relative.as_posix()
+    if relative.parts and relative.parts[0] == ".xenoid":
+        raise SystemExit(
+            f"refusing to package private runtime state: {normalized}"
+        )
+    if relative.suffix.lower() in {".zip", ".pem"}:
+        raise SystemExit(
+            f"refusing to package proprietary import payload: {normalized}"
+        )
+    if normalized.startswith("data/google-services/") and (
+        normalized not in registered_google
+    ):
+        raise SystemExit(
+            f"unregistered Google release metadata: {normalized}"
+        )
     source = root / relative
     if not source.is_file():
         continue
     destination = release / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
+for relative, expected_sha256 in registered_google.items():
+    packaged = release / relative
+    if not packaged.is_file():
+        raise SystemExit(f"registered Google release metadata missing: {relative}")
+    import hashlib
+    actual_sha256 = hashlib.sha256(packaged.read_bytes()).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise SystemExit(f"registered Google release metadata mismatch: {relative}")
 PY
 cp xenoid xenoid-mcp "$REL/bin/"
 mkdir -p "$REL/daemon/app/build/outputs/apk/debug"

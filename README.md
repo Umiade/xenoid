@@ -293,6 +293,22 @@ Generate app-layer and service-layer Frida profiles:
 
 `device apply` synchronizes daemon profile state, SettingsProvider, property-area state, and reboot-persistent data. After changing profiles, cold-start the target application and recollect the complete profile; one `getprop` value is not sufficient evidence.
 
+## Optional Google Play runtime
+
+Google Mobile Services is disabled by default. Xenoid supports one explicit Android 13 ARM64 release: `MindTheGapps-13.0.0-arm64-20231025_200931`. Obtain the official ZIP and its `release.x509.pem` sidecar from the [upstream GitHub release](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931), then configure a fresh instance:
+
+```bash
+./xenoid --instance play init --config examples/config-macos-colima.json
+./xenoid --instance play google-services import-mindthegapps \
+  /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
+  /path/to/release.x509.pem
+./xenoid --instance play google-services enable
+./xenoid --instance play up
+./xenoid --instance play google-services status --require-runtime
+```
+
+The import is local-only and verifies the pinned release certificate, archive signature, exact archive inventory, every member digest, APK signer lineage, package/version inventory, and native ABI before accepting the payload. Xenoid does not download, redistribute, or include Google binaries in source, release, or OTA bundles. The Google choice is immutable after Android data exists; enable or disable it only on a fresh instance. Google account login remains an operator action. Play Integrity and device certification are separate Google-controlled capabilities and are not claimed by this integration.
+
 ## Applications, input, and automation
 
 ```bash
@@ -348,6 +364,7 @@ Representative tools include:
 - `xenoid_doctor` with `full` and `requireRuntime`;
 - `xenoid_up_plan` for a non-mutating full-startup plan;
 - `xenoid_stop` and `xenoid_status` for runtime lifecycle control;
+- `xenoid_google_services_status`, `xenoid_google_services_enable`, and `xenoid_google_services_disable`;
 - `xenoid_root_status` and `xenoid_root_exec`;
 - `xenoid_frida_install` and `xenoid_frida_load_script`;
 - `xenoid_device_collect` and `xenoid_device_apply`;
@@ -389,7 +406,7 @@ Build individual components:
 ./xenoid build netctl
 ```
 
-Release bundles contain the CLI, MCP server, runtime assets, daemon APK, native helpers, configuration examples, skill files, `doctor.json`, and a SHA-256 manifest.
+Release bundles contain the CLI, MCP server, non-proprietary runtime assets, daemon APK, native helpers, configuration examples, public Google release metadata, skill files, `doctor.json`, and a SHA-256 manifest. They never contain an imported Google ZIP, certificate, or expanded payload.
 
 ## Roadmap
 
