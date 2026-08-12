@@ -470,9 +470,9 @@ def response(path: str, method: str, body: dict[str, Any]) -> dict[str, Any]:
     if path == "/automation/run":
         return {"ok": True, "taskId": f"mock-{int(time.time())}", "language": body.get("language", "js"), "parsedActions": body.get("script", "").count("xenoid."), "mock": True}
     if path == "/input/tap":
-        return {"ok": True, "driverLayer": True, "x": body.get("x"), "y": body.get("y"), "mock": True}
+        return {"ok": True, "driverLayer": True, "eventNode": "/dev/uinput", "fallback": False, "x": body.get("x"), "y": body.get("y"), "mock": True}
     if path == "/input/swipe":
-        return {"ok": True, "driverLayer": True, **body, "mock": True}
+        return {"ok": True, "driverLayer": True, "eventNode": "/dev/uinput", "fallback": False, **body, "mock": True}
     if path == "/app/install":
         return {"ok": True, "path": body.get("path"), "mock": True}
     if path == "/app/uninstall":

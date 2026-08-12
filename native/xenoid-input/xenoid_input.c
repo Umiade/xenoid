@@ -8,26 +8,34 @@
 #include <linux/input.h>
 #include <linux/uinput.h>
 
-/* API21 linux/input.h lacks some ABS_MT axes; define them from the kernel ABI. */
-#ifndef ABS_MT_TOOL_MAJOR
-#define ABS_MT_TOOL_MAJOR 0x30
-#endif
+/* Keep the Android API 21 build compatible with older NDK input headers. */
 #ifndef ABS_MT_TOUCH_MAJOR
-#define ABS_MT_TOUCH_MAJOR 0x31
+#define ABS_MT_TOUCH_MAJOR 0x30
+#endif
+#ifndef ABS_MT_TOUCH_MINOR
+#define ABS_MT_TOUCH_MINOR 0x31
 #endif
 #ifndef ABS_MT_WIDTH_MAJOR
 #define ABS_MT_WIDTH_MAJOR 0x32
 #endif
-#ifndef ABS_MT_HEIGHT_MAJOR
-#define ABS_MT_HEIGHT_MAJOR 0x33
+#ifndef ABS_MT_WIDTH_MINOR
+#define ABS_MT_WIDTH_MINOR 0x33
 #endif
 #ifndef ABS_MT_ORIENTATION
 #define ABS_MT_ORIENTATION 0x34
 #endif
+
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <dirent.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/sysmacros.h>
+#include <sys/un.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -58,10 +66,25 @@ static struct input_profile g_profile = {
     .product = 0x6860,
     .version = 0x0100,
     .width = 1080,
-    .height = 2400,
+    .height = 1920,
     .pressure_max = 255,
     .tracking_max = 65535,
 };
+
+static void reset_profile(void) {
+    struct input_profile defaults = {
+        .name = "sec_touchscreen",
+        .bustype = BUS_I2C,
+        .vendor = 0x04e8,
+        .product = 0x6860,
+        .version = 0x0100,
+        .width = 1080,
+        .height = 1920,
+        .pressure_max = 255,
+        .tracking_max = 65535,
+    };
+    g_profile = defaults;
+}
 
 static char *read_text_file(const char *path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -138,28 +161,90 @@ static void sanitize_name(char *s) {
     }
 }
 
-static void load_profile(void) {
-    char path[256]; profile_json_path(path, sizeof(path));
-    char *j = read_text_file(path);
-    if (!j) return;
-    json_copy_string(j, "input_name", g_profile.name, sizeof(g_profile.name));
-    json_copy_string(j, "touch_name", g_profile.name, sizeof(g_profile.name));
-    json_copy_string(j, "input_device_name", g_profile.name, sizeof(g_profile.name));
-    sanitize_name(g_profile.name);
-    g_profile.bustype = json_int_value(j, "input_bustype", g_profile.bustype);
-    g_profile.vendor = json_int_value(j, "input_vendor", g_profile.vendor);
-    g_profile.product = json_int_value(j, "input_product", g_profile.product);
-    g_profile.version = json_int_value(j, "input_version", g_profile.version);
-    g_profile.width = json_int_value(j, "width", json_int_value(j, "display_width", g_profile.width));
-    g_profile.height = json_int_value(j, "height", json_int_value(j, "display_height", g_profile.height));
-    g_profile.pressure_max = json_int_value(j, "pressure_max", g_profile.pressure_max);
-    g_profile.tracking_max = json_int_value(j, "tracking_max", g_profile.tracking_max);
-    if (g_profile.width < 1) g_profile.width = 1080;
-    if (g_profile.height < 1) g_profile.height = 2400;
-    if (g_profile.pressure_max < 1) g_profile.pressure_max = 255;
-    if (g_profile.tracking_max < 2) g_profile.tracking_max = 65535;
-    free(j);
+static char *read_profile_field(const char *field) {
+    char path[PATH_MAX];
+    profile_json_path(path, sizeof(path));
+    char *name = strrchr(path, '/');
+    if (!name) return NULL;
+    name++;
+    snprintf(name, sizeof(path) - (size_t)(name - path), "%s", field);
+    char *value = read_text_file(path);
+    if (!value) return NULL;
+    size_t length = strlen(value);
+    while (length > 0 && (value[length - 1] == ' ' || value[length - 1] == '\t'
+            || value[length - 1] == '\r' || value[length - 1] == '\n')) {
+        value[--length] = 0;
+    }
+    char *start = value;
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+    if (start != value) memmove(value, start, strlen(start) + 1);
+    return value;
 }
+
+static int profile_field_int(const char *field, int fallback) {
+    char *text = read_profile_field(field);
+    if (!text || !text[0]) {
+        free(text);
+        return fallback;
+    }
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(text, &end, 0);
+    int result = errno == 0 && end && *end == 0 && value >= INT_MIN && value <= INT_MAX
+            ? (int)value : fallback;
+    free(text);
+    return result;
+}
+
+static void profile_field_string(const char *field, char *out, size_t out_size) {
+    char *text = read_profile_field(field);
+    if (text && text[0]) snprintf(out, out_size, "%s", text);
+    free(text);
+}
+
+static void load_profile(void) {
+    char path[256];
+    profile_json_path(path, sizeof(path));
+    char *j = read_text_file(path);
+    if (j) {
+        json_copy_string(j, "input_name", g_profile.name, sizeof(g_profile.name));
+        json_copy_string(j, "touch_name", g_profile.name, sizeof(g_profile.name));
+        json_copy_string(j, "input_device_name", g_profile.name, sizeof(g_profile.name));
+        g_profile.bustype = json_int_value(j, "input_bustype", g_profile.bustype);
+        g_profile.vendor = json_int_value(j, "input_vendor", g_profile.vendor);
+        g_profile.product = json_int_value(j, "input_product", g_profile.product);
+        g_profile.version = json_int_value(j, "input_version", g_profile.version);
+        g_profile.width = json_int_value(j, "width", json_int_value(j, "display_width", g_profile.width));
+        g_profile.height = json_int_value(j, "height", json_int_value(j, "display_height", g_profile.height));
+        g_profile.pressure_max = json_int_value(j, "pressure_max", g_profile.pressure_max);
+        g_profile.tracking_max = json_int_value(j, "tracking_max", g_profile.tracking_max);
+        free(j);
+    }
+
+    profile_field_string("input_name", g_profile.name, sizeof(g_profile.name));
+    g_profile.bustype = profile_field_int("input_bustype", g_profile.bustype);
+    g_profile.vendor = profile_field_int("input_vendor", g_profile.vendor);
+    g_profile.product = profile_field_int("input_product", g_profile.product);
+    g_profile.version = profile_field_int("input_version", g_profile.version);
+    g_profile.width = profile_field_int(
+            "input_width", profile_field_int("display_width", g_profile.width));
+    g_profile.height = profile_field_int(
+            "input_height", profile_field_int("display_height", g_profile.height));
+    g_profile.pressure_max = profile_field_int("input_pressure_max", g_profile.pressure_max);
+    g_profile.tracking_max = profile_field_int("input_tracking_max", g_profile.tracking_max);
+
+    sanitize_name(g_profile.name);
+    if (g_profile.width < 1) g_profile.width = 1080;
+    if (g_profile.height < 1) g_profile.height = 1920;
+    if (g_profile.pressure_max < 1 || g_profile.pressure_max > 65535) g_profile.pressure_max = 255;
+    if (g_profile.tracking_max < 2 || g_profile.tracking_max >= INT_MAX) g_profile.tracking_max = 65535;
+}
+
+#define CONTACT_AXIS_MAX 31
+#define ORIENTATION_MAX 90
+#define MAX_GESTURE_DURATION_MS 15000
+
+static int g_emit_failed;
 
 static int emit_event(int fd, int type, int code, int value) {
     struct input_event ev;
@@ -167,7 +252,21 @@ static int emit_event(int fd, int type, int code, int value) {
     ev.type = type;
     ev.code = code;
     ev.value = value;
-    return write(fd, &ev, sizeof(ev)) == sizeof(ev) ? 0 : -1;
+
+    const unsigned char *src = (const unsigned char *)&ev;
+    size_t remaining = sizeof(ev);
+    while (remaining > 0) {
+        ssize_t written = write(fd, src, remaining);
+        if (written > 0) {
+            src += written;
+            remaining -= (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        g_emit_failed = 1;
+        return -1;
+    }
+    return 0;
 }
 
 static int setup_abs(int fd, int code, int min, int max, int resolution) {
@@ -177,34 +276,50 @@ static int setup_abs(int fd, int code, int min, int max, int resolution) {
     abs.absinfo.minimum = min;
     abs.absinfo.maximum = max;
     abs.absinfo.resolution = resolution;
-    return ioctl(fd, UI_ABS_SETUP, &abs);
+    if (ioctl(fd, UI_ABS_SETUP, &abs) < 0) {
+        perror("UI_ABS_SETUP");
+        return -1;
+    }
+    return 0;
+}
+
+static int enable_bit(int fd, unsigned long request, int code) {
+    if (ioctl(fd, request, code) < 0) {
+        perror("uinput capability");
+        return -1;
+    }
+    return 0;
 }
 
 static int create_device(void) {
-    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    int fd = open("/dev/uinput", O_WRONLY | O_CLOEXEC);
     if (fd < 0) {
         perror("open /dev/uinput");
         return -1;
     }
-    ioctl(fd, UI_SET_EVBIT, EV_SYN);
-    ioctl(fd, UI_SET_EVBIT, EV_KEY);
-    ioctl(fd, UI_SET_KEYBIT, BTN_TOUCH);
-    ioctl(fd, UI_SET_KEYBIT, BTN_TOOL_FINGER);
-    ioctl(fd, UI_SET_EVBIT, EV_ABS);
-    ioctl(fd, UI_SET_ABSBIT, ABS_X);
-    ioctl(fd, UI_SET_ABSBIT, ABS_Y);
-    ioctl(fd, UI_SET_ABSBIT, ABS_PRESSURE);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_SLOT);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_X);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_PRESSURE);
-    /* Human-realism axes: without these, MotionEvent toolMajor/touchMajor/orientation/size
-       read 0, which is a robotic tell for behavior-class detection SDKs. */
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_TOOL_MAJOR);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MAJOR);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_WIDTH_MAJOR);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_ORIENTATION);
+
+    if (enable_bit(fd, UI_SET_EVBIT, EV_SYN)
+            || enable_bit(fd, UI_SET_EVBIT, EV_KEY)
+            || enable_bit(fd, UI_SET_KEYBIT, BTN_TOUCH)
+            || enable_bit(fd, UI_SET_KEYBIT, BTN_TOOL_FINGER)
+            || enable_bit(fd, UI_SET_EVBIT, EV_ABS)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_X)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_Y)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_PRESSURE)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_SLOT)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_POSITION_X)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_PRESSURE)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MAJOR)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MINOR)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_WIDTH_MAJOR)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_WIDTH_MINOR)
+            || enable_bit(fd, UI_SET_ABSBIT, ABS_MT_ORIENTATION)
+            || enable_bit(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT)) {
+        close(fd);
+        return -1;
+    }
 
     struct uinput_setup usetup;
     memset(&usetup, 0, sizeof(usetup));
@@ -213,96 +328,145 @@ static int create_device(void) {
     usetup.id.product = (unsigned short)g_profile.product;
     usetup.id.version = (unsigned short)g_profile.version;
     snprintf(usetup.name, sizeof(usetup.name), "%s", g_profile.name);
-    if (ioctl(fd, UI_DEV_SETUP, &usetup) < 0) { perror("UI_DEV_SETUP"); close(fd); return -1; }
-    setup_abs(fd, ABS_X, 0, g_profile.width, 10);
-    setup_abs(fd, ABS_Y, 0, g_profile.height, 10);
-    setup_abs(fd, ABS_PRESSURE, 0, g_profile.pressure_max, 0);
-    setup_abs(fd, ABS_MT_SLOT, 0, 9, 0);
-    setup_abs(fd, ABS_MT_POSITION_X, 0, g_profile.width, 10);
-    setup_abs(fd, ABS_MT_POSITION_Y, 0, g_profile.height, 10);
-    setup_abs(fd, ABS_MT_TRACKING_ID, 0, g_profile.tracking_max, 0);
-    setup_abs(fd, ABS_MT_PRESSURE, 0, g_profile.pressure_max, 0);
-    setup_abs(fd, ABS_MT_TOOL_MAJOR, 0, 31, 0);
-    setup_abs(fd, ABS_MT_TOUCH_MAJOR, 0, 31, 0);
-    setup_abs(fd, ABS_MT_WIDTH_MAJOR, 0, 31, 0);
-    setup_abs(fd, ABS_MT_ORIENTATION, -90, 90, 0);
-    if (ioctl(fd, UI_DEV_CREATE) < 0) { perror("UI_DEV_CREATE"); close(fd); return -1; }
+    if (ioctl(fd, UI_DEV_SETUP, &usetup) < 0) {
+        perror("UI_DEV_SETUP");
+        close(fd);
+        return -1;
+    }
+
+    if (setup_abs(fd, ABS_X, 0, g_profile.width - 1, 10)
+            || setup_abs(fd, ABS_Y, 0, g_profile.height - 1, 10)
+            || setup_abs(fd, ABS_PRESSURE, 0, g_profile.pressure_max, 0)
+            || setup_abs(fd, ABS_MT_SLOT, 0, 9, 0)
+            || setup_abs(fd, ABS_MT_POSITION_X, 0, g_profile.width - 1, 10)
+            || setup_abs(fd, ABS_MT_POSITION_Y, 0, g_profile.height - 1, 10)
+            || setup_abs(fd, ABS_MT_TRACKING_ID, 0, g_profile.tracking_max, 0)
+            || setup_abs(fd, ABS_MT_PRESSURE, 0, g_profile.pressure_max, 0)
+            || setup_abs(fd, ABS_MT_TOUCH_MAJOR, 0, CONTACT_AXIS_MAX, 0)
+            || setup_abs(fd, ABS_MT_TOUCH_MINOR, 0, CONTACT_AXIS_MAX, 0)
+            || setup_abs(fd, ABS_MT_WIDTH_MAJOR, 0, CONTACT_AXIS_MAX, 0)
+            || setup_abs(fd, ABS_MT_WIDTH_MINOR, 0, CONTACT_AXIS_MAX, 0)
+            || setup_abs(fd, ABS_MT_ORIENTATION, -ORIENTATION_MAX, ORIENTATION_MAX, 0)) {
+        close(fd);
+        return -1;
+    }
+    if (ioctl(fd, UI_DEV_CREATE) < 0) {
+        perror("UI_DEV_CREATE");
+        close(fd);
+        return -1;
+    }
     usleep(200000);
     return fd;
+}
+#define INPUT_GROUP_ID 1004
+
+static char g_event_node[PATH_MAX];
+
+static int publish_event_node(int fd) {
+    char sysname[64];
+    memset(sysname, 0, sizeof(sysname));
+    if (ioctl(fd, UI_GET_SYSNAME(sizeof(sysname)), sysname) < 0) {
+        perror("UI_GET_SYSNAME");
+        return -1;
+    }
+
+    char input_path[PATH_MAX];
+    snprintf(input_path, sizeof(input_path), "/sys/class/input/%s", sysname);
+    DIR *dir = opendir(input_path);
+    if (!dir) {
+        perror("open input sysfs");
+        return -1;
+    }
+
+    char event_name[64] = {0};
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strncmp(entry->d_name, "event", 5) && entry->d_name[5] >= '0' && entry->d_name[5] <= '9') {
+            snprintf(event_name, sizeof(event_name), "%s", entry->d_name);
+            break;
+        }
+    }
+    closedir(dir);
+    if (!event_name[0]) {
+        fprintf(stderr, "uinput event sysfs node missing\n");
+        return -1;
+    }
+
+    char dev_path[PATH_MAX];
+    snprintf(dev_path, sizeof(dev_path), "%s/%s/dev", input_path, event_name);
+    char *dev_text = read_text_file(dev_path);
+    if (!dev_text) {
+        perror("read input device number");
+        return -1;
+    }
+    unsigned int major_number = 0;
+    unsigned int minor_number = 0;
+    int parsed = sscanf(dev_text, "%u:%u", &major_number, &minor_number);
+    free(dev_text);
+    if (parsed != 2) {
+        fprintf(stderr, "invalid input device number\n");
+        return -1;
+    }
+
+    struct stat st;
+    if (lstat("/dev/input", &st) < 0) {
+        if (errno != ENOENT || mkdir("/dev/input", 0755) < 0) {
+            perror("create /dev/input");
+            return -1;
+        }
+    } else if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+        fprintf(stderr, "/dev/input is not a real directory\n");
+        return -1;
+    }
+
+    snprintf(g_event_node, sizeof(g_event_node), "/dev/input/%s", event_name);
+    dev_t device_number = makedev(major_number, minor_number);
+    if (lstat(g_event_node, &st) < 0) {
+        if (errno != ENOENT || mknod(g_event_node, S_IFCHR | 0660, device_number) < 0) {
+            perror("create input event node");
+            g_event_node[0] = 0;
+            return -1;
+        }
+    } else if (!S_ISCHR(st.st_mode) || st.st_rdev != device_number) {
+        fprintf(stderr, "input event node collision\n");
+        g_event_node[0] = 0;
+        return -1;
+    }
+    if (chown(g_event_node, 0, INPUT_GROUP_ID) < 0 || chmod(g_event_node, 0660) < 0) {
+        perror("configure input event node");
+        unlink(g_event_node);
+        g_event_node[0] = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static void unpublish_event_node(void) {
+    if (g_event_node[0]) {
+        unlink(g_event_node);
+        g_event_node[0] = 0;
+    }
 }
 
 static void destroy_device(int fd) {
     if (fd >= 0) {
-        ioctl(fd, UI_DEV_DESTROY);
+        usleep(30000);
+        if (ioctl(fd, UI_DEV_DESTROY) < 0) perror("UI_DEV_DESTROY");
         close(fd);
     }
 }
 
-static int tap(int x, int y) {
-    int fd = create_device();
-    if (fd < 0) return 2;
-    emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
-    emit_event(fd, EV_ABS, ABS_X, x);
-    emit_event(fd, EV_ABS, ABS_Y, y);
-    emit_event(fd, EV_ABS, ABS_PRESSURE, 80);
-    emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 80);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, 1);
-    emit_event(fd, EV_ABS, ABS_MT_POSITION_X, x);
-    emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
-    emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 1);
-    emit_event(fd, EV_KEY, BTN_TOUCH, 1);
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(80000);
-    emit_event(fd, EV_KEY, BTN_TOUCH, 0);
-    emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 0);
-    emit_event(fd, EV_ABS, ABS_PRESSURE, 0);
-    emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    destroy_device(fd);
-    return 0;
+static uint64_t g_rng = UINT64_C(0x9e3779b97f4a7c15);
+
+static unsigned int rnd(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return (unsigned int)(g_rng >> 32);
 }
 
-static int swipe(int x1, int y1, int x2, int y2, int duration_ms) {
-    int fd = create_device();
-    if (fd < 0) return 2;
-    int steps = duration_ms / 16;
-    if (steps < 2) steps = 2;
-    emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, 1);
-    emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 1);
-    emit_event(fd, EV_KEY, BTN_TOUCH, 1);
-    for (int i = 0; i <= steps; i++) {
-        int x = x1 + (x2 - x1) * i / steps;
-        int y = y1 + (y2 - y1) * i / steps;
-        emit_event(fd, EV_ABS, ABS_X, x);
-        emit_event(fd, EV_ABS, ABS_Y, y);
-        emit_event(fd, EV_ABS, ABS_PRESSURE, 80);
-        emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 80);
-        emit_event(fd, EV_ABS, ABS_MT_POSITION_X, x);
-        emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
-        emit_event(fd, EV_SYN, SYN_REPORT, 0);
-        usleep((duration_ms * 1000) / steps);
-    }
-    emit_event(fd, EV_KEY, BTN_TOUCH, 0);
-    emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 0);
-    emit_event(fd, EV_ABS, ABS_PRESSURE, 0);
-    emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    destroy_device(fd);
-    return 0;
-}
-
-/* ---- human-behavior touch injection (P3b) ---- */
-/* A robotic tap is a perfect point with fixed pressure and zero contact area; real
-   fingers produce a small contact ellipse, a pressure ramp, slight position jitter,
-   and a non-linear swipe trajectory with ease-out velocity. These helpers inject
-   that shape so behavior-class detectors see human-like MotionEvent tuples. */
-static unsigned long g_rng = 0x9e3779b97f4a7c15UL;
-static unsigned int rnd(void){ g_rng^=g_rng<<13; g_rng^=g_rng>>7; g_rng^=g_rng<<17; return (unsigned int)(g_rng>>32); }
 static void seed_rng(void) {
-    unsigned long seed = 0;
+    uint64_t seed = 0;
     int rfd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (rfd >= 0) {
         if (read(rfd, &seed, sizeof(seed)) != (ssize_t)sizeof(seed)) seed = 0;
@@ -311,110 +475,543 @@ static void seed_rng(void) {
     if (seed == 0) {
         struct timespec ts;
         clock_gettime(CLOCK_BOOTTIME, &ts);
-        seed = (unsigned long)ts.tv_nsec ^ ((unsigned long)ts.tv_sec << 21) ^ (unsigned long)getpid();
+        seed = (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 21) ^ (uint64_t)getpid();
     }
     g_rng ^= seed;
-    if (g_rng == 0) g_rng = 0x9e3779b97f4a7c15UL;
+    if (g_rng == 0) g_rng = UINT64_C(0x9e3779b97f4a7c15);
 }
-static int rj(int spread){ return (int)(rnd()%(2*spread+1))-spread; } /* jitter in [-spread,spread] */
 
-static void finger_contact(int fd, int pressure, int area, int orient){
-    emit_event(fd, EV_ABS, ABS_MT_TOOL_MAJOR, area);
-    emit_event(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, area);
-    emit_event(fd, EV_ABS, ABS_MT_WIDTH_MAJOR, area);
-    emit_event(fd, EV_ABS, ABS_MT_ORIENTATION, orient);
+static int clamp_int(int value, int minimum, int maximum) {
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+static int random_between(int minimum, int maximum) {
+    return minimum + (int)(rnd() % (unsigned int)(maximum - minimum + 1));
+}
+
+static int random_jitter(int spread) {
+    return random_between(-spread, spread);
+}
+
+static int valid_point(int x, int y) {
+    return x >= 0 && x < g_profile.width && y >= 0 && y < g_profile.height;
+}
+
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
+        perror("clock_gettime");
+        g_emit_failed = 1;
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static void sleep_until_ns(uint64_t deadline_ns) {
+    struct timespec deadline;
+    deadline.tv_sec = (time_t)(deadline_ns / UINT64_C(1000000000));
+    deadline.tv_nsec = (long)(deadline_ns % UINT64_C(1000000000));
+    int result;
+    do {
+        result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+    } while (result == EINTR);
+    if (result != 0) {
+        errno = result;
+        perror("clock_nanosleep");
+        g_emit_failed = 1;
+    }
+}
+
+static int pressure_percent(int percent) {
+    int value = (g_profile.pressure_max * percent + 50) / 100;
+    return clamp_int(value, 1, g_profile.pressure_max);
+}
+
+static void emit_position(int fd, int x, int y) {
+    emit_event(fd, EV_ABS, ABS_X, x);
+    emit_event(fd, EV_ABS, ABS_Y, y);
+    emit_event(fd, EV_ABS, ABS_MT_POSITION_X, x);
+    emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
+}
+
+static void emit_contact(
+        int fd,
+        int pressure,
+        int touch_major,
+        int touch_minor,
+        int width_major,
+        int width_minor,
+        int orientation) {
     emit_event(fd, EV_ABS, ABS_PRESSURE, pressure);
     emit_event(fd, EV_ABS, ABS_MT_PRESSURE, pressure);
+    emit_event(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, touch_major);
+    emit_event(fd, EV_ABS, ABS_MT_TOUCH_MINOR, touch_minor);
+    emit_event(fd, EV_ABS, ABS_MT_WIDTH_MAJOR, width_major);
+    emit_event(fd, EV_ABS, ABS_MT_WIDTH_MINOR, width_minor);
+    emit_event(fd, EV_ABS, ABS_MT_ORIENTATION, orientation);
 }
 
-static int htap(int x, int y) {
-    int fd = create_device();
-    if (fd < 0) return 2;
-    int px = x + rj(3), py = y + rj(3);
-    int tracking = 1 + (int)(rnd() % (unsigned int)(g_profile.tracking_max - 1));
-    int peak = 70 + (int)(rnd()%31);
-    int area = 6 + (int)(rnd()%7);
-    int hold_ms = 85 + (int)(rnd()%55);
+static void emit_shaped_contact(
+        int fd,
+        int pressure,
+        int peak_pressure,
+        int peak_touch_major,
+        int peak_touch_minor,
+        int width_major,
+        int width_minor,
+        int orientation) {
+    int touch_major = 3 + (peak_touch_major - 3) * pressure / peak_pressure;
+    int touch_minor = 2 + (peak_touch_minor - 2) * pressure / peak_pressure;
+    touch_major = clamp_int(touch_major, 3, peak_touch_major);
+    touch_minor = clamp_int(touch_minor, 2, touch_major - 1);
+    emit_contact(
+            fd,
+            pressure,
+            touch_major,
+            touch_minor,
+            width_major,
+            clamp_int(width_minor, touch_minor + 1, width_major),
+            clamp_int(orientation, -ORIENTATION_MAX, ORIENTATION_MAX));
+}
+
+static void sync_frame(int fd) {
+    emit_event(fd, EV_SYN, SYN_REPORT, 0);
+}
+
+static void begin_contact(int fd, int tracking_id) {
     emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, tracking);
+    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, tracking_id);
     emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 1);
     emit_event(fd, EV_KEY, BTN_TOUCH, 1);
-    emit_event(fd, EV_ABS, ABS_X, px); emit_event(fd, EV_ABS, ABS_Y, py);
-    emit_event(fd, EV_ABS, ABS_MT_POSITION_X, px); emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, py);
-    finger_contact(fd, peak/2, area, rj(8));
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(20000);
-    px += rj(2); py += rj(2);
-    emit_event(fd, EV_ABS, ABS_X, px); emit_event(fd, EV_ABS, ABS_Y, py);
-    emit_event(fd, EV_ABS, ABS_MT_POSITION_X, px); emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, py);
-    finger_contact(fd, peak, area, rj(8));
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(hold_ms * 1000);
-    finger_contact(fd, peak/3, area, rj(8));
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(15000);
+}
+
+static void end_contact(int fd) {
+    emit_event(fd, EV_ABS, ABS_PRESSURE, 0);
+    emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 0);
+    emit_event(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 0);
+    emit_event(fd, EV_ABS, ABS_MT_TOUCH_MINOR, 0);
+    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
     emit_event(fd, EV_KEY, BTN_TOUCH, 0);
     emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 0);
-    emit_event(fd, EV_ABS, ABS_PRESSURE, 0); emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    destroy_device(fd);
-    return 0;
+    sync_frame(fd);
 }
 
-static int hswipe(int x1, int y1, int x2, int y2, int duration_ms) {
-    int fd = create_device();
-    if (fd < 0) return 2;
-    int steps = duration_ms / 14; if (steps < 4) steps = 4;
-    int area = 5 + (int)(rnd()%4);
-    int tracking = 1 + (int)(rnd() % (unsigned int)(g_profile.tracking_max - 1));
-    int mx = (x1+x2)/2 + rj(30), my = (y1+y2)/2 + rj(30);
-    emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, tracking);
-    emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 1);
-    emit_event(fd, EV_KEY, BTN_TOUCH, 1);
-    for (int i = 0; i <= steps; i++) {
-        double t = (double)i / steps;
-        double e = 1.0 - (1.0 - t) * (1.0 - t);
-        double bx = (1.0-e)*(1.0-e)*x1 + 2.0*(1.0-e)*e*mx + e*e*x2;
-        double by = (1.0-e)*(1.0-e)*y1 + 2.0*(1.0-e)*e*my + e*e*y2;
-        int px = (int)bx + rj(2), py = (int)by + rj(2);
-        int pressure = 70 + (int)(rnd()%25) - (int)(12*t);
-        emit_event(fd, EV_ABS, ABS_X, px); emit_event(fd, EV_ABS, ABS_Y, py);
-        emit_event(fd, EV_ABS, ABS_MT_POSITION_X, px); emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, py);
-        finger_contact(fd, pressure, area, rj(10));
-        emit_event(fd, EV_SYN, SYN_REPORT, 0);
-        usleep((duration_ms * 1000) / steps);
+static int tap(int fd, FILE *out, int x, int y) {
+    if (!valid_point(x, y)) {
+        fprintf(
+                out,
+                "{\"ok\":false,\"error\":\"tap coordinates outside display\","
+                "\"width\":%d,\"height\":%d}\n",
+                g_profile.width,
+                g_profile.height);
+        return 64;
     }
-    emit_event(fd, EV_KEY, BTN_TOUCH, 0);
-    emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 0);
-    emit_event(fd, EV_ABS, ABS_PRESSURE, 0); emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
-    destroy_device(fd);
+    g_emit_failed = 0;
+
+    int duration_ms = random_between(90, 145);
+    int tracking = random_between(1, g_profile.tracking_max - 1);
+    int peak_pressure = pressure_percent(random_between(32, 46));
+    int down_pressure = clamp_int(peak_pressure * random_between(45, 58) / 100, 1, peak_pressure);
+    int lift_pressure = clamp_int(peak_pressure * random_between(30, 42) / 100, 1, peak_pressure);
+    int peak_touch_major = random_between(10, 15);
+    int peak_touch_minor = peak_touch_major - random_between(2, 4);
+    int width_major = clamp_int(peak_touch_major + random_between(6, 9), 1, CONTACT_AXIS_MAX);
+    int width_minor = clamp_int(peak_touch_minor + random_between(5, 8), 1, width_major);
+    int orientation = random_between(-18, 18);
+    int px = clamp_int(x + random_jitter(2), 0, g_profile.width - 1);
+    int py = clamp_int(y + random_jitter(2), 0, g_profile.height - 1);
+
+    uint64_t start_ns = monotonic_ns();
+    begin_contact(fd, tracking);
+    emit_position(fd, px, py);
+    emit_shaped_contact(
+            fd, down_pressure, peak_pressure, peak_touch_major, peak_touch_minor,
+            width_major, width_minor, orientation);
+    sync_frame(fd);
+
+    sleep_until_ns(start_ns + UINT64_C(20000000));
+    px = clamp_int(x + random_jitter(1), 0, g_profile.width - 1);
+    py = clamp_int(y + random_jitter(1), 0, g_profile.height - 1);
+    emit_position(fd, px, py);
+    emit_shaped_contact(
+            fd, peak_pressure, peak_pressure, peak_touch_major, peak_touch_minor,
+            width_major, width_minor, orientation + random_jitter(2));
+    sync_frame(fd);
+
+    sleep_until_ns(start_ns + (uint64_t)(duration_ms - 15) * UINT64_C(1000000));
+    px = clamp_int(x + random_jitter(1), 0, g_profile.width - 1);
+    py = clamp_int(y + random_jitter(1), 0, g_profile.height - 1);
+    emit_position(fd, px, py);
+    emit_shaped_contact(
+            fd, lift_pressure, peak_pressure, peak_touch_major, peak_touch_minor,
+            width_major, width_minor, orientation + random_jitter(2));
+    sync_frame(fd);
+
+    sleep_until_ns(start_ns + (uint64_t)duration_ms * UINT64_C(1000000));
+    end_contact(fd);
+    int result = g_emit_failed ? 3 : 0;
+    if (result == 0) {
+        fprintf(
+                out,
+                "{\"ok\":true,\"schema\":\"dev.input-action/v2\",\"kind\":\"tap\","
+                "\"driverLayer\":true,\"contactDurationMs\":%d,\"frames\":4,"
+                "\"pressurePeak\":%d,\"touchMajorPeak\":%d,\"touchMinorPeak\":%d,"
+                "\"widthMajor\":%d,\"widthMinor\":%d}\n",
+                duration_ms, peak_pressure, peak_touch_major, peak_touch_minor,
+                width_major, width_minor);
+    } else {
+        fprintf(out, "{\"ok\":false,\"error\":\"uinput event write failed\"}\n");
+    }
+    return result;
+}
+
+static int swipe_pressure(double t, int start_pressure, int peak_pressure, int end_pressure) {
+    double value;
+    if (t < 0.18) {
+        value = start_pressure + (peak_pressure - start_pressure) * (t / 0.18);
+    } else {
+        value = peak_pressure - (peak_pressure - end_pressure) * ((t - 0.18) / 0.82);
+    }
+    int pressure = (int)(value + 0.5) + random_jitter(clamp_int(peak_pressure / 40, 1, 3));
+    return clamp_int(pressure, 1, g_profile.pressure_max);
+}
+
+static int swipe(int fd, FILE *out, int x1, int y1, int x2, int y2, int duration_ms) {
+    if (!valid_point(x1, y1) || !valid_point(x2, y2)) {
+        fprintf(
+                out,
+                "{\"ok\":false,\"error\":\"swipe coordinates outside display\","
+                "\"width\":%d,\"height\":%d}\n",
+                g_profile.width,
+                g_profile.height);
+        return 64;
+    }
+    if (x1 == x2 && y1 == y2) {
+        fprintf(out, "{\"ok\":false,\"error\":\"swipe endpoints must differ\"}\n");
+        return 64;
+    }
+    if (duration_ms < 16 || duration_ms > MAX_GESTURE_DURATION_MS) {
+        fprintf(
+                out,
+                "{\"ok\":false,\"error\":\"swipe duration outside range\","
+                "\"minimumMs\":16,\"maximumMs\":%d}\n",
+                MAX_GESTURE_DURATION_MS);
+        return 64;
+    }
+    g_emit_failed = 0;
+
+    int dx = x2 - x1;
+    int dy = y2 - y1;
+    int span = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+    int bend_limit = clamp_int(span / 32, 1, 24);
+    int bend = random_jitter(bend_limit);
+    int c1x = x1 + dx / 3 - dy * bend / span;
+    int c1y = y1 + dy / 3 + dx * bend / span;
+    int c2x = x1 + 2 * dx / 3 - dy * bend / span;
+    int c2y = y1 + 2 * dy / 3 + dx * bend / span;
+    int sample_period_ms = random_between(8, 11);
+    int frames = duration_ms / sample_period_ms;
+    if (frames < 4) frames = 4;
+
+    int tracking = random_between(1, g_profile.tracking_max - 1);
+    int peak_pressure = pressure_percent(random_between(34, 48));
+    int start_pressure = clamp_int(peak_pressure * random_between(48, 62) / 100, 1, peak_pressure);
+    int end_pressure = clamp_int(peak_pressure * random_between(28, 42) / 100, 1, peak_pressure);
+    int peak_touch_major = random_between(9, 14);
+    int peak_touch_minor = peak_touch_major - random_between(2, 4);
+    int width_major = clamp_int(peak_touch_major + random_between(6, 9), 1, CONTACT_AXIS_MAX);
+    int width_minor = clamp_int(peak_touch_minor + random_between(5, 8), 1, width_major);
+    int orientation = random_between(-24, 24);
+    int drift_x = 0;
+    int drift_y = 0;
+
+    uint64_t start_ns = monotonic_ns();
+    begin_contact(fd, tracking);
+    for (int i = 0; i < frames; i++) {
+        uint64_t frame_ns = start_ns
+                + (uint64_t)duration_ms * UINT64_C(1000000) * (uint64_t)i / (uint64_t)frames;
+        sleep_until_ns(frame_ns);
+        double t = (double)i / (double)(frames - 1);
+        double u = t * t * (3.0 - 2.0 * t);
+        double one = 1.0 - u;
+        double bx = one * one * one * x1
+                + 3.0 * one * one * u * c1x
+                + 3.0 * one * u * u * c2x
+                + u * u * u * x2;
+        double by = one * one * one * y1
+                + 3.0 * one * one * u * c1y
+                + 3.0 * one * u * u * c2y
+                + u * u * u * y2;
+        int px = (int)(bx + 0.5);
+        int py = (int)(by + 0.5);
+        if (i > 0 && i + 1 < frames) {
+            drift_x = clamp_int(drift_x + random_jitter(1), -2, 2);
+            drift_y = clamp_int(drift_y + random_jitter(1), -2, 2);
+            double envelope = 4.0 * u * (1.0 - u);
+            px += (int)(drift_x * envelope);
+            py += (int)(drift_y * envelope);
+        }
+        px = clamp_int(px, 0, g_profile.width - 1);
+        py = clamp_int(py, 0, g_profile.height - 1);
+
+        int pressure = swipe_pressure(t, start_pressure, peak_pressure, end_pressure);
+        emit_position(fd, px, py);
+        emit_shaped_contact(
+                fd, pressure, peak_pressure, peak_touch_major, peak_touch_minor,
+                width_major, width_minor, orientation + random_jitter(2));
+        sync_frame(fd);
+    }
+
+    sleep_until_ns(start_ns + (uint64_t)duration_ms * UINT64_C(1000000));
+    end_contact(fd);
+    int result = g_emit_failed ? 3 : 0;
+    if (result == 0) {
+        fprintf(
+                out,
+                "{\"ok\":true,\"schema\":\"dev.input-action/v2\",\"kind\":\"swipe\","
+                "\"driverLayer\":true,\"contactDurationMs\":%d,\"frames\":%d,"
+                "\"samplePeriodMs\":%d,\"trajectory\":\"cubic-bezier+smoothstep\","
+                "\"pressurePeak\":%d,\"touchMajorPeak\":%d,\"touchMinorPeak\":%d,"
+                "\"widthMajor\":%d,\"widthMinor\":%d}\n",
+                duration_ms, frames + 1, sample_period_ms, peak_pressure,
+                peak_touch_major, peak_touch_minor, width_major, width_minor);
+    } else {
+        fprintf(out, "{\"ok\":false,\"error\":\"uinput event write failed\"}\n");
+    }
+    return result;
+}
+
+static int status(FILE *out) {
+    fprintf(out, "{\"ok\":true,\"schema\":\"dev.input/v2\",\"name\":\"");
+    for (char *p = g_profile.name; *p; ++p) {
+        if (*p == '"' || *p == '\\') fputc('\\', out);
+        fputc(*p, out);
+    }
+    fprintf(
+            out,
+            "\",\"bustype\":%d,\"vendor\":%d,\"product\":%d,\"version\":%d,"
+            "\"width\":%d,\"height\":%d,\"pressureMax\":%d,\"trackingMax\":%d,"
+            "\"driverLayer\":true,\"directTouch\":true,\"persistentDevice\":true,"
+            "\"eventNode\":\"%s\",\"touchMajorMax\":%d,\"touchMinorMax\":%d,"
+            "\"widthMajorMax\":%d,\"widthMinorMax\":%d,"
+            "\"orientationMin\":%d,\"orientationMax\":%d}\n",
+            g_profile.bustype,
+            g_profile.vendor,
+            g_profile.product,
+            g_profile.version,
+            g_profile.width,
+            g_profile.height,
+            g_profile.pressure_max,
+            g_profile.tracking_max,
+            g_event_node,
+            CONTACT_AXIS_MAX,
+            CONTACT_AXIS_MAX,
+            CONTACT_AXIS_MAX,
+            CONTACT_AXIS_MAX,
+            -ORIENTATION_MAX,
+            ORIENTATION_MAX);
     return 0;
 }
 
-static int status(void) {
-    printf("{\"ok\":true,\"schema\":\"dev.input/v1\",\"name\":\"");
-    for (char *p = g_profile.name; *p; ++p) { if (*p == '"' || *p == '\\') putchar('\\'); putchar(*p); }
-    printf("\",\"bustype\":%d,\"vendor\":%d,\"product\":%d,\"version\":%d,\"width\":%d,\"height\":%d,\"pressureMax\":%d,\"trackingMax\":%d}\n",
-        g_profile.bustype, g_profile.vendor, g_profile.product, g_profile.version, g_profile.width, g_profile.height, g_profile.pressure_max, g_profile.tracking_max);
+static int parse_int_arg(const char *text, int *out) {
+    if (!text || !text[0] || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || value < INT_MIN || value > INT_MAX) return -1;
+    *out = (int)value;
     return 0;
+}
+
+#define INPUT_SOCKET_PATH "/dev/socket/.inputd"
+
+static volatile sig_atomic_t g_stop_service;
+
+static void stop_service(int signal_number) {
+    (void)signal_number;
+    g_stop_service = 1;
+}
+
+static int reload_input_device(int *input_fd, FILE *out) {
+    unpublish_event_node();
+    destroy_device(*input_fd);
+    *input_fd = -1;
+    reset_profile();
+    load_profile();
+
+    int replacement = create_device();
+    if (replacement < 0 || publish_event_node(replacement) < 0) {
+        if (replacement >= 0) destroy_device(replacement);
+        fprintf(out, "{\"ok\":false,\"error\":\"input device reload failed\"}\n");
+        return 2;
+    }
+    *input_fd = replacement;
+    return status(out);
+}
+
+static int handle_command(int *input_fd, FILE *out, char *line) {
+    char *tokens[8];
+    int count = 0;
+    char *save = NULL;
+    for (char *token = strtok_r(line, " \t\r\n", &save);
+            token && count < (int)(sizeof(tokens) / sizeof(tokens[0]));
+            token = strtok_r(NULL, " \t\r\n", &save)) {
+        tokens[count++] = token;
+    }
+
+    if (count == 1 && !strcmp(tokens[0], "status")) return status(out);
+    if (count == 1 && !strcmp(tokens[0], "reload")) return reload_input_device(input_fd, out);
+    if (*input_fd < 0) {
+        fprintf(out, "{\"ok\":false,\"error\":\"input driver unavailable\"}\n");
+        return 2;
+    }
+    if (count == 3 && !strcmp(tokens[0], "tap")) {
+        int x, y;
+        if (!parse_int_arg(tokens[1], &x) && !parse_int_arg(tokens[2], &y)) {
+            return tap(*input_fd, out, x, y);
+        }
+    }
+    if (count == 6 && !strcmp(tokens[0], "swipe")) {
+        int x1, y1, x2, y2, duration_ms;
+        if (!parse_int_arg(tokens[1], &x1)
+                && !parse_int_arg(tokens[2], &y1)
+                && !parse_int_arg(tokens[3], &x2)
+                && !parse_int_arg(tokens[4], &y2)
+                && !parse_int_arg(tokens[5], &duration_ms)) {
+            return swipe(*input_fd, out, x1, y1, x2, y2, duration_ms);
+        }
+    }
+    fprintf(out, "{\"ok\":false,\"error\":\"invalid input command\"}\n");
+    return 64;
+}
+
+static int run_service(void) {
+    reset_profile();
+    load_profile();
+    seed_rng();
+
+    int input_fd = create_device();
+    if (input_fd < 0) return 2;
+    if (publish_event_node(input_fd) < 0) {
+        destroy_device(input_fd);
+        return 2;
+    }
+
+    struct stat st;
+    if (lstat(INPUT_SOCKET_PATH, &st) == 0) {
+        if (!S_ISSOCK(st.st_mode) || unlink(INPUT_SOCKET_PATH) < 0) {
+            fprintf(stderr, "input service socket collision\n");
+            unpublish_event_node();
+            destroy_device(input_fd);
+            return 2;
+        }
+    } else if (errno != ENOENT) {
+        perror("inspect input service socket");
+        unpublish_event_node();
+        destroy_device(input_fd);
+        return 2;
+    }
+
+    int server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server_fd < 0) {
+        perror("create input service socket");
+        unpublish_event_node();
+        destroy_device(input_fd);
+        return 2;
+    }
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", INPUT_SOCKET_PATH);
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0
+            || chmod(INPUT_SOCKET_PATH, 0600) < 0
+            || listen(server_fd, 4) < 0) {
+        perror("start input service socket");
+        close(server_fd);
+        unlink(INPUT_SOCKET_PATH);
+        unpublish_event_node();
+        destroy_device(input_fd);
+        return 2;
+    }
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = stop_service;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGINT, &action, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    while (!g_stop_service) {
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept input command");
+            break;
+        }
+        fcntl(client_fd, F_SETFD, FD_CLOEXEC);
+        FILE *client = fdopen(client_fd, "r+");
+        if (!client) {
+            close(client_fd);
+            continue;
+        }
+        setvbuf(client, NULL, _IOLBF, 0);
+        char command[512];
+        if (fgets(command, sizeof(command), client)) handle_command(&input_fd, client, command);
+        fflush(client);
+        fclose(client);
+    }
+
+    close(server_fd);
+    unlink(INPUT_SOCKET_PATH);
+    unpublish_event_node();
+    destroy_device(input_fd);
+    return g_stop_service ? 0 : 2;
+}
+
+static int run_client(int argc, char **argv) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        printf("{\"ok\":false,\"error\":\"input driver service unavailable\"}\n");
+        return 2;
+    }
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", INPUT_SOCKET_PATH);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        close(fd);
+        printf("{\"ok\":false,\"error\":\"input driver service unavailable\"}\n");
+        return 2;
+    }
+
+    FILE *server = fdopen(fd, "r+");
+    if (!server) {
+        close(fd);
+        printf("{\"ok\":false,\"error\":\"input driver service unavailable\"}\n");
+        return 2;
+    }
+    for (int i = 1; i < argc; i++) fprintf(server, "%s%s", i == 1 ? "" : " ", argv[i]);
+    fputc('\n', server);
+    fflush(server);
+
+    char response[4096];
+    int result = 2;
+    if (fgets(response, sizeof(response), server)) {
+        fputs(response, stdout);
+        result = strstr(response, "\"ok\":true") ? 0 : 1;
+    } else {
+        printf("{\"ok\":false,\"error\":\"input driver service closed connection\"}\n");
+    }
+    fclose(server);
+    return result;
 }
 
 int main(int argc, char **argv) {
-    load_profile();
-    seed_rng();
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s status | tap x y | swipe x1 y1 x2 y2 duration_ms\n", argv[0]);
-        return 64;
-    }
-    if (!strcmp(argv[1], "status")) return status();
-    if (!strcmp(argv[1], "tap") && argc == 4) return tap(atoi(argv[2]), atoi(argv[3]));
-    if (!strcmp(argv[1], "swipe") && argc == 7) return swipe(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]));
-    if (!strcmp(argv[1], "htap") && argc == 4) return htap(atoi(argv[2]), atoi(argv[3]));
-    if (!strcmp(argv[1], "hswipe") && argc == 7) return hswipe(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]));
-    fprintf(stderr, "invalid arguments\n");
+    if (argc == 2 && !strcmp(argv[1], "serve")) return run_service();
+    if (argc >= 2) return run_client(argc, argv);
+    fprintf(stderr, "usage: %s status | tap x y | swipe x1 y1 x2 y2 duration_ms\n", argv[0]);
     return 64;
 }

@@ -284,7 +284,7 @@ Profile application converges SettingsProvider, property-area state, native runt
 ./xenoid automation run examples/automation/ordered-task.js
 ```
 
-The daemon performs low-level input through the deployed `/dev/uinput` helper. Use each subcommand's `--help` output as the parameter reference.
+The daemon requires the init-managed native input service. Its persistent profile-backed touchscreen writes Linux `input_event` records through `/dev/uinput`; Android InputReader consumes the published `/dev/input/event*` node. Tap and swipe never fall back to the framework `input` command, accessibility, or instrumentation.
 
 ## Protection policy
 

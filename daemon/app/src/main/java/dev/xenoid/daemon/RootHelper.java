@@ -235,29 +235,32 @@ final class RootHelper {
     }
     static Map<String,Object> stopFrida() { return execRootd("pkill frida-server 2>/dev/null || true; pkill svc.bin 2>/dev/null || true; pkill .fs64 2>/dev/null || true"); }
     static Map<String,Object> fridaStatus() { return execRootd("pidof .fs64 >/dev/null 2>&1 && ps -A | grep '[.]fs64'"); }
-    static Map<String,Object> inputTap(int x, int y) {
+    private static Map<String,Object> inputNative(String arguments) {
         String injector = "/data/local/tmp/xenoid-input";
-        Map<String,Object> nativeTry = exec("test -x " + injector + " && " + injector + " htap " + x + " " + y);
-        nativeTry.put("driverLayer", true);
-        nativeTry.put("injector", injector);
-        if (Boolean.TRUE.equals(nativeTry.get("ok"))) return nativeTry;
-        Map<String,Object> fallback = exec("input tap " + x + " " + y);
-        fallback.put("driverLayer", false);
-        fallback.put("fallback", "android input command; deploy xenoid-input native helper for /dev/uinput injection");
-        fallback.put("nativeAttempt", nativeTry);
-        return fallback;
+        Map<String,Object> result = execRootd(
+                "test -x " + shellQuote(injector) + " && exec " + shellQuote(injector) + " " + arguments,
+                20000);
+        boolean ok = Boolean.TRUE.equals(result.get("ok"));
+        result.put("driverLayer", ok);
+        result.put("eventNode", "/dev/uinput");
+        result.put("fallback", false);
+        result.put("injector", injector);
+        if (!ok) {
+            result.put("error", "native uinput injection failed; framework input fallback is disabled");
+        }
+        return result;
     }
+
+    static Map<String,Object> inputReload() {
+        return inputNative("reload");
+    }
+
+    static Map<String,Object> inputTap(int x, int y) {
+        return inputNative("tap " + x + " " + y);
+    }
+
     static Map<String,Object> inputSwipe(int x1, int y1, int x2, int y2, int durationMs) {
-        String injector = "/data/local/tmp/xenoid-input";
-        Map<String,Object> nativeTry = exec("test -x " + injector + " && " + injector + " hswipe " + x1 + " " + y1 + " " + x2 + " " + y2 + " " + durationMs);
-        nativeTry.put("driverLayer", true);
-        nativeTry.put("injector", injector);
-        if (Boolean.TRUE.equals(nativeTry.get("ok"))) return nativeTry;
-        Map<String,Object> fallback = exec("input swipe " + x1 + " " + y1 + " " + x2 + " " + y2 + " " + durationMs);
-        fallback.put("driverLayer", false);
-        fallback.put("fallback", "android input command; deploy xenoid-input native helper for /dev/uinput injection");
-        fallback.put("nativeAttempt", nativeTry);
-        return fallback;
+        return inputNative("swipe " + x1 + " " + y1 + " " + x2 + " " + y2 + " " + durationMs);
     }
     static Map<String,Object> profileStatus() { return exec("test -x /data/local/tmp/xenoid-profile-helper && /data/local/tmp/xenoid-profile-helper status || echo profile-helper-missing"); }
     static Map<String,Object> profileEnv() { return exec("test -x /data/local/tmp/xenoid-profile-helper && /data/local/tmp/xenoid-profile-helper env || echo profile-helper-missing"); }

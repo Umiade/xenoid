@@ -78,6 +78,7 @@ xenoid mcp-config
 - `POST /frida/start`
 - `POST /frida/stop`
 - `POST /input/tap`
+- `POST /input/swipe`
 - `GET /ota/check`
 - `POST /ota/apply`
 - `GET /camera/status`

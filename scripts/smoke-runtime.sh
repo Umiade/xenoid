@@ -72,7 +72,32 @@ elif python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if 
 else
   add frida_status false "$(cat /tmp/xenoid-smoke-frida-status.out)"
 fi
-if $XENOID_BIN input tap 1 1 >/tmp/xenoid-smoke-input.out 2>&1 && ./scripts/json-ok.py </tmp/xenoid-smoke-input.out; then add input_tap true "$(cat /tmp/xenoid-smoke-input.out)"; else add input_tap false "$(cat /tmp/xenoid-smoke-input.out)"; fi
+if $XENOID_BIN input tap 1 1 >/tmp/xenoid-smoke-input-tap.out 2>&1 \
+    && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); s=str(d.get("stdout","")); sys.exit(0 if d.get("ok") is True and d.get("driverLayer") is True and d.get("fallback") is False and d.get("eventNode")=="/dev/uinput" and "dev.input-action/v2" in s and "pressurePeak" in s and "touchMajorPeak" in s and "touchMinorPeak" in s else 1)' /tmp/xenoid-smoke-input-tap.out; then
+  add input_tap true "$(cat /tmp/xenoid-smoke-input-tap.out)"
+else
+  add input_tap false "$(cat /tmp/xenoid-smoke-input-tap.out)"
+fi
+if $XENOID_BIN input swipe 2 2 3 3 64 >/tmp/xenoid-smoke-input-swipe.out 2>&1 \
+    && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); s=str(d.get("stdout","")); sys.exit(0 if d.get("ok") is True and d.get("driverLayer") is True and d.get("fallback") is False and d.get("eventNode")=="/dev/uinput" and "dev.input-action/v2" in s and "contactDurationMs\\\":64" in s and "cubic-bezier+smoothstep" in s else 1)' /tmp/xenoid-smoke-input-swipe.out; then
+  add input_swipe true "$(cat /tmp/xenoid-smoke-input-swipe.out)"
+else
+  add input_swipe false "$(cat /tmp/xenoid-smoke-input-swipe.out)"
+fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell dumpsys input >/tmp/xenoid-smoke-input-driver.out 2>&1 \
+    && grep -q 'sec_touchscreen' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'Path: /dev/input/event' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'Sources: TOUCHSCREEN' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'Touch Input Mapper (mode - DIRECT)' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'TouchMajor: min=0, max=31' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'TouchMinor: min=0, max=31' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'ToolMajor: min=0, max=31' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'ToolMinor: min=0, max=31' /tmp/xenoid-smoke-input-driver.out \
+    && grep -q 'Pressure: min=0, max=255' /tmp/xenoid-smoke-input-driver.out; then
+  add input_driver true "persistent direct touchscreen exposes pressure and contact/tool major/minor axes"
+else
+  add input_driver false "$(cat /tmp/xenoid-smoke-input-driver.out)"
+fi
 if $XENOID_BIN device collect --out /tmp/xenoid-runtime-fingerprint.json >/tmp/xenoid-smoke-device.out 2>&1 && ./scripts/json-ok.py </tmp/xenoid-smoke-device.out; then add device_collect true "$(cat /tmp/xenoid-smoke-device.out)"; else add device_collect false "$(cat /tmp/xenoid-smoke-device.out)"; fi
 
 # Camera2 static metadata must describe the same ordered output tuples across

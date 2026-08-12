@@ -271,7 +271,14 @@ PY
 fi
 cat > "$OUT/payload/xenoid.rc" <<'RC'
 on early-init
+    mkdir /dev/input 0755 root root
+    start xenoid-input
     start xenoid-cellular-watch
+
+service xenoid-input /system/bin/xenoid-input serve
+    class core
+    user root
+    group root input
 
 # Preserve Docker's lease-owned dual-stack link before netd starts, then restore
 # addresses, gateways, and control-plane rules after Android boot completes.
@@ -367,6 +374,7 @@ __GOOGLE_LABELS__
 __GOOGLE_COPY__
 COPY payload/xenoid-init /xenoid-init
 COPY payload/xenoid-input /data/local/tmp/xenoid-input
+COPY payload/xenoid-input /system/bin/xenoid-input
 COPY payload/xenoid-hide-helper /data/local/tmp/xenoid-hide-helper
 COPY payload/xenoid-profile-helper /data/local/tmp/xenoid-profile-helper
 COPY payload/xenoid-netctl /data/local/tmp/xenoid-netctl

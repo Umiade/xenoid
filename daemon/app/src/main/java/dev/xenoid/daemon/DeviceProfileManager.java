@@ -165,6 +165,11 @@ final class DeviceProfileManager {
             if (profile.has("display_height")) actions.add(applyField("display.height", String.valueOf(profile.opt("display_height"))));
 
             actions.addAll(stageEffectiveProfile(rawJson == null ? "{}" : rawJson));
+            Map<String,Object> inputReload = RootHelper.inputReload();
+            actions.add(inputReload);
+            if (!Boolean.TRUE.equals(inputReload.get("ok"))) {
+                throw new IllegalStateException("input_driver_reload_failed");
+            }
             actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
             if (battery != null) actions.add(RootHelper.exec(BATTERY_HEALTH_REFRESH));
             out.put("ok", true);
@@ -194,7 +199,21 @@ final class DeviceProfileManager {
     }
 
     static Map<String,Object> setField(String field, String value) {
-        return applyField(field, value);
+        Map<String,Object> out = applyField(field, value);
+        boolean inputField = field != null
+                && (field.startsWith("input.")
+                    || field.startsWith("touch.")
+                    || "display.width".equals(field)
+                    || "display.height".equals(field));
+        if (inputField && Boolean.TRUE.equals(out.get("ok"))) {
+            Map<String,Object> reload = RootHelper.inputReload();
+            out.put("inputReload", reload);
+            if (!Boolean.TRUE.equals(reload.get("ok"))) {
+                out.put("ok", false);
+                out.put("error", "input_driver_reload_failed");
+            }
+        }
+        return out;
     }
 
     private static Map<String,Object> applyField(String field, String value) {
