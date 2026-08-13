@@ -4,12 +4,14 @@
 
 The daemon APK collector returns JSON with:
 
-- build identity (`Build.BRAND`, `Build.MODEL`, `Build.FINGERPRINT`, etc.)
-- ids (`android_id`, `boot_id`, serial when available)
-- battery
-- display metrics
-- sensors
-- locale/timezone
+- build and partition identity (`Build.*`, properties, security patch, shipping API, SKU)
+- ids (`android_id`, `boot_id`, serial, IMEI/IMEISV when available)
+- battery capacity, charge, voltage, temperature, status, health, and power source
+- display modes/metrics and touchscreen identity/axes
+- CPU topology/frequencies, memory, and storage geometry
+- sensor catalog plus an accelerometer event sample
+- Camera2 geometry, output sizes, flash/OIS state, and physical-camera IDs
+- locale/timezone and thermal zones
 
 ```bash
 ./xenoid device collect --out .xenoid/current-device.json
@@ -18,7 +20,7 @@ The daemon APK collector returns JSON with:
 ## Apply profile
 
 ```bash
-./xenoid device apply examples/fingerprints/sample-profile.json
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json
 ```
 
 By default Xenoid regenerates uniqueness fields:
@@ -42,11 +44,29 @@ The full profile is staged at:
 
 System services and native helpers consume the staged profile for non-mutable surfaces such as sensors, boot ID reads, and battery values.
 
+## Canonical Raven contract
+
+`examples/fingerprints/pixel-raven-android13.json` is the single production template. It identifies Google Pixel 6 Pro `raven` model/SKU `G8V0U` running Android 13 build `TP1A.221005.002` (`9012097`), fingerprint `google/raven/raven:13/TP1A.221005.002/9012097:user/release-keys`, bootloader `slider-1.2-8895132`, security patch `2022-10-05`, and shipping API 31.
+
+The same profile owns the surfaces that need cross-layer agreement:
+
+- 1440 x 3120 at 560 dpi, physical 512 ppi, with real 60/120 Hz display modes
+- eight Tensor CPU cores, 12 GiB memory, and a grow-only sparse 128,000,000,000-byte UFS 3.1 data image with an Android-facing f2fs contract
+- 5003 mAh typical / 4905 mAh minimum battery capacity and coherent charge fields
+- Raven sensor identities (LSM6DSR, MMC56X3X, TMD3719, ICP10101, CHRE fusion sensors, and the private VD6282 rear-light sensor)
+- one back and one front Camera2 device with per-camera geometry and output tables; only the rear device exposes flash/torch
+
+The `provenance` object records Google specifications, AOSP Raven sources, the factory image, the community sensor registry, and community-derived camera geometry. Community-derived fields are not represented as Google-published values. Body dimensions, weight, color, benchmark results, and other facts without an Android runtime owner do not belong in the profile.
+
+PackageManager feature declarations follow implemented HAL behavior rather than Pixel marketing specifications. NFC, UWB, fingerprint/UDFPS, true NR, autofocus, OIS, full/manual/RAW camera, HiFi sensor, and head-tracker support remain absent until their owning subsystem exists. The active cellular profile is LTE-only and each carrier's band list must be a subset of the official G8V0U LTE matrix.
+
+The 128 GB value is logical sparse capacity, not host-space preallocation. The profile's `capacityBytes == sectorSizeBytes * sectorCount` invariant drives `/proc/partitions`, `/proc/diskstats`, `/dev/block/sda`, the Raven userdata by-name alias, and block sysfs as one Android storage view. Its `filesystem: f2fs` value also drives canonical mount records and both libc and direct-syscall `statfs`/`fstatfs` results for unprivileged and isolated apps. The persistent backing image remains ext4 for grow-only recovery, and privileged maintenance paths retain that real view. Container/Colima memory budgets may remain below the 12 GiB Android view; those host budgets do not change the guest-visible device contract.
+
 ## Single field mutation
 
 ```bash
 ./xenoid device set android_id random
-./xenoid device set ro.product.model "Pixel 8 Pro"
+./xenoid device set ro.product.model "Pixel 6 Pro"
 ./xenoid device set timezone America/Los_Angeles
 ```
 
@@ -97,7 +117,7 @@ Deploy with `./xenoid frida deploy-scripts`; load into a target app with `./xeno
 ## Profile-generated Frida spoofing
 
 ```bash
-./xenoid device generate-frida examples/fingerprints/sample-profile.json --out .xenoid/frida/generated-profile.js
+./xenoid device generate-frida examples/fingerprints/pixel-raven-android13.json --out .xenoid/frida/generated-profile.js
 ./xenoid frida load-script com.example.app .xenoid/frida/generated-profile.js --spawn
 ```
 
@@ -136,7 +156,7 @@ The helper consumes staged profile files under `/data/local/tmp/xenoid-profile`,
 ## Service/system Frida generation
 
 ```bash
-./xenoid device generate-service-frida examples/fingerprints/sample-profile.json --out .xenoid/frida/generated-service-profile.js
+./xenoid device generate-service-frida examples/fingerprints/pixel-raven-android13.json --out .xenoid/frida/generated-service-profile.js
 ```
 
 The service-oriented script hooks:

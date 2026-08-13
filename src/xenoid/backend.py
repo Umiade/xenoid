@@ -59,7 +59,7 @@ from .google_services import (
     verify_context_copy,
 )
 from .storage import (
-    DEFAULT_DATA_SIZE_BYTES,
+    CANONICAL_DATA_SIZE_BYTES,
     StorageError,
     StorageStateStore,
     backup_image_name,
@@ -459,7 +459,7 @@ class RuntimeManager:
             "/system/etc/init/hw/init.zygote64.rc && "
             "test \"$(getprop init.svc.xenoid-sensorshal)\" = running && "
             "test \"$(getprop init.svc.vendor.camera-provider-aidl)\" = running && "
-            "test \"$(getprop ro.hardware)\" = tensor && "
+            "test \"$(getprop ro.hardware)\" = raven && "
             "test \"$(getprop ro.product.device)\" = raven && "
             "zygote_pid=$(pidof zygote64 | cut -d' ' -f1) && "
             "test -n \"$zygote_pid\" && "
@@ -738,6 +738,73 @@ class RuntimeManager:
             command = ["sudo", "-n", "sh", "-c", script]
         return run(command, timeout=timeout, env=self.docker_env())
 
+    @staticmethod
+    def _parse_engine_meminfo(raw: str) -> Optional[dict[str, int]]:
+        values: dict[str, int] = {}
+        for line in raw.splitlines():
+            match = re.fullmatch(r"([A-Za-z_()]+):\s+([0-9]+)\s+kB", line.strip())
+            if match:
+                values[match.group(1)] = int(match.group(2))
+        total_kib = values.get("MemTotal", 0)
+        available_kib = values.get("MemAvailable", 0)
+        if total_kib <= 0 or available_kib < 0:
+            return None
+        warning_kib = max(512 * 1024, total_kib // 10)
+        return {
+            "totalBytes": total_kib * 1024,
+            "availableBytes": available_kib * 1024,
+            "warningThresholdBytes": warning_kib * 1024,
+        }
+
+    def runtime_memory_status(
+        self,
+        container: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        if container is None:
+            inspected, _ = self._inspect_docker_object(
+                "container",
+                self.lease.container_name,
+            )
+            container = inspected
+        state = container.get("State") if isinstance(container, Mapping) else None
+        oom_killed = bool(
+            isinstance(state, Mapping) and state.get("OOMKilled") is True
+        )
+        probe = self._engine_host_shell("cat /proc/meminfo", timeout=10)
+        memory = (
+            self._parse_engine_meminfo(str(probe.stdout or ""))
+            if probe.returncode == 0
+            else None
+        )
+        pressure = bool(
+            memory is not None
+            and memory["availableBytes"] <= memory["warningThresholdBytes"]
+        )
+        result: dict[str, Any] = {
+            "ok": not oom_killed,
+            "oomKilled": oom_killed,
+            "pressure": pressure,
+            "deviceMemoryIsVirtual": True,
+        }
+        if memory is not None:
+            result["engineHost"] = memory
+        else:
+            result["probeError"] = (
+                str(probe.stderr or "").strip() or "engine host memory unavailable"
+            )
+        if oom_killed:
+            result["error"] = "runtime_oom_killed"
+            result["message"] = (
+                "Android runtime was killed by Docker/VM memory pressure; "
+                "increase the host or Colima memory budget, or reduce the workload"
+            )
+        elif pressure and memory is not None:
+            result["warning"] = (
+                "Docker engine host memory is low; the Android 12 GiB device "
+                "identity is virtual and does not reserve host memory"
+            )
+        return result
+
     def _inspect_volume_image(
         self,
         volume: dict[str, Any],
@@ -762,8 +829,21 @@ class RuntimeManager:
             f"set -eu; p={quoted}; "
             "[ -f \"$p\" ] && [ ! -L \"$p\" ] && [ -s \"$p\" ]; "
             "[ \"$(blkid -p -s TYPE -o value -- \"$p\" 2>/dev/null)\" = ext4 ]; "
-            "printf 'XENOID_DATA_UUID=%s\\n' \"$(blkid -p -s UUID -o value -- \"$p\" | tr A-F a-f)\"; "
-            "printf 'XENOID_DATA_SIZE=%s\\n' \"$(stat -c %s -- \"$p\")\""
+            "set -- $(tune2fs -l \"$p\" 2>/dev/null | awk -F: "
+            "'/Block count:/ {gsub(/[[:space:]]/,\"\",$2); c=$2} "
+            "/Block size:/ {gsub(/[[:space:]]/,\"\",$2); s=$2} END {print c,s}'); "
+            "[ \"$#\" -eq 2 ] && [ \"$1\" -gt 0 ] && [ \"$2\" -gt 0 ]; "
+            "fs_bytes=$(($1 * $2)); "
+            "set -- $(df -B1 --output=size,avail \"$p\" | awk 'NR==2 {print $1,$2}'); "
+            "[ \"$#\" -eq 2 ] && [ \"$1\" -gt 0 ] && [ \"$2\" -ge 0 ]; "
+            "printf 'XENOID_DATA_UUID=%s\\n' "
+            "\"$(blkid -p -s UUID -o value -- \"$p\" | tr A-F a-f)\"; "
+            "printf 'XENOID_DATA_LOGICAL_SIZE=%s\\n' \"$(stat -c %s -- \"$p\")\"; "
+            "printf 'XENOID_DATA_FILESYSTEM_SIZE=%s\\n' \"$fs_bytes\"; "
+            "printf 'XENOID_DATA_ALLOCATED_SIZE=%s\\n' "
+            "\"$(( $(stat -c %b -- \"$p\") * 512 ))\"; "
+            "printf 'XENOID_DATA_BACKING_TOTAL=%s\\n' \"$1\"; "
+            "printf 'XENOID_DATA_BACKING_AVAILABLE=%s\\n' \"$2\""
         )
         proc = self._engine_host_shell(command)
         if proc.returncode != 0:
@@ -775,14 +855,29 @@ class RuntimeManager:
                 "stderr": proc.stderr.strip()[-500:],
             }
         try:
-            filesystem_uuid, size_bytes = parse_storage_result(proc.stdout)
+            geometry = parse_storage_result(proc.stdout)
         except StorageError as exc:
             return exc.as_dict()
+        warning_threshold = max(
+            5 * 1024 * 1024 * 1024,
+            geometry["backingTotalBytes"] // 10,
+        )
+        pressure = geometry["backingAvailableBytes"] <= warning_threshold
         return {
             "ok": True,
-            "filesystemUuid": filesystem_uuid,
-            "sizeBytes": size_bytes,
+            **geometry,
             "image": image_name,
+            "backingPressure": pressure,
+            **(
+                {
+                    "warning": (
+                        "Docker backing storage is low; free host or VM disk space "
+                        "before write-heavy Android workloads"
+                    )
+                }
+                if pressure
+                else {}
+            ),
         }
 
     def _run_storage_image_action(
@@ -801,7 +896,7 @@ class RuntimeManager:
             self.effective_image(),
             self.lease.volume_name,
             "3072",
-            str(DEFAULT_DATA_SIZE_BYTES // (1024 * 1024)),
+            str(CANONICAL_DATA_SIZE_BYTES),
             action,
             expected_uuid or "-",
             transaction_id or "-",
@@ -825,36 +920,46 @@ class RuntimeManager:
             "stderr": proc.stderr.strip()[-2000:],
         }
         if proc.returncode != 0:
-            storage_failure = 41 <= proc.returncode <= 56
+            storage_failure = 41 <= proc.returncode <= 60
             capacity_failure = proc.returncode == 61
+            backing_full = proc.returncode == 62 or "No space left on device" in (
+                f"{proc.stdout}\n{proc.stderr}"
+            )
             result.update({
                 "error": (
-                    "storage_image_invalid"
-                    if storage_failure
+                    "storage_backing_full"
+                    if backing_full
                     else (
-                        "rootfs_capacity_insufficient"
-                        if capacity_failure
-                        else "rootfs_image_build_failed"
+                        "storage_image_invalid"
+                        if storage_failure
+                        else (
+                            "rootfs_capacity_insufficient"
+                            if capacity_failure
+                            else "rootfs_image_build_failed"
+                        )
                     )
                 ),
                 "message": (
-                    "persistent data image operation failed"
-                    if storage_failure
+                    "Docker backing filesystem is full; free host or VM disk space"
+                    if backing_full
                     else (
-                        "generated rootfs capacity is insufficient"
-                        if capacity_failure
-                        else "rootfs image preparation failed"
+                        "persistent data image operation failed"
+                        if storage_failure
+                        else (
+                            "generated rootfs capacity is insufficient"
+                            if capacity_failure
+                            else "rootfs image preparation failed"
+                        )
                     )
                 ),
             })
             return result
         try:
-            filesystem_uuid, size_bytes = parse_storage_result(proc.stdout)
+            geometry = parse_storage_result(proc.stdout)
         except StorageError as exc:
             return {**result, **exc.as_dict(), "ok": False}
         result.update({
-            "filesystemUuid": filesystem_uuid,
-            "sizeBytes": size_bytes,
+            **geometry,
             "action": action,
         })
         return result
@@ -894,7 +999,7 @@ class RuntimeManager:
             return None
         return {"volumeName": volume_name, "containerName": container_name}
 
-    def _legacy_volume_attachments(
+    def _volume_attachments(
         self,
         volume_name: str,
     ) -> tuple[Optional[list[tuple[str, str]]], dict[str, Any]]:
@@ -930,6 +1035,140 @@ class RuntimeManager:
 
     def _storage_error(self, code: str, message: str, **details: Any) -> dict[str, Any]:
         return {"ok": False, "error": code, "message": message, **details}
+
+    def _storage_growth_container(
+        self,
+    ) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+        attachments, status = self._volume_attachments(self.lease.volume_name)
+        if attachments is None:
+            return None, status
+        if not attachments:
+            return None, {"ok": True, "attached": False}
+        if (
+            len(attachments) != 1
+            or attachments[0][1] != self.lease.container_name
+        ):
+            return None, self._storage_error(
+                "storage_foreign_attachment",
+                "data volume has a foreign container attachment",
+                attachments=[
+                    {"id": container_id, "name": name}
+                    for container_id, name in attachments
+                ],
+            )
+        container, _ = self._inspect_docker_object(
+            "container",
+            attachments[0][0],
+        )
+        if (
+            not isinstance(container, dict)
+            or not container
+            or not self._container_has_lease_owner(container)
+        ):
+            return None, self._storage_error(
+                "storage_foreign_attachment",
+                "attached container is not owned by this instance",
+            )
+        return container, {"ok": True, "attached": True}
+
+    def _converge_storage_growth(
+        self,
+        store: StorageStateStore,
+        state: Mapping[str, Any],
+        image: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        container, attachment = self._storage_growth_container()
+        if attachment.get("ok") is not True:
+            return attachment
+        proxy = (
+            self._capture_proxy_desired_for_update()
+            if container is not None
+            else {"ok": True, "captured": False, "configured": False}
+        )
+        if proxy.get("ok") is not True:
+            return self._storage_error(
+                "proxy_state_backup_failed",
+                "cannot preserve proxy desired state before storage growth",
+                proxyDesired=proxy,
+            )
+        try:
+            if state["state"] == "committed":
+                pending = store.pending(
+                    str(state["source"]),
+                    filesystem_uuid=str(image["filesystemUuid"]),
+                    observed_logical_size_bytes=int(image["logicalSizeBytes"]),
+                    observed_filesystem_size_bytes=int(image["filesystemSizeBytes"]),
+                    host_allocated_bytes=int(image["allocatedBytes"]),
+                    legacy_volume=str(state["legacyVolume"]),
+                    legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
+                    backup_image=str(state["backupImage"]),
+                    backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
+                    backup_size_bytes=int(state["backupSizeBytes"]),
+                    growth=True,
+                )
+            else:
+                pending = dict(state)
+        except (StorageError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, StorageError):
+                return exc.as_dict()
+            return self._storage_error(
+                "storage_state_invalid",
+                "cannot begin storage growth transaction",
+            )
+        removal: dict[str, Any] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "data volume is detached",
+        }
+        if container is not None:
+            removal = self._remove_owned_container(container)
+            if removal.get("ok") is not True:
+                return self._storage_error(
+                    str(removal.get("error") or "container_remove_failed"),
+                    "owned container could not be removed for storage growth",
+                    storage=public_storage_state(
+                        pending,
+                        healthy=False,
+                        error="storage_transaction_pending",
+                    ),
+                    containerRemoval=removal,
+                )
+        action = self._run_storage_image_action(
+            "grow",
+            expected_uuid=str(pending["filesystemUuid"]),
+            transaction_id=str(pending["transactionId"]),
+        )
+        if (
+            action.get("ok") is not True
+            or action.get("filesystemUuid") != pending["filesystemUuid"]
+            or action.get("logicalSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+            or action.get("filesystemSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+        ):
+            code = str(action.get("error") or "storage_identity_mismatch")
+            return self._storage_error(
+                code,
+                str(action.get("message") or "data image growth verification failed"),
+                storage=public_storage_state(pending, healthy=False, error=code),
+                imageAction=action,
+                containerRemoval=removal,
+            )
+        try:
+            committed = store.commit(pending, action)
+        except (StorageError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, StorageError):
+                return exc.as_dict()
+            return self._storage_error(
+                "storage_state_invalid",
+                "cannot commit storage growth transaction",
+            )
+        return {
+            "ok": True,
+            "volume": {"ok": True, "exists": True},
+            "proxyDesiredBeforeGrowth": proxy,
+            "containerRemoval": removal,
+            "imageAction": action,
+            "storage": public_storage_state(committed, healthy=True),
+        }
 
     def ensure_instance_storage(self) -> dict[str, Any]:
         """Converge rootfs plus the one persistent, never-silently-replaced data image."""
@@ -968,20 +1207,46 @@ class RuntimeManager:
                     storage=public_storage_state(state, healthy=False, error="storage_image_invalid"),
                     image=image,
                 )
-            if (
-                image["filesystemUuid"] != state["filesystemUuid"]
-                or image["sizeBytes"] != state["sizeBytes"]
-            ):
+            if image["filesystemUuid"] != state["filesystemUuid"]:
                 return self._storage_error(
                     "storage_identity_mismatch",
-                    "committed data image identity changed",
+                    "committed data image UUID changed",
                     storage=public_storage_state(state, healthy=False, error="storage_identity_mismatch"),
                     image=image,
                 )
+            logical_size = int(image["logicalSizeBytes"])
+            filesystem_size = int(image["filesystemSizeBytes"])
+            if (
+                logical_size > CANONICAL_DATA_SIZE_BYTES
+                or filesystem_size > logical_size
+            ):
+                return self._storage_error(
+                    "storage_size_unsafe",
+                    "refusing to shrink an oversized or inconsistent data image",
+                    storage=public_storage_state(state, healthy=False, error="storage_size_unsafe"),
+                    image=image,
+                )
+            observations_migrated = int(state["hostAllocatedBytes"]) == 0
+            observations_match = (
+                logical_size == int(state["observedLogicalSizeBytes"])
+                and filesystem_size == int(state["observedFilesystemSizeBytes"])
+            )
+            if not observations_match and not observations_migrated:
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "committed data image geometry changed outside its transaction",
+                    storage=public_storage_state(state, healthy=False, error="storage_identity_mismatch"),
+                    image=image,
+                )
+            if (
+                logical_size < CANONICAL_DATA_SIZE_BYTES
+                or filesystem_size < CANONICAL_DATA_SIZE_BYTES
+            ):
+                return self._converge_storage_growth(store, state, image)
             action = self._run_storage_image_action(
                 "preserve",
-                expected_uuid=state["filesystemUuid"],
-                transaction_id=state["transactionId"],
+                expected_uuid=str(state["filesystemUuid"]),
+                transaction_id=str(state["transactionId"]),
             )
             if not action.get("ok"):
                 code = str(action.get("error") or "storage_image_invalid")
@@ -996,19 +1261,82 @@ class RuntimeManager:
                     ),
                     imageAction=action,
                 )
-            if action.get("sizeBytes") != state["sizeBytes"]:
+            if (
+                action.get("filesystemUuid") != state["filesystemUuid"]
+                or action.get("logicalSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+                or action.get("filesystemSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+            ):
                 return self._storage_error(
                     "storage_identity_mismatch",
                     "persistent data image validation failed",
                     storage=public_storage_state(state, healthy=False, error="storage_identity_mismatch"),
                     imageAction=action,
                 )
+            try:
+                refreshed = store.refresh(state, action)
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
+                if isinstance(exc, StorageError):
+                    return exc.as_dict()
+                return self._storage_error(
+                    "storage_state_invalid",
+                    "cannot refresh committed storage observations",
+                )
             return {
                 "ok": True,
                 "volume": {"ok": True, "exists": True},
                 "imageAction": action,
-                "storage": public_storage_state(state, healthy=True),
+                "storage": public_storage_state(refreshed, healthy=True),
             }
+
+        if (
+            state is not None
+            and state["state"] == "pending"
+            and state["temporaryImage"] == ""
+        ):
+            if volume is None:
+                return self._storage_error(
+                    "storage_volume_missing",
+                    "pending growth data volume is missing",
+                    storage=public_storage_state(
+                        state,
+                        healthy=False,
+                        error="storage_volume_missing",
+                    ),
+                )
+            image = self._inspect_volume_image(volume)
+            if (
+                image.get("ok") is not True
+                or image.get("filesystemUuid") != state["filesystemUuid"]
+            ):
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "pending growth data image identity changed",
+                    storage=public_storage_state(
+                        state,
+                        healthy=False,
+                        error="storage_identity_mismatch",
+                    ),
+                    image=image,
+                )
+            logical_size = int(image["logicalSizeBytes"])
+            filesystem_size = int(image["filesystemSizeBytes"])
+            if (
+                logical_size > CANONICAL_DATA_SIZE_BYTES
+                or filesystem_size > logical_size
+                or logical_size < int(state["observedLogicalSizeBytes"])
+                or filesystem_size < int(state["observedFilesystemSizeBytes"])
+            ):
+                return self._storage_error(
+                    "storage_size_unsafe",
+                    "pending growth image was shrunk or exceeds canonical capacity",
+                    storage=public_storage_state(
+                        state,
+                        healthy=False,
+                        error="storage_size_unsafe",
+                    ),
+                    image=image,
+                )
+            return self._converge_storage_growth(store, state, image)
 
         if state is None and legacy is not None:
             legacy_volume, _ = self._inspect_docker_object("volume", legacy["volumeName"])
@@ -1021,7 +1349,7 @@ class RuntimeManager:
                     "storage_legacy_invalid",
                     "recorded legacy data volume is missing or not local",
                 )
-            attachments, attachment_status = self._legacy_volume_attachments(legacy["volumeName"])
+            attachments, attachment_status = self._volume_attachments(legacy["volumeName"])
             if attachments is None:
                 return attachment_status
             unexpected = [
@@ -1054,6 +1382,16 @@ class RuntimeManager:
                     "legacy data image is missing or invalid",
                     source=source,
                 )
+            if (
+                int(source["logicalSizeBytes"]) > CANONICAL_DATA_SIZE_BYTES
+                or int(source["filesystemSizeBytes"])
+                > int(source["logicalSizeBytes"])
+            ):
+                return self._storage_error(
+                    "storage_size_unsafe",
+                    "legacy data image exceeds canonical capacity",
+                    source=source,
+                )
             backup_image = ""
             backup_uuid = ""
             backup_size = 0
@@ -1065,15 +1403,24 @@ class RuntimeManager:
                         "tagged data volume exists without a valid data image",
                         target=target,
                     )
+                if (
+                    int(target["logicalSizeBytes"]) > CANONICAL_DATA_SIZE_BYTES
+                    or int(target["filesystemSizeBytes"])
+                    > int(target["logicalSizeBytes"])
+                ):
+                    return self._storage_error(
+                        "storage_size_unsafe",
+                        "tagged data image exceeds canonical capacity",
+                        target=target,
+                    )
                 if target["filesystemUuid"] != source["filesystemUuid"]:
                     transaction = secrets.token_hex(16)
                     backup_image = backup_image_name(transaction)
                     backup_uuid = target["filesystemUuid"]
-                    backup_size = target["sizeBytes"]
+                    backup_size = int(target["logicalSizeBytes"])
                     state = store.pending(
                         "legacy",
                         transaction_id=transaction,
-                        size_bytes=source["sizeBytes"],
                         legacy_volume=legacy["volumeName"],
                         legacy_filesystem_uuid=source["filesystemUuid"],
                         backup_image=backup_image,
@@ -1083,7 +1430,6 @@ class RuntimeManager:
             if state is None:
                 state = store.pending(
                     "legacy",
-                    size_bytes=source["sizeBytes"],
                     legacy_volume=legacy["volumeName"],
                     legacy_filesystem_uuid=source["filesystemUuid"],
                 )
@@ -1099,7 +1445,25 @@ class RuntimeManager:
                         "existing instance volume has no valid data image",
                         image=adopted,
                     )
-                state = store.pending("adopted", size_bytes=adopted["sizeBytes"])
+                if (
+                    int(adopted["logicalSizeBytes"]) > CANONICAL_DATA_SIZE_BYTES
+                    or int(adopted["filesystemSizeBytes"])
+                    > int(adopted["logicalSizeBytes"])
+                ):
+                    return self._storage_error(
+                        "storage_size_unsafe",
+                        "refusing to adopt an oversized or inconsistent data image",
+                        image=adopted,
+                    )
+                state = store.pending(
+                    "adopted",
+                    filesystem_uuid=str(adopted["filesystemUuid"]),
+                    observed_logical_size_bytes=int(adopted["logicalSizeBytes"]),
+                    observed_filesystem_size_bytes=int(adopted["filesystemSizeBytes"]),
+                    host_allocated_bytes=int(adopted["allocatedBytes"]),
+                    growth=True,
+                )
+                return self._converge_storage_growth(store, state, adopted)
 
         if state["source"] == "legacy":
             source_volume, _ = self._inspect_docker_object(
@@ -1115,7 +1479,7 @@ class RuntimeManager:
                     "storage_legacy_invalid",
                     "pending legacy data volume is missing or not local",
                 )
-            attachments, attachment_status = self._legacy_volume_attachments(
+            attachments, attachment_status = self._volume_attachments(
                 state["legacyVolume"],
             )
             if attachments is None:
@@ -1152,7 +1516,10 @@ class RuntimeManager:
                 not source_image.get("ok")
                 or source_image.get("filesystemUuid")
                 != state["legacyFilesystemUuid"]
-                or source_image.get("sizeBytes") != state["sizeBytes"]
+                or int(source_image.get("logicalSizeBytes", 0))
+                > CANONICAL_DATA_SIZE_BYTES
+                or int(source_image.get("filesystemSizeBytes", 0))
+                > int(source_image.get("logicalSizeBytes", 0))
             ):
                 return self._storage_error(
                     "storage_legacy_invalid",
@@ -1181,10 +1548,36 @@ class RuntimeManager:
                 transaction_id=state["transactionId"],
             )
         elif state["source"] == "adopted":
-            action = self._run_storage_image_action(
-                "preserve",
-                transaction_id=state["transactionId"],
-            )
+            adopted = self._inspect_volume_image(volume)
+            if (
+                adopted.get("ok") is not True
+                or int(adopted.get("logicalSizeBytes", 0)) > CANONICAL_DATA_SIZE_BYTES
+                or int(adopted.get("filesystemSizeBytes", 0))
+                > int(adopted.get("logicalSizeBytes", 0))
+            ):
+                return self._storage_error(
+                    "storage_image_invalid",
+                    "pending adopted data image is invalid",
+                    image=adopted,
+                )
+            try:
+                state = store.pending(
+                    "adopted",
+                    transaction_id=str(state["transactionId"]),
+                    filesystem_uuid=str(adopted["filesystemUuid"]),
+                    observed_logical_size_bytes=int(adopted["logicalSizeBytes"]),
+                    observed_filesystem_size_bytes=int(adopted["filesystemSizeBytes"]),
+                    host_allocated_bytes=int(adopted["allocatedBytes"]),
+                    growth=True,
+                )
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
+                if isinstance(exc, StorageError):
+                    return exc.as_dict()
+                return self._storage_error(
+                    "storage_state_invalid",
+                    "cannot resume adopted storage transaction",
+                )
+            return self._converge_storage_growth(store, state, adopted)
         else:
             action = self._run_storage_image_action(
                 "migrate",
@@ -1202,10 +1595,13 @@ class RuntimeManager:
                 storage=public_storage_state(state, healthy=False, error=code),
                 imageAction=action,
             )
-        if action.get("sizeBytes") != state["sizeBytes"]:
+        if (
+            action.get("logicalSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+            or action.get("filesystemSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+        ):
             return self._storage_error(
                 "storage_identity_mismatch",
-                "instance data image size changed during transaction",
+                "instance data image geometry changed during transaction",
                 storage=public_storage_state(state, healthy=False, error="storage_identity_mismatch"),
                 imageAction=action,
             )
@@ -1216,11 +1612,7 @@ class RuntimeManager:
                 imageAction=action,
             )
         try:
-            committed = store.commit(
-                state,
-                str(action["filesystemUuid"]),
-                int(action["sizeBytes"]),
-            )
+            committed = store.commit(state, action)
         except (StorageError, KeyError, TypeError, ValueError) as exc:
             if isinstance(exc, StorageError):
                 return exc.as_dict()
@@ -1237,11 +1629,15 @@ class RuntimeManager:
 
     def _android_boot_command(self) -> list[str]:
         return [
-            "androidboot.redroid_width=1080",
-            "androidboot.redroid_height=1920",
-            "androidboot.redroid_dpi=480",
+            "androidboot.redroid_width=1440",
+            "androidboot.redroid_height=3120",
+            "androidboot.redroid_dpi=560",
+            "androidboot.redroid_fps=120",
+            "androidboot.hardware=raven",
+            "androidboot.hardware.sku=G8V0U",
             f"service.adb.tcp.port={self.lease.android_adb_port}",
             "androidboot.use_memfd=true",
+            "androidboot.use_redroid_c2=1",
             "androidboot.mode=normal",
         ]
 
@@ -2379,6 +2775,9 @@ class RuntimeManager:
             if self.lease.android_adb_port != 5555:
                 result["dockerAdbPortSwitch"] = self.switch_adbd_port_via_docker()
                 required.append(result["dockerAdbPortSwitch"])
+            if not already_running:
+                result["adbDisconnectStale"] = self.adb_disconnect()
+                required.append(result["adbDisconnectStale"])
             result["adbConnect"] = self.adb_connect()
             result["adbWait"] = self.adb_wait(timeout_sec=90)
             if self.lease.android_adb_port != 5555 and not result["adbWait"].get("ok"):
@@ -2508,10 +2907,20 @@ class RuntimeManager:
         required.append(result["proxyConverged"])
         result["imageProtectionStatus"] = self.image_protection_status()
         required.append(result["imageProtectionStatus"])
+        current_container, _ = self._inspect_docker_object(
+            "container",
+            self.lease.container_name,
+        )
+        result["runtimeMemory"] = self.runtime_memory_status(current_container)
+        required.append(result["runtimeMemory"])
         result["ok"] = all(bool(step.get("ok")) for step in required)
         result["ready"] = bool(result["ok"] and result["proxyConverged"].get("ok"))
         if not result["ok"]:
-            result["error"] = "one or more required runtime startup steps failed"
+            if result["runtimeMemory"].get("oomKilled") is True:
+                result["error"] = "runtime_oom_killed"
+                result["message"] = result["runtimeMemory"]["message"]
+            else:
+                result["error"] = "one or more required runtime startup steps failed"
         return result
 
     def stop(self) -> dict[str, Any]:
@@ -2661,7 +3070,9 @@ class RuntimeManager:
         if (
             not image.get("ok")
             or image.get("filesystemUuid") != state["filesystemUuid"]
-            or image.get("sizeBytes") != state["sizeBytes"]
+            or int(image.get("logicalSizeBytes", 0)) > CANONICAL_DATA_SIZE_BYTES
+            or int(image.get("filesystemSizeBytes", 0))
+            > int(image.get("logicalSizeBytes", 0))
         ):
             return {
                 "ok": False,
@@ -2673,6 +3084,20 @@ class RuntimeManager:
                     error="storage_identity_mismatch",
                 ),
             }
+        if (
+            image.get("logicalSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+            or image.get("filesystemSizeBytes") != CANONICAL_DATA_SIZE_BYTES
+        ):
+            return {
+                "ok": False,
+                "volume": self.lease.volume_name,
+                "image": image,
+                **public_storage_state(
+                    state,
+                    healthy=False,
+                    error="storage_growth_required",
+                ),
+            }
         backup_status: Optional[dict[str, Any]] = None
         if state["backupImage"]:
             backup_status = self._inspect_volume_image(volume, state["backupImage"])
@@ -2680,7 +3105,7 @@ class RuntimeManager:
                 not backup_status.get("ok")
                 or backup_status.get("filesystemUuid")
                 != state["backupFilesystemUuid"]
-                or backup_status.get("sizeBytes") != state["backupSizeBytes"]
+                or backup_status.get("logicalSizeBytes") != state["backupSizeBytes"]
             ):
                 return {
                     "ok": False,
@@ -2699,6 +3124,11 @@ class RuntimeManager:
             "image": image,
             "backupImage": backup_status,
             **public_storage_state(state, healthy=True),
+            **(
+                {"warning": image["warning"]}
+                if isinstance(image.get("warning"), str)
+                else {}
+            ),
         }
 
     def google_services_status(
@@ -2955,6 +3385,7 @@ class RuntimeManager:
             self.lease.container_name,
         )
         adb_stopped = {"ok": False, "error": "container not running"}
+        runtime_memory = self.runtime_memory_status(container)
         if container is None:
             return {
                 "ok": storage.get("ok") is True,
@@ -2965,6 +3396,7 @@ class RuntimeManager:
                 "storage": storage,
                 "identity": identity,
                 "googleServices": google_services,
+                "runtimeMemory": runtime_memory,
             }
         if not container or not self._container_has_lease_owner(container):
             return {
@@ -2995,7 +3427,9 @@ class RuntimeManager:
             adb_state = self.adb(["get-state"])
         spec_matches = self._container_matches_lease(container)
         return {
-            "ok": proc.returncode == 0 and storage.get("ok") is True,
+            "ok": proc.returncode == 0
+            and storage.get("ok") is True
+            and runtime_memory.get("ok") is True,
             "running": running,
             "runtimeSpecMatches": spec_matches,
             "rows": rows,
@@ -3004,6 +3438,7 @@ class RuntimeManager:
             "storage": storage,
             "identity": identity,
             "googleServices": google_services,
+            "runtimeMemory": runtime_memory,
         }
 
     def adb(self, args: list[str], timeout: Optional[float] = None) -> dict[str, Any]:
@@ -3044,6 +3479,23 @@ class RuntimeManager:
             ]
             stdout = "\n".join(lines) + ("\n" if lines else "")
         return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": stdout, "stderr": proc.stderr, "command": cmd}
+
+    def adb_disconnect(self) -> dict[str, Any]:
+        """Drop only this instance's transport before reconnecting a new container."""
+        adb_bin = which("adb")
+        if adb_bin is None:
+            return {"ok": False, "error": "adb not found"}
+        try:
+            proc = run([adb_bin, "disconnect", self.adb_target], timeout=5)
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "command": [adb_bin, "disconnect", self.adb_target],
+        }
 
     def adb_connect(self) -> dict[str, Any]:
         adb_bin = which("adb")

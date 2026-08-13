@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <new>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -176,101 +177,59 @@ bool addCharacteristicKeyList(MetadataBuilder* builder, std::vector<int32_t>* ke
                         keys->data(), keys->size());
 }
 
-struct CameraOutputSize {
-    int32_t width;
-    int32_t height;
-    int64_t blobStallDurationNs;
-};
-
 constexpr std::array<int32_t, 3> kStreamFormats = {
         kBlobFormat,
         kYuv420Format,
         kImplementationDefinedFormat,
 };
 
-constexpr std::array<CameraOutputSize, 8> kCameraOutputSizes = {{
-        {1920, 1080, 100'000'000LL},
-        {1440, 1080, 90'000'000LL},
-        {1280, 960, 80'000'000LL},
-        {1280, 720, 70'000'000LL},
-        {1024, 768, 60'000'000LL},
-        {800, 600, 50'000'000LL},
-        {640, 480, 30'000'000LL},
-        {320, 240, 15'000'000LL},
-}};
-
-constexpr size_t kStreamTupleValueCount =
-        kStreamFormats.size() * kCameraOutputSizes.size() * 4;
-
-constexpr std::array<int32_t, kStreamTupleValueCount> makeStreamConfigurations() {
-    std::array<int32_t, kStreamTupleValueCount> values{};
-    size_t index = 0;
-    for (const int32_t format : kStreamFormats) {
-        for (const CameraOutputSize& size : kCameraOutputSizes) {
-            values[index++] = format;
-            values[index++] = size.width;
-            values[index++] = size.height;
-            values[index++] = 0;  // output stream
-        }
+bool buildStreamTables(const CameraProfile& profile,
+                       std::vector<int32_t>* configurations,
+                       std::vector<int64_t>* minimumFrameDurations,
+                       std::vector<int64_t>* stallDurations,
+                       std::string* error) {
+    if (!cameraProfileIsSafe(profile) || configurations == nullptr ||
+        minimumFrameDurations == nullptr || stallDurations == nullptr) {
+        return fail(error, "camera profile stream table is invalid");
     }
-    return values;
-}
-
-constexpr std::array<int64_t, kStreamTupleValueCount> makeMinFrameDurations() {
-    std::array<int64_t, kStreamTupleValueCount> values{};
-    size_t index = 0;
-    for (const int32_t format : kStreamFormats) {
-        for (const CameraOutputSize& size : kCameraOutputSizes) {
-            values[index++] = format;
-            values[index++] = size.width;
-            values[index++] = size.height;
-            values[index++] = kNominalFrameDurationNs;
+    configurations->clear();
+    minimumFrameDurations->clear();
+    stallDurations->clear();
+    const size_t maximumValues =
+            kStreamFormats.size() * profile.outputSizeCount * 4U;
+    try {
+        configurations->reserve(maximumValues);
+        minimumFrameDurations->reserve(maximumValues);
+        stallDurations->reserve(maximumValues);
+        for (const int32_t format : kStreamFormats) {
+            const uint8_t requiredMask = outputFormatMask(format);
+            for (size_t index = 0; index < profile.outputSizeCount; ++index) {
+                const CameraOutputSize& size = profile.outputSizes[index];
+                if ((size.formatMask & requiredMask) == 0) continue;
+                configurations->insert(configurations->end(),
+                        {format, size.width, size.height, 0});
+                minimumFrameDurations->insert(minimumFrameDurations->end(),
+                        {format, size.width, size.height,
+                         kNominalFrameDurationNs});
+                stallDurations->insert(stallDurations->end(),
+                        {format, size.width, size.height,
+                         format == kBlobFormat
+                                 ? size.blobStallDurationNs : 0});
+            }
         }
+    } catch (const std::bad_alloc&) {
+        configurations->clear();
+        minimumFrameDurations->clear();
+        stallDurations->clear();
+        return fail(error, "camera profile stream table allocation failed");
     }
-    return values;
-}
-
-constexpr std::array<int64_t, kStreamTupleValueCount> makeStallDurations() {
-    std::array<int64_t, kStreamTupleValueCount> values{};
-    size_t index = 0;
-    for (const int32_t format : kStreamFormats) {
-        for (const CameraOutputSize& size : kCameraOutputSizes) {
-            values[index++] = format;
-            values[index++] = size.width;
-            values[index++] = size.height;
-            values[index++] = format == kBlobFormat ? size.blobStallDurationNs : 0;
-        }
-    }
-    return values;
-}
-
-constexpr bool outputSizesAreValid() {
-    for (size_t index = 0; index < kCameraOutputSizes.size(); ++index) {
-        const CameraOutputSize& size = kCameraOutputSizes[index];
-        if (size.width <= 0 || size.height <= 0 || size.width > 1920 ||
-            size.height > 1080) {
-            return false;
-        }
-        if (index != 0) {
-            const CameraOutputSize& previous = kCameraOutputSizes[index - 1];
-            const int64_t previousArea =
-                    static_cast<int64_t>(previous.width) * previous.height;
-            const int64_t area = static_cast<int64_t>(size.width) * size.height;
-            if (previousArea < area) return false;
-        }
+    if (configurations->empty() ||
+        configurations->size() != minimumFrameDurations->size() ||
+        configurations->size() != stallDurations->size()) {
+        return fail(error, "camera profile stream tables are inconsistent");
     }
     return true;
 }
-
-constexpr auto kStreamConfigurations = makeStreamConfigurations();
-constexpr auto kMinFrameDurations = makeMinFrameDurations();
-constexpr auto kStallDurations = makeStallDurations();
-
-static_assert(kCameraOutputSizes.size() == 8);
-static_assert(outputSizesAreValid());
-static_assert(kStreamConfigurations.size() == 3 * 8 * 4);
-static_assert(kMinFrameDurations.size() == kStreamConfigurations.size());
-static_assert(kStallDurations.size() == kStreamConfigurations.size());
 
 constexpr std::array<int32_t, 26> kAvailableRequestKeys = {
         keyValue(MetadataTag::ANDROID_COLOR_CORRECTION_ABERRATION_MODE),
@@ -301,7 +260,7 @@ constexpr std::array<int32_t, 26> kAvailableRequestKeys = {
         keyValue(MetadataTag::ANDROID_STATISTICS_HOT_PIXEL_MAP_MODE),
 };
 
-constexpr std::array<int32_t, 36> kAvailableResultKeys = {
+constexpr std::array<int32_t, 38> kAvailableResultKeys = {
         keyValue(MetadataTag::ANDROID_COLOR_CORRECTION_ABERRATION_MODE),
         keyValue(MetadataTag::ANDROID_CONTROL_AE_ANTIBANDING_MODE),
         keyValue(MetadataTag::ANDROID_CONTROL_AE_EXPOSURE_COMPENSATION),
@@ -325,6 +284,8 @@ constexpr std::array<int32_t, 36> kAvailableResultKeys = {
         keyValue(MetadataTag::ANDROID_FLASH_STATE),
         keyValue(MetadataTag::ANDROID_JPEG_ORIENTATION),
         keyValue(MetadataTag::ANDROID_JPEG_QUALITY),
+        keyValue(MetadataTag::ANDROID_LENS_APERTURE),
+        keyValue(MetadataTag::ANDROID_LENS_FOCAL_LENGTH),
         keyValue(MetadataTag::ANDROID_LENS_OPTICAL_STABILIZATION_MODE),
         keyValue(MetadataTag::ANDROID_LENS_STATE),
         keyValue(MetadataTag::ANDROID_NOISE_REDUCTION_MODE),
@@ -370,37 +331,51 @@ static_assert(keysAreStrictlyIncreasing(kAvailableResultKeys));
 static_assert(requestKeysAreResultKeys(kAvailableRequestKeys, kAvailableResultKeys));
 
 
-bool validateSettings(const RequestSettings& settings, std::string* error) {
-    const auto byteInRange = [](uint8_t value, uint8_t maximum) {
-        return value <= maximum;
-    };
+bool validateSettings(const CameraProfile& profile,
+                      const RequestSettings& settings, std::string* error) {
+    if (!cameraProfileIsSafe(profile)) {
+        return fail(error, "camera profile is invalid");
+    }
     const auto unsupported = [error](const char* name, uint8_t value) {
         return fail(error, std::string(name) + " value " +
                            std::to_string(static_cast<unsigned int>(value)) +
                            " is unsupported");
     };
-    if (!byteInRange(settings.captureIntent, 6)) {
+    if (settings.captureIntent > 5) {
         return fail(error, "capture intent is out of range");
     }
-    if (settings.controlMode > 1) return unsupported("control mode", settings.controlMode);
+    if (settings.controlMode > 1) {
+        return unsupported("control mode", settings.controlMode);
+    }
     if (settings.aeMode != 1) return unsupported("AE mode", settings.aeMode);
     if (settings.aeAntibandingMode > 3) {
         return unsupported("AE antibanding mode", settings.aeAntibandingMode);
     }
-    if (settings.aeLock > 1) return unsupported("AE lock", settings.aeLock);
+    if (settings.aeLock != 0) return unsupported("AE lock", settings.aeLock);
     if (settings.aePrecaptureTrigger > 2) {
-        return unsupported("AE precapture trigger", settings.aePrecaptureTrigger);
+        return unsupported("AE precapture trigger",
+                           settings.aePrecaptureTrigger);
     }
-    if (settings.afMode > 1) return unsupported("AF mode", settings.afMode);
-    if (settings.afTrigger > 2) return unsupported("AF trigger", settings.afTrigger);
+    if (settings.afMode != 0) return unsupported("AF mode", settings.afMode);
+    if (settings.afTrigger != 0) {
+        return unsupported("AF trigger", settings.afTrigger);
+    }
     if (settings.awbMode != 1) return unsupported("AWB mode", settings.awbMode);
-    if (settings.awbLock > 1) return unsupported("AWB lock", settings.awbLock);
-    if (settings.effectMode != 0) return unsupported("effect mode", settings.effectMode);
-    if (settings.sceneMode != 0) return unsupported("scene mode", settings.sceneMode);
-    if (settings.videoStabilizationMode != 0) {
-        return unsupported("video stabilization mode", settings.videoStabilizationMode);
+    if (settings.awbLock != 0) return unsupported("AWB lock", settings.awbLock);
+    if (settings.effectMode != 0) {
+        return unsupported("effect mode", settings.effectMode);
     }
-    if (settings.flashMode != 0) return unsupported("flash mode", settings.flashMode);
+    if (settings.sceneMode != 0) {
+        return unsupported("scene mode", settings.sceneMode);
+    }
+    if (settings.videoStabilizationMode != 0) {
+        return unsupported("video stabilization mode",
+                           settings.videoStabilizationMode);
+    }
+    if (settings.flashMode > 2 ||
+        (!profile.flashAvailable && settings.flashMode != 0)) {
+        return unsupported("flash mode", settings.flashMode);
+    }
     if (settings.aberrationMode != 0) {
         return unsupported("aberration mode", settings.aberrationMode);
     }
@@ -427,8 +402,9 @@ bool validateSettings(const RequestSettings& settings, std::string* error) {
         settings.aeTargetFpsRange != std::array<int32_t, 2>{30, 30}) {
         return fail(error, "target frame-rate range is unsupported");
     }
-
-    if (settings.cropRegion != std::array<int32_t, 4>{0, 0, 1920, 1080}) {
+    const std::array<int32_t, 4> activeArray = {
+            0, 0, profile.pixelWidth, profile.pixelHeight};
+    if (settings.cropRegion != activeArray) {
         return fail(error, "crop region must match the uncropped active array");
     }
     if (settings.jpegOrientation != 0 && settings.jpegOrientation != 90 &&
@@ -550,18 +526,30 @@ bool claimEntry(std::array<bool, static_cast<size_t>(ParsedField::Count)>* seen,
 
 }  // namespace
 
-bool buildStaticMetadata(bool frontFacing, CameraMetadata* output, std::string* error) {
+bool buildStaticMetadata(const CameraProfile& profile, CameraMetadata* output,
+                         std::string* error) {
     if (error != nullptr) error->clear();
     if (output == nullptr) return fail(error, "null static metadata output");
     output->metadata.clear();
+    if (!cameraProfileIsSafe(profile)) {
+        return fail(error, "camera profile is invalid");
+    }
+
+    std::vector<int32_t> streamConfigurations;
+    std::vector<int64_t> minimumFrameDurations;
+    std::vector<int64_t> stallDurations;
+    if (!buildStreamTables(profile, &streamConfigurations,
+                           &minimumFrameDurations, &stallDurations, error)) {
+        return false;
+    }
 
     MetadataBuilder builder;
     std::vector<int32_t> characteristicKeys;
-    characteristicKeys.reserve(64);
+    characteristicKeys.reserve(72);
 
     const std::array<uint8_t, 1> offModes = {0};
     const std::array<uint8_t, 2> controlModes = {0, 1};
-    const std::array<uint8_t, 2> afModes = {0, 1};
+    const std::array<uint8_t, 1> afModes = {0};
     const std::array<uint8_t, 4> aeAntibandingModes = {0, 1, 2, 3};
     const std::array<uint8_t, 1> aeModes = {1};
     const std::array<uint8_t, 1> awbModes = {1};
@@ -571,15 +559,21 @@ bool buildStaticMetadata(bool frontFacing, CameraMetadata* output, std::string* 
     const std::array<int32_t, 2> thumbnailSizes = {0, 0};
     const std::array<int32_t, 4> fpsRanges = {15, 30, 30, 30};
     const std::array<int32_t, 3> maxOutputStreams = {0, 2, 1};
-    const std::array<int32_t, 4> activeArray = {0, 0, 1920, 1080};
-    const std::array<int32_t, 2> pixelArray = {1920, 1080};
+    const std::array<int32_t, 4> activeArray = {
+            0, 0, profile.pixelWidth, profile.pixelHeight};
+    const std::array<int32_t, 2> pixelArray = {
+            profile.pixelWidth, profile.pixelHeight};
     const std::array<int32_t, 1> testPatterns = {0};
-    const std::array<float, 2> physicalSize = {5.76f, 4.29f};
-    const std::array<float, 1> focalLengths = {4.38f};
+    const std::array<float, 2> physicalSize = {
+            profile.physicalWidthMm, profile.physicalHeightMm};
+    const std::array<float, 1> focalLengths = {profile.focalLengthMm};
+    const std::array<float, 1> apertures = {profile.aperture};
     const std::array<float, 1> maximumDigitalZoom = {1.0f};
     const std::array<int32_t, 2> sensitivityRange = {50, 800};
-    const std::array<int64_t, 2> exposureTimeRange = {100'000LL, 66'666'666LL};
-    const std::array<uint8_t, 1> capabilities = {0};  // BACKWARD_COMPATIBLE
+    const std::array<int64_t, 2> exposureTimeRange = {
+            100'000LL, 66'666'666LL};
+    const std::array<uint8_t, 1> capabilities = {
+            0};  // BACKWARD_COMPATIBLE
 
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES,
@@ -611,51 +605,68 @@ bool buildStaticMetadata(bool frontFacing, CameraMetadata* output, std::string* 
                       MetadataTag::ANDROID_CONTROL_AWB_AVAILABLE_MODES, awbModes);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_CONTROL_MAX_REGIONS, maxRegions);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_CONTROL_AE_LOCK_AVAILABLE, 1);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_CONTROL_AWB_LOCK_AVAILABLE, 1);
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_CONTROL_AE_LOCK_AVAILABLE, 0);
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_CONTROL_AWB_LOCK_AVAILABLE, 0);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_CONTROL_AVAILABLE_MODES, controlModes);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_EDGE_AVAILABLE_EDGE_MODES, offModes);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_FLASH_INFO_AVAILABLE, 0);
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_FLASH_INFO_AVAILABLE,
+            profile.flashAvailable ? 1 : 0);
+    if (profile.flashAvailable) {
+        addCharacteristicOne<int32_t>(
+                &builder, &characteristicKeys,
+                MetadataTag::ANDROID_FLASH_INFO_STRENGTH_MAXIMUM_LEVEL, 1);
+        addCharacteristicOne<int32_t>(
+                &builder, &characteristicKeys,
+                MetadataTag::ANDROID_FLASH_INFO_STRENGTH_DEFAULT_LEVEL, 1);
+    }
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES,
                       offModes);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_JPEG_AVAILABLE_THUMBNAIL_SIZES,
                       thumbnailSizes);
-    addCharacteristicOne<int32_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_JPEG_MAX_SIZE, 13 * 1024 * 1024);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_LENS_FACING,
-                                  frontFacing ? 0 : 1);
+    addCharacteristicOne<int32_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_JPEG_MAX_SIZE, profile.jpegMaxSize);
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys, MetadataTag::ANDROID_LENS_FACING,
+            profile.frontFacing ? 0 : 1);
+    addCharacteristic(&builder, &characteristicKeys,
+                      MetadataTag::ANDROID_LENS_INFO_AVAILABLE_APERTURES,
+                      apertures);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS,
                       focalLengths);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION,
                       offModes);
-    addCharacteristicOne<float>(&builder, &characteristicKeys,
-                                MetadataTag::ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE,
-                                0.1f);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION,
-                                  1);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
-                      offModes);
+    addCharacteristicOne<float>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE, 0.0f);
+    addCharacteristic(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
+            offModes);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_REQUEST_MAX_NUM_OUTPUT_STREAMS,
                       maxOutputStreams);
-    addCharacteristicOne<int32_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_REQUEST_MAX_NUM_INPUT_STREAMS, 0);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_REQUEST_PIPELINE_MAX_DEPTH, 4);
-    addCharacteristicOne<int32_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_REQUEST_PARTIAL_RESULT_COUNT, 1);
+    addCharacteristicOne<int32_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_REQUEST_MAX_NUM_INPUT_STREAMS, 0);
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_REQUEST_PIPELINE_MAX_DEPTH, 4);
+    addCharacteristicOne<int32_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_REQUEST_PARTIAL_RESULT_COUNT, 1);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_REQUEST_AVAILABLE_CAPABILITIES,
                       capabilities);
@@ -671,37 +682,48 @@ bool buildStaticMetadata(bool frontFacing, CameraMetadata* output, std::string* 
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_SCALER_AVAILABLE_MAX_DIGITAL_ZOOM,
                       maximumDigitalZoom);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
-                      kStreamConfigurations);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS,
-                      kMinFrameDurations);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_SCALER_AVAILABLE_STALL_DURATIONS,
-                      kStallDurations);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_SCALER_CROPPING_TYPE, 0);
-    addCharacteristicOne<int32_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_SENSOR_ORIENTATION,
-                                  frontFacing ? 270 : 90);
+    addCharacteristic(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
+            streamConfigurations.data(), streamConfigurations.size());
+    addCharacteristic(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS,
+            minimumFrameDurations.data(), minimumFrameDurations.size());
+    addCharacteristic(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SCALER_AVAILABLE_STALL_DURATIONS,
+            stallDurations.data(), stallDurations.size());
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SCALER_CROPPING_TYPE, 0);
+    addCharacteristicOne<int32_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SENSOR_ORIENTATION,
+            profile.sensorOrientation);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_SENSOR_AVAILABLE_TEST_PATTERN_MODES,
                       testPatterns);
     addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE, activeArray);
-    addCharacteristicOne<int64_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_SENSOR_INFO_MAX_FRAME_DURATION,
-                                  66'666'666LL);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_SENSOR_INFO_PHYSICAL_SIZE, physicalSize);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE, pixelArray);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE, 1);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE,
+                      MetadataTag::ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE,
                       activeArray);
+    addCharacteristicOne<int64_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SENSOR_INFO_MAX_FRAME_DURATION,
+            66'666'666LL);
+    addCharacteristic(&builder, &characteristicKeys,
+                      MetadataTag::ANDROID_SENSOR_INFO_PHYSICAL_SIZE,
+                      physicalSize);
+    addCharacteristic(&builder, &characteristicKeys,
+                      MetadataTag::ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE,
+                      pixelArray);
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE, 1);
+    addCharacteristic(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE,
+            activeArray);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_SENSOR_INFO_SENSITIVITY_RANGE,
                       sensitivityRange);
@@ -710,11 +732,13 @@ bool buildStaticMetadata(bool frontFacing, CameraMetadata* output, std::string* 
                       exposureTimeRange);
     addCharacteristic(&builder, &characteristicKeys,
                       MetadataTag::ANDROID_SHADING_AVAILABLE_MODES, offModes);
-    addCharacteristic(&builder, &characteristicKeys,
-                      MetadataTag::ANDROID_STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES,
-                      offModes);
-    addCharacteristicOne<int32_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_STATISTICS_INFO_MAX_FACE_COUNT, 0);
+    addCharacteristic(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES,
+            offModes);
+    addCharacteristicOne<int32_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_STATISTICS_INFO_MAX_FACE_COUNT, 0);
     addCharacteristic(
             &builder, &characteristicKeys,
             MetadataTag::ANDROID_STATISTICS_INFO_AVAILABLE_HOT_PIXEL_MAP_MODES,
@@ -723,22 +747,27 @@ bool buildStaticMetadata(bool frontFacing, CameraMetadata* output, std::string* 
             &builder, &characteristicKeys,
             MetadataTag::ANDROID_STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES,
             offModes);
-    addCharacteristicOne<uint8_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL, 0);
-    addCharacteristicOne<int32_t>(&builder, &characteristicKeys,
-                                  MetadataTag::ANDROID_SYNC_MAX_LATENCY, -1);
+    addCharacteristicOne<uint8_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL, 0);
+    addCharacteristicOne<int32_t>(
+            &builder, &characteristicKeys,
+            MetadataTag::ANDROID_SYNC_MAX_LATENCY, -1);
 
     addCharacteristicKeyList(&builder, &characteristicKeys);
     return builder.finish(output, error);
 }
 
-bool buildDefaultRequest(RequestTemplate requestTemplate, CameraMetadata* output,
+bool buildDefaultRequest(const CameraProfile& profile,
+                         RequestTemplate requestTemplate, CameraMetadata* output,
                          std::string* error) {
     if (error != nullptr) error->clear();
     if (output == nullptr) return fail(error, "null default request output");
     output->metadata.clear();
 
     RequestSettings settings;
+    settings.cropRegion = {
+            0, 0, profile.pixelWidth, profile.pixelHeight};
     switch (requestTemplate) {
         case RequestTemplate::PREVIEW:
             settings.captureIntent = 1;
@@ -755,22 +784,18 @@ bool buildDefaultRequest(RequestTemplate requestTemplate, CameraMetadata* output
         case RequestTemplate::ZERO_SHUTTER_LAG:
             settings.captureIntent = 5;
             break;
-        case RequestTemplate::MANUAL:
-            settings.captureIntent = 6;
-            settings.controlMode = 0;
-            settings.afMode = 0;
-            break;
         default:
             return fail(error, "unsupported default request template");
     }
 
-    if (!validateSettings(settings, error)) return false;
+    if (!validateSettings(profile, settings, error)) return false;
     MetadataBuilder builder;
     addImplementedControls(&builder, settings);
     return builder.finish(output, error);
 }
 
-bool parseRequestSettings(const CameraMetadata& metadata,
+bool parseRequestSettings(const CameraProfile& profile,
+                          const CameraMetadata& metadata,
                           const RequestSettings* previous,
                           RequestSettings* output, std::string* error) {
     if (error != nullptr) error->clear();
@@ -779,7 +804,7 @@ bool parseRequestSettings(const CameraMetadata& metadata,
         if (previous == nullptr) {
             return fail(error, "empty request settings have no previous settings");
         }
-        if (!validateSettings(*previous, error)) return false;
+        if (!validateSettings(profile, *previous, error)) return false;
         *output = *previous;
         return true;
     }
@@ -788,6 +813,8 @@ bool parseRequestSettings(const CameraMetadata& metadata,
     if (!checked.copyFrom(metadata, error)) return false;
 
     RequestSettings parsed;
+    parsed.cropRegion = {
+            0, 0, profile.pixelWidth, profile.pixelHeight};
     std::array<bool, static_cast<size_t>(ParsedField::Count)> seen{};
     const size_t entryCount = get_camera_metadata_entry_count(checked.get());
     for (size_t index = 0; index < entryCount; ++index) {
@@ -941,49 +968,57 @@ bool parseRequestSettings(const CameraMetadata& metadata,
         }
     }
 
-    if (!validateSettings(parsed, error)) return false;
+    if (!validateSettings(profile, parsed, error)) return false;
     *output = std::move(parsed);
     return true;
 }
-
-bool buildResultMetadata(const RequestSettings& settings, const FrameTiming& timing,
-                         CameraMetadata* output, std::string* error) {
+bool buildResultMetadata(const CameraProfile& profile,
+                         const RequestSettings& settings,
+                         const FrameTiming& timing, CameraMetadata* output,
+                         std::string* error) {
     if (error != nullptr) error->clear();
     if (output == nullptr) return fail(error, "null result metadata output");
     output->metadata.clear();
-    if (!validateSettings(settings, error)) return false;
+    if (!validateSettings(profile, settings, error)) return false;
     if (timing.timestampNs < 0 || timing.frameDurationNs <= 0 ||
-        timing.frameDurationNs > 66'666'666LL || timing.exposureTimeNs < 100'000LL ||
-        timing.exposureTimeNs > timing.frameDurationNs || timing.sensitivity < 50 ||
-        timing.sensitivity > 800 || timing.pipelineDepth == 0 ||
-        timing.pipelineDepth > 4) {
+        timing.frameDurationNs > 66'666'666LL ||
+        timing.exposureTimeNs < 100'000LL ||
+        timing.exposureTimeNs > timing.frameDurationNs ||
+        timing.sensitivity < 50 || timing.sensitivity > 800 ||
+        timing.pipelineDepth == 0 || timing.pipelineDepth > 4) {
         return fail(error, "frame timing is outside advertised limits");
     }
 
     MetadataBuilder builder;
     addImplementedControls(&builder, settings);
-
-    const uint8_t aeState = settings.controlMode == 0 ? 0 :
-            (settings.aeLock == 1 ? 3 : 2);  // inactive/locked/converged
-    const uint8_t afState =
-            settings.controlMode == 0 || settings.afMode == 0 || settings.afTrigger == 2
-                    ? 0
-                    : (settings.afTrigger == 1 ? 4 : 0);  // focused-locked/inactive
-    const uint8_t awbState = settings.controlMode == 0 ? 0 :
-            (settings.awbLock == 1 ? 3 : 2);  // inactive/locked/converged
+    const uint8_t aeState =
+            settings.controlMode == 0 ? 0 : 2;  // inactive/converged
+    const uint8_t afState = 0;                  // fixed-focus inactive
+    const uint8_t awbState =
+            settings.controlMode == 0 ? 0 : 2;  // inactive/converged
     builder.addOne(MetadataTag::ANDROID_CONTROL_AE_STATE, aeState);
     builder.addOne(MetadataTag::ANDROID_CONTROL_AF_STATE, afState);
     builder.addOne(MetadataTag::ANDROID_CONTROL_AWB_STATE, awbState);
-    builder.addOne<uint8_t>(MetadataTag::ANDROID_FLASH_STATE, 0);  // unavailable
-    builder.addOne<uint8_t>(MetadataTag::ANDROID_LENS_STATE, 0);   // stationary
+    builder.addOne<uint8_t>(
+            MetadataTag::ANDROID_FLASH_STATE,
+            profile.flashAvailable
+                    ? (settings.flashMode == 0 ? 2 : 3)  // ready/fired
+                    : 0);                               // unavailable
+    builder.addOne<float>(MetadataTag::ANDROID_LENS_APERTURE,
+                          profile.aperture);
+    builder.addOne<float>(MetadataTag::ANDROID_LENS_FOCAL_LENGTH,
+                          profile.focalLengthMm);
+    builder.addOne<uint8_t>(MetadataTag::ANDROID_LENS_STATE, 0);
     builder.addOne(MetadataTag::ANDROID_REQUEST_PIPELINE_DEPTH,
                    timing.pipelineDepth);
     builder.addOne(MetadataTag::ANDROID_SENSOR_EXPOSURE_TIME,
                    timing.exposureTimeNs);
     builder.addOne(MetadataTag::ANDROID_SENSOR_FRAME_DURATION,
                    timing.frameDurationNs);
-    builder.addOne(MetadataTag::ANDROID_SENSOR_SENSITIVITY, timing.sensitivity);
-    builder.addOne(MetadataTag::ANDROID_SENSOR_TIMESTAMP, timing.timestampNs);
+    builder.addOne(MetadataTag::ANDROID_SENSOR_SENSITIVITY,
+                   timing.sensitivity);
+    builder.addOne(MetadataTag::ANDROID_SENSOR_TIMESTAMP,
+                   timing.timestampNs);
     return builder.finish(output, error);
 }
 

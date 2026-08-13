@@ -85,6 +85,7 @@ then pass+=("mcp-tools"); else fail+=("mcp-tools"); fi
 STATIC_SMOKES=(
   smoke-prop-area-rules.py
   smoke-profile-template.py
+  smoke-storage-surfaces.py
   smoke-netctl-source.py
   smoke-native-shim.py
   smoke-rootd-auth.py

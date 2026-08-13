@@ -24,6 +24,12 @@ INSTANCE = "123e4567-e89b-42d3-a456-426614174000"
 EPOCH_1 = location_runtime_epoch("a" * 64)
 EPOCH_2 = location_runtime_epoch("b" * 64)
 EPOCH_3 = location_runtime_epoch("c" * 64)
+# Google Pixel 6 Pro model G8V0U LTE bands. NR/mmWave hardware capability is
+# intentionally excluded because the runtime RIL executes LTE only.
+G8V0U_LTE_BANDS = {
+    1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18, 19, 20, 25, 26, 28, 29,
+    30, 32, 38, 39, 40, 41, 42, 46, 48, 66, 71,
+}
 
 
 def require(value: bool) -> None:
@@ -280,6 +286,7 @@ def test_earfcn_band_roundtrip_matches_aosp_bridge() -> None:
     for country, record in dataset_countries().items():
         bands = {band for carrier in record["carriers"] for band in carrier["bands"]}
         require(bands and bands <= set(AOSP_EARFCN_BANDS))
+        require(bands <= G8V0U_LTE_BANDS)
         for seed in (b"e" * 32, b"f" * 32):
             profile = generate_cellular_profile(country, seed)
             cell = profile["cell"]

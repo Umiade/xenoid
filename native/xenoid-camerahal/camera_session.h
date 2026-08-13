@@ -24,7 +24,7 @@ class CameraSession final
     : public aidl::android::hardware::camera::device::BnCameraDeviceSession {
 public:
     explicit CameraSession(
-            int32_t sensorOrientation,
+            const CameraProfile& profile,
             std::shared_ptr<aidl::android::hardware::camera::device::ICameraDeviceCallback>
                     callback,
             std::function<void()> onClosed) noexcept;

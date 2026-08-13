@@ -16,11 +16,13 @@ Each instance is a logical device with three persistent components:
 
 1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
 2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
-3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 `xenoid-data.img` that is bind-mounted as the container's `/data`.
+3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 backing image (`xenoid-data.img`) that is bind-mounted as the container's `/data`.
 
 `stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
 
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
+
+The storage owner deliberately separates persistence format from device view. Host recovery and growth operate on the ext4 backing image; unprivileged Raven processes observe f2fs consistently through the canonical mount records, userdata by-name alias, libc calls, and the kernel `vfs_statfs` producer used by direct syscalls. UID-below-10000 maintenance paths retain the real backing view.
 
 The runtime preserves Android's per-app SSAID store instead of rewriting it during profile convergence; each signing identity therefore keeps the value Android generated for that device. Profile application updates only the device-wide secure Android ID. The runtime PackageManager patch tolerates only redroid's known unsupported SELinux `restorecon` result while recovering existing `/data` app directories; every other `installd` failure remains fatal.
 
@@ -60,7 +62,7 @@ xenoid stop
 xenoid status
 xenoid daemon health
 xenoid device collect --out .xenoid/device.json
-xenoid device apply examples/fingerprints/sample-profile.json
+xenoid device apply examples/fingerprints/pixel-raven-android13.json
 xenoid automation run examples/automation/tap-home.js
 xenoid camera status --check
 xenoid proxy status --check

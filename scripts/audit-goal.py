@@ -50,8 +50,8 @@ required_files = [
     "scripts/generate-profile-frida.py",
     "scripts/xenoid-js-runner.mjs",
     "scripts/automation-plan.py",
-    "frida/scripts/generated-sample-profile.js",
-    "frida/scripts/generated-service-sample-profile.js",
+    "frida/scripts/generated-raven-profile.js",
+    "frida/scripts/generated-service-raven-profile.js",
     "scripts/generate-service-frida.py",
     "src/xenoid/mock_daemon.py",
     "scripts/make-ota-bundle.sh",
@@ -183,7 +183,7 @@ proc = subprocess.run([str(ROOT / "xenoid"), "automation", "run-host", "examples
 add("automation run-host", proc.returncode == 0 and ("node not found" in proc.stdout or "\"mode\": " in proc.stdout), proc.stdout + proc.stderr)
 
 # Service Frida generation
-proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-service-frida", "examples/fingerprints/sample-profile.json"], text=True, capture_output=True, cwd=ROOT)
+proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-service-frida", "examples/fingerprints/pixel-raven-android13.json"], text=True, capture_output=True, cwd=ROOT)
 service_js = None
 try:
     service_js = pathlib.Path(json.loads(proc.stdout)["out"])
@@ -192,7 +192,7 @@ except Exception:
 add("service frida generation", proc.returncode == 0 and service_js.exists() and "SensorManager" in service_js.read_text() and "BufferedReader" in service_js.read_text(), proc.stdout + proc.stderr)
 
 # Profile Frida generation
-proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-frida", "examples/fingerprints/sample-profile.json"], text=True, capture_output=True, cwd=ROOT)
+proc = subprocess.run([str(ROOT / "xenoid"), "device", "generate-frida", "examples/fingerprints/pixel-raven-android13.json"], text=True, capture_output=True, cwd=ROOT)
 try:
     profile_js = pathlib.Path(json.loads(proc.stdout)["out"])
 except Exception:

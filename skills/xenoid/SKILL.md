@@ -35,11 +35,13 @@ Each instance is a logical device with three persistent components:
 
 1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
 2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
-3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 `xenoid-data.img` that is bind-mounted as the container's `/data`.
+3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 backing image (`xenoid-data.img`) that is bind-mounted as the container's `/data`.
 
 `stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
 
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
+
+Raven applications observe the profile-owned f2fs contract across mount records, the userdata by-name alias, libc filesystem calls, and direct raw syscalls. Root maintenance continues to inspect the real ext4 backing image.
 
 ## Multi-instance operation
 
@@ -86,7 +88,7 @@ Never download the payload implicitly, pass import paths through MCP, copy priva
 
 ```bash
 ./xenoid device collect --out .xenoid/current-device.json
-./xenoid device apply examples/fingerprints/sample-profile.json
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json
 ./xenoid app install /path/on/host/app.apk
 ./xenoid app launch com.example.app/.MainActivity
 ./xenoid app uninstall com.example.app

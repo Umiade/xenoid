@@ -29,16 +29,6 @@ using camera::device::HalStream;
 using camera::device::StreamConfiguration;
 using ndk::ScopedAStatus;
 
-constexpr std::array<std::array<int32_t, 2>, 8> kAdvertisedSizes = {{
-        {1920, 1080},
-        {1440, 1080},
-        {1280, 960},
-        {1280, 720},
-        {1024, 768},
-        {800, 600},
-        {640, 480},
-        {320, 240},
-}};
 
 constexpr int64_t kProducerUsage =
         static_cast<int64_t>(graphics::BufferUsage::CPU_WRITE_OFTEN) |
@@ -56,17 +46,6 @@ bool fail(std::string* error, const char* message) {
     return false;
 }
 
-bool isAdvertisedSize(int32_t width, int32_t height) {
-    for (const auto& size : kAdvertisedSizes) {
-        if (size[0] == width && size[1] == height) return true;
-    }
-    return false;
-}
-
-bool isSupportedFormat(int32_t format) {
-    return format == kBlobFormat || format == kImplementationDefinedFormat ||
-            format == kYuv420Format;
-}
 
 }  // namespace
 
@@ -76,8 +55,9 @@ struct CameraOpenState {
     uint64_t generation = 0;
 };
 
-bool validateStreamConfiguration(const StreamConfiguration& configuration,
-        bool validateStreamIds, std::vector<HalStream>* halStreams,
+bool validateStreamConfiguration(const CameraProfile& profile,
+        const StreamConfiguration& configuration, bool validateStreamIds,
+        std::vector<HalStream>* halStreams,
         std::vector<StreamDescriptor>* streamDescriptors, std::string* error) {
     if (halStreams != nullptr) halStreams->clear();
     if (streamDescriptors != nullptr) streamDescriptors->clear();
@@ -107,8 +87,8 @@ bool validateStreamConfiguration(const StreamConfiguration& configuration,
             }
         }
         const int32_t requestedFormat = static_cast<int32_t>(stream.format);
-        if (!isSupportedFormat(requestedFormat) ||
-                !isAdvertisedSize(stream.width, stream.height)) {
+        if (findCameraOutputSize(profile, requestedFormat,
+                                 stream.width, stream.height) == nullptr) {
             return fail(error, "format and size tuple is not advertised");
         }
         if (requestedFormat == kBlobFormat) {
@@ -180,11 +160,14 @@ bool validateStreamConfiguration(const StreamConfiguration& configuration,
     return true;
 }
 
-CameraDevice::CameraDevice(bool frontFacing)
-    : sensorOrientation_(frontFacing ? 270 : 90),
+CameraDevice::CameraDevice(
+        const CameraProfile& profile,
+        std::function<void(bool, bool)> onTorchStateChanged)
+    : profile_(profile),
+      onTorchStateChanged_(std::move(onTorchStateChanged)),
       openState_(std::make_shared<CameraOpenState>()) {
     std::string error;
-    metadataOk_ = buildStaticMetadata(frontFacing, &characteristics_, &error);
+    metadataOk_ = buildStaticMetadata(profile_, &characteristics_, &error);
 }
 
 ScopedAStatus CameraDevice::getCameraCharacteristics(CameraMetadata* out) {
@@ -208,7 +191,8 @@ ScopedAStatus CameraDevice::getResourceCost(camera::common::CameraResourceCost* 
 ScopedAStatus CameraDevice::isStreamCombinationSupported(
         const StreamConfiguration& streams, bool* out) {
     std::string error;
-    *out = validateStreamConfiguration(streams, false, nullptr, nullptr, &error);
+    *out = validateStreamConfiguration(
+            profile_, streams, false, nullptr, nullptr, &error);
     if (!*out) {
         __android_log_print(ANDROID_LOG_WARN, "camera-provider",
                 "unsupported stream combination: %s; %s", error.c_str(),
@@ -236,16 +220,34 @@ ScopedAStatus CameraDevice::open(
         openState_->open = true;
         openGeneration = ++openState_->generation;
     }
+    {
+        std::lock_guard<std::mutex> lock(torchMutex_);
+        torchOn_ = false;
+    }
+    if (profile_.flashAvailable && onTorchStateChanged_) {
+        onTorchStateChanged_(true, false);
+    }
 
     const std::weak_ptr<CameraOpenState> weakState = openState_;
     try {
+        const auto onTorchStateChanged = onTorchStateChanged_;
+        const bool flashAvailable = profile_.flashAvailable;
         auto session = ndk::SharedRefBase::make<CameraSession>(
-                sensorOrientation_, callback, [weakState, openGeneration] {
+                profile_, callback,
+                [weakState, openGeneration, onTorchStateChanged,
+                 flashAvailable] {
+                    bool closed = false;
                     if (const auto state = weakState.lock()) {
                         std::lock_guard<std::mutex> lock(state->mutex);
-                        if (state->generation == openGeneration) {
+                        if (state->generation == openGeneration &&
+                            state->open) {
                             state->open = false;
+                            closed = true;
                         }
+                    }
+                    if (closed && flashAvailable &&
+                        onTorchStateChanged) {
+                        onTorchStateChanged(false, false);
                     }
                 });
         if (!session->ready()) {
@@ -254,6 +256,9 @@ ScopedAStatus CameraDevice::open(
             if (openState_->generation == openGeneration) {
                 openState_->open = false;
             }
+            if (profile_.flashAvailable && onTorchStateChanged_) {
+                onTorchStateChanged_(false, false);
+            }
             return halError(Status::INTERNAL_ERROR, "camera session initialization failed");
         }
         *out = std::move(session);
@@ -261,6 +266,9 @@ ScopedAStatus CameraDevice::open(
         std::lock_guard<std::mutex> lock(openState_->mutex);
         if (openState_->generation == openGeneration) {
             openState_->open = false;
+        }
+        if (profile_.flashAvailable && onTorchStateChanged_) {
+            onTorchStateChanged_(false, false);
         }
         return halError(Status::INTERNAL_ERROR, "camera session creation failed");
     }
@@ -274,17 +282,46 @@ ScopedAStatus CameraDevice::openInjectionSession(
     return halError(Status::OPERATION_NOT_SUPPORTED, "operation is not supported");
 }
 
-ScopedAStatus CameraDevice::setTorchMode(bool) {
-    return halError(Status::OPERATION_NOT_SUPPORTED, "flash is not available");
+ScopedAStatus CameraDevice::setTorchMode(bool on) {
+    if (!profile_.flashAvailable) {
+        return halError(Status::OPERATION_NOT_SUPPORTED,
+                        "flash is not available");
+    }
+    {
+        std::lock_guard<std::mutex> openLock(openState_->mutex);
+        if (openState_->open) {
+            return halError(Status::CAMERA_IN_USE, "camera is open");
+        }
+    }
+    {
+        std::lock_guard<std::mutex> torchLock(torchMutex_);
+        torchOn_ = on;
+    }
+    if (onTorchStateChanged_) onTorchStateChanged_(false, on);
+    return ScopedAStatus::ok();
 }
 
-ScopedAStatus CameraDevice::turnOnTorchWithStrengthLevel(int32_t) {
-    return halError(Status::OPERATION_NOT_SUPPORTED, "flash is not available");
+ScopedAStatus CameraDevice::turnOnTorchWithStrengthLevel(
+        int32_t torchStrength) {
+    if (!profile_.flashAvailable) {
+        return halError(Status::OPERATION_NOT_SUPPORTED,
+                        "flash is not available");
+    }
+    if (torchStrength != 1) {
+        return halError(Status::ILLEGAL_ARGUMENT,
+                        "torch strength must be one");
+    }
+    return setTorchMode(true);
 }
 
 ScopedAStatus CameraDevice::getTorchStrengthLevel(int32_t* out) {
     *out = 0;
-    return halError(Status::OPERATION_NOT_SUPPORTED, "flash is not available");
+    if (!profile_.flashAvailable) {
+        return halError(Status::OPERATION_NOT_SUPPORTED,
+                        "flash is not available");
+    }
+    *out = 1;
+    return ScopedAStatus::ok();
 }
 
 }  // namespace camera_provider

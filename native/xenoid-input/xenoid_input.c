@@ -53,9 +53,13 @@ struct input_profile {
     int vendor;
     int product;
     int version;
-    int width;
-    int height;
+    int x_min;
+    int x_max;
+    int y_min;
+    int y_max;
+    int pressure_min;
     int pressure_max;
+    int tracking_min;
     int tracking_max;
 };
 
@@ -65,10 +69,14 @@ static struct input_profile g_profile = {
     .vendor = 0x04e8,
     .product = 0x6860,
     .version = 0x0100,
-    .width = 1080,
-    .height = 1920,
+    .x_min = 0,
+    .x_max = 1439,
+    .y_min = 0,
+    .y_max = 3119,
+    .pressure_min = 0,
     .pressure_max = 255,
-    .tracking_max = 65535,
+    .tracking_min = 0,
+    .tracking_max = 31,
 };
 
 static void reset_profile(void) {
@@ -78,10 +86,14 @@ static void reset_profile(void) {
         .vendor = 0x04e8,
         .product = 0x6860,
         .version = 0x0100,
-        .width = 1080,
-        .height = 1920,
+        .x_min = 0,
+        .x_max = 1439,
+        .y_min = 0,
+        .y_max = 3119,
+        .pressure_min = 0,
         .pressure_max = 255,
-        .tracking_max = 65535,
+        .tracking_min = 0,
+        .tracking_max = 31,
     };
     g_profile = defaults;
 }
@@ -202,42 +214,105 @@ static void profile_field_string(const char *field, char *out, size_t out_size) 
     free(text);
 }
 
+static char *json_object_value(const char *json, const char *key) {
+    if (!json || !key) return NULL;
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return NULL;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return NULL;
+    while (*++p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {}
+    if (*p != '{') return NULL;
+    int depth = 0;
+    int in_string = 0;
+    int escaped = 0;
+    for (const char *end = p; *end; ++end) {
+        if (in_string) {
+            if (escaped) escaped = 0;
+            else if (*end == '\\') escaped = 1;
+            else if (*end == '"') in_string = 0;
+            continue;
+        }
+        if (*end == '"') in_string = 1;
+        else if (*end == '{') depth++;
+        else if (*end == '}' && --depth == 0) {
+            return strndup(p, (size_t)(end - p + 1));
+        }
+    }
+    return NULL;
+}
+
 static void load_profile(void) {
     char path[256];
     profile_json_path(path, sizeof(path));
-    char *j = read_text_file(path);
-    if (j) {
-        json_copy_string(j, "input_name", g_profile.name, sizeof(g_profile.name));
-        json_copy_string(j, "touch_name", g_profile.name, sizeof(g_profile.name));
-        json_copy_string(j, "input_device_name", g_profile.name, sizeof(g_profile.name));
-        g_profile.bustype = json_int_value(j, "input_bustype", g_profile.bustype);
-        g_profile.vendor = json_int_value(j, "input_vendor", g_profile.vendor);
-        g_profile.product = json_int_value(j, "input_product", g_profile.product);
-        g_profile.version = json_int_value(j, "input_version", g_profile.version);
-        g_profile.width = json_int_value(j, "width", json_int_value(j, "display_width", g_profile.width));
-        g_profile.height = json_int_value(j, "height", json_int_value(j, "display_height", g_profile.height));
-        g_profile.pressure_max = json_int_value(j, "pressure_max", g_profile.pressure_max);
-        g_profile.tracking_max = json_int_value(j, "tracking_max", g_profile.tracking_max);
-        free(j);
+    char *json = read_text_file(path);
+    if (json) {
+        char *input = json_object_value(json, "input");
+        if (input) {
+            char *axis = NULL;
+            json_copy_string(input, "name", g_profile.name, sizeof(g_profile.name));
+            g_profile.bustype = json_int_value(input, "busType", g_profile.bustype);
+            g_profile.vendor = json_int_value(input, "vendorId", g_profile.vendor);
+            g_profile.product = json_int_value(input, "productId", g_profile.product);
+            g_profile.version = json_int_value(input, "version", g_profile.version);
+            axis = json_object_value(input, "x");
+            if (axis) {
+                g_profile.x_min = json_int_value(axis, "minimum", g_profile.x_min);
+                g_profile.x_max = json_int_value(axis, "maximum", g_profile.x_max);
+                free(axis);
+            }
+            axis = json_object_value(input, "y");
+            if (axis) {
+                g_profile.y_min = json_int_value(axis, "minimum", g_profile.y_min);
+                g_profile.y_max = json_int_value(axis, "maximum", g_profile.y_max);
+                free(axis);
+            }
+            axis = json_object_value(input, "pressure");
+            if (axis) {
+                g_profile.pressure_min = json_int_value(axis, "minimum", g_profile.pressure_min);
+                g_profile.pressure_max = json_int_value(axis, "maximum", g_profile.pressure_max);
+                free(axis);
+            }
+            axis = json_object_value(input, "trackingId");
+            if (axis) {
+                g_profile.tracking_min = json_int_value(axis, "minimum", g_profile.tracking_min);
+                g_profile.tracking_max = json_int_value(axis, "maximum", g_profile.tracking_max);
+                free(axis);
+            }
+        }
+        free(input);
+        free(json);
     }
-
     profile_field_string("input_name", g_profile.name, sizeof(g_profile.name));
-    g_profile.bustype = profile_field_int("input_bustype", g_profile.bustype);
-    g_profile.vendor = profile_field_int("input_vendor", g_profile.vendor);
-    g_profile.product = profile_field_int("input_product", g_profile.product);
+    g_profile.bustype = profile_field_int("input_busType", g_profile.bustype);
+    g_profile.vendor = profile_field_int("input_vendorId", g_profile.vendor);
+    g_profile.product = profile_field_int("input_productId", g_profile.product);
     g_profile.version = profile_field_int("input_version", g_profile.version);
-    g_profile.width = profile_field_int(
-            "input_width", profile_field_int("display_width", g_profile.width));
-    g_profile.height = profile_field_int(
-            "input_height", profile_field_int("display_height", g_profile.height));
-    g_profile.pressure_max = profile_field_int("input_pressure_max", g_profile.pressure_max);
-    g_profile.tracking_max = profile_field_int("input_tracking_max", g_profile.tracking_max);
+    g_profile.x_min = profile_field_int("input_x_minimum", g_profile.x_min);
+    g_profile.x_max = profile_field_int("input_x_maximum", g_profile.x_max);
+    g_profile.y_min = profile_field_int("input_y_minimum", g_profile.y_min);
+    g_profile.y_max = profile_field_int("input_y_maximum", g_profile.y_max);
+    g_profile.pressure_min = profile_field_int("input_pressure_minimum", g_profile.pressure_min);
+    g_profile.pressure_max = profile_field_int("input_pressure_maximum", g_profile.pressure_max);
+    g_profile.tracking_min = profile_field_int("input_trackingId_minimum", g_profile.tracking_min);
+    g_profile.tracking_max = profile_field_int("input_trackingId_maximum", g_profile.tracking_max);
 
     sanitize_name(g_profile.name);
-    if (g_profile.width < 1) g_profile.width = 1080;
-    if (g_profile.height < 1) g_profile.height = 1920;
-    if (g_profile.pressure_max < 1 || g_profile.pressure_max > 65535) g_profile.pressure_max = 255;
-    if (g_profile.tracking_max < 2 || g_profile.tracking_max >= INT_MAX) g_profile.tracking_max = 65535;
+    if (g_profile.x_min < 0 || g_profile.x_max <= g_profile.x_min) {
+        g_profile.x_min = 0; g_profile.x_max = 1439;
+    }
+    if (g_profile.y_min < 0 || g_profile.y_max <= g_profile.y_min) {
+        g_profile.y_min = 0; g_profile.y_max = 3119;
+    }
+    if (g_profile.pressure_min < 0 || g_profile.pressure_max <= g_profile.pressure_min
+            || g_profile.pressure_max > 65535) {
+        g_profile.pressure_min = 0; g_profile.pressure_max = 255;
+    }
+    if (g_profile.tracking_min < 0 || g_profile.tracking_max <= g_profile.tracking_min
+            || g_profile.tracking_max >= INT_MAX) {
+        g_profile.tracking_min = 0; g_profile.tracking_max = 31;
+    }
 }
 
 #define CONTACT_AXIS_MAX 31
@@ -334,14 +409,14 @@ static int create_device(void) {
         return -1;
     }
 
-    if (setup_abs(fd, ABS_X, 0, g_profile.width - 1, 10)
-            || setup_abs(fd, ABS_Y, 0, g_profile.height - 1, 10)
-            || setup_abs(fd, ABS_PRESSURE, 0, g_profile.pressure_max, 0)
+    if (setup_abs(fd, ABS_X, g_profile.x_min, g_profile.x_max, 10)
+            || setup_abs(fd, ABS_Y, g_profile.y_min, g_profile.y_max, 10)
+            || setup_abs(fd, ABS_PRESSURE, g_profile.pressure_min, g_profile.pressure_max, 0)
             || setup_abs(fd, ABS_MT_SLOT, 0, 9, 0)
-            || setup_abs(fd, ABS_MT_POSITION_X, 0, g_profile.width - 1, 10)
-            || setup_abs(fd, ABS_MT_POSITION_Y, 0, g_profile.height - 1, 10)
-            || setup_abs(fd, ABS_MT_TRACKING_ID, 0, g_profile.tracking_max, 0)
-            || setup_abs(fd, ABS_MT_PRESSURE, 0, g_profile.pressure_max, 0)
+            || setup_abs(fd, ABS_MT_POSITION_X, g_profile.x_min, g_profile.x_max, 10)
+            || setup_abs(fd, ABS_MT_POSITION_Y, g_profile.y_min, g_profile.y_max, 10)
+            || setup_abs(fd, ABS_MT_TRACKING_ID, g_profile.tracking_min, g_profile.tracking_max, 0)
+            || setup_abs(fd, ABS_MT_PRESSURE, g_profile.pressure_min, g_profile.pressure_max, 0)
             || setup_abs(fd, ABS_MT_TOUCH_MAJOR, 0, CONTACT_AXIS_MAX, 0)
             || setup_abs(fd, ABS_MT_TOUCH_MINOR, 0, CONTACT_AXIS_MAX, 0)
             || setup_abs(fd, ABS_MT_WIDTH_MAJOR, 0, CONTACT_AXIS_MAX, 0)
@@ -496,7 +571,8 @@ static int random_jitter(int spread) {
 }
 
 static int valid_point(int x, int y) {
-    return x >= 0 && x < g_profile.width && y >= 0 && y < g_profile.height;
+    return x >= g_profile.x_min && x <= g_profile.x_max
+            && y >= g_profile.y_min && y <= g_profile.y_max;
 }
 
 static uint64_t monotonic_ns(void) {
@@ -603,15 +679,14 @@ static int tap(int fd, FILE *out, int x, int y) {
         fprintf(
                 out,
                 "{\"ok\":false,\"error\":\"tap coordinates outside display\","
-                "\"width\":%d,\"height\":%d}\n",
-                g_profile.width,
-                g_profile.height);
+                "\"xMin\":%d,\"xMax\":%d,\"yMin\":%d,\"yMax\":%d}\n",
+                g_profile.x_min, g_profile.x_max, g_profile.y_min, g_profile.y_max);
         return 64;
     }
     g_emit_failed = 0;
 
     int duration_ms = random_between(90, 145);
-    int tracking = random_between(1, g_profile.tracking_max - 1);
+    int tracking = random_between(g_profile.tracking_min, g_profile.tracking_max);
     int peak_pressure = pressure_percent(random_between(32, 46));
     int down_pressure = clamp_int(peak_pressure * random_between(45, 58) / 100, 1, peak_pressure);
     int lift_pressure = clamp_int(peak_pressure * random_between(30, 42) / 100, 1, peak_pressure);
@@ -620,8 +695,8 @@ static int tap(int fd, FILE *out, int x, int y) {
     int width_major = clamp_int(peak_touch_major + random_between(6, 9), 1, CONTACT_AXIS_MAX);
     int width_minor = clamp_int(peak_touch_minor + random_between(5, 8), 1, width_major);
     int orientation = random_between(-18, 18);
-    int px = clamp_int(x + random_jitter(2), 0, g_profile.width - 1);
-    int py = clamp_int(y + random_jitter(2), 0, g_profile.height - 1);
+    int px = clamp_int(x + random_jitter(2), g_profile.x_min, g_profile.x_max);
+    int py = clamp_int(y + random_jitter(2), g_profile.y_min, g_profile.y_max);
 
     uint64_t start_ns = monotonic_ns();
     begin_contact(fd, tracking);
@@ -632,8 +707,8 @@ static int tap(int fd, FILE *out, int x, int y) {
     sync_frame(fd);
 
     sleep_until_ns(start_ns + UINT64_C(20000000));
-    px = clamp_int(x + random_jitter(1), 0, g_profile.width - 1);
-    py = clamp_int(y + random_jitter(1), 0, g_profile.height - 1);
+    px = clamp_int(x + random_jitter(1), g_profile.x_min, g_profile.x_max);
+    py = clamp_int(y + random_jitter(1), g_profile.y_min, g_profile.y_max);
     emit_position(fd, px, py);
     emit_shaped_contact(
             fd, peak_pressure, peak_pressure, peak_touch_major, peak_touch_minor,
@@ -641,8 +716,8 @@ static int tap(int fd, FILE *out, int x, int y) {
     sync_frame(fd);
 
     sleep_until_ns(start_ns + (uint64_t)(duration_ms - 15) * UINT64_C(1000000));
-    px = clamp_int(x + random_jitter(1), 0, g_profile.width - 1);
-    py = clamp_int(y + random_jitter(1), 0, g_profile.height - 1);
+    px = clamp_int(x + random_jitter(1), g_profile.x_min, g_profile.x_max);
+    py = clamp_int(y + random_jitter(1), g_profile.y_min, g_profile.y_max);
     emit_position(fd, px, py);
     emit_shaped_contact(
             fd, lift_pressure, peak_pressure, peak_touch_major, peak_touch_minor,
@@ -683,9 +758,8 @@ static int swipe(int fd, FILE *out, int x1, int y1, int x2, int y2, int duration
         fprintf(
                 out,
                 "{\"ok\":false,\"error\":\"swipe coordinates outside display\","
-                "\"width\":%d,\"height\":%d}\n",
-                g_profile.width,
-                g_profile.height);
+                "\"xMin\":%d,\"xMax\":%d,\"yMin\":%d,\"yMax\":%d}\n",
+                g_profile.x_min, g_profile.x_max, g_profile.y_min, g_profile.y_max);
         return 64;
     }
     if (x1 == x2 && y1 == y2) {
@@ -715,7 +789,7 @@ static int swipe(int fd, FILE *out, int x1, int y1, int x2, int y2, int duration
     int frames = duration_ms / sample_period_ms;
     if (frames < 4) frames = 4;
 
-    int tracking = random_between(1, g_profile.tracking_max - 1);
+    int tracking = random_between(g_profile.tracking_min, g_profile.tracking_max);
     int peak_pressure = pressure_percent(random_between(34, 48));
     int start_pressure = clamp_int(peak_pressure * random_between(48, 62) / 100, 1, peak_pressure);
     int end_pressure = clamp_int(peak_pressure * random_between(28, 42) / 100, 1, peak_pressure);
@@ -753,8 +827,8 @@ static int swipe(int fd, FILE *out, int x1, int y1, int x2, int y2, int duration
             px += (int)(drift_x * envelope);
             py += (int)(drift_y * envelope);
         }
-        px = clamp_int(px, 0, g_profile.width - 1);
-        py = clamp_int(py, 0, g_profile.height - 1);
+        px = clamp_int(px, g_profile.x_min, g_profile.x_max);
+        py = clamp_int(py, g_profile.y_min, g_profile.y_max);
 
         int pressure = swipe_pressure(t, start_pressure, peak_pressure, end_pressure);
         emit_position(fd, px, py);
@@ -792,7 +866,9 @@ static int status(FILE *out) {
     fprintf(
             out,
             "\",\"bustype\":%d,\"vendor\":%d,\"product\":%d,\"version\":%d,"
-            "\"width\":%d,\"height\":%d,\"pressureMax\":%d,\"trackingMax\":%d,"
+            "\"xMin\":%d,\"xMax\":%d,\"yMin\":%d,\"yMax\":%d,"
+            "\"pressureMin\":%d,\"pressureMax\":%d,"
+            "\"trackingMin\":%d,\"trackingMax\":%d,"
             "\"driverLayer\":true,\"directTouch\":true,\"persistentDevice\":true,"
             "\"eventNode\":\"%s\",\"touchMajorMax\":%d,\"touchMinorMax\":%d,"
             "\"widthMajorMax\":%d,\"widthMinorMax\":%d,"
@@ -801,9 +877,13 @@ static int status(FILE *out) {
             g_profile.vendor,
             g_profile.product,
             g_profile.version,
-            g_profile.width,
-            g_profile.height,
+            g_profile.x_min,
+            g_profile.x_max,
+            g_profile.y_min,
+            g_profile.y_max,
+            g_profile.pressure_min,
             g_profile.pressure_max,
+            g_profile.tracking_min,
             g_profile.tracking_max,
             g_event_node,
             CONTACT_AXIS_MAX,

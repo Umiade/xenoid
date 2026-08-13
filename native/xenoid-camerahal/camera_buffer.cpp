@@ -26,8 +26,6 @@ using aidl::android::hardware::common::NativeHandle;
 constexpr int32_t kHandleMagic = 0x03141592;
 constexpr size_t kLegacyHandleIntCount = 8;
 constexpr size_t kCameraHandleIntCount = 13;
-constexpr uint64_t kMaximumMappedBytes = 64U * 1024U * 1024U;
-constexpr uint64_t kJpegBlobFooterBytes = 8;
 
 constexpr size_t kMagicIndex = 0;
 constexpr size_t kFlagsIndex = 1;
@@ -434,7 +432,7 @@ bool CameraBufferCache::prepareInMap(
             blobCapacity = capacity;
         }
         if (requiredSize > capacity || requiredSize > blobCapacity ||
-            capacity > kMaximumMappedBytes) {
+            capacity > kMaximumCameraBufferBytes) {
             setError(error, "buffer capacity is invalid");
             return false;
         }

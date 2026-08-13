@@ -109,27 +109,36 @@ import re
 import sys
 
 raw = open("/tmp/xenoid-smoke-camera-metadata.out").read()
-sizes = [
-    (1920, 1080),
-    (1440, 1080),
-    (1280, 960),
-    (1280, 720),
-    (1024, 768),
-    (800, 600),
-    (640, 480),
-    (320, 240),
-]
+contracts = {
+    "0": {
+        "facing": "Back",
+        "jpeg": [
+            (4080, 3072), (3840, 2160), (1920, 1080),
+            (1280, 720), (640, 480), (320, 240),
+        ],
+        "nonstall": [
+            (1920, 1080), (1280, 720), (640, 480), (320, 240),
+        ],
+        "blobStalls": [
+            220000000, 180000000, 100000000,
+            70000000, 30000000, 15000000,
+        ],
+    },
+    "1": {
+        "facing": "Front",
+        "jpeg": [
+            (3840, 2880), (1920, 1080), (1280, 720),
+            (640, 480), (320, 240),
+        ],
+        "nonstall": [
+            (1920, 1080), (1280, 720), (640, 480), (320, 240),
+        ],
+        "blobStalls": [
+            200000000, 100000000, 70000000, 30000000, 15000000,
+        ],
+    },
+}
 formats = [33, 35, 34]
-blob_stalls = [
-    100000000,
-    90000000,
-    80000000,
-    70000000,
-    60000000,
-    50000000,
-    30000000,
-    15000000,
-]
 
 try:
     marker_pattern = re.compile(
@@ -185,18 +194,21 @@ try:
             for offset in range(0, len(values), 4)
         ]
 
-    expected_keys = [
-        (fmt, width, height)
-        for fmt in formats
-        for width, height in sizes
-    ]
-    expected_stalls = [
-        stall if fmt == 33 else 0
-        for fmt in formats
-        for stall in blob_stalls
-    ]
     camera_summary = {}
-    for camera_id, expected_facing in (("0", "Back"), ("1", "Front")):
+    for camera_id, contract in contracts.items():
+        expected_keys = (
+            [(33, width, height) for width, height in contract["jpeg"]]
+            + [
+                (fmt, width, height)
+                for fmt in (35, 34)
+                for width, height in contract["nonstall"]
+            ]
+        )
+        expected_stalls = (
+            contract["blobStalls"]
+            + [0] * (2 * len(contract["nonstall"]))
+        )
+        expected_facing = contract["facing"]
         section = sections[camera_id]
         facing_match = re.search(r"\n    Facing: (\w+)", section)
         if not facing_match:
@@ -241,9 +253,14 @@ try:
                 "ok": True,
                 "cameras": camera_summary,
                 "formats": formats,
-                "sizes": [f"{width}x{height}" for width, height in sizes],
+                "sizesByCamera": {
+                    camera_id: [
+                        f"{width}x{height}"
+                        for width, height in contract["jpeg"]
+                    ]
+                    for camera_id, contract in contracts.items()
+                },
                 "minFrameDurationNs": 33333333,
-                "blobStallDurationsNs": blob_stalls,
             },
             separators=(",", ":"),
         )
@@ -314,6 +331,23 @@ if ./scripts/smoke-camera-runtime.sh --quick \
 else
   add camera_runtime_probe false "$(cat /tmp/xenoid-smoke-camera-runtime.json 2>/dev/null || printf '%s' '{"ok":false,"error":"camera runtime probe failed"}')"
 fi
+# PackageManager must expose only hardware implemented by the active camera,
+# sensor, and cellular HALs. Validate the installed contract as well as the
+# merged feature set so a stale or inherited base-image declaration fails.
+if "$ADB_BIN" -s "$ADB_TARGET" exec-out \
+    cat /system/etc/permissions/xenoid-hardware-features.xml \
+    >/tmp/xenoid-smoke-hardware-features.xml 2>/tmp/xenoid-smoke-hardware-features.err \
+    && "$ADB_BIN" -s "$ADB_TARGET" shell pm list features \
+    >/tmp/xenoid-smoke-package-features.out 2>&1 \
+    && python3 ./scripts/smoke-hardware-features.py \
+    --contract /tmp/xenoid-smoke-hardware-features.xml \
+    --pm-features /tmp/xenoid-smoke-package-features.out \
+    >/tmp/xenoid-smoke-hardware-features-summary.out 2>&1; then
+  add hardware_features true "$(cat /tmp/xenoid-smoke-hardware-features-summary.out)"
+else
+  add hardware_features false "$(cat /tmp/xenoid-smoke-hardware-features-summary.out 2>/dev/null || cat /tmp/xenoid-smoke-hardware-features.err 2>/dev/null || cat /tmp/xenoid-smoke-package-features.out 2>/dev/null)"
+fi
+
 
 
 # Apply native overlays/hide helpers if they are deployed; these commands are idempotent.
@@ -393,10 +427,9 @@ fi
 # App-visible adb.tcp.port=-1 comes from the shim only; the global property must stay usable for host TCP adb.
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(getprop ro.debuggable)" = 0 && test "$(getprop ro.adb.secure)" = 1 && { test -z "$(getprop init.svc.adbd)" || test "$(getprop init.svc.adbd)" = stopped; } && LD_PRELOAD=/data/local/tmp/.ld/core.so getprop service.adb.tcp.port | grep -qx -- -1' >/tmp/xenoid-smoke-adb-hide.out 2>&1; then add adb_debug_hidden true "ro.debuggable=$("$ADB_BIN" -s "$ADB_TARGET" shell getprop ro.debuggable 2>/dev/null), ro.adb.secure=$("$ADB_BIN" -s "$ADB_TARGET" shell getprop ro.adb.secure 2>/dev/null), app service.adb.tcp.port=$("$ADB_BIN" -s "$ADB_TARGET" shell 'LD_PRELOAD=/data/local/tmp/.ld/core.so getprop service.adb.tcp.port' 2>/dev/null), global service.adb.tcp.port=$("$ADB_BIN" -s "$ADB_TARGET" shell getprop service.adb.tcp.port 2>/dev/null), init.svc.adbd=$("$ADB_BIN" -s "$ADB_TARGET" shell getprop init.svc.adbd 2>/dev/null)"; else add adb_debug_hidden false "$(cat /tmp/xenoid-smoke-adb-hide.out)"; fi
 
-# ro.boot.hardware may be redroid during early boot for the base stack. Once
-# sys.boot_completed=1, prop_area --identity exposes gs101 and tensor.
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(getprop ro.boot.verifiedbootstate)" = green && test "$(getprop ro.boot.flash.locked)" = 1 && test "$(getprop ro.boot.vbmeta.device_state)" = locked && test "$(getprop ro.boot.veritymode)" = enforcing && test "$(getprop ro.boot.hardware)" = gs101 && test "$(getprop ro.boot.bootreason)" = reboot,normal && test "$(getprop ro.bootmode)" = normal' >/tmp/xenoid-smoke-boot-verified.out 2>&1; then add boot_verified_state true "verifiedbootstate=green flash.locked=1 vbmeta.device_state=locked veritymode=enforcing boot.hardware=gs101 bootreason=reboot,normal bootmode=normal"; else add boot_verified_state false "$(cat /tmp/xenoid-smoke-boot-verified.out)"; fi
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(LD_PRELOAD=/data/local/tmp/.ld/core.so getprop ro.hardware)" = tensor && test "$(getprop ro.product.device)" = raven && test "$(getprop ro.product.model)" = "Pixel 6 Pro"' >/tmp/xenoid-smoke-hardware-identity.out 2>&1; then add hardware_identity true "app ro.hardware=tensor (global=$("$ADB_BIN" -s "$ADB_TARGET" shell getprop ro.hardware 2>/dev/null)) device=raven model=Pixel 6 Pro"; else add hardware_identity false "$(cat /tmp/xenoid-smoke-hardware-identity.out)"; fi
+# Raven hardware identity is present before graphics and framework startup.
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(getprop ro.boot.verifiedbootstate)" = green && test "$(getprop ro.boot.flash.locked)" = 1 && test "$(getprop ro.boot.vbmeta.device_state)" = locked && test "$(getprop ro.boot.veritymode)" = enforcing && test "$(getprop ro.boot.hardware)" = raven && test "$(getprop ro.boot.hardware.sku)" = G8V0U && test "$(getprop ro.boot.bootreason)" = reboot,normal && test "$(getprop ro.bootmode)" = normal' >/tmp/xenoid-smoke-boot-verified.out 2>&1; then add boot_verified_state true "verifiedbootstate=green flash.locked=1 vbmeta=locked verity=enforcing hardware=raven sku=G8V0U bootreason=reboot,normal bootmode=normal"; else add boot_verified_state false "$(cat /tmp/xenoid-smoke-boot-verified.out)"; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(LD_PRELOAD=/data/local/tmp/.ld/core.so getprop ro.hardware)" = raven && test "$(getprop ro.product.device)" = raven && test "$(getprop ro.product.model)" = "Pixel 6 Pro"' >/tmp/xenoid-smoke-hardware-identity.out 2>&1; then add hardware_identity true "app ro.hardware=raven (global=$("$ADB_BIN" -s "$ADB_TARGET" shell getprop ro.hardware 2>/dev/null)) device=raven model=Pixel 6 Pro"; else add hardware_identity false "$(cat /tmp/xenoid-smoke-hardware-identity.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test ! -e /system/xbin/su && test ! -e /system/bin/su && ! ls /data/local/tmp/libxenoid_*.so >/dev/null 2>&1' >/tmp/xenoid-smoke-leak-surfaces.out 2>&1; then add hide_leak_surfaces true "su paths and retired top-level libraries absent"; else add hide_leak_surfaces false "$(cat /tmp/xenoid-smoke-leak-surfaces.out)"; fi
 
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(getprop ro.oem_unlock_supported)" = 1 && test "$(getprop sys.oem_unlock_allowed)" = 0 && test "$(getprop ro.boot.warranty_bit)" = 0 && test "$(getprop ro.warranty_bit)" = 0 && test "$(getprop ro.build.version.security_patch)" = 2022-10-05 && test "$(getprop ro.vendor.build.security_patch)" = 2022-10-05' >/tmp/xenoid-smoke-oem.out 2>&1; then add oem_unlock_attestation_props true "oem_unlock_supported=1 oem_unlock_allowed=0 warranty=0 security_patch=2022-10-05"; else add oem_unlock_attestation_props false "$(cat /tmp/xenoid-smoke-oem.out)"; fi
@@ -412,40 +445,36 @@ if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="ksu|kernelsu|apatch|magisk|frida|virt
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="virtio|qemu|vbox|xen|vmw|hvc|xvc"; ! grep -Eiq "$bad" /proc/devices /proc/misc /proc/tty/drivers /proc/driver/rtc 2>/dev/null && grep -q binder /proc/devices 2>/dev/null && grep -q ashmem /proc/misc 2>/dev/null' >/tmp/xenoid-smoke-kernel-devices.out 2>&1; then add kernel_device_tables true "proc devices/misc/tty/driver tables sanitized"; else add kernel_device_tables false "$(cat /tmp/xenoid-smoke-kernel-devices.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /sys/class/rtc/rtc0/name ]; then test "$(cat /sys/class/rtc/rtc0/name 2>/dev/null)" = rtc-pm8xxx && test "$(cat /sys/class/rtc/rtc0/hctosys 2>/dev/null)" = 1 && test "$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null)" = 1715040000; else exit 77; fi' >/tmp/xenoid-smoke-rtc.out 2>&1; then add rtc_sysfs true "rtc0 sysfs sanitized"; else rc=$?; if [ "$rc" = 77 ]; then add rtc_sysfs true "no /sys/class/rtc/rtc0 on this runtime; skip"; else add rtc_sysfs false "$(cat /tmp/xenoid-smoke-rtc.out)"; fi; fi
 
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'mt=$(awk "/MemTotal/ {print \$2}" /proc/meminfo); test "$mt" -gt 7000000 -a "$mt" -lt 9000000 && test "$(cat /sys/devices/system/cpu/online)" = "0-7"' >/tmp/xenoid-smoke-resource-overlay.out 2>&1; then add resource_overlay true "mem/cpu topology sanitized"; else add resource_overlay false "$(cat /tmp/xenoid-smoke-resource-overlay.out)"; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(awk "/MemTotal/ {print \$2}" /proc/meminfo)" = 12582912 && test "$(cat /sys/devices/system/cpu/online)" = "0-7"' >/tmp/xenoid-smoke-resource-overlay.out 2>&1; then add resource_overlay true "memory=12582912 KiB, cpu online=0-7"; else add resource_overlay false "$(cat /tmp/xenoid-smoke-resource-overlay.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'grep -q "nr_free_pages" /proc/vmstat 2>/dev/null && grep -q "Node 0, zone" /proc/zoneinfo 2>/dev/null && grep -q "Node 0" /proc/buddyinfo 2>/dev/null && ! grep -q "Node 1" /proc/zoneinfo /proc/buddyinfo /proc/pagetypeinfo 2>/dev/null' >/tmp/xenoid-smoke-memory-proc.out 2>&1; then add memory_proc_details true "vmstat/zoneinfo/buddyinfo single-node sanitized"; else add memory_proc_details false "$(cat /tmp/xenoid-smoke-memory-proc.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(grep -E "^cpu[0-9]+ " /proc/stat 2>/dev/null | wc -l | tr -d " ")" = 8 && grep -q "CPU7" /proc/softirqs 2>/dev/null && ! grep -q "CPU8" /proc/softirqs /proc/schedstat 2>/dev/null' >/tmp/xenoid-smoke-cpu-proc-stats.out 2>&1; then add cpu_proc_stats true "proc/stat softirqs schedstat expose 8 CPUs"; else add cpu_proc_stats false "$(cat /tmp/xenoid-smoke-cpu-proc-stats.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(cat /proc/sys/kernel/ostype 2>/dev/null)" = Linux && grep -q android13 /proc/sys/kernel/osrelease 2>/dev/null && ! grep -Eiq "overlay|docker|container|ubuntu|generic|x86_64|epyc" /proc/filesystems /proc/swaps /proc/sys/kernel/osrelease /proc/sys/kernel/version 2>/dev/null' >/tmp/xenoid-smoke-kernel-proc.out 2>&1; then add kernel_proc_misc true "kernel proc/sysctl misc sanitized"; else add kernel_proc_misc false "$(cat /tmp/xenoid-smoke-kernel-proc.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)" = 2 && test "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = 1 && test "$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)" = 3' >/tmp/xenoid-smoke-kernel-hardening.out 2>&1; then add kernel_hardening true "kptr/dmesg/perf hardened"; else add kernel_hardening false "$(cat /tmp/xenoid-smoke-kernel-hardening.out)"; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'dev="$(cat /sys/block/sda/dev 2>/dev/null)" && test "$(grep -E "[[:space:]]sda$" /proc/partitions | tr -s " " | cut -d" " -f4)" = 125000000 && grep -Eq "[[:space:]]sda[[:space:]]" /proc/diskstats && test -b /dev/block/sda && test -L /dev/block/platform/14700000.ufs/by-name/userdata && test "$(readlink /dev/block/platform/14700000.ufs/by-name/userdata)" = ../../../sda && test -b /dev/block/platform/14700000.ufs/by-name/userdata && test -L /sys/block/sda && test "$(readlink /sys/block/sda)" = ../devices/virtual/block/sda && test -L /sys/class/block/sda && test "$(readlink /sys/class/block/sda)" = ../../devices/virtual/block/sda && test -n "$dev" && test -L "/sys/dev/block/$dev" && test "$(cat /sys/block/sda/size 2>/dev/null)" = 250000000 && test "$(cat /sys/block/sda/queue/logical_block_size 2>/dev/null)" = 512 && test "$(cat /sys/block/sda/queue/rotational 2>/dev/null)" = 0 && set -- /sys/block/* && test "$#" = 1 && test "${1##*/}" = sda' >/tmp/xenoid-smoke-storage-surfaces.out 2>&1; then add storage_surfaces true "proc/dev/sysfs expose one coherent 128000000000-byte non-rotational Raven userdata contract"; else add storage_surfaces false "$(cat /tmp/xenoid-smoke-storage-surfaces.out)"; fi
 # Mount namespace: two views. (a) Global fixed-path view via /proc/1/* (bind-mount overlay works there).
 # (b) App-process view via shim-injected reader (LD_PRELOAD) — what a hooked app sees.
 # Plain-shell /proc/mounts and /proc/self/* are per-reader-resolved and need the P2 kernel module; tracked as known gap.
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="docker|containerd|overlayfs|upperdir|lowerdir|workdir|/var/lib|xenoid|colima|lxc"; ! grep -Eiq "$bad" /proc/1/cgroup /proc/1/mounts /proc/1/mountinfo /proc/1/mountstats /proc/cgroups 2>/dev/null && grep -q "/system" /proc/1/mountinfo 2>/dev/null && grep -q "/data" /proc/1/mountinfo 2>/dev/null && grep -q "cpuset" /proc/cgroups 2>/dev/null' >/tmp/xenoid-smoke-mount-ns.out 2>&1; then
-  if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="docker|containerd|overlayfs|upperdir|lowerdir|workdir|/var/lib|xenoid|colima|lxc"; ! XENOID_TEST_FORCE_APP_UID=1 LD_PRELOAD=/data/local/tmp/.ld/core.so grep -Eiq "$bad" /proc/self/cgroup /proc/self/mounts /proc/self/mountinfo /proc/self/mountstats 2>/dev/null' >>/tmp/xenoid-smoke-mount-ns.out 2>&1; then add mount_namespace true "global(pid1) and app-process(shim) mount views sanitized; plain-shell global view pending P2 kernel module"; else add mount_namespace false "shim view dirty: $(cat /tmp/xenoid-smoke-mount-ns.out)"; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="docker|containerd|overlayfs|upperdir|lowerdir|workdir|/var/lib|xenoid|colima|lxc"; ! grep -Eiq "$bad" /proc/1/cgroup /proc/1/mounts /proc/1/mountinfo /proc/1/mountstats /proc/cgroups 2>/dev/null && grep -q "/system" /proc/1/mountinfo 2>/dev/null && grep -qE " - f2fs /dev/block/platform/14700000[.]ufs/by-name/userdata " /proc/1/mountinfo 2>/dev/null && grep -q "mounted on /data with fstype f2fs" /proc/1/mountstats 2>/dev/null && grep -q "cpuset" /proc/cgroups 2>/dev/null' >/tmp/xenoid-smoke-mount-ns.out 2>&1; then
+  if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="docker|containerd|overlayfs|upperdir|lowerdir|workdir|/var/lib|xenoid|colima|lxc"; ! XENOID_TEST_FORCE_APP_UID=1 LD_PRELOAD=/data/local/tmp/.ld/core.so grep -Eiq "$bad" /proc/self/cgroup /proc/self/mounts /proc/self/mountinfo /proc/self/mountstats 2>/dev/null && XENOID_TEST_FORCE_APP_UID=1 LD_PRELOAD=/data/local/tmp/.ld/core.so grep -qE " /data f2fs | - f2fs /dev/block/platform/14700000[.]ufs/by-name/userdata " /proc/self/mounts /proc/self/mountinfo 2>/dev/null'; then add mount_namespace true "global(pid1) and app-process(shim) mount views expose Raven f2fs; raw mountinfo remains kernel-owned"; else add mount_namespace false "shim view dirty: $(cat /tmp/xenoid-smoke-mount-ns.out)"; fi
 else add mount_namespace false "pid1 view dirty: $(cat /tmp/xenoid-smoke-mount-ns.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'grep -q "TracerPid:[[:space:]]*0" /proc/1/status && grep -q "NSpid:[[:space:]]*1" /proc/1/status && grep -q "Cpus_allowed_list:[[:space:]]*0-7" /proc/1/status && grep -q "0[[:space:]]*0[[:space:]]*4294967295" /proc/1/uid_map && grep -q "u:r:init:s0" /proc/1/attr/current 2>/dev/null' >/tmp/xenoid-smoke-proc-identity-tables.out 2>&1; then
   if "$ADB_BIN" -s "$ADB_TARGET" shell 'LD_PRELOAD=/data/local/tmp/.ld/core.so grep -q "TracerPid:[[:space:]]*0" /proc/self/status 2>/dev/null && LD_PRELOAD=/data/local/tmp/.ld/core.so grep -q "Cpus_allowed_list:[[:space:]]*0-7" /proc/self/status 2>/dev/null' >>/tmp/xenoid-smoke-proc-identity-tables.out 2>&1; then add proc_identity_tables true "proc status/id-map/attr sanitized (pid1 global + shim app view)"; else add proc_identity_tables false "shim app view mismatch: $(cat /tmp/xenoid-smoke-proc-identity-tables.out)"; fi
 else add proc_identity_tables false "pid1 view mismatch: $(cat /tmp/xenoid-smoke-proc-identity-tables.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]; then test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)" = 2995000 && test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)" = schedutil; else exit 77; fi; if [ -e /sys/devices/system/cpu/cpu0/topology/core_id ]; then test "$(cat /sys/devices/system/cpu/cpu0/topology/core_id 2>/dev/null)" = 0; fi' >/tmp/xenoid-smoke-cpu-sysfs.out 2>&1; then add cpu_sysfs true "cpu0 cpufreq/topology sanitized"; else rc=$?; if [ "$rc" = 77 ]; then add cpu_sysfs true "no cpu0 cpufreq on this runtime; skip"; else add cpu_sysfs false "$(cat /tmp/xenoid-smoke-cpu-sysfs.out)"; fi; fi
 
-# Battery service shaping smoke: use Android BatteryService command path.
-"$XENOID_BIN" device set battery.level 42 >/tmp/xenoid-smoke-battery-level.out 2>&1 || true
-"$XENOID_BIN" device set battery.temperature 299 >/tmp/xenoid-smoke-battery-temp.out 2>&1 || true
-"$XENOID_BIN" device set battery.status 2 >/tmp/xenoid-smoke-battery-status.out 2>&1 || true
-"$XENOID_BIN" device set battery.plugged 0 >/tmp/xenoid-smoke-battery-plugged.out 2>&1 || true
-# cmd battery set freezes HAL updates and cannot set voltage/technology. Restart
-# health + reset so Launch/BatteryManager see kmod psy (voltage/technology).
-./xenoid root exec 'stop vendor.health-default >/dev/null 2>&1 || true; start vendor.health-default >/dev/null 2>&1 || true; sleep 1; dumpsys battery reset >/dev/null 2>&1 || true' >/tmp/xenoid-smoke-battery-health.out 2>&1 || true
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'dumpsys battery | grep -q "voltage: 4100" && dumpsys battery | grep -q "technology: Li-ion" && dumpsys battery | grep -q "present: true"' >/tmp/xenoid-smoke-battery.out 2>&1; then add battery_service true "voltage=4100 technology=Li-ion present=true"; else add battery_service false "$(cat /tmp/xenoid-smoke-battery.out)"; fi
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /sys/class/power_supply/battery/capacity ]; then test "$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)" = 42 && test "$(cat /sys/class/power_supply/battery/temp 2>/dev/null)" = 299 && test "$(cat /sys/class/power_supply/battery/voltage_now 2>/dev/null)" = 4100000; else exit 77; fi' >/tmp/xenoid-smoke-battery-sysfs.out 2>&1; then add battery_sysfs true "capacity=42 temp=299 voltage_now=4100000"; else rc=$?; if [ "$rc" = 77 ]; then add battery_sysfs true "no /sys/class/power_supply/battery on this runtime; skip"; else add battery_sysfs false "$(cat /tmp/xenoid-smoke-battery-sysfs.out)"; fi; fi
+# Battery service shaping smoke: reapply the complete canonical profile so
+# capacity-dependent fields remain coherent across the HAL and sysfs views.
+"$XENOID_BIN" device apply examples/fingerprints/pixel-raven-android13.json --keep-unique >/tmp/xenoid-smoke-battery-profile.out 2>&1 || true
+./xenoid root exec 'stop vendor.health-default >/dev/null 2>&1 || true; sleep 1; start vendor.health-default >/dev/null 2>&1 || true; sleep 1; dumpsys battery reset >/dev/null 2>&1 || true' >/tmp/xenoid-smoke-battery-health.out 2>&1 || true
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'dumpsys battery | grep -q "status: 3" && dumpsys battery | grep -q "present: true" && dumpsys battery | grep -q "level: 83" && dumpsys battery | grep -q "voltage: 4100" && dumpsys battery | grep -q "temperature: 310" && dumpsys battery | grep -q "technology: Li-ion"' >/tmp/xenoid-smoke-battery.out 2>&1; then add battery_service true "status=3 present=true level=83 voltage=4100 temperature=310 technology=Li-ion"; else add battery_service false "$(cat /tmp/xenoid-smoke-battery.out)"; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /sys/class/power_supply/battery/capacity ]; then test "$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)" = 83 && test "$(cat /sys/class/power_supply/battery/temp 2>/dev/null)" = 310 && test "$(cat /sys/class/power_supply/battery/voltage_now 2>/dev/null)" = 4100000 && test "$(cat /sys/class/power_supply/battery/charge_full_design 2>/dev/null)" = 5003000 && test "$(cat /sys/class/power_supply/battery/charge_full 2>/dev/null)" = 5003000 && test "$(cat /sys/class/power_supply/battery/charge_counter 2>/dev/null)" = 4152490; else exit 77; fi' >/tmp/xenoid-smoke-battery-sysfs.out 2>&1; then add battery_sysfs true "capacity=83 temp=310 voltage_now=4100000 charge_full=5003000 charge_counter=4152490"; else rc=$?; if [ "$rc" = 77 ]; then add battery_sysfs true "no /sys/class/power_supply/battery on this runtime; skip"; else add battery_sysfs false "$(cat /tmp/xenoid-smoke-battery-sysfs.out)"; fi; fi
 "$XENOID_BIN" device set thermal.zone0.temp 32000 >/tmp/xenoid-smoke-thermal-temp.out 2>&1 || true
 "$XENOID_BIN" device set thermal.zone0.type skin >/tmp/xenoid-smoke-thermal-type.out 2>&1 || true
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /sys/class/thermal/thermal_zone0/temp ]; then test "$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)" = 32000 && test "$(cat /sys/class/thermal/thermal_zone0/type 2>/dev/null)" = skin; else exit 77; fi' >/tmp/xenoid-smoke-thermal-sysfs.out 2>&1; then add thermal_sysfs true "thermal_zone0 temp=32000 type=skin"; else rc=$?; if [ "$rc" = 77 ]; then add thermal_sysfs true "no /sys/class/thermal/thermal_zone0 on this runtime; skip"; else add thermal_sysfs false "$(cat /tmp/xenoid-smoke-thermal-sysfs.out)"; fi; fi
 "$XENOID_BIN" device set input.name sec_touchscreen >/tmp/xenoid-smoke-input-name.out 2>&1 || true
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /proc/bus/input/devices ]; then grep -q "sec_touchscreen" /proc/bus/input/devices && grep -q "gpio-keys" /proc/bus/input/devices && ! grep -Eiq "xenoid|frida|minitouch|uinput" /proc/bus/input/devices; else exit 77; fi' >/tmp/xenoid-smoke-input-devices.out 2>&1; then add input_devices_proc true "sec_touchscreen and gpio-keys present; no xenoid/frida/minitouch/uinput"; else rc=$?; if [ "$rc" = 77 ]; then add input_devices_proc true "no /proc/bus/input/devices on this runtime; skip"; else add input_devices_proc false "$(cat /tmp/xenoid-smoke-input-devices.out)"; fi; fi
-"$XENOID_BIN" device set display.width 1344 >/tmp/xenoid-smoke-display-width.out 2>&1 || true
-"$XENOID_BIN" device set display.height 2992 >/tmp/xenoid-smoke-display-height.out 2>&1 || true
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /proc/fb ]; then grep -q "msmfb" /proc/fb; else exit 77; fi; if [ -e /sys/class/graphics/fb0/virtual_size ]; then test "$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)" = "1344,2992"; fi' >/tmp/xenoid-smoke-framebuffer.out 2>&1; then add framebuffer_sysfs true "proc/fb=msmfb fb0 virtual_size=1344,2992"; else rc=$?; if [ "$rc" = 77 ]; then add framebuffer_sysfs true "no /proc/fb on this runtime; skip"; else add framebuffer_sysfs false "$(cat /tmp/xenoid-smoke-framebuffer.out)"; fi; fi
+"$XENOID_BIN" device apply examples/fingerprints/pixel-raven-android13.json --keep-unique >/tmp/xenoid-smoke-display-profile.out 2>&1 || true
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'wm size | grep -q "1440x3120" && wm density | grep -q "560" && if [ -e /proc/fb ]; then grep -q "msmfb" /proc/fb; else exit 77; fi; if [ -e /sys/class/graphics/fb0/virtual_size ]; then test "$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)" = "1440,3120" && grep -q "1440x3120p-60" /sys/class/graphics/fb0/modes && grep -q "1440x3120p-120" /sys/class/graphics/fb0/modes; fi' >/tmp/xenoid-smoke-framebuffer.out 2>&1; then add framebuffer_sysfs true "wm/fb0 converge at 1440x3120/560 with 60/120 Hz modes"; else rc=$?; if [ "$rc" = 77 ]; then add framebuffer_sysfs true "no /proc/fb on this runtime; wm profile verified"; else add framebuffer_sysfs false "$(cat /tmp/xenoid-smoke-framebuffer.out)"; fi; fi
 "$XENOID_BIN" device set serial 3A4940E5EDFA >/tmp/xenoid-smoke-usb-serial.out 2>&1 || true
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'p=/config/usb_gadget/g1/strings/0x409/serialnumber; if [ -e "$p" ]; then test "$(cat "$p" 2>/dev/null)" = 3A4940E5EDFA && test "$(cat /config/usb_gadget/g1/strings/0x409/manufacturer 2>/dev/null)" = Google && grep -q "Pixel" /config/usb_gadget/g1/strings/0x409/product 2>/dev/null; else exit 77; fi' >/tmp/xenoid-smoke-usb.out 2>&1; then add usb_identity true "usb gadget serial/manufacturer/product sanitized"; else rc=$?; if [ "$rc" = 77 ]; then add usb_identity true "no usb gadget configfs on this runtime; skip"; else add usb_identity false "$(cat /tmp/xenoid-smoke-usb.out)"; fi; fi
 
@@ -471,6 +500,11 @@ if printf '%s' "$EBPF_STATUS" | grep -q '"loaded":true\|"loaded": true'; then ad
 
 # Native shim/linker/libc surface smoke.
 if ./scripts/smoke-native-surfaces.sh >/tmp/xenoid-smoke-native-surfaces.out 2>&1; then add native_surfaces true "$(cat /tmp/xenoid-smoke-native-surfaces.out)"; else add native_surfaces false "$(cat /tmp/xenoid-smoke-native-surfaces.out)"; fi
+if ./scripts/smoke-filesystem-runtime.sh >/tmp/xenoid-smoke-filesystem-runtime.out 2>&1; then
+  add filesystem_raw_statfs true "$(cat /tmp/xenoid-smoke-filesystem-runtime.out)"
+else
+  add filesystem_raw_statfs false "$(cat /tmp/xenoid-smoke-filesystem-runtime.out)"
+fi
 
 # Package denylist smoke: use a harmless debug package if present.
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'pm list packages dev.xenoid.sensorpatch >/dev/null 2>&1 && pm unhide --user 0 dev.xenoid.sensorpatch >/dev/null 2>&1 || true; pm list packages | grep -q dev.xenoid.sensorpatch' >/tmp/xenoid-smoke-pkg-pre.out 2>&1; then

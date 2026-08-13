@@ -4,7 +4,7 @@ import json, pathlib, sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 src = (ROOT / "native/xenoid-hide/xenoid_overlay.c").read_text()
 daemon = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/DeviceProfileManager.java").read_text()
-profile = json.loads((ROOT / "examples/fingerprints/pixel-husky-template.json").read_text())
+profile = json.loads((ROOT / "examples/fingerprints/pixel-raven-android13.json").read_text())
 checks = {
     "overlay_function": "overlay_usb_identity" in src,
     "gadget_serial": "/config/usb_gadget/g1/strings/0x409/serialnumber" in src,

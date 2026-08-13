@@ -7,7 +7,7 @@
 //    cpuinfo, meminfo, status, uid/gid maps, kallsyms, cmdline, version...)
 //  - uname / sched_getaffinity / sysinfo / statfs: post-call shaping
 //
-// Everything is kprobe/kretprobe based: no syscall table patching, no ABI hacks.
+// Everything is kprobe/kretprobe based: no syscall table patching or ABI hacks.
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -27,6 +27,7 @@
 #include <linux/namei.h>
 #include <linux/mount.h>
 #include <linux/statfs.h>
+#include <linux/magic.h>
 #include <linux/utsname.h>
 #include <linux/mm.h>
 #include <linux/un.h>
@@ -39,6 +40,7 @@
 #include <linux/skbuff.h>
 #include <net/net_namespace.h>
 #include <net/sock.h>
+#include <linux/sysinfo.h>
 #include <uapi/linux/android/binder.h>
 
 MODULE_LICENSE("GPL");
@@ -131,6 +133,173 @@ static bool current_net_is_xenoid_android_runtime(void)
     return net_is_xenoid_android_runtime(current->nsproxy->net_ns);
 }
 
+
+/* Raw syscall views must agree with the procfs and libc surfaces. Hook the
+ * internal producers, while their kernel buffers are still writable, so no
+ * user-memory access occurs from kprobe context. */
+#define XENOID_MEMORY_TOTAL_BYTES (12ULL * 1024ULL * 1024ULL * 1024ULL)
+#define XENOID_MEMORY_FREE_BYTES  (XENOID_MEMORY_TOTAL_BYTES / 2ULL)
+
+struct sysinfo_ctx {
+	struct sysinfo *info;
+	bool shape;
+};
+
+static int sysinfo_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct sysinfo_ctx *ctx = (void *)ri->data;
+
+	ctx->info = (struct sysinfo *)regs->regs[0];
+	ctx->shape = current_is_android_app() &&
+		     current_net_is_xenoid_android_runtime();
+	return 0;
+}
+
+static int sysinfo_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct sysinfo_ctx *ctx = (void *)ri->data;
+	struct sysinfo *info = ctx->info;
+
+	if (!ctx->shape || !info)
+		return 0;
+	info->totalram = (unsigned long)XENOID_MEMORY_TOTAL_BYTES;
+	info->freeram = (unsigned long)XENOID_MEMORY_FREE_BYTES;
+	info->sharedram = (unsigned long)(XENOID_MEMORY_TOTAL_BYTES / 48ULL);
+	info->bufferram = (unsigned long)(XENOID_MEMORY_TOTAL_BYTES / 96ULL);
+	info->totalswap = 0;
+	info->freeswap = 0;
+	info->totalhigh = 0;
+	info->freehigh = 0;
+	info->mem_unit = 1;
+	return 0;
+}
+
+static struct kretprobe sysinfo_kprobes[] = {
+	{
+		.handler = sysinfo_post,
+		.entry_handler = sysinfo_pre,
+		.data_size = sizeof(struct sysinfo_ctx),
+		.kp = { .symbol_name = "do_sysinfo" },
+		.maxactive = 32,
+	},
+	{
+		.handler = sysinfo_post,
+		.entry_handler = sysinfo_pre,
+		.data_size = sizeof(struct sysinfo_ctx),
+		.kp = { .symbol_name = "do_sysinfo.isra.0" },
+		.maxactive = 32,
+	},
+	{
+		.handler = sysinfo_post,
+		.entry_handler = sysinfo_pre,
+		.data_size = sizeof(struct sysinfo_ctx),
+		.kp = { .symbol_name = "do_sysinfo.constprop.0" },
+		.maxactive = 32,
+	},
+};
+
+#ifndef F2FS_SUPER_MAGIC
+#define F2FS_SUPER_MAGIC 0xF2F52010
+#endif
+
+struct statfs_ctx {
+	struct kstatfs *buf;
+	bool shape;
+};
+
+static bool dentry_is_android_data(const struct dentry *dentry)
+{
+	const struct dentry *cursor = dentry;
+
+	while (cursor) {
+		if (cursor->d_name.len == 4 &&
+		    !memcmp(cursor->d_name.name, "data", 4) &&
+		    cursor->d_parent == cursor->d_sb->s_root)
+			return true;
+		if (cursor == cursor->d_parent || cursor == cursor->d_sb->s_root)
+			break;
+		cursor = cursor->d_parent;
+	}
+	return false;
+}
+
+static bool statfs_cloned_abi;
+static bool statfs_needs_clone_success;
+
+static int statfs_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct statfs_ctx *ctx = (void *)ri->data;
+	const struct dentry *dentry;
+
+	ctx->buf = (struct kstatfs *)regs->regs[1];
+	if (statfs_cloned_abi)
+		dentry = ((const struct vfsmount *)regs->regs[0])->mnt_root;
+	else
+		dentry = ((const struct path *)regs->regs[0])->dentry;
+	ctx->shape = current_is_android_app() &&
+		current_net_is_xenoid_android_runtime() &&
+		dentry_is_android_data(dentry);
+	return 0;
+}
+
+static int statfs_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct statfs_ctx *ctx = (void *)ri->data;
+
+	if (!ctx->shape || !ctx->buf ||
+	    (statfs_needs_clone_success && (long)regs_return_value(regs) != 0))
+		return 0;
+	WRITE_ONCE(ctx->buf->f_type, F2FS_SUPER_MAGIC);
+	return 0;
+}
+
+static char statfs_symbol[128] = "vfs_statfs";
+module_param_string(statfs_symbol, statfs_symbol, sizeof(statfs_symbol), 0444);
+MODULE_PARM_DESC(statfs_symbol, "Resolved vfs_statfs implementation symbol");
+
+static struct kretprobe statfs_kp = {
+	.handler = statfs_post,
+	.entry_handler = statfs_pre,
+	.data_size = sizeof(struct statfs_ctx),
+	.kp = { .symbol_name = statfs_symbol },
+	.maxactive = 32,
+};
+
+struct affinity_ctx {
+	struct cpumask *mask;
+	bool shape;
+};
+
+static int affinity_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct affinity_ctx *ctx = (void *)ri->data;
+
+	ctx->mask = (struct cpumask *)regs->regs[1];
+	ctx->shape = current_is_android_app() &&
+		     current_net_is_xenoid_android_runtime();
+	return 0;
+}
+
+static int affinity_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct affinity_ctx *ctx = (void *)ri->data;
+	int cpu;
+
+	if (!ctx->shape || !ctx->mask || (long)regs_return_value(regs) != 0)
+		return 0;
+	cpumask_clear(ctx->mask);
+	for (cpu = 0; cpu < 8 && cpu < nr_cpu_ids; cpu++)
+		cpumask_set_cpu(cpu, ctx->mask);
+	return 0;
+}
+
+static struct kretprobe affinity_kp = {
+	.handler = affinity_post,
+	.entry_handler = affinity_pre,
+	.data_size = sizeof(struct affinity_ctx),
+	.kp = { .symbol_name = "sched_getaffinity" },
+	.maxactive = 32,
+};
 
 static bool path_hidden(const char *path)
 {
@@ -908,25 +1077,84 @@ ATTRIBUTE_GROUPS(xenoid_selinux);
    minimal power_supply device gives healthd realistic battery values. */
 #include <linux/power_supply.h>
 static int enable_battery = 1;
+static int battery_level = 83;
+static int battery_voltage_mv = 4100;
+static int battery_temperature_deci_c = 310;
+static int battery_status_android = 3;
+static int battery_plugged_android;
+static int battery_health_android = 2;
+static int battery_present = 1;
+static int battery_charge_full_design_uah = 5003000;
+static int battery_charge_full_uah = 5003000;
+static int battery_charge_counter_uah = 4152490;
 module_param(enable_battery, int, 0600);
+module_param(battery_level, int, 0600);
+module_param(battery_voltage_mv, int, 0600);
+module_param(battery_temperature_deci_c, int, 0600);
+module_param(battery_status_android, int, 0600);
+module_param(battery_plugged_android, int, 0600);
+module_param(battery_health_android, int, 0600);
+module_param(battery_present, int, 0600);
+module_param(battery_charge_full_design_uah, int, 0600);
+module_param(battery_charge_full_uah, int, 0600);
+module_param(battery_charge_counter_uah, int, 0600);
+
+static int xb_status(void)
+{
+    switch (battery_status_android) {
+    case 2: return POWER_SUPPLY_STATUS_CHARGING;
+    case 3: return POWER_SUPPLY_STATUS_DISCHARGING;
+    case 4: return POWER_SUPPLY_STATUS_NOT_CHARGING;
+    case 5: return POWER_SUPPLY_STATUS_FULL;
+    default: return POWER_SUPPLY_STATUS_UNKNOWN;
+    }
+}
+
+static int xb_health(void)
+{
+    switch (battery_health_android) {
+    case 2: return POWER_SUPPLY_HEALTH_GOOD;
+    case 3: return POWER_SUPPLY_HEALTH_OVERHEAT;
+    case 4: return POWER_SUPPLY_HEALTH_DEAD;
+    case 5: return POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+    case 6: return POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+    case 7: return POWER_SUPPLY_HEALTH_COLD;
+    default: return POWER_SUPPLY_HEALTH_UNKNOWN;
+    }
+}
 
 static enum power_supply_property xb_props[] = {
     POWER_SUPPLY_PROP_STATUS, POWER_SUPPLY_PROP_PRESENT, POWER_SUPPLY_PROP_CAPACITY,
     POWER_SUPPLY_PROP_VOLTAGE_NOW, POWER_SUPPLY_PROP_TEMP, POWER_SUPPLY_PROP_HEALTH,
     POWER_SUPPLY_PROP_TECHNOLOGY, POWER_SUPPLY_PROP_CHARGE_TYPE,
+    POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN, POWER_SUPPLY_PROP_CHARGE_FULL,
+    POWER_SUPPLY_PROP_CHARGE_COUNTER,
 };
 static int xb_get_property(struct power_supply *psy, enum power_supply_property psp,
                            union power_supply_propval *val)
 {
     switch (psp) {
-    case POWER_SUPPLY_PROP_STATUS:        val->intval = POWER_SUPPLY_STATUS_DISCHARGING; break;
-    case POWER_SUPPLY_PROP_PRESENT:       val->intval = 1; break;
-    case POWER_SUPPLY_PROP_CAPACITY:      val->intval = 83; break;
-    case POWER_SUPPLY_PROP_VOLTAGE_NOW:   val->intval = 4100000; break;
-    case POWER_SUPPLY_PROP_TEMP:          val->intval = 310; break;
-    case POWER_SUPPLY_PROP_HEALTH:        val->intval = POWER_SUPPLY_HEALTH_GOOD; break;
+    case POWER_SUPPLY_PROP_STATUS:        val->intval = xb_status(); break;
+    case POWER_SUPPLY_PROP_PRESENT:       val->intval = battery_present; break;
+    case POWER_SUPPLY_PROP_CAPACITY:      val->intval = battery_level; break;
+    case POWER_SUPPLY_PROP_VOLTAGE_NOW:   val->intval = battery_voltage_mv * 1000; break;
+    case POWER_SUPPLY_PROP_TEMP:          val->intval = battery_temperature_deci_c; break;
+    case POWER_SUPPLY_PROP_HEALTH:        val->intval = xb_health(); break;
     case POWER_SUPPLY_PROP_TECHNOLOGY:    val->intval = POWER_SUPPLY_TECHNOLOGY_LION; break;
-    case POWER_SUPPLY_PROP_CHARGE_TYPE:   val->intval = POWER_SUPPLY_CHARGE_TYPE_NONE; break;
+    case POWER_SUPPLY_PROP_CHARGE_TYPE:
+        val->intval = battery_plugged_android && battery_status_android == 2
+            ? POWER_SUPPLY_CHARGE_TYPE_STANDARD
+            : POWER_SUPPLY_CHARGE_TYPE_NONE;
+        break;
+    case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+        val->intval = battery_charge_full_design_uah;
+        break;
+    case POWER_SUPPLY_PROP_CHARGE_FULL:
+        val->intval = battery_charge_full_uah;
+        break;
+    case POWER_SUPPLY_PROP_CHARGE_COUNTER:
+        val->intval = battery_charge_counter_uah;
+        break;
     default: return -EINVAL;
     }
     return 0;
@@ -946,6 +1174,7 @@ static struct power_supply *xb_psy;
 static struct kretprobe *rprobes[] = {
     &open_kp, &stat_kp, &statx_kp, &access_kp,
     &faccessat_kp, &unlinkat_kp, &readlink_kp, &maps_seq_kp, &smaps_seq_kp,
+    &affinity_kp, &statfs_kp,
 };
 static struct kretprobe *seclabel_rprobes[] = {
     &igs_kp, &vfs_xattr_kp, &gpa_kp, &aa_gpa_kp, &tiocsti_kp,
@@ -953,6 +1182,7 @@ static struct kretprobe *seclabel_rprobes[] = {
 };
 static unsigned int rprobes_registered;
 static unsigned int seclabel_rprobes_registered;
+static struct kretprobe *sysinfo_registered;
 static bool binder_transaction_registered;
 static bool selinux_groups_registered;
 
@@ -965,6 +1195,10 @@ static void unregister_protection(void)
     while (rprobes_registered > 0) {
         rprobes_registered--;
         unregister_kretprobe(rprobes[rprobes_registered]);
+    }
+    if (sysinfo_registered) {
+        unregister_kretprobe(sysinfo_registered);
+        sysinfo_registered = NULL;
     }
     if (binder_transaction_registered) {
         unregister_kprobe(&binder_transaction_kp);
@@ -1018,6 +1252,9 @@ static int __init xenoid_kmod_init(void)
         goto fail;
     }
     selinux_groups_registered = true;
+    statfs_cloned_abi = strcmp(statfs_symbol, "vfs_statfs") != 0;
+    statfs_needs_clone_success =
+        !strstr(statfs_symbol, ".part.") && !strstr(statfs_symbol, ".constprop.");
 
     for (i = 0; i < ARRAY_SIZE(rprobes); i++) {
         ret = register_kretprobe(rprobes[i]);
@@ -1027,6 +1264,20 @@ static int __init xenoid_kmod_init(void)
             goto fail;
         }
         rprobes_registered++;
+    }
+
+
+    for (i = 0; i < ARRAY_SIZE(sysinfo_kprobes); i++) {
+        ret = register_kretprobe(&sysinfo_kprobes[i]);
+        if (!ret) {
+            sysinfo_registered = &sysinfo_kprobes[i];
+            break;
+        }
+    }
+    if (!sysinfo_registered) {
+        pr_err("xenoid_kmod: required sysinfo producer probe unavailable\n");
+        ret = -ENOENT;
+        goto fail;
     }
 
     xb_psy = power_supply_register(NULL, &xb_desc, NULL);
@@ -1039,7 +1290,7 @@ static int __init xenoid_kmod_init(void)
     power_supply_changed(xb_psy);
 
     pr_info("xenoid_kmod: loaded with %u required probes\n",
-            rprobes_registered + seclabel_rprobes_registered + 1);
+            rprobes_registered + seclabel_rprobes_registered + 2);
     return 0;
 
 fail:

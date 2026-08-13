@@ -10,7 +10,7 @@ checks = {
     "pixel_model": "Google Pixel 6 Pro" in src,
     "tensor_compatible": "google,raven" in src and "google,gs101" in src,
     "serial": "serial-number" in src and "PROFILE_DIR \"/serial\"" in src,
-    "bootargs": "androidboot.hardware=gs101" in src,
+    "bootargs": "androidboot.hardware=raven" in src and "androidboot.hardware.sku=G8V0U" in src,
     "optional_mount": "overlay_text_optional" in src,
     "apply_calls": "devicetree=ok" in src,
 }

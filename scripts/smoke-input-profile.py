@@ -6,6 +6,7 @@ src = ROOT / "native/xenoid-input/xenoid_input.c"
 text = src.read_text()
 root_helper = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/RootHelper.java").read_text()
 runtime_context = (ROOT / "scripts/make-runtime-context.sh").read_text()
+overlay = (ROOT / "native/xenoid-hide/xenoid_overlay.c").read_text()
 checks = {
     "no_xenoid_device_name": "xenoid-uinput-touch" not in text,
     "profile_json_runtime_path": "profile_json_path" in text and "effective.json" in text,
@@ -28,16 +29,37 @@ checks = {
         and "COPY payload/xenoid-input /system/bin/xenoid-input" in runtime_context
         and "publish_event_node" in text
         and "persistentDevice" in text,
+    "proc_input_identity": "input_busType" in overlay
+        and "input_vendorId" in overlay
+        and "input_productId" in overlay
+        and "input_version" in overlay,
+    "proc_input_axes": "B: ABS=67f800001000003" in overlay
+        and "Handlers=event0 \\n" in overlay
+        and "Handlers=event0 mouse0" not in overlay,
 }
 # Build source-level plus run binary status on host is not possible for Android ELF, but compile is covered by build all.
-profile = json.loads((ROOT / "examples/fingerprints/pixel-husky-template.json").read_text())
-for k in ["input_name","input_bustype","input_vendor","input_product","input_version","display_width","display_height","pressure_max","tracking_max"]:
-    checks["template_" + k] = k in profile and profile[k] not in (None, "")
+profile_path = ROOT / "examples/fingerprints/pixel-raven-android13.json"
+profile = json.loads(profile_path.read_text())
+input_profile = profile.get("input") or {}
+display_profile = profile.get("display") or {}
+checks["template_input_identity"] = (
+    input_profile.get("name") == "sec_touchscreen"
+    and input_profile.get("busType") == 24
+    and input_profile.get("vendorId") == 0x04E8
+    and input_profile.get("productId") == 0x6860
+    and input_profile.get("version") == 0x0100
+)
+checks["template_input_axes"] = (
+    input_profile.get("x") == {"minimum": 0, "maximum": display_profile.get("width") - 1}
+    and input_profile.get("y") == {"minimum": 0, "maximum": display_profile.get("height") - 1}
+    and input_profile.get("pressure") == {"minimum": 0, "maximum": 255}
+    and input_profile.get("trackingId") == {"minimum": 0, "maximum": 31}
+)
 td = pathlib.Path(tempfile.mkdtemp(prefix="xenoid-input-template-"))
-proc = subprocess.run([str(ROOT/"scripts/import-pixel-template.py"), str(ROOT/"examples/fingerprints/pixel-husky-template.json"), "--out-dir", str(td), "--overwrite"], text=True, capture_output=True, cwd=ROOT)
+proc = subprocess.run([str(ROOT/"scripts/import-pixel-template.py"), str(profile_path), "--out-dir", str(td), "--overwrite"], text=True, capture_output=True, cwd=ROOT)
 imported = next(td.glob("*.json"), None)
 imported_data = json.loads(imported.read_text()) if imported and imported.exists() else {}
-checks["import_preserves_input"] = proc.returncode == 0 and imported_data.get("input_name") == "sec_touchscreen" and isinstance(imported_data.get("input"), dict)
+checks["import_preserves_input"] = proc.returncode == 0 and imported_data.get("input") == input_profile
 binp = ROOT / "native/xenoid-input/xenoid-input"
 if binp.exists():
     import subprocess as _sp

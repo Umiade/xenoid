@@ -43,13 +43,10 @@ final class HideManager {
                 "setprop ro.boot.vbmeta.device_state locked 2>/dev/null || true; " +
                 "setprop ro.boot.veritymode enforcing 2>/dev/null || true; " +
                 "setprop ro.boot.mode normal 2>/dev/null || true; " +
-                "setprop ro.boot.baseband msm 2>/dev/null || true; " +
-                "setprop ro.boot.hardware.sku raven 2>/dev/null || true; " +
                 "setprop ro.oem_unlock_supported 1 2>/dev/null || true; " +
                 "setprop sys.oem_unlock_allowed 0 2>/dev/null || true; " +
                 "setprop ro.boot.warranty_bit 0 2>/dev/null || true; " +
-                "setprop ro.warranty_bit 0 2>/dev/null || true; " +
-                "setprop ro.vendor.build.security_patch 2022-10-05 2>/dev/null || true",
+                "setprop ro.warranty_bit 0 2>/dev/null || true",
                 false);
         addAction(actions, failures, "property-area",
                 "if [ -x /system/bin/xenoid-prop-area ]; then " +

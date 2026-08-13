@@ -81,15 +81,16 @@ final class CameraSupport {
         return configured.get();
     }
 
-    static long capture(CameraCaptureSession session, CaptureRequest request, Handler handler)
+    static TotalCaptureResult captureResult(
+            CameraCaptureSession session, CaptureRequest request, Handler handler)
             throws Exception {
         CountDownLatch terminal = new CountDownLatch(1);
-        AtomicReference<Long> timestamp = new AtomicReference<>();
+        AtomicReference<TotalCaptureResult> result = new AtomicReference<>();
         AtomicReference<String> error = new AtomicReference<>();
         session.capture(request, new CameraCaptureSession.CaptureCallback() {
             @Override public void onCaptureCompleted(CameraCaptureSession value,
-                    CaptureRequest captureRequest, TotalCaptureResult result) {
-                timestamp.set(result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP));
+                    CaptureRequest captureRequest, TotalCaptureResult captureResult) {
+                result.set(captureResult);
                 terminal.countDown();
             }
             @Override public void onCaptureFailed(CameraCaptureSession value,
@@ -98,10 +99,20 @@ final class CameraSupport {
                 terminal.countDown();
             }
         }, handler);
-        if (!terminal.await(TIMEOUT_SECONDS, TimeUnit.SECONDS) || timestamp.get() == null) {
-            throw new IllegalStateException(error.get() == null ? "capture timeout" : error.get());
+        if (!terminal.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                || result.get() == null) {
+            throw new IllegalStateException(
+                    error.get() == null ? "capture timeout" : error.get());
         }
-        return timestamp.get();
+        return result.get();
+    }
+
+    static long capture(CameraCaptureSession session, CaptureRequest request, Handler handler)
+            throws Exception {
+        Long timestamp = captureResult(session, request, handler).get(
+                android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP);
+        if (timestamp == null) throw new IllegalStateException("capture timestamp missing");
+        return timestamp;
     }
 
     static final class Frame {

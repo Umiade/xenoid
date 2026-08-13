@@ -10,6 +10,8 @@ python3 scripts/test-google-services.py
 python3 scripts/test-proxy-control.py
 python3 scripts/test-proxy-compiler.py >/tmp/xenoid-test-proxy-compiler.json
 python3 scripts/audit-sensitive-data.py
+python3 scripts/smoke-profile-template.py >/tmp/xenoid-smoke-profile-template.json
+python3 scripts/smoke-storage-surfaces.py >/tmp/xenoid-smoke-storage-surfaces.json
 ./xenoid --help >/tmp/xenoid-help.txt
 ./xenoid google-services --help >/tmp/xenoid-google-services-help.txt
 tests/google-services-runtime-probe/build.sh >/tmp/xenoid-google-services-probe-build.txt

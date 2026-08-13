@@ -56,6 +56,14 @@ static void make_block_alias(const char *alias, int fd) {
     if (mknod(alias, S_IFBLK | 0600, st.st_rdev) < 0) die("mknod %s", alias);
 }
 
+static void make_userdata_alias(void) {
+    const char *directory = "/dev/block/platform/14700000.ufs/by-name";
+    const char *alias = "/dev/block/platform/14700000.ufs/by-name/userdata";
+    xmkdir_p(directory);
+    if (unlink(alias) < 0 && errno != ENOENT) die("unlink %s", alias);
+    if (symlink("../../../sda", alias) < 0) die("symlink %s", alias);
+}
+
 /* minimal loop setup without lib: find free loop, attach image */
 static int loop_attach_rw(const char *img, char *loopdev, size_t n, int rw) {
     int ctl = open("/dev/loop-control", O_RDWR);
@@ -140,9 +148,10 @@ int main(int argc, char **argv) {
         char dpath[512];
         snprintf(dpath, sizeof(dpath), "/oldroot%s", data_img);
         int dlfd = loop_attach_rw(dpath, dloop, sizeof(dloop), 1);
-        const char *datadev = "/dev/block/dm-1";
+        const char *datadev = "/dev/block/sda";
         make_block_alias(datadev, dlfd);
-        if (mount(datadev, "/data", "ext4", 0, NULL) < 0)
+        make_userdata_alias();
+        if (mount(datadev, "/data", "ext4", MS_NOSUID | MS_NODEV | MS_NOATIME, NULL) < 0)
             die("mount data %s", datadev);
         close(dlfd);
     } else {

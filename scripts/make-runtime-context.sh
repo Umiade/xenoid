@@ -29,9 +29,16 @@ PIVOT="$ROOT/native/xenoid-pivot/xenoid-pivot"
 SENSORSHAL="$ROOT/native/xenoid-sensorshal/xenoid-sensorshal"
 CAMERA_PROVIDER="$ROOT/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
 GRALLOC="$ROOT/native/xenoid-gralloc/gralloc.redroid.so"
+HWCOMPOSER="$ROOT/native/xenoid-hwcomposer/hwcomposer.raven.so"
 MEDIA_PROFILES="$ROOT/native/xenoid-camerahal/media_profiles_V1_0.xml"
 RIL="$ROOT/native/xenoid-ril/libxenoid-ril.so"
 RADIO_CONFIG="$ROOT/native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"
+HARDWARE_FEATURES="$ROOT/runtime/redroid/xenoid-hardware-features.xml"
+[[ -f "$HARDWARE_FEATURES" && ! -L "$HARDWARE_FEATURES" ]] || {
+  echo "missing runtime/redroid/xenoid-hardware-features.xml" >&2
+  exit 1
+}
+python3 "$ROOT/scripts/smoke-hardware-features.py" --contract "$HARDWARE_FEATURES" >/dev/null
 [[ -f "$DAEMON" ]] || "$ROOT/scripts/build-daemon.sh" >/dev/null
 [[ -f "$INPUT" ]] || "$ROOT/scripts/build-native-input.sh" >/dev/null
 [[ -f "$HIDE" ]] || "$ROOT/scripts/build-native-hide.sh" >/dev/null
@@ -44,6 +51,7 @@ RADIO_CONFIG="$ROOT/native/xenoid-radio-config/android.hardware.radio.config-ser
 [[ -f "$SHIM" ]] || "$ROOT/scripts/build-native-shim.sh" arm64 prop >/dev/null
 [[ -f "$SENSORSHAL" ]] || "$ROOT/scripts/build-sensors-hal.sh" arm64 >/dev/null
 [[ -f "$GRALLOC" ]] || "$ROOT/scripts/build-gralloc.sh" arm64 >/dev/null
+[[ -f "$HWCOMPOSER" ]] || "$ROOT/scripts/build-hwcomposer.sh" arm64 >/dev/null
 [[ -f "$CAMERA_PROVIDER" ]] || "$ROOT/scripts/build-camera-hal.sh" arm64 >/dev/null
 [[ -f "$RIL" ]] || "$ROOT/scripts/build-ril.sh" arm64 >/dev/null
 [[ -f "$RADIO_CONFIG" ]] || "$ROOT/scripts/build-radio-config.sh" arm64 >/dev/null
@@ -73,6 +81,7 @@ cp "$SENSORSHAL" "$OUT/payload/xenoid-sensorshal"
 cp "$ROOT/native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml" "$OUT/payload/android.hardware.sensors.ISensors.xml" || { echo "missing native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
 cp "$CAMERA_PROVIDER" "$OUT/payload/android.hardware.camera.provider-service-aidl"
 cp "$GRALLOC" "$OUT/payload/gralloc.redroid.so"
+cp "$HWCOMPOSER" "$OUT/payload/hwcomposer.raven.so"
 cp "$ROOT/native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml" "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml" || { echo "missing native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
 cp "$MEDIA_PROFILES" "$OUT/payload/media_profiles_V1_0.xml" || { echo "missing native/xenoid-camerahal/media_profiles_V1_0.xml (required by Dockerfile camera profile COPY)" >&2; exit 1; }
 cp "$RIL" "$OUT/payload/libxenoid-ril.so"
@@ -81,6 +90,14 @@ cp "$RADIO_CONFIG" "$OUT/payload/android.hardware.radio.config-service.xenoid"
 cp "$ROOT/native/xenoid-radio-config/android.hardware.radio.config.IRadioConfig.xml" "$OUT/payload/android.hardware.radio.config.IRadioConfig.xml"
 cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/apns-conf.xml" "$OUT/payload/apns-conf.xml"
 cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/xenoid-cellular-features.xml" "$OUT/payload/xenoid-cellular-features.xml"
+cp "$HARDWARE_FEATURES" "$OUT/payload/xenoid-hardware-features.xml" || {
+  echo "failed to stage xenoid-hardware-features.xml" >&2
+  exit 1
+}
+cmp -s "$HARDWARE_FEATURES" "$OUT/payload/xenoid-hardware-features.xml" || {
+  echo "staged xenoid-hardware-features.xml differs from source" >&2
+  exit 1
+}
 cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/privapp-permissions-xenoid.xml" "$OUT/payload/privapp-permissions-xenoid.xml"
 if [[ "${XENOID_ZYGOTE_PRELOAD:-1}" == "0" ]]; then
   # Explicit source experiments may disable the preload; production acceptance requires it.
@@ -108,9 +125,9 @@ if command -v docker >/dev/null 2>&1; then
     # app with Seccomp_filters=0 (real devices have the AOSP app filter). Force
     # the stored flag to 1: CSET W9,NE -> MOVZ W9,#1 @ VA 0x1c9cfc.
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libandroid_runtime.so" "$OUT/payload/libandroid_runtime.so" >/dev/null 2>&1 || true
-    # ro.hardware=tensor makes libhardware request tensor-named graphics HALs.
+    # ro.hardware=raven makes libhardware request raven-named graphics HALs.
     # Preserve the base image's redroid implementations under those names so
-    # the Pixel identity is safe from the first graphics-stack initialization.
+    # the canonical hardware identity is correct before graphics initialization.
     _required_extract_ok=1
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libui.so" "$OUT/payload/libui.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libselinux.so" "$OUT/payload/libselinux.so" >/dev/null || _required_extract_ok=0
@@ -307,8 +324,7 @@ service xenoid-overlay /system/bin/xenoid-overlay-helper apply
     oneshot
     disabled
 
-# Property-area identity must run after /dev/__properties__ is mounted and writable.
-# Starting too early on `on init` leaves ro.hardware=redroid until hide apply re-runs it.
+# Property-area identity runs after /dev/__properties__ is mounted and writable.
 on property:sys.boot_completed=1
     start xenoid-cellular-ready
     start xenoid-props
@@ -360,8 +376,29 @@ assert_no_artifact_markers() {
 # product-specific marker.
 assert_no_artifact_markers "$OUT/payload/android.hardware.camera.provider-service-aidl" \
   xenoid mock replay /Users/ /home/
+assert_no_artifact_markers "$OUT/payload/gralloc.redroid.so" \
+  mock replay inject /Users/ /home/
+# Gralloc consumes the one owned device-profile directory. Permit only that
+# intentional product token; any extra branded string remains a build failure.
+python3 - "$OUT/payload/gralloc.redroid.so" <<'PY'
+import subprocess
+import sys
+
+artifact = sys.argv[1]
+lines = subprocess.run(
+    ["strings", artifact],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.splitlines()
+markers = [line for line in lines if "xenoid" in line.casefold()]
+expected = "/data/local/tmp/xenoid-profile"
+if not markers or set(markers) != {expected}:
+    raise SystemExit(
+        f"gralloc runtime artifact has unexpected product markers: {markers}"
+    )
+PY
 for artifact in \
-  "$OUT/payload/gralloc.redroid.so" \
   "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml" \
   "$OUT/payload/android.hardware.camera.provider-service-aidl.rc"; do
   assert_no_artifact_markers "$artifact" \
@@ -391,6 +428,7 @@ COPY payload/android.hardware.radio.IRadio.xml /vendor/etc/vintf/manifest/androi
 COPY payload/android.hardware.radio.config.IRadioConfig.xml /vendor/etc/vintf/manifest/android.hardware.radio.config.IRadioConfig.xml
 COPY --chmod=644 payload/apns-conf.xml /system/etc/apns-conf.xml
 COPY --chmod=644 payload/xenoid-cellular-features.xml /system/etc/permissions/xenoid-cellular-features.xml
+COPY --chmod=644 payload/xenoid-hardware-features.xml /system/etc/permissions/xenoid-hardware-features.xml
 COPY --chmod=644 payload/privapp-permissions-xenoid.xml /system/etc/permissions/privapp-permissions-xenoid.xml
 COPY payload/android.hardware.sensors.ISensors.xml /vendor/etc/vintf/manifest/android.hardware.sensors.ISensors.xml
 COPY payload/android.hardware.camera.provider-service-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl
@@ -403,11 +441,11 @@ COPY payload/libandroid_runtime.so /system/lib64/libandroid_runtime.so
 COPY --chmod=644 payload/libui.so /system/lib64/libui.so
 # Restore standard SELinux context APIs removed by redroid's HACKED stubs.
 COPY --chmod=644 payload/libselinux.so /system/lib64/libselinux.so
-# ro.hardware=tensor resolves these aliases during early graphics HAL loading.
-# Replace the owning redroid allocator and provide the existing tensor-name alias.
+# ro.hardware=raven resolves these aliases during early graphics HAL loading.
+# Replace the owning redroid allocator and provide the matching Raven alias.
 COPY --chmod=644 payload/gralloc.redroid.so /vendor/lib64/hw/gralloc.redroid.so
-COPY --chmod=644 payload/gralloc.redroid.so /vendor/lib64/hw/gralloc.tensor.so
-COPY --chmod=644 payload/hwcomposer.redroid.so /vendor/lib64/hw/hwcomposer.tensor.so
+COPY --chmod=644 payload/gralloc.redroid.so /vendor/lib64/hw/gralloc.raven.so
+COPY --chmod=644 payload/hwcomposer.raven.so /vendor/lib64/hw/hwcomposer.raven.so
 COPY --chmod=644 payload/media_profiles_V1_0.xml /vendor/etc/media_profiles_V1_0.xml
 # RootOfTrust-only SoftKeymaster patch; this is not hardware-backed KeyMint.
 COPY --chmod=644 payload/libpuresoftkeymasterdevice.so /vendor/lib64/libpuresoftkeymasterdevice.so
@@ -481,7 +519,7 @@ cat >> "$OUT/Dockerfile" <<'DOCKER'
 #   daemon applies device and runtime policies through the token-gated root channel.
 # Pivot into real ext4 rootfs+data loop images before Android init so the mount
 # table looks like a physical device (no container overlayfs/binds anywhere).
-ENTRYPOINT ["/xenoid-init","/data/xenoid-rootfs.img","/data/xenoid-data.img","/init","qemu=1","androidboot.hardware=redroid","androidboot.mode=normal","androidboot.bootreason=reboot,normal","androidboot.verifiedbootstate=green","androidboot.flash.locked=1","androidboot.vbmeta.device_state=locked","androidboot.veritymode=enforcing"]
+ENTRYPOINT ["/xenoid-init","/data/xenoid-rootfs.img","/data/xenoid-data.img","/init","qemu=1","androidboot.hardware=raven","androidboot.hardware.sku=G8V0U","androidboot.mode=normal","androidboot.bootreason=reboot,normal","androidboot.verifiedbootstate=green","androidboot.flash.locked=1","androidboot.vbmeta.device_state=locked","androidboot.veritymode=enforcing","androidboot.use_redroid_c2=1"]
 DOCKER
 cat > "$OUT/build.sh" <<'BUILD'
 #!/usr/bin/env bash

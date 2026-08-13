@@ -36,10 +36,12 @@ rm -rf "$TMP"; mkdir -p "$TMP"
 cat > "$TMP/surfaces.c" <<'C'
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <sched.h>
 #include <link.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/sysinfo.h>
 #include <sys/prctl.h>
 #include <unistd.h>
 static int bad=0;
@@ -51,8 +53,16 @@ int main(){
   check(h1!=0,"dlopen_normal","libm"); check(h2==0,"dlopen_hidden","frida"); if(h1)dlclose(h1); if(h2)dlclose(h2);
   dl_iterate_phdr(phdr_cb,0); check(!bad,"dl_iterate_phdr","no hidden libs");
   prctl(PR_SET_NAME,"gmain",0,0,0); char nm[16]={0}; prctl(PR_GET_NAME,nm,0,0,0); check(strcmp(nm,"main")==0,"prctl_name",nm);
-  check(sysconf(_SC_NPROCESSORS_CONF)==8 && sysconf(_SC_NPROCESSORS_ONLN)==8,"sysconf_cpu","8");
-  check(sysconf(_SC_PHYS_PAGES)==2031616,"sysconf_pages","7.75GB");
+  long configured=sysconf(_SC_NPROCESSORS_CONF), online=sysconf(_SC_NPROCESSORS_ONLN);
+  check(configured==8 && online==8,"sysconf_cpu","8");
+  long pages=sysconf(_SC_PHYS_PAGES), available=sysconf(_SC_AVPHYS_PAGES);
+  check(pages==3145728 && available==1572864,"sysconf_pages","12GiB/6GiB");
+  cpu_set_t affinity; CPU_ZERO(&affinity);
+  check(sched_getaffinity(0,sizeof(affinity),&affinity)==0 && CPU_COUNT(&affinity)==8,"affinity_cpu","0-7");
+  struct sysinfo si={0};
+  check(sysinfo(&si)==0 && (unsigned long long)si.totalram*si.mem_unit==12884901888ULL
+        && (unsigned long long)si.freeram*si.mem_unit==6442450944ULL
+        && si.totalswap==0,"sysinfo_memory","12GiB/6GiB/0swap");
   unsigned long p=getauxval(AT_PLATFORM); check(p && strcmp((char*)p,"aarch64")==0,"getauxval_platform",p?(char*)p:"null");
   return bad?1:0;
 }

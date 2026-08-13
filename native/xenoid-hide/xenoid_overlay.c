@@ -11,12 +11,68 @@
 #define MS_NOSYMFOLLOW 256
 #endif
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
+#include "xenoid_power_supply.h"
 
 #define OVERLAY_DIR "/xenoid/overlay.d"
 #define PROFILE_DIR "/data/local/tmp/xenoid-profile"
 
-static int ensure_dir(const char *p) { return mkdir(p, 0777) == 0 || errno == EEXIST ? 0 : -1; }
+#define XENOID_KERNEL_RELEASE "5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab9012097"
+
+static int ensure_dir(const char *p) {
+  if (mkdir(p, 0777) == 0) return 0;
+  if (errno != EEXIST) return -1;
+  struct stat st;
+  if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+  errno = ENOTDIR;
+  return -1;
+}
+static int child_path(char *out, size_t n, const char *parent, const char *child) {
+  int written = snprintf(out, n, "%s/%s", parent, child);
+  if (written < 0 || (size_t)written >= n) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+static int write_text(const char *path, const char *s);
+static int write_child_text(const char *parent, const char *child, const char *content) {
+  char path[PATH_MAX];
+  return child_path(path, sizeof(path), parent, child) || write_text(path, content);
+}
+static int ensure_symlink_value(const char *target, const char *path) {
+  char current[PATH_MAX];
+  ssize_t size = readlink(path, current, sizeof(current) - 1);
+  if (size >= 0) {
+    current[size] = 0;
+    if (!strcmp(current, target)) return 0;
+  }
+  struct stat st;
+  if (lstat(path, &st) == 0) {
+    if (S_ISDIR(st.st_mode)) {
+      errno = EISDIR;
+      return -1;
+    }
+    if (unlink(path)) return -1;
+  } else if (errno != ENOENT) {
+    return -1;
+  }
+  return symlink(target, path);
+}
+static int clear_directory_entries(const char *path) {
+  DIR *dir = opendir(path);
+  if (!dir) return -1;
+  int fail = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+    char child[PATH_MAX];
+    if (child_path(child, sizeof(child), path, entry->d_name) || unlink(child)) fail = 1;
+  }
+  closedir(dir);
+  return fail ? -1 : 0;
+}
 static char *read_all(const char *path) {
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) return strdup("");
@@ -58,20 +114,11 @@ static const char *overlay_targets[] = {
   "/vendor/odm_dlkm/etc/build.prop", "/vendor/vendor_dlkm/etc/build.prop", "/vendor/odm/etc/build.prop",
   "/system/system_dlkm/etc/build.prop", "/system/system_ext/etc/build.prop", "/system/product/etc/build.prop",
   "/vendor/build.prop", "/system/build.prop",
-  "/sys/block/vdb/queue/rotational", "/sys/block/vda/queue/rotational", "/sys/block/vdb/size", "/sys/block/vda/size",
+  "/sys/block", "/sys/class/block", "/sys/dev/block", "/sys/devices/virtual/block",
   "/proc/partitions", "/proc/diskstats", "/proc/modules", "/proc/interrupts", "/proc/iomem", "/proc/ioports", "/proc/kallsyms",
   "/proc/devices", "/proc/misc", "/proc/tty/drivers",
   "/sys/class/rtc/rtc0/name", "/sys/class/rtc/rtc0/hctosys",
-  "/sys/devices/system/cpu/present", "/sys/devices/system/cpu/possible", "/sys/devices/system/cpu/online",
-  "/sys/devices/system/cpu/cpu0/topology/core_id", "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
-  "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", "/sys/devices/system/cpu/cpu0/topology/core_siblings_list",
-  "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq",
-  "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-  "/sys/devices/system/cpu/cpu7/topology/core_id", "/sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq",
-  "/sys/devices/system/cpu/cpu0", "/sys/devices/system/cpu/cpu1",
-  "/sys/devices/system/cpu/cpu2", "/sys/devices/system/cpu/cpu3",
-  "/sys/devices/system/cpu/cpu4", "/sys/devices/system/cpu/cpu5",
-  "/sys/devices/system/cpu/cpu6", "/sys/devices/system/cpu/cpu7",
+  "/sys/devices/system/cpu",
   "/proc/filesystems", "/proc/swaps",
   "/proc/cgroups", "/proc/1/status", "/proc/1/uid_map", "/proc/1/gid_map", "/proc/1/attr/current",
   "/proc/1/cgroup", "/proc/1/mounts", "/proc/1/mountinfo", "/proc/1/mountstats",
@@ -83,7 +130,7 @@ static const char *overlay_targets[] = {
   "/proc/cmdline", "/proc/version", "/proc/cpuinfo", "/proc/bus/input/devices", "/proc/fb",
   "/proc/sys/kernel/random/boot_id",
   "/proc/sys/kernel/random/uuid", "/proc/sys/kernel/random/entropy_avail", "/proc/sys/kernel/random/poolsize", "/proc/sys/kernel/random/urandom_min_reseed_secs",
-  "/sys/class/graphics/fb0/name", "/sys/class/graphics/fb0/virtual_size", "/sys/class/graphics/fb0/bits_per_pixel", "/sys/class/graphics/fb0/modes",
+  "/sys/class/graphics/fb0/name", "/sys/class/graphics/fb0/virtual_size", "/sys/class/graphics/fb0/bits_per_pixel", "/sys/class/graphics/fb0/modes", "/sys/class/graphics/fb0/refresh_rate",
   "/sys/class/backlight/panel0-backlight/brightness", "/sys/class/backlight/panel0-backlight/max_brightness",
   "/sys/class/backlight/panel0-backlight/actual_brightness", "/sys/class/backlight/panel0-backlight/type",
   "/sys/class/leds/vibrator/brightness", "/sys/class/leds/vibrator/max_brightness",
@@ -102,6 +149,7 @@ static const char *overlay_targets[] = {
   "/sys/fs/selinux/enforce", "/sys/fs/selinux/policyvers", "/sys/fs/selinux/mls",
   "/sys/devices/virtual/dmi/id/product_name", "/sys/devices/virtual/dmi/id/sys_vendor", "/sys/hypervisor/type",
   "/etc/hosts", "/proc/sys/kernel/hostname", "/proc/sys/kernel/domainname", "/proc/sys/kernel/tainted",
+  "/sys/class/power_supply/battery",
   "/sys/class/power_supply/battery/capacity", "/sys/class/power_supply/battery/status",
   "/sys/class/power_supply/battery/health", "/sys/class/power_supply/battery/present",
   "/sys/class/power_supply/battery/temp", "/sys/class/power_supply/battery/voltage_now",
@@ -120,6 +168,8 @@ static const char *overlay_targets[] = {
   NULL
 };
 static const char *deprecated_dynamic_targets[] = {
+  "/sys/block/vdb/queue/rotational", "/sys/block/vda/queue/rotational",
+  "/sys/block/vdb/size", "/sys/block/vda/size",
   "/proc/driver/rtc",
   "/sys/class/rtc/rtc0/date", "/sys/class/rtc/rtc0/time", "/sys/class/rtc/rtc0/since_epoch",
   "/proc/meminfo", "/proc/vmstat", "/proc/zoneinfo", "/proc/buddyinfo", "/proc/pagetypeinfo",
@@ -290,125 +340,101 @@ static long read_long_default(const char *path, long fallback) {
   free(s); return e && e != s ? v : fallback;
 }
 static void long_line(char *buf, size_t n, long v) { snprintf(buf, n, "%ld\n", v); }
-static const char *battery_status_text(long status, long plugged) {
-  if (status == 5) return "Full\n";
-  if (status == 2 || plugged > 0) return "Charging\n";
-  if (status == 3) return "Discharging\n";
-  if (status == 4) return "Not charging\n";
-  return "Discharging\n";
-}
-static const char *battery_health_text(long health) {
-  if (health == 2) return "Good\n";
-  if (health == 3) return "Overheat\n";
-  if (health == 4) return "Dead\n";
-  if (health == 5) return "Over voltage\n";
-  return "Good\n";
-}
 
 
 
 
-static const char *system_build_prop_text(void) {
-  return "ro.product.system.brand=google\n"
-         "ro.product.system.device=raven\n"
-         "ro.product.system.manufacturer=Google\n"
-         "ro.product.system.model=Pixel 6 Pro\n"
-         "ro.product.system.name=raven\n"
-         "ro.system.product.cpu.abilist=arm64-v8a\n"
-         "ro.system.product.cpu.abilist64=arm64-v8a\n"
-         "ro.system.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\n"
-         "ro.system.build.tags=release-keys\n"
-         "ro.system.build.type=user\n"
-         "ro.build.display.id=TP1A.221005.002\n"
-         "ro.build.version.security_patch=2022-10-05\n"
-         "ro.build.type=user\n"
-         "ro.build.tags=release-keys\n"
-         "ro.build.flavor=raven-user\n"
-         "ro.product.cpu.abi=arm64-v8a\n"
-         "ro.product.locale=en-US\n"
-         "ro.build.product=raven\n"
-         "ro.build.description=raven-user 13 TP1A.221005.002 8977058 release-keys\n"
-         "ro.debuggable=0\n"
-         "ro.secure=1\n"
-         "ro.crypto.state=encrypted\n"
-         "ro.adb.secure=1\n";
-}
-static const char *vendor_build_prop_text(void) {
-  return "ro.product.vendor.brand=google\n"
-         "ro.product.vendor.device=raven\n"
-         "ro.product.vendor.manufacturer=Google\n"
-         "ro.product.vendor.model=Pixel 6 Pro\n"
-         "ro.product.vendor.name=raven\n"
-         "ro.vendor.product.cpu.abilist=arm64-v8a\n"
-         "ro.vendor.product.cpu.abilist64=arm64-v8a\n"
-         "ro.vendor.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\n"
-         "ro.vendor.build.tags=release-keys\n"
-         "ro.vendor.build.type=user\n"
-         "ro.vendor.build.security_patch=2022-10-05\n"
-         "ro.hardware=tensor\n"
-         "ro.bionic.arch=arm64\n"
-         "dalvik.vm.isa.arm64.variant=cortex-a76\n"
-         "dalvik.vm.isa.arm64.features=default\n"
-         "ro.product.first_api_level=33\n"
-         "ro.product.debugfs_restrictions.enabled=true\n"
-         "ro.product.board=raven\n";
+static int overlay_existing_file(const char *name, const char *target) {
+  char *content = read_all(target);
+  if (!content || !content[0]) {
+    free(content);
+    errno = ENOENT;
+    return -1;
+  }
+  int result = overlay_text(name, target, content);
+  free(content);
+  return result;
 }
 static int overlay_build_props(void) {
   int fail = 0;
-  fail += overlay_text("system_build.prop", "/system/build.prop", system_build_prop_text()) != 0;
-  fail += overlay_text("vendor_build.prop", "/vendor/build.prop", vendor_build_prop_text()) != 0;
+  fail += overlay_existing_file("system_build.prop", "/system/build.prop") != 0;
+  fail += overlay_existing_file("vendor_build.prop", "/vendor/build.prop") != 0;
   return fail ? -1 : 0;
 }
-
-
 static int overlay_extra_build_props(void) {
   int fail = 0;
-  const char *product =
-    "ro.product.product.brand=google\nro.product.product.device=raven\nro.product.product.manufacturer=Google\nro.product.product.model=Pixel 6 Pro\nro.product.product.name=raven\nro.product.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.product.build.tags=release-keys\nro.product.build.type=user\nro.product.vndk.version=33\n";
-  const char *system_ext =
-    "ro.product.system_ext.brand=google\nro.product.system_ext.device=raven\nro.product.system_ext.manufacturer=Google\nro.product.system_ext.model=Pixel 6 Pro\nro.product.system_ext.name=raven\nro.system_ext.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.system_ext.build.tags=release-keys\nro.system_ext.build.type=user\n";
-  const char *system_dlkm =
-    "ro.product.system_dlkm.brand=google\nro.product.system_dlkm.device=raven\nro.product.system_dlkm.manufacturer=Google\nro.product.system_dlkm.model=Pixel 6 Pro\nro.product.system_dlkm.name=raven\nro.system_dlkm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.system_dlkm.build.tags=release-keys\nro.system_dlkm.build.type=user\n";
-  const char *odm =
-    "ro.product.odm.brand=google\nro.product.odm.device=raven\nro.product.odm.manufacturer=Google\nro.product.odm.model=Pixel 6 Pro\nro.product.odm.name=raven\nro.odm.product.cpu.abilist=arm64-v8a\nro.odm.product.cpu.abilist64=arm64-v8a\nro.odm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.odm.build.tags=release-keys\nro.odm.build.type=user\n";
-  const char *vendor_dlkm =
-    "ro.product.vendor_dlkm.brand=google\nro.product.vendor_dlkm.device=raven\nro.product.vendor_dlkm.manufacturer=Google\nro.product.vendor_dlkm.model=Pixel 6 Pro\nro.product.vendor_dlkm.name=raven\nro.vendor_dlkm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.vendor_dlkm.build.tags=release-keys\nro.vendor_dlkm.build.type=user\n";
-  const char *odm_dlkm =
-    "ro.product.odm_dlkm.brand=google\nro.product.odm_dlkm.device=raven\nro.product.odm_dlkm.manufacturer=Google\nro.product.odm_dlkm.model=Pixel 6 Pro\nro.product.odm_dlkm.name=raven\nro.odm_dlkm.build.fingerprint=google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys\nro.odm_dlkm.build.tags=release-keys\nro.odm_dlkm.build.type=user\n";
-  fail += overlay_text("product_build.prop", "/system/product/etc/build.prop", product) != 0;
-  fail += overlay_text("system_ext_build.prop", "/system/system_ext/etc/build.prop", system_ext) != 0;
-  fail += overlay_text("system_dlkm_build.prop", "/system/system_dlkm/etc/build.prop", system_dlkm) != 0;
-  fail += overlay_text("odm_build.prop", "/vendor/odm/etc/build.prop", odm) != 0;
-  fail += overlay_text("vendor_dlkm_build.prop", "/vendor/vendor_dlkm/etc/build.prop", vendor_dlkm) != 0;
-  fail += overlay_text("odm_dlkm_build.prop", "/vendor/odm_dlkm/etc/build.prop", odm_dlkm) != 0;
+  fail += overlay_existing_file("product_build.prop", "/system/product/etc/build.prop") != 0;
+  fail += overlay_existing_file("system_ext_build.prop", "/system/system_ext/etc/build.prop") != 0;
+  fail += overlay_existing_file("system_dlkm_build.prop", "/system/system_dlkm/etc/build.prop") != 0;
+  fail += overlay_existing_file("odm_build.prop", "/vendor/odm/etc/build.prop") != 0;
+  fail += overlay_existing_file("vendor_dlkm_build.prop", "/vendor/vendor_dlkm/etc/build.prop") != 0;
+  fail += overlay_existing_file("odm_dlkm_build.prop", "/vendor/odm_dlkm/etc/build.prop") != 0;
   return fail ? -1 : 0;
 }
 
 
 static int overlay_power_supply(void) {
+  const char *target = "/sys/class/power_supply/battery";
+  char directory[PATH_MAX], path[PATH_MAX], buf[64];
+  struct xenoid_battery_file files[XENOID_BATTERY_FILE_COUNT];
+  char *technology = first_or_default(
+      PROFILE_DIR "/battery_technology", "Li-ion\n");
+  technology[strcspn(technology, "\r\n")] = 0;
+  struct xenoid_battery_profile profile = {
+    .level = read_long_default(PROFILE_DIR "/battery_level", 83),
+    .scale = read_long_default(PROFILE_DIR "/battery_scale", 100),
+    .voltage_mv = read_long_default(PROFILE_DIR "/battery_voltage", 4100),
+    .temperature_deci_c =
+        read_long_default(PROFILE_DIR "/battery_temperature", 310),
+    .status = read_long_default(PROFILE_DIR "/battery_status", 3),
+    .plugged = read_long_default(PROFILE_DIR "/battery_plugged", 0),
+    .health = read_long_default(PROFILE_DIR "/battery_health", 2),
+    .present = read_long_default(PROFILE_DIR "/battery_present", 1),
+    .technology = technology,
+    .capacity_mah =
+        read_long_default(PROFILE_DIR "/battery_capacityMah", 5003),
+    .minimum_capacity_mah =
+        read_long_default(PROFILE_DIR "/battery_minimumCapacityMah", 4905),
+    .charge_full_design_uah =
+        read_long_default(PROFILE_DIR "/battery_chargeFullDesignUah", 5003000),
+    .charge_full_uah =
+        read_long_default(PROFILE_DIR "/battery_chargeFullUah", 5003000),
+    .charge_counter_uah =
+        read_long_default(PROFILE_DIR "/battery_chargeCounterUah", 4152490),
+  };
+  if (access(target, F_OK) != 0
+      || xenoid_render_battery_files(
+          &profile, files, XENOID_BATTERY_FILE_COUNT) != 0) {
+    free(technology);
+    return -1;
+  }
+  snprintf(directory, sizeof(directory), "%s/power_supply_battery", OVERLAY_DIR);
+  if (ensure_dir(directory) || chmod(directory, 0755) != 0) {
+    free(technology);
+    return -1;
+  }
+  for (size_t index = 0; index < XENOID_BATTERY_FILE_COUNT; index++) {
+    int written = snprintf(
+        path, sizeof(path), "%s/%s", directory, files[index].name);
+    if (written < 0 || (size_t)written >= sizeof(path)
+        || write_text(path, files[index].value)) {
+      free(technology);
+      return -1;
+    }
+  }
+  free(technology);
+  if (bind_file(directory, target)) return -1;
+
   int fail = 0;
-  char buf[64];
-  long level = read_long_default(PROFILE_DIR "/battery_level", 83);
-  long temp = read_long_default(PROFILE_DIR "/battery_temperature", 310);
-  long voltage = read_long_default(PROFILE_DIR "/battery_voltage", 4100);
-  long status = read_long_default(PROFILE_DIR "/battery_status", 2);
-  long plugged = read_long_default(PROFILE_DIR "/battery_plugged", 0);
-  long health = read_long_default(PROFILE_DIR "/battery_health", 2);
-  long present = read_long_default(PROFILE_DIR "/battery_present", 1);
-  if (voltage > 0 && voltage < 100000) voltage *= 1000;
-  if (level < 0) level = 0; if (level > 100) level = 100;
-  long_line(buf, sizeof(buf), level); fail += overlay_text_optional("battery_capacity", "/sys/class/power_supply/battery/capacity", buf) != 0;
-  long_line(buf, sizeof(buf), temp); fail += overlay_text_optional("battery_temp", "/sys/class/power_supply/battery/temp", buf) != 0;
-  long_line(buf, sizeof(buf), voltage); fail += overlay_text_optional("battery_voltage_now", "/sys/class/power_supply/battery/voltage_now", buf) != 0;
-  long_line(buf, sizeof(buf), present); fail += overlay_text_optional("battery_present", "/sys/class/power_supply/battery/present", buf) != 0;
-  fail += overlay_text_optional("battery_status", "/sys/class/power_supply/battery/status", battery_status_text(status, plugged)) != 0;
-  fail += overlay_text_optional("battery_health", "/sys/class/power_supply/battery/health", battery_health_text(health)) != 0;
-  fail += overlay_text_optional("battery_technology", "/sys/class/power_supply/battery/technology", "Li-ion\n") != 0;
-  fail += overlay_text_optional("battery_capacity_level", "/sys/class/power_supply/battery/capacity_level", level >= 95 ? "Full\n" : (level <= 15 ? "Low\n" : "Normal\n")) != 0;
-  long ac = plugged == 1 ? 1 : 0, usb = plugged == 2 ? 1 : 0, wireless = plugged == 4 ? 1 : 0;
-  long_line(buf, sizeof(buf), usb); fail += overlay_text_optional("usb_online", "/sys/class/power_supply/usb/online", buf) != 0;
-  long_line(buf, sizeof(buf), ac); fail += overlay_text_optional("ac_online", "/sys/class/power_supply/ac/online", buf) != 0;
-  long_line(buf, sizeof(buf), wireless); fail += overlay_text_optional("wireless_online", "/sys/class/power_supply/wireless/online", buf) != 0;
+  long_line(buf, sizeof(buf), profile.plugged == 2 ? 1 : 0);
+  fail += overlay_text_optional(
+      "usb_online", "/sys/class/power_supply/usb/online", buf) != 0;
+  long_line(buf, sizeof(buf), profile.plugged == 1 ? 1 : 0);
+  fail += overlay_text_optional(
+      "ac_online", "/sys/class/power_supply/ac/online", buf) != 0;
+  long_line(buf, sizeof(buf), profile.plugged == 4 ? 1 : 0);
+  fail += overlay_text_optional(
+      "wireless_online", "/sys/class/power_supply/wireless/online", buf) != 0;
   return fail ? -1 : 0;
 }
 
@@ -580,7 +606,7 @@ static int overlay_devicetree_identity(void) {
   const char *model = "Google Pixel 6 Pro\n";
   static const char compatible[] = "google,raven\0google,gs101\0";
   const char *name = "raven\n";
-  const char *bootargs = "console=ttyMSM0 androidboot.hardware=gs101 androidboot.verifiedbootstate=green androidboot.veritymode=enforcing\n";
+  const char *bootargs = "console=ttyMSM0 androidboot.hardware=raven androidboot.hardware.sku=G8V0U androidboot.verifiedbootstate=green androidboot.veritymode=enforcing\n";
   fail += overlay_text_optional("proc_dt_model", "/proc/device-tree/model", model) != 0;
   fail += overlay_bytes_optional("proc_dt_compatible", "/proc/device-tree/compatible", compatible, sizeof(compatible) - 1) != 0;
   fail += overlay_text_optional("proc_dt_name", "/proc/device-tree/name", name) != 0;
@@ -607,104 +633,391 @@ static int overlay_dmi_hypervisor(void) {
   return fail ? -1 : 0;
 }
 
+struct storage_profile_view {
+  unsigned long long capacity_bytes;
+  unsigned long long sector_size_bytes;
+  unsigned long long sector_count;
+  unsigned int dev_major;
+  unsigned int dev_minor;
+  char block_device[32];
+  char mount_source[128];
+  char filesystem[16];
+};
+
+static int load_storage_profile(struct storage_profile_view *view) {
+  long capacity = read_long_default(
+      PROFILE_DIR "/storage_capacityBytes", 128000000000L);
+  long sector_size = read_long_default(
+      PROFILE_DIR "/storage_sectorSizeBytes", 512);
+  long sector_count = read_long_default(
+      PROFILE_DIR "/storage_sectorCount", 250000000);
+  char *block_device = first_or_default(
+      PROFILE_DIR "/storage_blockDevice", "sda\n");
+  block_device[strcspn(block_device, "\r\n")] = 0;
+  char *mount_source = first_or_default(
+      PROFILE_DIR "/storage_mountSource",
+      "/dev/block/platform/14700000.ufs/by-name/userdata\n");
+  mount_source[strcspn(mount_source, "\r\n")] = 0;
+  char *filesystem = first_or_default(
+      PROFILE_DIR "/storage_filesystem", "f2fs\n");
+  filesystem[strcspn(filesystem, "\r\n")] = 0;
+  char block_path[PATH_MAX];
+  struct stat block_stat;
+  int path_written = snprintf(
+      block_path, sizeof(block_path), "/dev/block/%s", block_device);
+  int valid = capacity > 0 && sector_size > 0 && sector_count > 0
+      && (unsigned long long)sector_count
+          <= ~0ULL / (unsigned long long)sector_size
+      && (unsigned long long)capacity
+          == (unsigned long long)sector_size * (unsigned long long)sector_count
+      && capacity == 128000000000L
+      && sector_size == 512
+      && sector_count == 250000000
+      && !strcmp(block_device, "sda")
+      && !strcmp(mount_source, "/dev/block/platform/14700000.ufs/by-name/userdata")
+      && !strcmp(filesystem, "f2fs")
+      && path_written > 0 && (size_t)path_written < sizeof(block_path)
+      && stat(block_path, &block_stat) == 0 && S_ISBLK(block_stat.st_mode);
+  if (valid) {
+    view->capacity_bytes = (unsigned long long)capacity;
+    view->sector_size_bytes = (unsigned long long)sector_size;
+    view->sector_count = (unsigned long long)sector_count;
+    view->dev_major = major(block_stat.st_rdev);
+    view->dev_minor = minor(block_stat.st_rdev);
+    snprintf(view->block_device, sizeof(view->block_device), "%s", block_device);
+    snprintf(view->mount_source, sizeof(view->mount_source), "%s", mount_source);
+    snprintf(view->filesystem, sizeof(view->filesystem), "%s", filesystem);
+  }
+  free(block_device);
+  free(mount_source);
+  free(filesystem);
+  return valid ? 0 : -1;
+}
+
 static int overlay_storage_proc(void) {
-  const char *diskstats =
-    " 179       0 mmcblk0 1200 0 65536 120 3400 0 262144 520 0 600 640 0 0 0 0 0 0\n"
-    " 179       1 mmcblk0p1 100 0 4096 10 0 0 0 0 0 10 10 0 0 0 0 0 0\n"
-    " 179       2 mmcblk0p2 1100 0 61440 110 3400 0 262144 520 0 590 630 0 0 0 0 0 0\n";
-  const char *parts =
-    "major minor  #blocks  name\n\n"
-    " 179        0   62500000 mmcblk0\n"
-    " 179        1     262144 mmcblk0p1\n"
-    " 179        2   62237856 mmcblk0p2\n";
+  struct storage_profile_view view;
+  char diskstats[1024], parts[512];
+  if (load_storage_profile(&view)) return -1;
+  int diskstats_written = snprintf(
+      diskstats, sizeof(diskstats),
+      "%4u %7u %s 1200 0 65536 120 3400 0 262144 520 0 600 640 0 0 0 0 0 0\n",
+      view.dev_major, view.dev_minor, view.block_device);
+  int parts_written = snprintf(
+      parts, sizeof(parts),
+      "major minor  #blocks  name\n\n"
+      "%4u %8u %10llu %s\n",
+      view.dev_major, view.dev_minor,
+      view.capacity_bytes / 1024ULL, view.block_device);
+  if (diskstats_written < 0 || (size_t)diskstats_written >= sizeof(diskstats)
+      || parts_written < 0 || (size_t)parts_written >= sizeof(parts)) return -1;
   int fail = 0;
   fail += overlay_text("diskstats", "/proc/diskstats", diskstats) != 0;
   fail += overlay_text("partitions", "/proc/partitions", parts) != 0;
   return fail ? -1 : 0;
 }
+
 static int overlay_block_sysfs(void) {
+  struct storage_profile_view view;
+  char stage[PATH_MAX], devices[PATH_MAX], virtual_devices[PATH_MAX];
+  char device_root[PATH_MAX], block_root[PATH_MAX], class_root[PATH_MAX];
+  char class_block[PATH_MAX], dev_root[PATH_MAX], dev_block[PATH_MAX];
+  char sda_root[PATH_MAX], queue_root[PATH_MAX], link_path[PATH_MAX];
+  char size[64], sector_size[64], dev_number[64], uevent[256];
+  if (load_storage_profile(&view)) return -1;
+  if (child_path(stage, sizeof(stage), OVERLAY_DIR, "storage_sysfs")
+      || child_path(devices, sizeof(devices), stage, "devices")
+      || child_path(virtual_devices, sizeof(virtual_devices), devices, "virtual")
+      || child_path(device_root, sizeof(device_root), virtual_devices, "block")
+      || child_path(sda_root, sizeof(sda_root), device_root, view.block_device)
+      || child_path(queue_root, sizeof(queue_root), sda_root, "queue")
+      || child_path(block_root, sizeof(block_root), stage, "block")
+      || child_path(class_root, sizeof(class_root), stage, "class")
+      || child_path(class_block, sizeof(class_block), class_root, "block")
+      || child_path(dev_root, sizeof(dev_root), stage, "dev")
+      || child_path(dev_block, sizeof(dev_block), dev_root, "block")) return -1;
+  if (ensure_dir(stage) || ensure_dir(devices) || ensure_dir(virtual_devices)
+      || ensure_dir(device_root) || ensure_dir(sda_root) || ensure_dir(queue_root)
+      || ensure_dir(block_root) || ensure_dir(class_root) || ensure_dir(class_block)
+      || ensure_dir(dev_root) || ensure_dir(dev_block)) return -1;
+  if (chmod(device_root, 0755) || chmod(sda_root, 0755)
+      || chmod(queue_root, 0755) || chmod(block_root, 0755)
+      || chmod(class_block, 0755) || chmod(dev_block, 0755)) return -1;
+  int size_written = snprintf(size, sizeof(size), "%llu\n", view.sector_count);
+  int sector_written = snprintf(
+      sector_size, sizeof(sector_size), "%llu\n", view.sector_size_bytes);
+  int dev_written = snprintf(
+      dev_number, sizeof(dev_number), "%u:%u\n", view.dev_major, view.dev_minor);
+  int uevent_written = snprintf(
+      uevent, sizeof(uevent),
+      "MAJOR=%u\nMINOR=%u\nDEVNAME=%s\nDEVTYPE=disk\n",
+      view.dev_major, view.dev_minor, view.block_device);
+  if (size_written < 0 || (size_t)size_written >= sizeof(size)
+      || sector_written < 0 || (size_t)sector_written >= sizeof(sector_size)
+      || dev_written < 0 || (size_t)dev_written >= sizeof(dev_number)
+      || uevent_written < 0 || (size_t)uevent_written >= sizeof(uevent)) return -1;
   int fail = 0;
-  fail += overlay_text("vda_size", "/sys/block/vda/size", "125000000\n") != 0;
-  fail += overlay_text("vdb_size", "/sys/block/vdb/size", "0\n") != 0;
-  fail += overlay_text("vda_rotational", "/sys/block/vda/queue/rotational", "0\n") != 0;
-  fail += overlay_text("vdb_rotational", "/sys/block/vdb/queue/rotational", "0\n") != 0;
+  fail += write_child_text(sda_root, "size", size) != 0;
+  fail += write_child_text(sda_root, "dev", dev_number) != 0;
+  fail += write_child_text(sda_root, "removable", "0\n") != 0;
+  fail += write_child_text(sda_root, "ro", "0\n") != 0;
+  fail += write_child_text(sda_root, "range", "16\n") != 0;
+  fail += write_child_text(sda_root, "capability", "50\n") != 0;
+  fail += write_child_text(sda_root, "inflight", "0 0\n") != 0;
+  fail += write_child_text(
+      sda_root, "stat", "1200 0 65536 120 3400 0 262144 520 0 600 640 0 0 0 0 0 0\n") != 0;
+  fail += write_child_text(sda_root, "uevent", uevent) != 0;
+  fail += write_child_text(queue_root, "rotational", "0\n") != 0;
+  fail += write_child_text(queue_root, "logical_block_size", sector_size) != 0;
+  fail += write_child_text(queue_root, "physical_block_size", sector_size) != 0;
+  fail += write_child_text(queue_root, "minimum_io_size", sector_size) != 0;
+  fail += write_child_text(queue_root, "optimal_io_size", "0\n") != 0;
+  fail += write_child_text(queue_root, "read_ahead_kb", "128\n") != 0;
+  fail += write_child_text(queue_root, "nr_requests", "128\n") != 0;
+  fail += write_child_text(queue_root, "scheduler", "[none] mq-deadline\n") != 0;
+  if (fail) return -1;
+  if (child_path(link_path, sizeof(link_path), block_root, view.block_device)
+      || ensure_symlink_value("../devices/virtual/block/sda", link_path)
+      || child_path(link_path, sizeof(link_path), class_block, view.block_device)
+      || ensure_symlink_value("../../devices/virtual/block/sda", link_path)
+      || clear_directory_entries(dev_block)) return -1;
+  char dev_link_name[64];
+  int link_written = snprintf(
+      dev_link_name, sizeof(dev_link_name), "%u:%u", view.dev_major, view.dev_minor);
+  if (link_written < 0 || (size_t)link_written >= sizeof(dev_link_name)
+      || child_path(link_path, sizeof(link_path), dev_block, dev_link_name)
+      || ensure_symlink_value("../../devices/virtual/block/sda", link_path)) return -1;
+  fail += bind_file(device_root, "/sys/devices/virtual/block") != 0;
+  fail += bind_file(block_root, "/sys/block") != 0;
+  fail += bind_file(class_block, "/sys/class/block") != 0;
+  fail += bind_file(dev_block, "/sys/dev/block") != 0;
   return fail ? -1 : 0;
 }
 
-static int overlay_meminfo(void) {
-  const char *mem =
-    "MemTotal:        8126464 kB\n"
-    "MemFree:         2145320 kB\n"
-    "MemAvailable:    5120480 kB\n"
-    "Buffers:          128000 kB\n"
-    "Cached:          2864000 kB\n"
-    "SwapCached:            0 kB\n"
-    "Active:          2100000 kB\n"
-    "Inactive:        1800000 kB\n"
-    "Active(anon):     900000 kB\n"
-    "Inactive(anon):   300000 kB\n"
-    "Active(file):    1200000 kB\n"
-    "Inactive(file):  1500000 kB\n"
-    "Unevictable:           0 kB\n"
-    "Mlocked:               0 kB\n"
-    "SwapTotal:             0 kB\n"
-    "SwapFree:              0 kB\n"
-    "Dirty:               128 kB\n"
-    "Writeback:             0 kB\n"
-    "AnonPages:       1200000 kB\n"
-    "Mapped:           600000 kB\n"
-    "Shmem:            120000 kB\n"
-    "Slab:             320000 kB\n"
-    "SReclaimable:     180000 kB\n"
-    "SUnreclaim:       140000 kB\n"
-    "KernelStack:       12000 kB\n"
-    "PageTables:        20000 kB\n"
-    "CommitLimit:     3932160 kB\n"
-    "Committed_AS:    3500000 kB\n";
-  return overlay_text("meminfo", "/proc/meminfo", mem);
+struct memory_profile_view {
+  unsigned long long total_kib;
+  unsigned long long swap_kib;
+  unsigned long long free_kib;
+  unsigned long long available_kib;
+  unsigned long long buffers_kib;
+  unsigned long long cached_kib;
+  unsigned long long active_anon_kib;
+  unsigned long long inactive_anon_kib;
+  unsigned long long active_file_kib;
+  unsigned long long inactive_file_kib;
+  unsigned long long anon_kib;
+  unsigned long long mapped_kib;
+  unsigned long long shmem_kib;
+  unsigned long long slab_reclaimable_kib;
+  unsigned long long slab_unreclaimable_kib;
+  unsigned long long kernel_stack_kib;
+  unsigned long long page_tables_kib;
+};
+
+static void load_memory_profile(struct memory_profile_view *view) {
+  const unsigned long long fallback_kib = 12ULL * 1024ULL * 1024ULL;
+  long total_kib = read_long_default(PROFILE_DIR "/memory_totalKiB", (long)fallback_kib);
+  long total_bytes = read_long_default(
+      PROFILE_DIR "/memory_totalBytes", (long)(fallback_kib * 1024ULL));
+  long swap_bytes = read_long_default(PROFILE_DIR "/memory_swapBytes", 0);
+  if (total_kib < 1048576 || total_kib % 4 != 0
+      || total_bytes < 0 || (unsigned long long)total_bytes != (unsigned long long)total_kib * 1024ULL) {
+    total_kib = (long)fallback_kib;
+  }
+  if (swap_bytes < 0 || swap_bytes % 1024 != 0) swap_bytes = 0;
+  memset(view, 0, sizeof(*view));
+  view->total_kib = (unsigned long long)total_kib;
+  view->swap_kib = (unsigned long long)swap_bytes / 1024ULL;
+  view->free_kib = view->total_kib / 2ULL;
+  view->available_kib = view->total_kib * 2ULL / 3ULL;
+  view->buffers_kib = view->total_kib / 96ULL;
+  view->cached_kib = view->total_kib / 6ULL;
+  view->active_anon_kib = view->total_kib / 8ULL;
+  view->inactive_anon_kib = view->total_kib / 24ULL;
+  view->active_file_kib = view->total_kib / 12ULL;
+  view->inactive_file_kib = view->total_kib / 12ULL;
+  view->anon_kib = view->active_anon_kib + view->inactive_anon_kib;
+  view->mapped_kib = view->total_kib / 24ULL;
+  view->shmem_kib = view->total_kib / 48ULL;
+  view->slab_reclaimable_kib = view->total_kib / 48ULL;
+  view->slab_unreclaimable_kib = view->total_kib / 96ULL;
+  view->kernel_stack_kib = view->total_kib / 768ULL;
+  view->page_tables_kib = view->total_kib / 384ULL;
 }
+
+static int overlay_meminfo(void) {
+  struct memory_profile_view view;
+  char meminfo[4096];
+  load_memory_profile(&view);
+  unsigned long long active_kib = view.active_anon_kib + view.active_file_kib;
+  unsigned long long inactive_kib = view.inactive_anon_kib + view.inactive_file_kib;
+  unsigned long long slab_kib =
+      view.slab_reclaimable_kib + view.slab_unreclaimable_kib;
+  unsigned long long commit_limit_kib = view.total_kib / 2ULL + view.swap_kib;
+  unsigned long long committed_kib = view.total_kib * 5ULL / 12ULL;
+  int written = snprintf(
+      meminfo, sizeof(meminfo),
+      "MemTotal:       %10llu kB\n"
+      "MemFree:        %10llu kB\n"
+      "MemAvailable:   %10llu kB\n"
+      "Buffers:        %10llu kB\n"
+      "Cached:         %10llu kB\n"
+      "SwapCached:              0 kB\n"
+      "Active:         %10llu kB\n"
+      "Inactive:       %10llu kB\n"
+      "Active(anon):   %10llu kB\n"
+      "Inactive(anon): %10llu kB\n"
+      "Active(file):   %10llu kB\n"
+      "Inactive(file): %10llu kB\n"
+      "Unevictable:             0 kB\n"
+      "Mlocked:                 0 kB\n"
+      "SwapTotal:      %10llu kB\n"
+      "SwapFree:       %10llu kB\n"
+      "Dirty:                 128 kB\n"
+      "Writeback:               0 kB\n"
+      "AnonPages:      %10llu kB\n"
+      "Mapped:         %10llu kB\n"
+      "Shmem:          %10llu kB\n"
+      "Slab:           %10llu kB\n"
+      "SReclaimable:   %10llu kB\n"
+      "SUnreclaim:     %10llu kB\n"
+      "KernelStack:    %10llu kB\n"
+      "PageTables:     %10llu kB\n"
+      "CommitLimit:    %10llu kB\n"
+      "Committed_AS:   %10llu kB\n",
+      view.total_kib, view.free_kib, view.available_kib, view.buffers_kib,
+      view.cached_kib, active_kib, inactive_kib, view.active_anon_kib,
+      view.inactive_anon_kib, view.active_file_kib, view.inactive_file_kib,
+      view.swap_kib, view.swap_kib, view.anon_kib, view.mapped_kib,
+      view.shmem_kib, slab_kib, view.slab_reclaimable_kib,
+      view.slab_unreclaimable_kib, view.kernel_stack_kib,
+      view.page_tables_kib, commit_limit_kib, committed_kib);
+  if (written < 0 || (size_t)written >= sizeof(meminfo)) return -1;
+  return overlay_text("meminfo", "/proc/meminfo", meminfo);
+}
+
+static int append_unsigned_column(
+    char *buffer, size_t capacity, size_t *used, unsigned long long value) {
+  int written = snprintf(buffer + *used, capacity - *used, " %10llu", value);
+  if (written < 0 || (size_t)written >= capacity - *used) return -1;
+  *used += (size_t)written;
+  return 0;
+}
+
 static int overlay_memory_proc_details(void) {
+  struct memory_profile_view view;
+  char vmstat[2048], zoneinfo[1024], buddyinfo[1024], pagetypeinfo[4096];
+  unsigned long long buddy[11] = {0};
+  load_memory_profile(&view);
+  const unsigned long long page_kib = 4ULL;
+  unsigned long long total_pages = view.total_kib / page_kib;
+  unsigned long long free_pages = view.free_kib / page_kib;
+  unsigned long long managed_pages = total_pages - total_pages / 48ULL;
+  unsigned long long target_small_pages = free_pages / 64ULL;
+  unsigned long long remaining_pages = free_pages;
+  for (int order = 0; order < 10; order++) {
+    buddy[order] = target_small_pages >> order;
+    remaining_pages -= buddy[order] << order;
+  }
+  for (int order = 10; order >= 0; order--) {
+    unsigned long long count = remaining_pages >> order;
+    buddy[order] += count;
+    remaining_pages -= count << order;
+  }
+  if (remaining_pages != 0) return -1;
+
+  int written = snprintf(
+      vmstat, sizeof(vmstat),
+      "nr_free_pages %llu\n"
+      "nr_zone_inactive_anon %llu\n"
+      "nr_zone_active_anon %llu\n"
+      "nr_zone_inactive_file %llu\n"
+      "nr_zone_active_file %llu\n"
+      "nr_zone_unevictable 0\n"
+      "nr_mlock 0\n"
+      "nr_anon_pages %llu\n"
+      "nr_mapped %llu\n"
+      "nr_file_pages %llu\n"
+      "nr_shmem %llu\n"
+      "nr_dirty 32\n"
+      "nr_writeback 0\n"
+      "nr_slab_reclaimable %llu\n"
+      "nr_slab_unreclaimable %llu\n"
+      "nr_kernel_stack %llu\n"
+      "nr_page_table_pages %llu\n"
+      "pgpgin 120000\n"
+      "pgpgout 220000\n"
+      "pswpin 0\n"
+      "pswpout 0\n"
+      "pgfault 500000\n"
+      "pgmajfault 120\n",
+      free_pages, view.inactive_anon_kib / page_kib,
+      view.active_anon_kib / page_kib, view.inactive_file_kib / page_kib,
+      view.active_file_kib / page_kib, view.anon_kib / page_kib,
+      view.mapped_kib / page_kib, view.cached_kib / page_kib,
+      view.shmem_kib / page_kib, view.slab_reclaimable_kib / page_kib,
+      view.slab_unreclaimable_kib / page_kib,
+      view.kernel_stack_kib / page_kib, view.page_tables_kib / page_kib);
+  if (written < 0 || (size_t)written >= sizeof(vmstat)) return -1;
+
+  written = snprintf(
+      zoneinfo, sizeof(zoneinfo),
+      "Node 0, zone   Normal\n"
+      "  pages free     %llu\n"
+      "        min      %llu\n"
+      "        low      %llu\n"
+      "        high     %llu\n"
+      "        spanned  %llu\n"
+      "        present  %llu\n"
+      "        managed  %llu\n"
+      "  start_pfn:     0\n",
+      free_pages, total_pages / 384ULL, total_pages / 192ULL,
+      total_pages / 128ULL, total_pages, total_pages, managed_pages);
+  if (written < 0 || (size_t)written >= sizeof(zoneinfo)) return -1;
+
+  size_t used = 0;
+  written = snprintf(buddyinfo, sizeof(buddyinfo), "Node 0, zone   Normal");
+  if (written < 0 || (size_t)written >= sizeof(buddyinfo)) return -1;
+  used = (size_t)written;
+  for (int order = 0; order <= 10; order++) {
+    if (append_unsigned_column(buddyinfo, sizeof(buddyinfo), &used, buddy[order])) return -1;
+  }
+  if (used + 2 > sizeof(buddyinfo)) return -1;
+  buddyinfo[used++] = '\n';
+  buddyinfo[used] = 0;
+
+  written = snprintf(
+      pagetypeinfo, sizeof(pagetypeinfo),
+      "Page block order: 9\n"
+      "Pages per block:  512\n\n"
+      "Free pages count per migrate type at order");
+  if (written < 0 || (size_t)written >= sizeof(pagetypeinfo)) return -1;
+  used = (size_t)written;
+  for (int order = 0; order <= 10; order++) {
+    if (append_unsigned_column(pagetypeinfo, sizeof(pagetypeinfo), &used, order)) return -1;
+  }
+  if (used + 2 > sizeof(pagetypeinfo)) return -1;
+  pagetypeinfo[used++] = '\n';
+  pagetypeinfo[used] = 0;
+  static const char *migrate_types[3] = {"Unmovable  ", "Movable    ", "Reclaimable"};
+  for (int type = 0; type < 3; type++) {
+    written = snprintf(
+        pagetypeinfo + used, sizeof(pagetypeinfo) - used,
+        "Node    0, zone   Normal, type %s",
+        migrate_types[type]);
+    if (written < 0 || (size_t)written >= sizeof(pagetypeinfo) - used) return -1;
+    used += (size_t)written;
+    for (int order = 0; order <= 10; order++) {
+      unsigned long long quarter = buddy[order] / 4ULL;
+      unsigned long long count = type == 1 ? buddy[order] - 2ULL * quarter : quarter;
+      if (append_unsigned_column(
+              pagetypeinfo, sizeof(pagetypeinfo), &used, count)) return -1;
+    }
+    if (used + 2 > sizeof(pagetypeinfo)) return -1;
+    pagetypeinfo[used++] = '\n';
+    pagetypeinfo[used] = 0;
+  }
+
   int fail = 0;
-  const char *vmstat =
-    "nr_free_pages 536330\n"
-    "nr_zone_inactive_anon 75000\n"
-    "nr_zone_active_anon 225000\n"
-    "nr_zone_inactive_file 375000\n"
-    "nr_zone_active_file 300000\n"
-    "nr_zone_unevictable 0\n"
-    "nr_mlock 0\n"
-    "nr_anon_pages 300000\n"
-    "nr_mapped 150000\n"
-    "nr_file_pages 716000\n"
-    "nr_dirty 32\n"
-    "nr_writeback 0\n"
-    "nr_slab_reclaimable 45000\n"
-    "nr_slab_unreclaimable 35000\n"
-    "pgpgin 120000\n"
-    "pgpgout 220000\n"
-    "pswpin 0\n"
-    "pswpout 0\n"
-    "pgfault 500000\n"
-    "pgmajfault 120\n";
-  const char *zoneinfo =
-    "Node 0, zone   Normal\n"
-    "  pages free     536330\n"
-    "        min      4096\n"
-    "        low      8192\n"
-    "        high     12288\n"
-    "        spanned  1966080\n"
-    "        present  1966080\n"
-    "        managed  1900000\n"
-    "  start_pfn:     0\n";
-  const char *buddyinfo =
-    "Node 0, zone   Normal  128 256 512 256 128 64 32 16 8 4 2\n";
-  const char *pagetypeinfo =
-    "Page block order: 9\n"
-    "Pages per block:  512\n\n"
-    "Free pages count per migrate type at order 0\n"
-    "Node    0, zone   Normal, type    Unmovable      128\n"
-    "Node    0, zone   Normal, type      Movable      512\n"
-    "Node    0, zone   Normal, type  Reclaimable      256\n";
   fail += overlay_text_optional("proc_vmstat", "/proc/vmstat", vmstat) != 0;
   fail += overlay_text_optional("proc_zoneinfo", "/proc/zoneinfo", zoneinfo) != 0;
   fail += overlay_text_optional("proc_buddyinfo", "/proc/buddyinfo", buddyinfo) != 0;
@@ -772,7 +1085,7 @@ static int overlay_kernel_proc_misc(void) {
     "nodev\tselinuxfs\n"
     "nodev\tbinder\n") != 0;
   fail += overlay_text_optional("kernel_ostype", "/proc/sys/kernel/ostype", "Linux\n") != 0;
-  fail += overlay_text_optional("kernel_osrelease", "/proc/sys/kernel/osrelease", "5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab8977058\n") != 0;
+  fail += overlay_text_optional("kernel_osrelease", "/proc/sys/kernel/osrelease", XENOID_KERNEL_RELEASE "\n") != 0;
   fail += overlay_text_optional("kernel_version", "/proc/sys/kernel/version", "#1 SMP PREEMPT Wed Oct 5 04:00:00 UTC 2022\n") != 0;
   return fail ? -1 : 0;
 }
@@ -842,21 +1155,35 @@ static int overlay_proc_identity_tables(void) {
 
 static int overlay_mount_namespace_texts(void) {
   int fail = 0;
-  const char *mounts =
-    "tmpfs / tmpfs rw,seclabel,nosuid,nodev,relatime,size=8126464k,mode=755 0 0\n"
-    "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
-    "sysfs /sys sysfs rw,seclabel,nosuid,nodev,noexec,relatime 0 0\n"
-    "devpts /dev/pts devpts rw,seclabel,nosuid,noexec,relatime,mode=600,ptmxmode=000 0 0\n"
-    "/dev/block/dm-0 /system ext4 ro,seclabel,relatime 0 0\n"
-    "/dev/block/dm-1 /vendor ext4 ro,seclabel,relatime 0 0\n"
-    "/dev/block/dm-2 /data f2fs rw,seclabel,nosuid,nodev,noatime 0 0\n";
-  const char *mountinfo =
-    "21 0 0:20 / / rw,seclabel shared:1 - tmpfs tmpfs rw,seclabel,size=8126464k,mode=755\n"
-    "22 21 0:3 / /proc rw,nosuid,nodev,noexec,relatime shared:2 - proc proc rw\n"
-    "23 21 0:7 / /sys rw,seclabel,nosuid,nodev,noexec,relatime shared:3 - sysfs sysfs rw,seclabel\n"
-    "24 21 259:0 / /system ro,seclabel,relatime shared:4 - ext4 /dev/block/dm-0 ro\n"
-    "25 21 259:1 / /vendor ro,seclabel,relatime shared:5 - ext4 /dev/block/dm-1 ro\n"
-    "26 21 259:2 / /data rw,seclabel,nosuid,nodev,noatime shared:6 - f2fs /dev/block/dm-2 rw\n";
+  struct memory_profile_view memory;
+  struct storage_profile_view storage;
+  char mounts[2048], mountinfo[2048];
+  load_memory_profile(&memory);
+  if (load_storage_profile(&storage)) return -1;
+  int mounts_written = snprintf(
+      mounts, sizeof(mounts),
+      "tmpfs / tmpfs rw,seclabel,nosuid,nodev,relatime,size=%lluk,mode=755 0 0\n"
+      "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+      "sysfs /sys sysfs rw,seclabel,nosuid,nodev,noexec,relatime 0 0\n"
+      "devpts /dev/pts devpts rw,seclabel,nosuid,noexec,relatime,mode=600,ptmxmode=000 0 0\n"
+      "/dev/block/dm-0 /system ext4 ro,seclabel,relatime 0 0\n"
+      "/dev/block/dm-1 /vendor ext4 ro,seclabel,relatime 0 0\n"
+      "%s /data %s rw,seclabel,nosuid,nodev,noatime,discard,inlinecrypt,atgc,checkpoint_merge,reserve_root=32768,resgid=1065,fsync_mode=nobarrier 0 0\n",
+      memory.total_kib, storage.mount_source, storage.filesystem);
+  int mountinfo_written = snprintf(
+      mountinfo, sizeof(mountinfo),
+      "21 0 0:20 / / rw,seclabel shared:1 - tmpfs tmpfs rw,seclabel,size=%lluk,mode=755\n"
+      "22 21 0:3 / /proc rw,nosuid,nodev,noexec,relatime shared:2 - proc proc rw\n"
+      "23 21 0:7 / /sys rw,seclabel,nosuid,nodev,noexec,relatime shared:3 - sysfs sysfs rw,seclabel\n"
+      "24 21 259:0 / /system ro,seclabel,relatime shared:4 - ext4 /dev/block/dm-0 ro\n"
+      "25 21 259:1 / /vendor ro,seclabel,relatime shared:5 - ext4 /dev/block/dm-1 ro\n"
+      "26 21 %u:%u / /data rw,seclabel,nosuid,nodev,noatime - %s %s rw,discard,inlinecrypt,atgc,checkpoint_merge,reserve_root=32768,resgid=1065,fsync_mode=nobarrier\n",
+      memory.total_kib, storage.dev_major, storage.dev_minor,
+      storage.filesystem, storage.mount_source);
+  if (mounts_written < 0 || (size_t)mounts_written >= sizeof(mounts)
+      || mountinfo_written < 0 || (size_t)mountinfo_written >= sizeof(mountinfo)) {
+    return -1;
+  }
   const char *cgroups =
     "#subsys_name\thierarchy\tnum_cgroups\tenabled\n"
     "cpuset\t0\t1\t1\n"
@@ -870,96 +1197,214 @@ static int overlay_mount_namespace_texts(void) {
   fail += overlay_text_optional("proc_1_cgroup", "/proc/1/cgroup", "0::/init.scope\n") != 0;
   fail += overlay_text_optional("proc_1_mounts", "/proc/1/mounts", mounts) != 0;
   fail += overlay_text_optional("proc_1_mountinfo", "/proc/1/mountinfo", mountinfo) != 0;
-  fail += overlay_text_optional("proc_1_mountstats", "/proc/1/mountstats", "device tmpfs mounted on / with fstype tmpfs\n") != 0;
-  return fail ? -1 : 0;
-}
-
-
-static int overlay_cpu_topology(void) {
-  int fail = 0;
-  fail += overlay_text("cpu_online", "/sys/devices/system/cpu/online", "0-7\n") != 0;
-  fail += overlay_text("cpu_possible", "/sys/devices/system/cpu/possible", "0-7\n") != 0;
-  fail += overlay_text("cpu_present", "/sys/devices/system/cpu/present", "0-7\n") != 0;
-  return fail ? -1 : 0;
-}
-
-
-static int stage_cpu_sysfs_details(int cpu, long max_freq, long min_freq, long cur_freq) {
-  char target[256], topology[256], cpufreq[256], path[320], buf[64];
-  snprintf(target, sizeof(target), "/sys/devices/system/cpu/cpu%d", cpu);
-  if (access(target, F_OK) != 0) return 0;
-
-  /* Use tmpfs so the mounted view has no overlayfs metadata while retaining
-     the original CPU directory contents that are copied below. */
-  umount2(target, MNT_DETACH);
-  if (mount("tmpfs", target, "tmpfs", 0, "mode=755")) return -1;
-  mount(NULL, target, NULL, MS_PRIVATE | MS_REC, NULL);
-
-  snprintf(topology, sizeof(topology), "%s/topology", target);
-  snprintf(cpufreq, sizeof(cpufreq), "%s/cpufreq", target);
-  if (ensure_dir(topology) || ensure_dir(cpufreq)) return -1;
-
-  snprintf(path, sizeof(path), "%s/core_id", topology);
-  long_line(buf, sizeof(buf), cpu);
-  if (write_text(path, buf)) return -1;
-  snprintf(path, sizeof(path), "%s/physical_package_id", topology);
-  if (write_text(path, "0\n")) return -1;
-  snprintf(path, sizeof(path), "%s/thread_siblings_list", topology);
-  long_line(buf, sizeof(buf), cpu);
-  if (write_text(path, buf)) return -1;
-  snprintf(path, sizeof(path), "%s/core_siblings_list", topology);
-  if (write_text(path, "0-7\n")) return -1;
-
-  snprintf(path, sizeof(path), "%s/cpuinfo_max_freq", cpufreq);
-  long_line(buf, sizeof(buf), max_freq);
-  if (write_text(path, buf)) return -1;
-  snprintf(path, sizeof(path), "%s/cpuinfo_min_freq", cpufreq);
-  long_line(buf, sizeof(buf), min_freq);
-  if (write_text(path, buf)) return -1;
-  snprintf(path, sizeof(path), "%s/scaling_cur_freq", cpufreq);
-  long_line(buf, sizeof(buf), cur_freq);
-  if (write_text(path, buf)) return -1;
-  snprintf(path, sizeof(path), "%s/scaling_governor", cpufreq);
-  if (write_text(path, "schedutil\n")) return -1;
-
-  if (cpu > 0) {
-    snprintf(path, sizeof(path), "%s/online", target);
-    if (write_text(path, "1\n")) return -1;
+  {
+    char mountstats[512];
+    int mountstats_written = snprintf(
+        mountstats, sizeof(mountstats),
+        "device tmpfs mounted on / with fstype tmpfs\n"
+        "device %s mounted on /data with fstype %s\n",
+        storage.mount_source, storage.filesystem);
+    if (mountstats_written < 0
+        || (size_t)mountstats_written >= sizeof(mountstats)) return -1;
+    fail += overlay_text_optional(
+        "proc_1_mountstats", "/proc/1/mountstats", mountstats) != 0;
   }
-  snprintf(path, sizeof(path), "%s/uevent", target);
-  if (write_text(path, "\n")) return -1;
+  return fail ? -1 : 0;
+}
+
+
+struct cpu_profile_view {
+  char implementer[16];
+  char part[8][16];
+  char model[8][65];
+  long minimum_khz[8];
+  long maximum_khz[8];
+};
+
+static void profile_line_value(const char *leaf, const char *fallback, char *out, size_t out_size) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), PROFILE_DIR "/%s", leaf);
+  char *value = first_or_default(path, fallback);
+  value[strcspn(value, "\r\n")] = 0;
+  snprintf(out, out_size, "%s", value[0] ? value : fallback);
+  free(value);
+}
+
+static void load_cpu_profile(struct cpu_profile_view *view) {
+  static const char *fallback_parts[8] = {
+    "0xd05", "0xd05", "0xd05", "0xd05", "0xd0b", "0xd0b", "0xd44", "0xd44"
+  };
+  static const char *fallback_models[8] = {
+    "Cortex-A55", "Cortex-A55", "Cortex-A55", "Cortex-A55",
+    "Cortex-A76", "Cortex-A76", "Cortex-X1", "Cortex-X1"
+  };
+  static const long fallback_minimums[8] = {
+    300000, 300000, 300000, 300000, 400000, 400000, 500000, 500000
+  };
+  static const long fallback_maximums[8] = {
+    1800000, 1800000, 1800000, 1800000, 2253000, 2253000, 2802000, 2802000
+  };
+  char leaf[96];
+  memset(view, 0, sizeof(*view));
+  profile_line_value("cpu_implementer", "0x41", view->implementer, sizeof(view->implementer));
+  for (int cpu = 0; cpu < 8; cpu++) {
+    snprintf(leaf, sizeof(leaf), "cpu_%d_part", cpu);
+    profile_line_value(leaf, fallback_parts[cpu], view->part[cpu], sizeof(view->part[cpu]));
+    snprintf(leaf, sizeof(leaf), "cpu_%d_model", cpu);
+    profile_line_value(leaf, fallback_models[cpu], view->model[cpu], sizeof(view->model[cpu]));
+    snprintf(leaf, sizeof(leaf), PROFILE_DIR "/cpu_%d_minimumFrequencyKhz", cpu);
+    view->minimum_khz[cpu] = read_long_default(leaf, fallback_minimums[cpu]);
+    snprintf(leaf, sizeof(leaf), PROFILE_DIR "/cpu_%d_maximumFrequencyKhz", cpu);
+    view->maximum_khz[cpu] = read_long_default(leaf, fallback_maximums[cpu]);
+    if (view->minimum_khz[cpu] < 1 || view->minimum_khz[cpu] > 10000000) {
+      view->minimum_khz[cpu] = fallback_minimums[cpu];
+    }
+    if (view->maximum_khz[cpu] < view->minimum_khz[cpu]
+        || view->maximum_khz[cpu] > 10000000) {
+      view->maximum_khz[cpu] = fallback_maximums[cpu];
+    }
+  }
+}
+
+static int write_long_file(const char *path, long value) {
+  char line[64];
+  long_line(line, sizeof(line), value);
+  return write_text(path, line);
+}
+
+static int write_cpu_policy(
+    const char *directory, const char *cpus, long minimum_khz, long maximum_khz) {
+  char path[PATH_MAX], line[128];
+  if (ensure_dir(directory)) return -1;
+#define WRITE_POLICY_TEXT(name, value) \
+  do { snprintf(path, sizeof(path), "%s/" name, directory); if (write_text(path, value)) return -1; } while (0)
+#define WRITE_POLICY_LONG(name, value) \
+  do { snprintf(path, sizeof(path), "%s/" name, directory); if (write_long_file(path, value)) return -1; } while (0)
+  WRITE_POLICY_TEXT("affected_cpus", cpus);
+  WRITE_POLICY_TEXT("related_cpus", cpus);
+  WRITE_POLICY_LONG("cpuinfo_min_freq", minimum_khz);
+  WRITE_POLICY_LONG("cpuinfo_max_freq", maximum_khz);
+  WRITE_POLICY_LONG("scaling_min_freq", minimum_khz);
+  WRITE_POLICY_LONG("scaling_max_freq", maximum_khz);
+  WRITE_POLICY_LONG("cpuinfo_cur_freq", minimum_khz);
+  WRITE_POLICY_LONG("scaling_cur_freq", minimum_khz);
+  WRITE_POLICY_TEXT("scaling_available_governors", "schedutil performance\n");
+  WRITE_POLICY_TEXT("scaling_governor", "schedutil\n");
+  snprintf(line, sizeof(line), "%ld %ld\n", minimum_khz, maximum_khz);
+  WRITE_POLICY_TEXT("scaling_available_frequencies", line);
+  snprintf(path, sizeof(path), "%s/stats", directory);
+  if (ensure_dir(path)) return -1;
+  snprintf(path, sizeof(path), "%s/stats/time_in_state", directory);
+  snprintf(line, sizeof(line), "%ld 1000\n%ld 1000\n", minimum_khz, maximum_khz);
+  if (write_text(path, line)) return -1;
+#undef WRITE_POLICY_LONG
+#undef WRITE_POLICY_TEXT
+  return 0;
+}
+
+static int overlay_cpu_sysfs(void) {
+  static const int policy_leaders[3] = {0, 4, 6};
+  static const char *policy_cpu_lists[3] = {"0 1 2 3\n", "4 5\n", "6 7\n"};
+  static const char *cluster_ranges[3] = {"0-3\n", "4-5\n", "6-7\n"};
+  struct cpu_profile_view view;
+  const char *target = "/sys/devices/system/cpu";
+  char path[PATH_MAX], directory[PATH_MAX], line[64];
+  load_cpu_profile(&view);
+  if (access(target, F_OK) != 0) return -1;
+  if (umount2(target, MNT_DETACH) != 0 && errno != EINVAL) return -1;
+  if (mount("tmpfs", target, "tmpfs", 0, "mode=755")) return -1;
+  if (mount(NULL, target, NULL, MS_PRIVATE | MS_REC, NULL)) return -1;
+  if (write_text("/sys/devices/system/cpu/online", "0-7\n")
+      || write_text("/sys/devices/system/cpu/possible", "0-7\n")
+      || write_text("/sys/devices/system/cpu/present", "0-7\n")
+      || write_text("/sys/devices/system/cpu/offline", "\n")
+      || write_text("/sys/devices/system/cpu/isolated", "\n")
+      || write_text("/sys/devices/system/cpu/kernel_max", "7\n")) return -1;
+
+  if (ensure_dir("/sys/devices/system/cpu/cpufreq")) return -1;
+  for (int cluster = 0; cluster < 3; cluster++) {
+    int leader = policy_leaders[cluster];
+    snprintf(directory, sizeof(directory), "/sys/devices/system/cpu/cpufreq/policy%d", leader);
+    if (write_cpu_policy(directory, policy_cpu_lists[cluster],
+                         view.minimum_khz[leader], view.maximum_khz[leader])) return -1;
+  }
+
+  for (int cpu = 0; cpu < 8; cpu++) {
+    int cluster = cpu < 4 ? 0 : (cpu < 6 ? 1 : 2);
+    int leader = policy_leaders[cluster];
+    snprintf(directory, sizeof(directory), "/sys/devices/system/cpu/cpu%d", cpu);
+    if (ensure_dir(directory)) return -1;
+    snprintf(path, sizeof(path), "%s/topology", directory);
+    if (ensure_dir(path)) return -1;
+    snprintf(path, sizeof(path), "%s/topology/core_id", directory);
+    if (write_long_file(path, cpu)) return -1;
+    snprintf(path, sizeof(path), "%s/topology/cluster_id", directory);
+    if (write_long_file(path, cluster)) return -1;
+    snprintf(path, sizeof(path), "%s/topology/physical_package_id", directory);
+    if (write_text(path, "0\n")) return -1;
+    snprintf(path, sizeof(path), "%s/topology/thread_siblings_list", directory);
+    if (write_long_file(path, cpu)) return -1;
+    snprintf(path, sizeof(path), "%s/topology/core_cpus_list", directory);
+    if (write_long_file(path, cpu)) return -1;
+    snprintf(path, sizeof(path), "%s/topology/cluster_cpus_list", directory);
+    if (write_text(path, cluster_ranges[cluster])) return -1;
+    snprintf(path, sizeof(path), "%s/topology/core_siblings_list", directory);
+    if (write_text(path, "0-7\n")) return -1;
+    snprintf(path, sizeof(path), "%s/topology/package_cpus_list", directory);
+    if (write_text(path, "0-7\n")) return -1;
+    snprintf(path, sizeof(path), "%s/cpu_capacity", directory);
+    if (write_long_file(path, cluster == 0 ? 512 : (cluster == 1 ? 768 : 1024))) return -1;
+    snprintf(path, sizeof(path), "%s/cpufreq", directory);
+    snprintf(line, sizeof(line), "../../cpufreq/policy%d", leader);
+    if (symlink(line, path)) return -1;
+    if (cpu > 0) {
+      snprintf(path, sizeof(path), "%s/online", directory);
+      if (write_text(path, "1\n")) return -1;
+    }
+    snprintf(path, sizeof(path), "%s/uevent", directory);
+    if (write_text(path, "\n")) return -1;
+  }
   mark_mounted(target);
   return 0;
 }
 
-static int overlay_cpu_sysfs_details(void) {
-  int fail = 0;
-  const long max_freqs[8] = {2995000, 2995000, 2995000, 2995000, 2995000, 2995000, 2850000, 2850000};
-  const long min_freqs[8] = {300000, 300000, 300000, 300000, 300000, 300000, 300000, 300000};
-  for (int cpu = 0; cpu < 8; cpu++) {
-    long cur_freq = cpu < 6 ? 1800000 : 1500000;
-    fail += stage_cpu_sysfs_details(cpu, max_freqs[cpu], min_freqs[cpu], cur_freq) != 0;
-  }
-  return fail ? -1 : 0;
-}
-
 static int overlay_cpuinfo(void) {
-  const char *cpu =
-    "Processor\t: AArch64 Processor rev 1 (aarch64)\n"
-    "processor\t: 0\nBogoMIPS\t: 38.40\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\nCPU implementer\t: 0x51\nCPU architecture: 8\nCPU variant\t: 0x1\nCPU part\t: 0x0d4\nCPU revision\t: 1\n\n"
-    "processor\t: 1\nBogoMIPS\t: 38.40\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\nCPU implementer\t: 0x51\nCPU architecture: 8\nCPU variant\t: 0x1\nCPU part\t: 0x0d4\nCPU revision\t: 1\n\n"
-    "Hardware\t: tensor\n";
-  return overlay_text("cpuinfo", "/proc/cpuinfo", cpu);
+  struct cpu_profile_view view;
+  char cpuinfo[8192];
+  size_t used = 0;
+  load_cpu_profile(&view);
+  int written = snprintf(cpuinfo, sizeof(cpuinfo),
+                         "Processor\t: AArch64 Processor rev 1 (aarch64)\n");
+  if (written < 0 || (size_t)written >= sizeof(cpuinfo)) return -1;
+  used = (size_t)written;
+  for (int cpu = 0; cpu < 8; cpu++) {
+    written = snprintf(
+        cpuinfo + used, sizeof(cpuinfo) - used,
+        "processor\t: %d\n"
+        "model name\t: %s\n"
+        "BogoMIPS\t: 38.40\n"
+        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp "
+        "asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n"
+        "CPU implementer\t: %s\n"
+        "CPU architecture: 8\n"
+        "CPU part\t: %s\n\n",
+        cpu, view.model[cpu], view.implementer, view.part[cpu]);
+    if (written < 0 || (size_t)written >= sizeof(cpuinfo) - used) return -1;
+    used += (size_t)written;
+  }
+  written = snprintf(cpuinfo + used, sizeof(cpuinfo) - used, "Hardware\t: raven\n");
+  if (written < 0 || (size_t)written >= sizeof(cpuinfo) - used) return -1;
+  return overlay_text("cpuinfo", "/proc/cpuinfo", cpuinfo);
 }
 static int overlay_version(void) {
-  return overlay_text("version", "/proc/version", "Linux version 5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab8977058 (android-build@abfarm) (Android (9352603) clang version 14.0.7) #1 SMP PREEMPT Wed Oct 5 04:00:00 UTC 2022\n");
+  return overlay_text("version", "/proc/version", "Linux version " XENOID_KERNEL_RELEASE " (android-build@abfarm) (Android (9352603) clang version 14.0.7) #1 SMP PREEMPT Wed Oct 5 04:00:00 UTC 2022\n");
 }
 static int overlay_cmdline(void) {
   char *serial = first_or_default(PROFILE_DIR "/serial", "3A4940E5EDFA\n");
   serial[strcspn(serial, "\r\n")] = 0;
   char cmdline[1024];
   snprintf(cmdline, sizeof(cmdline),
-           "console=ttyMSM0 androidboot.hardware=gs101 "
+           "console=ttyMSM0 androidboot.hardware=raven androidboot.hardware.sku=G8V0U "
            "androidboot.verifiedbootstate=green androidboot.veritymode=enforcing "
            "androidboot.serialno=%s\n", serial);
   free(serial);
@@ -968,31 +1413,46 @@ static int overlay_cmdline(void) {
 
 static int overlay_framebuffer(void) {
   int fail = 0;
-  long width = read_long_default(PROFILE_DIR "/display_width", 1344);
-  long height = read_long_default(PROFILE_DIR "/display_height", 2992);
-  if (width < 320) width = 1344; if (height < 480) height = 2992;
+  long width = read_long_default(PROFILE_DIR "/display_width", 1440);
+  long height = read_long_default(PROFILE_DIR "/display_height", 3120);
+  long default_refresh = read_long_default(PROFILE_DIR "/display_defaultRefreshRateHz", 120);
+  if (width < 320) width = 1440;
+  if (height < 480) height = 3120;
+  if (default_refresh != 60 && default_refresh != 120) default_refresh = 120;
   char buf[128];
   fail += overlay_text_optional("proc_fb", "/proc/fb", "0 msmfb\n") != 0;
   fail += overlay_text_optional("fb0_name", "/sys/class/graphics/fb0/name", "msmfb\n") != 0;
   snprintf(buf, sizeof(buf), "%ld,%ld\n", width, height);
   fail += overlay_text_optional("fb0_virtual_size", "/sys/class/graphics/fb0/virtual_size", buf) != 0;
   fail += overlay_text_optional("fb0_bits_per_pixel", "/sys/class/graphics/fb0/bits_per_pixel", "32\n") != 0;
-  snprintf(buf, sizeof(buf), "U:%ldx%ldp-60\n", width, height);
+  snprintf(buf, sizeof(buf), "U:%ldx%ldp-60\nU:%ldx%ldp-120\n", width, height, width, height);
   fail += overlay_text_optional("fb0_modes", "/sys/class/graphics/fb0/modes", buf) != 0;
+  long_line(buf, sizeof(buf), default_refresh);
+  fail += overlay_text_optional("fb0_refresh_rate", "/sys/class/graphics/fb0/refresh_rate", buf) != 0;
   return fail ? -1 : 0;
 }
 
 static int overlay_backlight_leds(void) {
   int fail = 0;
-  long brightness = read_long_default(PROFILE_DIR "/display_brightness", 512);
-  if (brightness < 0) brightness = 0; if (brightness > 1023) brightness = 1023;
-  char buf[64]; long_line(buf, sizeof(buf), brightness);
-  fail += overlay_text_optional("panel0_brightness", "/sys/class/backlight/panel0-backlight/brightness", buf) != 0;
-  fail += overlay_text_optional("panel0_actual_brightness", "/sys/class/backlight/panel0-backlight/actual_brightness", buf) != 0;
-  fail += overlay_text_optional("panel0_max_brightness", "/sys/class/backlight/panel0-backlight/max_brightness", "1023\n") != 0;
+  char *brightness = read_all("/sys/class/backlight/panel0-backlight/brightness");
+  char *maximum = read_all("/sys/class/backlight/panel0-backlight/max_brightness");
+  if (brightness && brightness[0]) {
+    fail += overlay_text_optional(
+        "panel0_brightness", "/sys/class/backlight/panel0-backlight/brightness", brightness) != 0;
+    fail += overlay_text_optional(
+        "panel0_actual_brightness", "/sys/class/backlight/panel0-backlight/actual_brightness", brightness) != 0;
+    fail += overlay_text_optional(
+        "lcd_backlight_brightness", "/sys/class/leds/lcd-backlight/brightness", brightness) != 0;
+  }
+  if (maximum && maximum[0]) {
+    fail += overlay_text_optional(
+        "panel0_max_brightness", "/sys/class/backlight/panel0-backlight/max_brightness", maximum) != 0;
+    fail += overlay_text_optional(
+        "lcd_backlight_max", "/sys/class/leds/lcd-backlight/max_brightness", maximum) != 0;
+  }
+  free(brightness);
+  free(maximum);
   fail += overlay_text_optional("panel0_type", "/sys/class/backlight/panel0-backlight/type", "raw\n") != 0;
-  fail += overlay_text_optional("lcd_backlight_brightness", "/sys/class/leds/lcd-backlight/brightness", buf) != 0;
-  fail += overlay_text_optional("lcd_backlight_max", "/sys/class/leds/lcd-backlight/max_brightness", "1023\n") != 0;
   fail += overlay_text_optional("vibrator_brightness", "/sys/class/leds/vibrator/brightness", "0\n") != 0;
   fail += overlay_text_optional("vibrator_max", "/sys/class/leds/vibrator/max_brightness", "1\n") != 0;
   fail += overlay_text_optional("flash_brightness", "/sys/class/leds/white:flash/brightness", "0\n") != 0;
@@ -1006,19 +1466,27 @@ static char *profile_value_line(const char *path, const char *fallback) {
 static int overlay_input_devices(void) {
   char *touch = profile_value_line(PROFILE_DIR "/input_name", "sec_touchscreen\n");
   size_t n = strcspn(touch, "\r\n"); touch[n] = 0;
-  if (!touch[0]) snprintf(touch, 32, "%s", "sec_touchscreen");
+  if (!touch[0]) {
+    free(touch);
+    touch = strdup("sec_touchscreen");
+    if (!touch) return -1;
+  }
+  long bus = read_long_default(PROFILE_DIR "/input_busType", 0x18);
+  long vendor = read_long_default(PROFILE_DIR "/input_vendorId", 0x04e8);
+  long product = read_long_default(PROFILE_DIR "/input_productId", 0x6860);
+  long version = read_long_default(PROFILE_DIR "/input_version", 0x0100);
   char body[4096];
   snprintf(body, sizeof(body),
-    "I: Bus=0018 Vendor=04e8 Product=6860 Version=0100\n"
+    "I: Bus=%04lx Vendor=%04lx Product=%04lx Version=%04lx\n"
     "N: Name=\"%s\"\n"
     "P: Phys=i2c/sec_touchscreen/input0\n"
     "S: Sysfs=/devices/platform/soc/soc:i2c/sec_touchscreen/input/input0\n"
     "U: Uniq=\n"
-    "H: Handlers=event0 mouse0 \n"
+    "H: Handlers=event0 \n"
     "B: PROP=2\n"
     "B: EV=b\n"
     "B: KEY=400 0 0 0 0 0\n"
-    "B: ABS=661800001000003\n\n"
+    "B: ABS=67f800001000003\n\n"
     "I: Bus=0019 Vendor=0001 Product=0001 Version=0100\n"
     "N: Name=\"gpio-keys\"\n"
     "P: Phys=gpio-keys/input0\n"
@@ -1036,7 +1504,8 @@ static int overlay_input_devices(void) {
     "H: Handlers=kbd event2 wakeup \n"
     "B: PROP=0\n"
     "B: EV=3\n"
-    "B: KEY=100000 0 0 0\n\n", touch);
+    "B: KEY=100000 0 0 0\n\n",
+    bus, vendor, product, version, touch);
   free(touch);
   return overlay_text_optional("proc_bus_input_devices", "/proc/bus/input/devices", body);
 }
@@ -1095,8 +1564,7 @@ static int apply(void) {
   if (overlay_kernel_hardening_sysctls()) { printf("kernel_hardening_sysctls=fail:%s\n", strerror(errno)); fail++; } else printf("kernel_hardening_sysctls=ok\n");
   if (overlay_proc_identity_tables()) { printf("proc_identity_tables=fail:%s\n", strerror(errno)); fail++; } else printf("proc_identity_tables=ok\n");
   if (overlay_mount_namespace_texts()) { printf("mount_namespace=fail:%s\n", strerror(errno)); fail++; } else printf("mount_namespace=ok\n");
-  if (overlay_cpu_topology()) { printf("cpu_topology=fail:%s\n", strerror(errno)); fail++; } else printf("cpu_topology=ok\n");
-  if (overlay_cpu_sysfs_details()) { printf("cpu_sysfs_details=fail:%s\n", strerror(errno)); fail++; } else printf("cpu_sysfs_details=ok\n");
+  if (overlay_cpu_sysfs()) { printf("cpu_sysfs=fail:%s\n", strerror(errno)); fail++; } else printf("cpu_sysfs=ok\n");
   if (overlay_storage_proc()) { printf("storage_proc=fail:%s\n", strerror(errno)); fail++; } else printf("storage_proc=ok\n");
   if (overlay_block_sysfs()) { printf("block_sysfs=fail:%s\n", strerror(errno)); fail++; } else printf("block_sysfs=ok\n");
   if (overlay_selinuxfs()) { printf("selinuxfs=fail:%s\n", strerror(errno)); fail++; } else printf("selinuxfs=ok\n");

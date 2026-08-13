@@ -97,6 +97,30 @@ final class RootHelper {
         return Boolean.TRUE.equals(execRootd(command, 20000).get("ok"));
     }
 
+    static boolean publishDeviceProfile(File source, long size, String sha256) {
+        int appUid = android.os.Process.myUid();
+        if (source == null || !source.getName().equals("device-profile.stage")
+                || source.getParentFile() == null
+                || !source.getParentFile().getName().equals("no_backup")
+                || appUid <= 0 || size <= 0 || size > 256 * 1024
+                || sha256 == null || !sha256.matches("[0-9a-f]{64}")) {
+            return false;
+        }
+        String command = "set -eu;s=" + shellQuote(source.getAbsolutePath())
+                + ";d=/data/local/tmp/xenoid-profile;u=" + appUid + ";n=" + size
+                + ";h=" + sha256 + ";"
+                + "[ -f $s ];[ ! -L $s ];[ $(stat -c %u $s) = $u ];[ $(stat -c %s $s) = $n ];"
+                + "x=$(sha256sum $s);x=${x%% *};[ $x = $h ];"
+                + "if [ -e $d ];then [ -d $d ];[ ! -L $d ];else mkdir -p $d;fi;"
+                + "chown 0:0 $d;chmod 700 $d;umask 077;rm -f $d/.effective.json.tmp;"
+                + "cp -- $s $d/.effective.json.tmp;chown 0:0 $d/.effective.json.tmp;"
+                + "chmod 600 $d/.effective.json.tmp;sync -f $d/.effective.json.tmp;"
+                + "mv -f $d/.effective.json.tmp $d/effective.json;sync -f $d;"
+                + "[ $(stat -c %u:%g:%a:%s $d/effective.json) = 0:0:600:$n ];"
+                + "x=$(sha256sum $d/effective.json);x=${x%% *};[ $x = $h ]";
+        return Boolean.TRUE.equals(execRootd(command, 20000).get("ok"));
+    }
+
     /** Removes the abandoned pre-location regional state copies owned by rootd. */
     static void purgeLegacyRegionalState() {
         execRootd("rm -f /data/vendor/radio/xenoid/state.v1", 20000);

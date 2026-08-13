@@ -833,10 +833,9 @@ bool CameraRenderer::resizeScratch(int32_t width, int32_t height,
     return true;
 }
 
-bool CameraRenderer::renderFallbackScratch(const SceneState& state,
-                                           int32_t outputRotation,
-                                           int32_t width, int32_t height,
-                                           std::string* error) {
+bool CameraRenderer::renderFallbackScratch(
+        const SceneState& state, int32_t outputRotation,
+        int32_t width, int32_t height, std::string* error) {
     if (!resizeScratch(width, height, error)) {
         return false;
     }
@@ -973,12 +972,11 @@ bool CameraRenderer::renderSourceScratch(const SourceFrame& source,
     return true;
 }
 
-bool CameraRenderer::renderScratch(const RequestSettings& settings,
-                                   const FrameTiming& timing,
-                                   int64_t frameNumber,
-                                   const SourceFrame& source, SourceMode mode,
-                                   int32_t outputRotation, int32_t width,
-                                   int32_t height, std::string* error) {
+bool CameraRenderer::renderScratch(
+        const RequestSettings& settings, const FrameTiming& timing,
+        int64_t frameNumber, const SourceFrame& source, SourceMode mode,
+        bool flashAvailable, int32_t outputRotation,
+        int32_t width, int32_t height, std::string* error) {
     if (mode != SourceMode::Naturalized && mode != SourceMode::Faithful) {
         return fail(error, "renderer source mode is invalid");
     }
@@ -1049,11 +1047,21 @@ bool CameraRenderer::renderScratch(const RequestSettings& settings,
         rendered = renderSourceScratch(source, naturalStatePointer,
                                        outputRotation, width, height, error);
     } else {
-        rendered = renderFallbackScratch(fallbackState, outputRotation, width,
-                                         height, error);
+        rendered = renderFallbackScratch(
+                fallbackState, outputRotation, width, height, error);
     }
     if (!rendered) {
         return false;
+    }
+    if (flashAvailable && settings.flashMode != 0) {
+        for (size_t offset = 0; offset < rgbaScratch_.size(); offset += 4U) {
+            rgbaScratch_[offset] = static_cast<uint8_t>(
+                    std::min<int>(255, rgbaScratch_[offset] + 28));
+            rgbaScratch_[offset + 1U] = static_cast<uint8_t>(
+                    std::min<int>(255, rgbaScratch_[offset + 1U] + 24));
+            rgbaScratch_[offset + 2U] = static_cast<uint8_t>(
+                    std::min<int>(255, rgbaScratch_[offset + 2U] + 18));
+        }
     }
     renderedIdentity_ = identity;
     scratchValid_ = true;
@@ -1280,12 +1288,11 @@ bool CameraRenderer::writeJpeg(const RequestSettings& settings,
     return true;
 }
 
-bool CameraRenderer::writeFrame(const RequestSettings& settings,
-                                const FrameTiming& timing, int64_t frameNumber,
-                                const StreamDescriptor& stream,
-                                CachedBuffer& buffer,
-                                const SourceFrame& source, SourceMode mode,
-                                std::string* error) {
+bool CameraRenderer::writeFrame(
+        const RequestSettings& settings, const FrameTiming& timing,
+        int64_t frameNumber, const StreamDescriptor& stream,
+        CachedBuffer& buffer, const SourceFrame& source, SourceMode mode,
+        bool flashAvailable, std::string* error) {
     if (error != nullptr) {
         error->clear();
     }
@@ -1326,8 +1333,9 @@ bool CameraRenderer::writeFrame(const RequestSettings& settings,
             jpegSwapsAxes ? stream.width : stream.height;
     const int32_t outputRotation =
             normalizeRotation(jpegRotation - sensorOrientation_);
-    if (!renderScratch(settings, timing, frameNumber, source, mode,
-                       outputRotation, outputWidth, outputHeight, error)) {
+    if (!renderScratch(
+                settings, timing, frameNumber, source, mode, flashAvailable,
+                outputRotation, outputWidth, outputHeight, error)) {
         return false;
     }
 

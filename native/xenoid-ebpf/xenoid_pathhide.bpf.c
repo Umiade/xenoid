@@ -175,7 +175,7 @@ int BPF_KRETPROBE(xenoid_kret_newuname, long ret)
 	struct new_utsname_spoof u = {
 		.sysname = "Linux",
 		.nodename = "localhost",
-		.release = "5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab8977058",
+		.release = "5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab9012097",
 		.version = "#1 SMP PREEMPT Wed Oct 5 04:00:00 UTC 2022",
 		.machine = "aarch64",
 		.domainname = "",

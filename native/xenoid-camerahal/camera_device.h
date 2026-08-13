@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <mutex>
+#include <functional>
 #include <vector>
 
 #include "camera_metadata.h"
@@ -17,15 +19,20 @@ namespace camera_provider {
 struct CameraOpenState;
 
 bool validateStreamConfiguration(
-        const aidl::android::hardware::camera::device::StreamConfiguration& configuration,
+        const CameraProfile& profile,
+        const aidl::android::hardware::camera::device::StreamConfiguration&
+                configuration,
         bool validateStreamIds,
-        std::vector<aidl::android::hardware::camera::device::HalStream>* halStreams,
+        std::vector<aidl::android::hardware::camera::device::HalStream>*
+                halStreams,
         std::vector<StreamDescriptor>* streamDescriptors,
         std::string* error);
 
 class CameraDevice final : public aidl::android::hardware::camera::device::BnCameraDevice {
 public:
-    explicit CameraDevice(bool frontFacing);
+    CameraDevice(
+            const CameraProfile& profile,
+            std::function<void(bool, bool)> onTorchStateChanged);
 
     ndk::ScopedAStatus getCameraCharacteristics(CameraMetadata* out) override;
     ndk::ScopedAStatus getPhysicalCameraCharacteristics(
@@ -50,7 +57,10 @@ public:
     ndk::ScopedAStatus getTorchStrengthLevel(int32_t* out) override;
 
 private:
-    int32_t sensorOrientation_;
+    const CameraProfile& profile_;
+    std::function<void(bool, bool)> onTorchStateChanged_;
+    std::mutex torchMutex_;
+    bool torchOn_ = false;
     std::shared_ptr<CameraOpenState> openState_;
     CameraMetadata characteristics_;
     bool metadataOk_ = false;

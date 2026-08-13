@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, pathlib, sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 src = (ROOT / "native/xenoid-hide/xenoid_overlay.c").read_text()
-profile = json.loads((ROOT / "examples/fingerprints/pixel-husky-template.json").read_text())
+profile = json.loads((ROOT / "examples/fingerprints/pixel-raven-android13.json").read_text())
 checks = {
     "overlay_function": "overlay_input_devices" in src,
     "proc_target": "/proc/bus/input/devices" in src,

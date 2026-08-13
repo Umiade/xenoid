@@ -40,11 +40,13 @@ cd xenoid
 
 1. **实例配置** `.xenoid/instances/<name>/config.json`（项目根目录）；
 2. **私有控制状态** `~/.xenoid/instances/<UUID>/`（操作者状态）；
-3. **Android 用户数据** Docker engine 命名卷（`xenoid-data-<tag>`），其中包含稀疏 ext4 `xenoid-data.img`，作为容器的 `/data` 挂载。
+3. **Android 用户数据** Docker engine 命名卷（`xenoid-data-<tag>`），其中包含稀疏 ext4 后端镜像 `xenoid-data.img`，作为容器的 `/data` 挂载。
 
 `stop`、重复 `up`、容器重建以及 `colima stop/start` 都会保留数据卷。`colima delete`、外部删除/清理 volume，或丢失宿主实例状态，会在下次启动时导致 Xenoid 硬失败，而不是静默创建空盘。
 
 应用缓存和登录状态保存在同一 `/data` 分区，跨重启保留。Android 自身的存储压力和缓存清理语义仍然适用；Xenoid 不增加每次启动擦除的临时设备模式。
+
+后端镜像继续使用 ext4，以保留既有扩容和故障恢复合同。非特权 Android Raven 视图为 f2fs：profile、挂载表、userdata by-name 别名、libc `statfs`/`fstatfs` 与直接 raw syscall 都返回 Raven 文件系统合同；特权维护命令仍观察真实后端文件系统。
 
 ### 多实例操作
 
@@ -263,26 +265,28 @@ Frida 适合应用进程动态分析与 app-layer hook。文件系统、mount、
 ./xenoid device collect --out /tmp/device-profile.json
 ```
 
-应用画像并重新生成唯一标识：
+应用标准 Android 13 Pixel 6 Pro（`raven`）画像并重新生成唯一标识：
 
 ```bash
-./xenoid device apply examples/fingerprints/sample-profile.json
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json
 ```
 
 应用 profile 中明确给出的唯一标识，不再生成替代值：
 
 ```bash
-./xenoid device apply examples/fingerprints/sample-profile.json --keep-unique
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json --keep-unique
 ```
 
 生成应用层与服务层 Frida profile：
 
 ```bash
-./xenoid device generate-frida examples/fingerprints/sample-profile.json --out /tmp/device-profile.js
-./xenoid device generate-service-frida examples/fingerprints/sample-profile.json --out /tmp/service-profile.js
+./xenoid device generate-frida examples/fingerprints/pixel-raven-android13.json --out /tmp/device-profile.js
+./xenoid device generate-service-frida examples/fingerprints/pixel-raven-android13.json --out /tmp/service-profile.js
 ```
 
-`device apply` 会同步 daemon profile、SettingsProvider、property-area 状态与重启后持久化的数据。换机后必须冷启动目标应用并重新采集完整画像，单个 `getprop` 值不能作为充分证据。
+生产画像对应 Google Pixel 6 Pro 型号 `G8V0U`、build `TP1A.221005.002`/`9012097`、首发 API 31，设备视图为 1440 x 3120、60/120 Hz、12 GiB 内存与稀疏 128,000,000,000 字节 UFS 3.1 数据镜像。Android 侧的 `/proc/partitions`、`/proc/diskstats`、`/dev/block/sda`、`/dev/block/platform/14700000.ufs/by-name/userdata`、block sysfs、f2fs 挂载记录与 raw 文件系统 magic 均由同一画像合同驱动。`provenance` 对象区分 Google/AOSP 事实与社区推导的传感器、相机几何数据。
+
+`device apply` 会同步 daemon profile、SettingsProvider、property-area 状态、原生 HAL 输入与重启后持久化的数据。PackageManager 只声明运行时已实现的相机和传感器能力；NFC、UWB、指纹/UDFPS、真实 NR、full/manual/RAW 相机、HiFi sensor 与 head tracker 均保持未声明。换机后必须冷启动目标应用并重新采集完整画像，单个 `getprop` 值不能作为充分证据。
 
 ## 可选 Google Play 运行时
 

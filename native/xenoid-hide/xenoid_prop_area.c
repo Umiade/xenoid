@@ -20,13 +20,21 @@ static char g_manufacturer[PROP_VALUE_MAX] = "Google";
 static char g_model[PROP_VALUE_MAX] = "Pixel 6 Pro";
 static char g_device[PROP_VALUE_MAX] = "raven";
 static char g_product[PROP_VALUE_MAX] = "raven";
-static char g_fingerprint[PROP_VALUE_MAX] = "google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys";
-static char g_hardware[PROP_VALUE_MAX] = "tensor";
+static char g_fingerprint[PROP_VALUE_MAX] = "google/raven/raven:13/TP1A.221005.002/9012097:user/release-keys";
+static char g_hardware[PROP_VALUE_MAX] = "raven";
 static char g_board[PROP_VALUE_MAX] = "raven";
-static char g_bootloader[PROP_VALUE_MAX] = "slider-1.2-8977058";
+static char g_platform[PROP_VALUE_MAX] = "gs101";
+static char g_soc_manufacturer[PROP_VALUE_MAX] = "Google";
+static char g_soc_model[PROP_VALUE_MAX] = "Tensor";
+static char g_bootloader[PROP_VALUE_MAX] = "slider-1.2-8895132";
 static char g_security_patch[PROP_VALUE_MAX] = "2022-10-05";
-static char g_first_api_level[PROP_VALUE_MAX] = "33";
-static char g_sku[PROP_VALUE_MAX] = "G1MNW";
+static char g_first_api_level[PROP_VALUE_MAX] = "31";
+static char g_sku[PROP_VALUE_MAX] = "G8V0U";
+static char g_build_id[PROP_VALUE_MAX] = "TP1A.221005.002";
+static char g_incremental[PROP_VALUE_MAX] = "9012097";
+static char g_release[PROP_VALUE_MAX] = "13";
+static char g_sdk[PROP_VALUE_MAX] = "33";
+static char g_description[PROP_VALUE_MAX] = "raven-user 13 TP1A.221005.002 9012097 release-keys";
 static char g_abi[PROP_VALUE_MAX] = "arm64-v8a";
 static char g_abilist[PROP_VALUE_MAX] = "arm64-v8a";
 static char g_abilist32[PROP_VALUE_MAX] = "";
@@ -41,15 +49,57 @@ static char *read_text_file(const char *path){
   char *b=calloc(1,cap+1); if(!b){close(fd); return NULL;}
   ssize_t n=read(fd,b,cap); close(fd); if(n<0){free(b); return NULL;} b[n]=0; return b;
 }
+static char *json_top_level_object(const char *json, const char *key){
+  if(!json || !key) return NULL;
+  int depth=0, in_string=0, escaped=0;
+  for(const char *p=json; *p; p++){
+    if(in_string){
+      if(escaped){ escaped=0; continue; }
+      if(*p=='\\'){ escaped=1; continue; }
+      if(*p=='"') in_string=0;
+      continue;
+    }
+    if(*p=='{'){ depth++; continue; }
+    if(*p=='}'){ if(depth>0) depth--; continue; }
+    if(*p!='"') continue;
+    const char *start=++p; escaped=0;
+    while(*p){
+      if(escaped){ escaped=0; p++; continue; }
+      if(*p=='\\'){ escaped=1; p++; continue; }
+      if(*p=='"') break;
+      p++;
+    }
+    if(!*p || depth!=1 || (size_t)(p-start)!=strlen(key) || memcmp(start,key,strlen(key))) continue;
+    const char *value=p+1;
+    while(*value && isspace((unsigned char)*value)) value++;
+    if(*value++!=':') continue;
+    while(*value && isspace((unsigned char)*value)) value++;
+    if(*value!='{') continue;
+    int object_depth=0, object_string=0, object_escaped=0;
+    for(const char *end=value; *end; end++){
+      if(object_string){
+        if(object_escaped){ object_escaped=0; continue; }
+        if(*end=='\\'){ object_escaped=1; continue; }
+        if(*end=='"') object_string=0;
+        continue;
+      }
+      if(*end=='"'){ object_string=1; continue; }
+      if(*end=='{') object_depth++;
+      else if(*end=='}' && --object_depth==0) return strndup(value,(size_t)(end-value+1));
+    }
+    return NULL;
+  }
+  return NULL;
+}
 static void json_copy_string(const char *json, const char *key, char *dst, size_t dstsz){
   if(!json || !key || !dst || dstsz==0) return;
   char needle[128]; snprintf(needle,sizeof(needle),"\"%s\"",key);
   const char *p=strstr(json,needle); if(!p) return;
   p=strchr(p+strlen(needle),':'); if(!p) return; p++;
-  while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;
-  if(*p!='\"') return; p++;
+  while(isspace((unsigned char)*p)) p++;
+  if(*p!='"') return; p++;
   size_t n=0;
-  while(*p && !(*p=='\"' && (p==json || *(p-1)!='\\')) && n+1<dstsz){
+  while(*p && !(*p=='"' && (p==json || *(p-1)!='\\')) && n+1<dstsz){
     if(*p=='\\' && p[1]){
       p++;
       if(*p=='n') dst[n++]='\n';
@@ -63,27 +113,38 @@ static void json_copy_string(const char *json, const char *key, char *dst, size_
   dst[n]=0;
 }
 static void load_profile_values(void){
-  char *j=read_text_file(PROFILE_JSON); if(!j) return;
-  json_copy_string(j,"brand",g_brand,sizeof(g_brand));
-  json_copy_string(j,"manufacturer",g_manufacturer,sizeof(g_manufacturer));
-  json_copy_string(j,"model",g_model,sizeof(g_model));
-  json_copy_string(j,"device",g_device,sizeof(g_device));
-  json_copy_string(j,"product",g_product,sizeof(g_product));
-  json_copy_string(j,"fingerprint",g_fingerprint,sizeof(g_fingerprint));
-  json_copy_string(j,"hardware",g_hardware,sizeof(g_hardware));
-  json_copy_string(j,"board",g_board,sizeof(g_board));
-  json_copy_string(j,"bootloader",g_bootloader,sizeof(g_bootloader));
-  json_copy_string(j,"security_patch",g_security_patch,sizeof(g_security_patch));
-  json_copy_string(j,"first_api_level",g_first_api_level,sizeof(g_first_api_level));
-  json_copy_string(j,"sku",g_sku,sizeof(g_sku));
-  json_copy_string(j,"abi",g_abi,sizeof(g_abi));
-  json_copy_string(j,"abilist",g_abilist,sizeof(g_abilist));
-  json_copy_string(j,"abilist32",g_abilist32,sizeof(g_abilist32));
-  json_copy_string(j,"abilist64",g_abilist64,sizeof(g_abilist64));
-  json_copy_string(j,"bionic_arch",g_bionic_arch,sizeof(g_bionic_arch));
-  json_copy_string(j,"dalvik_isa_arm64",g_dalvik_isa_arm64,sizeof(g_dalvik_isa_arm64));
-  json_copy_string(j,"dalvik_isa_arm",g_dalvik_isa_arm,sizeof(g_dalvik_isa_arm));
-  free(j);
+  char *json=read_text_file(PROFILE_JSON); if(!json) return;
+  char *build=json_top_level_object(json,"build");
+  free(json);
+  if(!build) return;
+  json_copy_string(build,"brand",g_brand,sizeof(g_brand));
+  json_copy_string(build,"manufacturer",g_manufacturer,sizeof(g_manufacturer));
+  json_copy_string(build,"model",g_model,sizeof(g_model));
+  json_copy_string(build,"device",g_device,sizeof(g_device));
+  json_copy_string(build,"product",g_product,sizeof(g_product));
+  json_copy_string(build,"fingerprint",g_fingerprint,sizeof(g_fingerprint));
+  json_copy_string(build,"hardware",g_hardware,sizeof(g_hardware));
+  json_copy_string(build,"board",g_board,sizeof(g_board));
+  json_copy_string(build,"platform",g_platform,sizeof(g_platform));
+  json_copy_string(build,"soc_manufacturer",g_soc_manufacturer,sizeof(g_soc_manufacturer));
+  json_copy_string(build,"soc_model",g_soc_model,sizeof(g_soc_model));
+  json_copy_string(build,"bootloader",g_bootloader,sizeof(g_bootloader));
+  json_copy_string(build,"security_patch",g_security_patch,sizeof(g_security_patch));
+  json_copy_string(build,"first_api_level",g_first_api_level,sizeof(g_first_api_level));
+  json_copy_string(build,"sku",g_sku,sizeof(g_sku));
+  json_copy_string(build,"id",g_build_id,sizeof(g_build_id));
+  json_copy_string(build,"incremental",g_incremental,sizeof(g_incremental));
+  json_copy_string(build,"release",g_release,sizeof(g_release));
+  json_copy_string(build,"sdk",g_sdk,sizeof(g_sdk));
+  json_copy_string(build,"description",g_description,sizeof(g_description));
+  json_copy_string(build,"abi",g_abi,sizeof(g_abi));
+  json_copy_string(build,"abilist",g_abilist,sizeof(g_abilist));
+  json_copy_string(build,"abilist32",g_abilist32,sizeof(g_abilist32));
+  json_copy_string(build,"abilist64",g_abilist64,sizeof(g_abilist64));
+  json_copy_string(build,"bionic_arch",g_bionic_arch,sizeof(g_bionic_arch));
+  json_copy_string(build,"dalvik_isa_arm64",g_dalvik_isa_arm64,sizeof(g_dalvik_isa_arm64));
+  json_copy_string(build,"dalvik_isa_arm",g_dalvik_isa_arm,sizeof(g_dalvik_isa_arm));
+  free(build);
 }
 typedef struct { unsigned char *m; size_t len; uint32_t bytes_used; const char *path; int patched; } area_t;
 static uint32_t u32(const unsigned char *p){ uint32_t v; memcpy(&v,p,4); return v; }
@@ -178,16 +239,24 @@ static int patch_propinfo(area_t *a, uint32_t prop_off, const char *full, const 
   g_verified++;
   return 1;
 }
+static int ends_with(const char *value, const char *suffix){
+  size_t value_len=strlen(value), suffix_len=strlen(suffix);
+  return value_len>=suffix_len && !strcmp(value+value_len-suffix_len,suffix);
+}
 static const char *desired_value(const char *full){
   if(!strcmp(full,"ro.debuggable")) return "0";
   if(!strcmp(full,"ro.secure")) return "1";
   if(!strcmp(full,"ro.adb.secure")) return "1";
-  if(!strcmp(full,"ro.boot.hardware")) return "gs101"; /* Tensor HAL aliases make ro.hardware=tensor safe during graphics init; once boot_completed, normalize the app-visible boot platform to gs101. */
+  if(!strcmp(full,"ro.boot.hardware")) return g_hardware;
   if(!strcmp(full,"ro.boot.bootreason")) return "reboot,normal";
   if(!strcmp(full,"ro.bootloader")) return g_bootloader;
   if(!strcmp(full,"ro.build.version.security_patch")) return g_security_patch;
   if(!strcmp(full,"ro.vendor.build.security_patch")) return g_security_patch;
   if(!strcmp(full,"ro.product.first_api_level")) return g_first_api_level;
+  if(!strcmp(full,"ro.product.board")) return g_board;
+  if(!strcmp(full,"ro.board.platform")) return g_platform;
+  if(!strcmp(full,"ro.soc.manufacturer")) return g_soc_manufacturer;
+  if(!strcmp(full,"ro.soc.model")) return g_soc_model;
   if(!strcmp(full,"ro.oem_unlock_supported")) return "1";
   if(!strcmp(full,"sys.oem_unlock_allowed")) return "0";
   if(!strcmp(full,"ro.boot.warranty_bit")) return "0";
@@ -196,8 +265,7 @@ static const char *desired_value(const char *full){
   if(!strcmp(full,"ro.boot.mode")) return "normal";
   if(!strcmp(full,"ro.boot.serialno")) return "";
   if(!strcmp(full,"ro.serialno")) return "";
-  if(!strcmp(full,"ro.boot.baseband")) return "msm";
-  if(!strcmp(full,"ro.boot.hardware.sku")) return g_sku;
+  if(!strcmp(full,"ro.boot.hardware.sku") || !strcmp(full,"ro.hardware.sku")) return g_sku;
   if(strstr(full,"cpu.abilist64")) return g_abilist64;
   if(strstr(full,"cpu.abilist32")) return g_abilist32;
   if(strstr(full,"cpu.abilist")) return g_abilist;
@@ -208,11 +276,10 @@ static const char *desired_value(const char *full){
   if(!strcmp(full,"dalvik.vm.isa.x86.variant")) return "";
   if(!strcmp(full,"dalvik.vm.isa.x86_64.variant")) return "";
   if(!strcmp(full,"ro.boot.verifiedbootstate")) return "green";
-  if(!strcmp(full,"init.svc.adbd")) return ""; /* empty value + inherited serial 2 keeps ART's ADB-JDWP waiter blocked while app/raw readers observe no active adbd */
-  if(!strcmp(full,"sys.usb.config")) return "mtp"; /* app-visible USB functions without adb; host still uses TCP adb forward */
+  if(!strcmp(full,"init.svc.adbd")) return "";
+  if(!strcmp(full,"sys.usb.config")) return "mtp";
   if(!strcmp(full,"sys.usb.state")) return "mtp";
   if(!strcmp(full,"persist.sys.usb.config")) return "mtp";
-  /* Remove runtime implementation properties from the application-visible area. */
   if(strstr(full,"ro.boot.redroid_") || strstr(full,"ro.kernel.redroid.")) return "";
   if(!strcmp(full,"ro.boot.use_redroid_c2")) return "";
   if(!strcmp(full,"init.svc.redroid_net")) return "stopped";
@@ -220,19 +287,23 @@ static const char *desired_value(const char *full){
   if(!strcmp(full,"ro.boot.vbmeta.device_state")) return "locked";
   if(!strcmp(full,"ro.boot.veritymode")) return "enforcing";
   if(!strcmp(full,"ro.boottime.apexd")) return "";
-  if(!strcmp(full,"ro.build.tags")) return "release-keys";
-  if(!strcmp(full,"ro.build.type")) return "user";
-  if(!strcmp(full,"ro.hardware")) return g_hardware; /* Tensor HAL aliases exist in the runtime image; patching after boot_completed is safe and removes the last multi-source identity split. */
-  if(strstr(full,".build.tags") && !strncmp(full,"ro.",3)) return "release-keys";
-  if(strstr(full,".build.type") && !strncmp(full,"ro.",3)) return "user";
+  if(!strcmp(full,"ro.build.tags") || ends_with(full,".build.tags")) return "release-keys";
+  if(!strcmp(full,"ro.build.type") || ends_with(full,".build.type")) return "user";
+  if(!strcmp(full,"ro.hardware")) return g_hardware;
   if(!g_patch_identity) return NULL;
-  if(!strcmp(full,"ro.build.fingerprint")) return g_fingerprint;
+  if(!strcmp(full,"ro.build.fingerprint") || ends_with(full,".build.fingerprint")) return g_fingerprint;
+  if(!strcmp(full,"ro.build.id") || ends_with(full,".build.id")) return g_build_id;
+  if(!strcmp(full,"ro.build.display.id")) return g_build_id;
+  if(!strcmp(full,"ro.build.version.incremental") || ends_with(full,".build.version.incremental")) return g_incremental;
+  if(!strcmp(full,"ro.build.version.release_or_codename") || ends_with(full,".build.version.release_or_codename")) return g_release;
+  if(!strcmp(full,"ro.build.version.release") || ends_with(full,".build.version.release")) return g_release;
+  if(!strcmp(full,"ro.build.version.sdk") || ends_with(full,".build.version.sdk")) return g_sdk;
+  if(!strcmp(full,"ro.build.description")) return g_description;
   if(strstr(full,".brand") && !strncmp(full,"ro.product",10)) return g_brand;
   if(strstr(full,".manufacturer") && !strncmp(full,"ro.product",10)) return g_manufacturer;
   if(strstr(full,".model") && !strncmp(full,"ro.product",10)) return g_model;
   if(strstr(full,".device") && !strncmp(full,"ro.product",10)) return g_device;
   if(strstr(full,".name") && !strncmp(full,"ro.product",10)) return g_product;
-  if(strstr(full,".build.fingerprint") && !strncmp(full,"ro.",3)) return g_fingerprint;
   return NULL;
 }
 static void traverse(area_t *a, uint32_t off, const char *prefix, int depth){

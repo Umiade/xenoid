@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <!-- Back/front Camera2 devices and rear flash are implemented by xenoid-camerahal. -->
+    <feature name="android.hardware.camera" />
+    <feature name="android.hardware.camera.any" />
+    <feature name="android.hardware.camera.flash" />
+    <feature name="android.hardware.camera.front" />
+
+    <!-- Every advertised sensor is backed by xenoid-sensorshal. -->
+    <feature name="android.hardware.sensor.accelerometer" />
+    <feature name="android.hardware.sensor.barometer" />
+    <feature name="android.hardware.sensor.compass" />
+    <feature name="android.hardware.sensor.gyroscope" />
+    <feature name="android.hardware.sensor.light" />
+    <feature name="android.hardware.sensor.proximity" />
+    <feature name="android.hardware.sensor.stepcounter" />
+    <feature name="android.hardware.sensor.stepdetector" />
+
+    <!-- Remove capabilities that the base image may advertise but Xenoid does not execute. -->
+    <unavailable-feature name="android.hardware.camera.autofocus" />
+    <unavailable-feature name="android.hardware.camera.capability.manual_post_processing" />
+    <unavailable-feature name="android.hardware.camera.capability.manual_sensor" />
+    <unavailable-feature name="android.hardware.camera.capability.raw" />
+    <unavailable-feature name="android.hardware.camera.concurrent" />
+    <unavailable-feature name="android.hardware.camera.external" />
+    <unavailable-feature name="android.hardware.camera.level.full" />
+    <unavailable-feature name="android.hardware.fingerprint" />
+    <unavailable-feature name="android.hardware.nfc" />
+    <unavailable-feature name="android.hardware.nfc.any" />
+    <unavailable-feature name="android.hardware.nfc.ese" />
+    <unavailable-feature name="android.hardware.nfc.hce" />
+    <unavailable-feature name="android.hardware.nfc.hcef" />
+    <unavailable-feature name="android.hardware.nfc.uicc" />
+    <unavailable-feature name="android.hardware.sensor.head_tracker" />
+    <unavailable-feature name="android.hardware.sensor.hifi_sensors" />
+    <unavailable-feature name="android.hardware.uwb" />
+</permissions>

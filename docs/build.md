@@ -14,6 +14,12 @@ No external Python dependencies are required.
 python3 scripts/test-instance-storage.py
 ```
 
+Profile-driven Android storage surfaces:
+
+```bash
+python3 scripts/smoke-storage-surfaces.py
+```
+
 Covers fresh initialization, pending recovery, tagged adoption, committed hard-failure, legacy migration with backup, safe container removal order, and dual-instance isolation.
 
 ## Global proxy runtime
@@ -84,6 +90,16 @@ native/xenoid-camerahal/media_profiles_V1_0.xml
 The runtime image installs the provider at `/system/bin/hw/android.hardware.camera.provider-service-aidl` and its framework camcorder profiles at `/vendor/etc/media_profiles_V1_0.xml`. The enhanced allocator replaces the owning `gralloc.redroid.so` and supplies the existing `gralloc.tensor.so` hardware-name alias from the same binary; it is not a second allocator.
 
 The provider build generates the Android 13 stable-AIDL NDK bindings, links the matching platform camera metadata/Binder libraries, strips the service, and rejects product-specific marker strings in the runtime artifact.
+
+## Hardware feature contract
+
+```bash
+python3 scripts/smoke-hardware-features.py
+```
+
+`runtime/redroid/xenoid-hardware-features.xml` is the PackageManager contract for the active camera and sensor HALs. Runtime-context generation validates the source, stages an identical payload, and emits a mandatory Dockerfile `COPY`; a missing, malformed, changed, or unstaged payload fails generation/build. Live runtime smoke validates both the installed XML and `pm list features`.
+
+The contract requires the implemented back/front cameras, rear flash, accelerometer, barometer, compass, gyroscope, light, proximity, step-counter, and step-detector features. It removes inherited autofocus, full/manual/RAW/concurrent/external camera, NFC, UWB, fingerprint, HiFi sensor, and head-tracker claims.
 
 ## Build all
 
@@ -181,6 +197,8 @@ python3 scripts/test-proxy-control.py      # generation/check-bound proxy data-p
 ```
 
 `test-cellular-profile.py` pins the libphonenumber-derived per-country MSISDN templates, the 3GPP EARFCN/band round-trip used by the image's telephony band bridge (`scripts/patch-telephony-legacy-lte-band.py`), profile digest stability, and the stage/arm/recreate/verify/promote transaction including crash resume. `scripts/smoke-cellular-runtime.sh` is the live counterpart: an ordinary + isolated-process probe APK checks SIM/subscription/LTE cell/MSISDN, the single `rmnet_data0` cellular network, and the raw-syscall interface views.
+
+The carrier dataset remains LTE-only. Every active carrier band list must be a subset of the official Pixel 6 Pro `G8V0U` LTE matrix and every generated EARFCN must round-trip to that LTE band; NR and mmWave hardware bands are not advertised as working data paths.
 
 ## Native profile helper
 

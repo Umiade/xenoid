@@ -1,6 +1,7 @@
 // xenoid_sensors_hal.cpp — virtual AIDL sensor HAL with a real FMQ event stream.
 // SensorService owns the queue; this service maps the supplied descriptor and
 // writes fixed-size Event records using the synchronized FMQ memory protocol.
+#include "sensor_catalog.h"
 #include <android/binder_status.h>
 #include <android/log.h>
 #include <atomic>
@@ -43,48 +44,39 @@ namespace {
 
 SensorInfo mk(int handle, const char* name, const char* vendor, SensorType type,
               const char* typeStr, float maxRange, float resolution, float power,
-              int minDelayUs, int flags) {
-  SensorInfo s;
-  s.sensorHandle = handle;
-  s.name = name;
-  s.vendor = vendor;
-  s.version = 1;
-  s.type = type;
-  s.typeAsString = typeStr;
-  s.maxRange = maxRange;
-  s.resolution = resolution;
-  s.power = power;
-  s.minDelayUs = minDelayUs;
-  s.fifoReservedEventCount = 0;
-  s.fifoMaxEventCount = 10000;
-  s.requiredPermission = "";
-  s.maxDelayUs = 0;
-  s.flags = flags;
-  return s;
+              int minDelayUs, int maxDelayUs, int flags) {
+  SensorInfo sensor;
+  sensor.sensorHandle = handle;
+  sensor.name = name;
+  sensor.vendor = vendor;
+  sensor.version = 1;
+  sensor.type = type;
+  sensor.typeAsString = typeStr;
+  sensor.maxRange = maxRange;
+  sensor.resolution = resolution;
+  sensor.power = power;
+  sensor.minDelayUs = minDelayUs;
+  sensor.fifoReservedEventCount = 0;
+  sensor.fifoMaxEventCount = 10000;
+  sensor.requiredPermission = "";
+  sensor.maxDelayUs = maxDelayUs;
+  sensor.flags = flags;
+  return sensor;
 }
 
-// Realistic Pixel 6 Pro sensor catalog.
 std::vector<SensorInfo> buildCatalog() {
-  return {
-    mk(1,  "LSM6DSO Accelerometer", "STMicro", SensorType::ACCELEROMETER, "android.sensor.accelerometer", 78.45f, 0.0024f, 0.24f, 5000, 0),
-    mk(2,  "LSM6DSO Gyroscope", "STMicro", SensorType::GYROSCOPE, "android.sensor.gyroscope", 34.91f, 0.0012f, 0.55f, 5000, 0),
-    mk(3,  "MMC5602 Magnetometer", "Memsic", SensorType::MAGNETIC_FIELD, "android.sensor.magnetic_field", 3000.0f, 0.1f, 0.2f, 10000, 0),
-    mk(4,  "TMD3725 Proximity", "AMS", SensorType::PROXIMITY, "android.sensor.proximity", 5.0f, 1.0f, 0.13f, 0, 2),
-    mk(5,  "TMD3725 Light", "AMS", SensorType::LIGHT, "android.sensor.light", 12000.0f, 1.0f, 0.13f, 0, 2),
-    mk(6,  "BMP380 Barometer", "Bosch", SensorType::PRESSURE, "android.sensor.pressure", 1100.0f, 0.0002f, 0.02f, 50000, 0),
-    mk(7,  "LSM6DSO Accelerometer Uncalibrated", "STMicro", SensorType::ACCELEROMETER_UNCALIBRATED, "android.sensor.accelerometer_uncalibrated", 78.45f, 0.0024f, 0.24f, 5000, 0),
-    mk(8,  "LSM6DSO Gyroscope Uncalibrated", "STMicro", SensorType::GYROSCOPE_UNCALIBRATED, "android.sensor.gyroscope_uncalibrated", 34.91f, 0.0012f, 0.55f, 5000, 0),
-    mk(9,  "MMC5602 Magnetometer Uncalibrated", "Memsic", SensorType::MAGNETIC_FIELD_UNCALIBRATED, "android.sensor.magnetic_field_uncalibrated", 3000.0f, 0.1f, 0.2f, 10000, 0),
-    mk(10, "Step Counter", "Google", SensorType::STEP_COUNTER, "android.sensor.step_counter", 1.0f, 1.0f, 0.0f, 0, 2),
-    mk(11, "Step Detector", "Google", SensorType::STEP_DETECTOR, "android.sensor.step_detector", 1.0f, 1.0f, 0.0f, 0, 6),
-    mk(12, "Significant Motion", "Google", SensorType::SIGNIFICANT_MOTION, "android.sensor.significant_motion", 1.0f, 1.0f, 0.0f, 0, 4),
-    mk(13, "Game Rotation Vector", "Google", SensorType::GAME_ROTATION_VECTOR, "android.sensor.game_rotation_vector", 1.0f, 1.0f, 0.0f, 5000, 0),
-    mk(14, "GeoMag Rotation Vector", "Google", SensorType::GEOMAGNETIC_ROTATION_VECTOR, "android.sensor.geomagnetic_rotation_vector", 1.0f, 1.0f, 0.0f, 10000, 0),
-    mk(15, "Gravity", "Google", SensorType::GRAVITY, "android.sensor.gravity", 9.81f, 0.001f, 0.0f, 10000, 0),
-    mk(16, "Linear Acceleration", "Google", SensorType::LINEAR_ACCELERATION, "android.sensor.linear_acceleration", 78.45f, 0.0024f, 0.0f, 5000, 0),
-    mk(17, "Rotation Vector", "Google", SensorType::ROTATION_VECTOR, "android.sensor.rotation_vector", 1.0f, 1.0f, 0.0f, 5000, 0),
-    mk(18, "Orientation", "Google", SensorType::ORIENTATION, "android.sensor.orientation", 360.0f, 0.01f, 0.0f, 10000, 0),
-  };
+  size_t count = 0;
+  const XenoidSensorSpec* specs = xenoid_sensor_catalog(&count);
+  std::vector<SensorInfo> catalog;
+  catalog.reserve(count);
+  for (size_t index = 0; index < count; index++) {
+    const XenoidSensorSpec& spec = specs[index];
+    catalog.push_back(mk(
+        spec.handle, spec.name, spec.vendor, static_cast<SensorType>(spec.type),
+        spec.type_string, spec.maximum_range, spec.resolution, spec.power_ma,
+        spec.minimum_delay_us, spec.maximum_delay_us, spec.flags));
+  }
+  return catalog;
 }
 
 class XenoidSensorsHal : public aidl::android::hardware::sensors::BnSensors {
@@ -152,17 +144,20 @@ class XenoidSensorsHal : public aidl::android::hardware::sensors::BnSensors {
     return ScopedAStatus::ok();
   }
 
-  ScopedAStatus batch(int32_t handle, int64_t samplingPeriodNs, int64_t) override {
+  ScopedAStatus batch(
+      int32_t handle, int64_t samplingPeriodNs,
+      int64_t maxReportLatencyNs) override {
     const SensorInfo* info = findSensor(handle);
-    if (info == nullptr || samplingPeriodNs <= 0) {
+    if (info == nullptr
+        || !xenoid_sensor_period_valid(
+            info->minDelayUs, info->maxDelayUs, samplingPeriodNs,
+            maxReportLatencyNs)) {
       return ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
     }
-    int64_t minPeriod = std::max<int64_t>(info->minDelayUs * 1000LL, 5000000LL);
-    int64_t period = std::max(samplingPeriodNs, minPeriod);
     std::lock_guard<std::mutex> lock(mu_);
-    periods_[handle] = period;
+    periods_[handle] = samplingPeriodNs;
     auto it = active_.find(handle);
-    if (it != active_.end()) it->second.periodNs = period;
+    if (it != active_.end()) it->second.periodNs = samplingPeriodNs;
     return ScopedAStatus::ok();
   }
 
@@ -368,11 +363,19 @@ class XenoidSensorsHal : public aidl::android::hardware::sensors::BnSensors {
         event.payload.set<Payload::stepCount>(static_cast<int64_t>(t / 1.7));
         break;
       default: {
-        float value = 0.0f;
-        if (sensor.type == SensorType::LIGHT) value = 74.0f + 2.0f * a;
-        else if (sensor.type == SensorType::PROXIMITY) value = 5.0f;
-        else if (sensor.type == SensorType::PRESSURE) value = 1008.2f + 0.03f * a;
-        event.payload.set<Payload::scalar>(value);
+        float sample = 0.0f;
+        if (xenoid_sensor_scalar_sample(
+                static_cast<int32_t>(sensor.type), t, &sample) != 0) {
+          sample = 0.0f;
+        }
+        if (static_cast<int32_t>(sensor.type) >=
+            static_cast<int32_t>(SensorType::DEVICE_PRIVATE_BASE)) {
+          Payload::Data value{};
+          value.values[0] = sample;
+          event.payload.set<Payload::data>(value);
+        } else {
+          event.payload.set<Payload::scalar>(sample);
+        }
         break;
       }
     }

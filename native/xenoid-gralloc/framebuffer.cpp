@@ -38,6 +38,20 @@
 #define USE_PAN_DISPLAY 0
 #endif
 
+
+#define XENOID_PROFILE_DIR "/data/local/tmp/xenoid-profile"
+
+static int readProfileInt(const char* name, int fallback, int minimum, int maximum) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", XENOID_PROFILE_DIR, name);
+    FILE* file = fopen(path, "re");
+    if (file == nullptr) return fallback;
+    long value = 0;
+    const int parsed = fscanf(file, "%ld", &value);
+    fclose(file);
+    if (parsed != 1 || value < minimum || value > maximum) return fallback;
+    return static_cast<int>(value);
+}
 #ifndef NUM_BUFFERS
 #define NUM_BUFFERS 2
 #endif
@@ -191,28 +205,17 @@ int mapFrameBufferLocked(struct private_module_t* module, int format) {
         return -error;
     }
 
-    const uint64_t refreshQuotient =
-            static_cast<uint64_t>(variableInfo.upper_margin + variableInfo.lower_margin +
-                                  variableInfo.yres) *
-            (variableInfo.left_margin + variableInfo.right_margin + variableInfo.xres) *
-            variableInfo.pixclock;
-    int refreshRate = refreshQuotient > 0
-            ? static_cast<int>(UINT64_C(1000000000000000) / refreshQuotient)
-            : 0;
-    if (refreshRate == 0) {
-        refreshRate = 60 * 1000;
-    }
-
-    if (static_cast<int>(variableInfo.width) <= 0 ||
-        static_cast<int>(variableInfo.height) <= 0) {
-        variableInfo.width = static_cast<uint32_t>(
-                (variableInfo.xres * 25.4f) / 160.0f + 0.5f);
-        variableInfo.height = static_cast<uint32_t>(
-                (variableInfo.yres * 25.4f) / 160.0f + 0.5f);
-    }
-
-    const float xdpi = (variableInfo.xres * 25.4f) / variableInfo.width;
-    const float ydpi = (variableInfo.yres * 25.4f) / variableInfo.height;
+    int refreshRate = readProfileInt(
+            "display_defaultRefreshRateHz", 120, 1, 240) * 1000;
+    const int physicalPpi = readProfileInt("display_physicalPpi", 512, 1, 2000);
+    variableInfo.width = static_cast<uint32_t>(
+            (variableInfo.xres * 25.4f) / physicalPpi + 0.5f);
+    variableInfo.height = static_cast<uint32_t>(
+            (variableInfo.yres * 25.4f) / physicalPpi + 0.5f);
+    if (variableInfo.width == 0) variableInfo.width = 1;
+    if (variableInfo.height == 0) variableInfo.height = 1;
+    const float xdpi = static_cast<float>(physicalPpi);
+    const float ydpi = static_cast<float>(physicalPpi);
     const float fps = refreshRate / 1000.0f;
 
     ALOGI("using framebuffer fd=%d, id=%s, %ux%u, virtual=%ux%u, bpp=%u",

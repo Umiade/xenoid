@@ -19,7 +19,8 @@ class CameraRenderer final {
     bool writeFrame(const RequestSettings& settings, const FrameTiming& timing,
                     int64_t frameNumber, const StreamDescriptor& stream,
                     CachedBuffer& buffer, const SourceFrame& source,
-                    SourceMode mode, std::string* error);
+                    SourceMode mode, bool flashAvailable,
+                    std::string* error);
     // Releases frame-sized working storage after the session worker stops.
     void releaseScratch();
 
@@ -91,11 +92,14 @@ class CameraRenderer final {
                                uint32_t normalizedY);
 
     bool resizeScratch(int32_t width, int32_t height, std::string* error);
-    bool renderScratch(const RequestSettings& settings, const FrameTiming& timing,
+    bool renderScratch(const RequestSettings& settings,
+                       const FrameTiming& timing,
                        int64_t frameNumber, const SourceFrame& source,
-                       SourceMode mode, int32_t outputRotation, int32_t width,
+                       SourceMode mode, bool flashAvailable,
+                       int32_t outputRotation, int32_t width,
                        int32_t height, std::string* error);
-    bool renderFallbackScratch(const SceneState& state, int32_t outputRotation,
+    bool renderFallbackScratch(const SceneState& state,
+                               int32_t outputRotation,
                                int32_t width, int32_t height,
                                std::string* error);
     bool renderSourceScratch(const SourceFrame& source,

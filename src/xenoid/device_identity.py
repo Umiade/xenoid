@@ -84,10 +84,12 @@ def _valid_imei(value: str) -> bool:
 
 
 def _generate_stable() -> dict[str, str]:
-    first_fourteen = "35693803" + "".join(str(secrets.randbelow(10)) for _ in range(6))
+    first_fourteen = str(secrets.randbelow(9) + 1) + "".join(
+        str(secrets.randbelow(10)) for _ in range(13)
+    )
     return {
         "androidId": secrets.token_hex(8),
-        "serial": "3A" + secrets.token_hex(5).upper(),
+        "serial": secrets.token_hex(8).upper(),
         "imei": first_fourteen + _imei_check_digit(first_fourteen),
         "imeisv": "01",
     }

@@ -1,6 +1,7 @@
 #include <aidl/android/hardware/camera/common/Status.h>
 #include <aidl/android/hardware/camera/common/VendorTagSection.h>
 #include <aidl/android/hardware/camera/provider/BnCameraProvider.h>
+#include <aidl/android/hardware/camera/common/TorchModeStatus.h>
 #include <aidl/android/hardware/camera/provider/CameraIdAndStreamCombination.h>
 #include <aidl/android/hardware/camera/provider/ConcurrentCameraIdCombination.h>
 #include <aidl/android/hardware/camera/provider/ICameraProviderCallback.h>
@@ -41,14 +42,39 @@ ScopedAStatus halError(Status status, const char* message) {
 class CameraProvider final : public camera::provider::BnCameraProvider {
 public:
     CameraProvider()
-        : backDevice_(ndk::SharedRefBase::make<CameraDevice>(false)),
-          frontDevice_(ndk::SharedRefBase::make<CameraDevice>(true)) {}
+        : backDevice_(ndk::SharedRefBase::make<CameraDevice>(
+                  kCameraProfiles[0],
+                  [this](bool inUse, bool on) {
+                      reportRearTorch(inUse, on);
+                  })),
+          frontDevice_(ndk::SharedRefBase::make<CameraDevice>(
+                  kCameraProfiles[1],
+                  std::function<void(bool, bool)>{})) {}
 
     ScopedAStatus setCallback(
             const std::shared_ptr<camera::provider::ICameraProviderCallback>& callback) override {
+        if (callback == nullptr) {
+            return halError(Status::ILLEGAL_ARGUMENT,
+                            "camera provider callback is null");
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         callback_ = callback;
         return ScopedAStatus::ok();
+    }
+
+    void reportRearTorch(bool inUse, bool on) {
+        std::shared_ptr<camera::provider::ICameraProviderCallback> callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = callback_;
+        }
+        if (callback != nullptr) {
+            callback->torchModeStatusChange(
+                    kBackDeviceName,
+                    inUse ? camera::common::TorchModeStatus::NOT_AVAILABLE
+                          : on ? camera::common::TorchModeStatus::AVAILABLE_ON
+                               : camera::common::TorchModeStatus::AVAILABLE_OFF);
+        }
     }
 
     ScopedAStatus getVendorTags(std::vector<camera::common::VendorTagSection>* out) override {

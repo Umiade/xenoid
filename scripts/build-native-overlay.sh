@@ -10,5 +10,8 @@ SDK="$(xenoid_android_sdk_root)"
 BIN=""
 for ndk in "$SDK"/ndk/*; do for pre in darwin-x86_64 darwin-arm64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
 [[ -n "$BIN" ]] || { echo "$TOOL not found" >&2; exit 127; }
-"$BIN" -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 -o "$OUT" "$ROOT/native/xenoid-hide/xenoid_overlay.c"
+"$BIN" -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+  -o "$OUT" \
+  "$ROOT/native/xenoid-hide/xenoid_overlay.c" \
+  "$ROOT/native/xenoid-hide/xenoid_power_supply.c"
 echo "$OUT"

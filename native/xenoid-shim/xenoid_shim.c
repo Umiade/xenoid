@@ -141,6 +141,58 @@ static void join_profile_path(char *buf, size_t bufsz, const char *leaf) {
   snprintf(buf, bufsz, "%s/%s", profile_dir(), leaf);
 }
 
+static long profile_long_value(const char *leaf, long fallback, long minimum, long maximum) {
+#if defined(__linux__)
+  char path[512], text[64];
+  join_profile_path(path, sizeof(path), leaf);
+  int fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0);
+  if (fd < 0) return fallback;
+  ssize_t size = (ssize_t)syscall(SYS_read, fd, text, sizeof(text) - 1);
+  syscall(SYS_close, fd);
+  if (size <= 0) return fallback;
+  text[size] = 0;
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(text, &end, 10);
+  if (errno || end == text || value < minimum || value > maximum) return fallback;
+  return value;
+#else
+  (void)leaf;
+  (void)minimum;
+  (void)maximum;
+  return fallback;
+#endif
+}
+
+static long profile_cpu_frequency(int cpu, int maximum) {
+  static const long minimums[8] = {
+    300000, 300000, 300000, 300000, 400000, 400000, 500000, 500000
+  };
+  static const long maximums[8] = {
+    1800000, 1800000, 1800000, 1800000, 2253000, 2253000, 2802000, 2802000
+  };
+  char leaf[96];
+  if (cpu < 0 || cpu > 7) return 0;
+  snprintf(leaf, sizeof(leaf), "cpu_%d_%sFrequencyKhz", cpu, maximum ? "maximum" : "minimum");
+  return profile_long_value(
+      leaf, maximum ? maximums[cpu] : minimums[cpu], 1, 10000000);
+}
+
+static unsigned long long profile_memory_bytes(const char *leaf, unsigned long long fallback) {
+  long value = profile_long_value(leaf, (long)fallback, 0, (long)(1ULL << 50));
+  return (unsigned long long)value;
+}
+
+static unsigned long long profile_total_memory_bytes(void) {
+  const unsigned long long fallback = 12ULL * 1024ULL * 1024ULL * 1024ULL;
+  unsigned long long bytes = profile_memory_bytes("memory_totalBytes", fallback);
+  unsigned long long kib = profile_memory_bytes("memory_totalKiB", fallback / 1024ULL);
+  if (kib < 1048576ULL || kib > (1ULL << 40) || bytes != kib * 1024ULL) {
+    return fallback;
+  }
+  return bytes;
+}
+
 static char *load_boot_id(void) {
   char p[512];
   join_profile_path(p, sizeof(p), "boot_id");
@@ -248,9 +300,22 @@ static void rewrite_maps_line(char *line) {
   memmove(p + strlen(to), p + strlen(from), strlen(p + strlen(from)) + 1);
   memcpy(p, to, strlen(to));
 }
+static const char *canonical_mount_view_path(const char *path) {
+  const char *test_reader = getenv("XENOID_TEST_MOUNTS_PATH");
+  const char *test_source = getenv("XENOID_TEST_CANONICAL_MOUNTS_PATH");
+  if (path && test_reader && test_source && !strcmp(path, test_reader)) return test_source;
+  if (!path || strncmp(path, "/proc/", 6)) return path;
+  const char *leaf = strrchr(path, '/');
+  if (!leaf) return path;
+  if (!strcmp(leaf, "/mounts")) return "/proc/1/mounts";
+  if (!strcmp(leaf, "/mountinfo")) return "/proc/1/mountinfo";
+  if (!strcmp(leaf, "/mountstats")) return "/proc/1/mountstats";
+  return path;
+}
+
 
 static char *filter_lines(const char *p){
-  char*s=read_file_real(p); size_t slen=strlen(s); char*out=calloc(1,slen+64); if(!out){free(s); return strdup("");}
+  const char *source=canonical_mount_view_path(p); char*s=read_file_real(source); size_t slen=strlen(s); char*out=calloc(1,slen+64); if(!out){free(s); return strdup("");}
   int is_status = p && strstr(p,"/status");
   int filter_app_maps = xenoid_reader_is_app_uid() && is_maps_text_path(p);
   size_t off=0; char*save=NULL;
@@ -325,27 +390,59 @@ static int hidden_proc_pid(int pid);
 static int is_fdinfo_file(const char *p){ return p && strncmp(p,"/proc/",6)==0 && strstr(p,"/fdinfo/"); }
 
 static int fake_cpufreq_fd(const char *path) {
-  /* Provide profile-consistent per-CPU frequency nodes when the base runtime
-     does not expose them. */
+  static const char per_cpu_prefix[] = "/sys/devices/system/cpu/cpu";
+  static const char policy_prefix[] = "/sys/devices/system/cpu/cpufreq/policy";
   if (!path) return -2;
-  const char *p = strstr(path, "/sys/devices/system/cpu/cpu");
-  if (!p) return -2;
-  p += strlen("/sys/devices/system/cpu/cpu");
-  if (*p < '0' || *p > '9') return -2;
-  int cpu = 0; while (*p >= '0' && *p <= '9') { cpu = cpu * 10 + (*p - '0'); p++; }
-  if (cpu < 0 || cpu > 7) return -2;
-  if (strncmp(p, "/cpufreq/", 9) != 0) return -2;
-  const char *leaf = p + 9;
-  long maxf = cpu < 6 ? 2995000 : 2850000;
-  long minf = 300000;
-  long curf = 1500000 + (long)cpu * 70000; /* vary so allSame=false */
-  char buf[64];
-  if (!strcmp(leaf, "cpuinfo_max_freq")) snprintf(buf, sizeof(buf), "%ld\n", maxf);
-  else if (!strcmp(leaf, "cpuinfo_min_freq")) snprintf(buf, sizeof(buf), "%ld\n", minf);
-  else if (!strcmp(leaf, "scaling_cur_freq")) snprintf(buf, sizeof(buf), "%ld\n", curf);
-  else if (!strcmp(leaf, "scaling_governor")) snprintf(buf, sizeof(buf), "schedutil\n");
-  else return -2;
-  return make_fake(buf);
+  const char *p = NULL;
+  int cpu = -1;
+  int policy = 0;
+  if (strncmp(path, policy_prefix, sizeof(policy_prefix) - 1) == 0) {
+    p = path + sizeof(policy_prefix) - 1;
+    if (*p < '0' || *p > '9') return -2;
+    cpu = 0;
+    while (*p >= '0' && *p <= '9') {
+      cpu = cpu * 10 + (*p - '0');
+      p++;
+    }
+    if ((cpu != 0 && cpu != 4 && cpu != 6) || *p != '/') return -2;
+    p++;
+    policy = 1;
+  } else if (strncmp(path, per_cpu_prefix, sizeof(per_cpu_prefix) - 1) == 0) {
+    p = path + sizeof(per_cpu_prefix) - 1;
+    if (*p < '0' || *p > '9') return -2;
+    cpu = 0;
+    while (*p >= '0' && *p <= '9') {
+      cpu = cpu * 10 + (*p - '0');
+      p++;
+    }
+    if (cpu < 0 || cpu > 7 || strncmp(p, "/cpufreq/", 9) != 0) return -2;
+    p += 9;
+  } else {
+    return -2;
+  }
+  int leader = cpu < 4 ? 0 : (cpu < 6 ? 4 : 6);
+  long minimum_khz = profile_cpu_frequency(leader, 0);
+  long maximum_khz = profile_cpu_frequency(leader, 1);
+  char buffer[128];
+  if (!strcmp(p, "cpuinfo_max_freq") || !strcmp(p, "scaling_max_freq")) {
+    snprintf(buffer, sizeof(buffer), "%ld\n", maximum_khz);
+  } else if (!strcmp(p, "cpuinfo_min_freq") || !strcmp(p, "scaling_min_freq")
+             || !strcmp(p, "cpuinfo_cur_freq") || !strcmp(p, "scaling_cur_freq")) {
+    snprintf(buffer, sizeof(buffer), "%ld\n", minimum_khz);
+  } else if (!strcmp(p, "scaling_available_frequencies")) {
+    snprintf(buffer, sizeof(buffer), "%ld %ld\n", minimum_khz, maximum_khz);
+  } else if (!strcmp(p, "scaling_available_governors")) {
+    snprintf(buffer, sizeof(buffer), "schedutil performance\n");
+  } else if (!strcmp(p, "scaling_governor")) {
+    snprintf(buffer, sizeof(buffer), "schedutil\n");
+  } else if (policy && (!strcmp(p, "affected_cpus") || !strcmp(p, "related_cpus"))) {
+    snprintf(buffer, sizeof(buffer), "%s", leader == 0 ? "0 1 2 3\n" : (leader == 4 ? "4 5\n" : "6 7\n"));
+  } else if (!strcmp(p, "stats/time_in_state")) {
+    snprintf(buffer, sizeof(buffer), "%ld 1000\n%ld 1000\n", minimum_khz, maximum_khz);
+  } else {
+    return -2;
+  }
+  return make_fake(buffer);
 }
 
 static int open_virtual(const char *path) {
@@ -521,10 +618,6 @@ ssize_t readlink(const char*path,char*buf,size_t bufsiz){
   readlink_t real=(readlink_t)dlsym(RTLD_NEXT,"readlink");
   if(!xenoid_reader_is_app_uid()) return real?real(path,buf,bufsiz):-1;
   if(path_hidden_for_reader(path)){errno=ENOENT;return -1;}
-  if(path && (strcmp(path,"/sys/block/vda")==0 || strcmp(path,"/sys/block/vdb")==0)) {
-    const char *fake = "../devices/platform/soc/1d84000.ufshc/mmc_host/mmc0/mmc0:0001/block/mmcblk0";
-    size_t n=strlen(fake); if(n>bufsiz) n=bufsiz; memcpy(buf,fake,n); return (ssize_t)n;
-  }
   ssize_t r=real?real(path,buf,bufsiz):-1;
   if(r>0 && buf && (memmem(buf,(size_t)r,"virtio",6) || memmem(buf,(size_t)r,"pci",3))) { errno=ENOENT; return -1; }
   return sanitize_readlink_result(path,buf,bufsiz,r);
@@ -567,7 +660,7 @@ int uname(struct utsname *buf) {
   if(r==0 && buf && xenoid_runtime_identity_scope()){
     snprintf(buf->sysname,sizeof(buf->sysname),"Linux");
     snprintf(buf->nodename,sizeof(buf->nodename),"localhost");
-    snprintf(buf->release,sizeof(buf->release),"5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab8977058");
+    snprintf(buf->release,sizeof(buf->release),"5.10.107-android13-4-00001-g6f2c7c7f0f0e-ab9012097");
     snprintf(buf->version,sizeof(buf->version),"#1 SMP PREEMPT Wed Oct 5 04:00:00 UTC 2022");
     snprintf(buf->machine,sizeof(buf->machine),"aarch64");
   }
@@ -580,10 +673,6 @@ ssize_t readlinkat(int dirfd,const char*path,char*buf,size_t bufsiz){
   readlinkat_t real=(readlinkat_t)dlsym(RTLD_NEXT,"readlinkat");
   if(!xenoid_reader_is_app_uid()) return real?real(dirfd,path,buf,bufsiz):-1;
   if(path_hidden_for_reader(path)){errno=ENOENT;return -1;}
-  if(path && (strcmp(path,"/sys/block/vda")==0 || strcmp(path,"/sys/block/vdb")==0 || strcmp(path,"vda")==0 || strcmp(path,"vdb")==0)) {
-    const char *fake = "../devices/platform/soc/1d84000.ufshc/mmc_host/mmc0/mmc0:0001/block/mmcblk0";
-    size_t n=strlen(fake); if(n>bufsiz) n=bufsiz; memcpy(buf,fake,n); return (ssize_t)n;
-  }
   ssize_t r=real?real(dirfd,path,buf,bufsiz):-1;
   if(r>0 && buf && (memmem(buf,(size_t)r,"virtio",6) || memmem(buf,(size_t)r,"pci",3))) { errno=ENOENT; return -1; }
   return sanitize_readlink_result(path,buf,bufsiz,r);
@@ -614,9 +703,17 @@ struct dirent *readdir(DIR *dirp) { readdir_t real=(readdir_t)dlsym(RTLD_NEXT,"r
 
 
 long sysconf(int name) {
-  if(xenoid_reader_is_app_uid() && (name==_SC_NPROCESSORS_CONF || name==_SC_NPROCESSORS_ONLN)) return 8;
+  if (xenoid_reader_is_app_uid()
+      && (name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN)) return 8;
 #ifdef _SC_PHYS_PAGES
-  if(xenoid_reader_is_app_uid() && name==_SC_PHYS_PAGES) return 2031616; // 7.75 GiB / 4 KiB
+  if (xenoid_reader_is_app_uid() && name == _SC_PHYS_PAGES) {
+    return (long)(profile_total_memory_bytes() / 4096ULL);
+  }
+#endif
+#ifdef _SC_AVPHYS_PAGES
+  if (xenoid_reader_is_app_uid() && name == _SC_AVPHYS_PAGES) {
+    return (long)(profile_total_memory_bytes() / 2ULL / 4096ULL);
+  }
 #endif
   sysconf_t real=(sysconf_t)dlsym(RTLD_NEXT,"sysconf");
   return real?real(name):-1;
@@ -642,25 +739,58 @@ int sysinfo(struct sysinfo *info) {
   sysinfo_t real=(sysinfo_t)dlsym(RTLD_NEXT,"sysinfo");
   int r=real?real(info):-1;
   if(r==0 && info && xenoid_reader_is_app_uid()){
-    info->totalram = 7936UL*1024*1024;      // 7.75 GiB, aligned with ActivityManager
-    info->freeram  = 5UL*1024*1024*1024;
-    info->totalswap = 4194300UL*1024;
-    info->freeswap = 4194300UL*1024;
+    unsigned long long total = profile_total_memory_bytes();
+    unsigned long long swap = profile_memory_bytes("memory_swapBytes", 0);
+    info->totalram = (unsigned long)total;
+    info->freeram = (unsigned long)(total / 2ULL);
+    info->sharedram = (unsigned long)(total / 48ULL);
+    info->bufferram = (unsigned long)(total / 96ULL);
+    info->totalswap = (unsigned long)swap;
+    info->freeswap = (unsigned long)swap;
+    info->totalhigh = 0;
+    info->freehigh = 0;
     info->mem_unit = 1;
   }
   return r;
 }
 
 typedef int (*statfs_t)(const char *, struct statfs *);
-static void shape_statfs(struct statfs *st) {
-  if(!st) return;
-  if(st->f_type == 0x794c7630 /* OVERLAYFS_SUPER_MAGIC */ || st->f_type == 0x65735546 /* FUSE */)
-    st->f_type = 0xEF53; /* EXT4_SUPER_MAGIC */
+#define XENOID_EXT4_SUPER_MAGIC 0xEF53
+#define XENOID_F2FS_SUPER_MAGIC 0xF2F52010L
+#define XENOID_OVERLAYFS_SUPER_MAGIC 0x794c7630
+#define XENOID_FUSE_SUPER_MAGIC 0x65735546
+
+static int path_has_component_prefix(const char *path, const char *prefix) {
+  size_t size;
+  if(!path || !prefix || !prefix[0]) return 0;
+  size=strlen(prefix);
+  return !strncmp(path,prefix,size) && (path[size]=='\0' || path[size]=='/');
+}
+static int path_is_android_data(const char *path) {
+  const char *test_path=getenv("XENOID_TEST_DATA_PATH");
+  return path_has_component_prefix(path,"/data")
+      || (test_path && path_has_component_prefix(path,test_path));
+}
+static int fd_is_android_data(int fd) {
+  char proc_path[64], resolved[PATH_MAX];
+  readlink_t real=(readlink_t)dlsym(RTLD_NEXT,"readlink");
+  if(!real || snprintf(proc_path,sizeof(proc_path),"/proc/self/fd/%d",fd)<0) return 0;
+  ssize_t size=real(proc_path,resolved,sizeof(resolved)-1);
+  if(size<0) return 0;
+  resolved[size]='\0';
+  return path_is_android_data(resolved);
+}
+static long shaped_statfs_type(const char *path, long type) {
+  if(path_is_android_data(path)) return XENOID_F2FS_SUPER_MAGIC;
+  if(type==XENOID_OVERLAYFS_SUPER_MAGIC || type==XENOID_FUSE_SUPER_MAGIC)
+    return XENOID_EXT4_SUPER_MAGIC;
+  return type;
 }
 int statfs(const char *path, struct statfs *buf) {
   statfs_t real=(statfs_t)dlsym(RTLD_NEXT,"statfs");
   int r=real?real(path,buf):-1;
-  if(r==0 && xenoid_reader_is_app_uid()) shape_statfs(buf);
+  if(r==0 && buf && xenoid_reader_is_app_uid())
+    buf->f_type=shaped_statfs_type(path,buf->f_type);
   return r;
 }
 
@@ -668,7 +798,8 @@ typedef int (*statfs64_t)(const char *, struct statfs64 *);
 int statfs64(const char *path, struct statfs64 *buf) {
   statfs64_t real=(statfs64_t)dlsym(RTLD_NEXT,"statfs64");
   int r=real?real(path,buf):-1;
-  if(r==0 && buf && xenoid_reader_is_app_uid() && (buf->f_type == 0x794c7630 || buf->f_type == 0x65735546)) buf->f_type = 0xEF53;
+  if(r==0 && buf && xenoid_reader_is_app_uid())
+    buf->f_type=shaped_statfs_type(path,buf->f_type);
   return r;
 }
 
@@ -676,7 +807,8 @@ typedef int (*fstatfs_t)(int, struct statfs *);
 int fstatfs(int fd, struct statfs *buf) {
   fstatfs_t real=(fstatfs_t)dlsym(RTLD_NEXT,"fstatfs");
   int r=real?real(fd,buf):-1;
-  if(r==0 && xenoid_reader_is_app_uid()) shape_statfs(buf);
+  if(r==0 && buf && xenoid_reader_is_app_uid())
+    buf->f_type=shaped_statfs_type(fd_is_android_data(fd)?"/data":NULL,buf->f_type);
   return r;
 }
 
@@ -684,7 +816,8 @@ typedef int (*fstatfs64_t)(int, struct statfs64 *);
 int fstatfs64(int fd, struct statfs64 *buf) {
   fstatfs64_t real=(fstatfs64_t)dlsym(RTLD_NEXT,"fstatfs64");
   int r=real?real(fd,buf):-1;
-  if(r==0 && buf && xenoid_reader_is_app_uid() && (buf->f_type == 0x794c7630 || buf->f_type == 0x65735546)) buf->f_type = 0xEF53;
+  if(r==0 && buf && xenoid_reader_is_app_uid())
+    buf->f_type=shaped_statfs_type(fd_is_android_data(fd)?"/data":NULL,buf->f_type);
   return r;
 }
 #endif /* __linux__ */
@@ -771,13 +904,21 @@ __attribute__((visibility("default"))) struct dirent *xenoid_readdir_probe(DIR *
 struct xenoid_prop_kv { const char *k; const char *v; };
 static const struct xenoid_prop_kv xenoid_prop_spoofs[] = {
   {"ro.debuggable","0"},{"ro.secure","1"},{"ro.adb.secure","1"},
+  {"ro.crypto.state","encrypted"},{"ro.crypto.type","file"},
   {"service.adb.tcp.port","-1"},{"service.adb.tls.port","-1"},{"init.svc.adbd","stopped"},
   {"ro.product.brand","google"},{"ro.product.manufacturer","Google"},{"ro.product.model","Pixel 6 Pro"},{"ro.product.device","raven"},{"ro.product.name","raven"},
-  {"ro.build.fingerprint","google/raven/raven:13/TP1A.221005.002/8977058:user/release-keys"},{"ro.build.tags","release-keys"},{"ro.build.type","user"},
-  {"ro.hardware","tensor"},{"ro.boot.hardware","gs101"},{"ro.hardware.sku","G1MNW"},
+  {"ro.build.fingerprint","google/raven/raven:13/TP1A.221005.002/9012097:user/release-keys"},{"ro.build.id","TP1A.221005.002"},{"ro.build.version.incremental","9012097"},
+  {"ro.build.description","raven-user 13 TP1A.221005.002 9012097 release-keys"},{"ro.build.tags","release-keys"},{"ro.build.type","user"},
+  {"ro.bootloader","slider-1.2-8895132"},{"ro.product.first_api_level","31"},
+  {"ro.hardware","raven"},{"ro.boot.hardware","raven"},{"ro.product.board","raven"},{"ro.board.platform","gs101"},
+  {"ro.hardware.sku","G8V0U"},{"ro.boot.hardware.sku","G8V0U"},
   {NULL,NULL}};
 static const char *xenoid_prop_spoof(const char *name) {
   if (!name) return NULL;
+  if (!xenoid_reader_is_app_uid()
+      && (!strcmp(name, "ro.crypto.state") || !strcmp(name, "ro.crypto.type"))) {
+    return NULL;
+  }
   for (int i = 0; xenoid_prop_spoofs[i].k; i++) if (!strcmp(name, xenoid_prop_spoofs[i].k)) return xenoid_prop_spoofs[i].v;
   return NULL;
 }

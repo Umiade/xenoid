@@ -66,7 +66,7 @@ if [[ ! -f "$HAL/libbinder_ndk.so" ]]; then
       trap - EXIT
     }
 fi
-SRCS=( "$HAL/xenoid_sensors_hal.cpp" )
+SRCS=( "$HAL/xenoid_sensors_hal.cpp" "$HAL/sensor_catalog.cpp" )
 while IFS= read -r c; do SRCS+=( "$c" ); done < <(find "$GEN" -name '*.cpp')
 
 "$CXX" -std=c++17 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2 --sysroot="$SYSROOT" "${INC[@]}" \

@@ -323,12 +323,13 @@ struct CameraSession::Impl {
         bool cancelAll = false;
     };
 
-    Impl(int32_t sensorOrientation,
+    Impl(const CameraProfile& profileValue,
             std::shared_ptr<camera::device::ICameraDeviceCallback> callbackValue,
             std::function<void()> onClosedValue)
-        : callback(std::move(callbackValue)),
+        : profile(profileValue),
+          callback(std::move(callbackValue)),
           onClosed(std::move(onClosedValue)),
-          renderer(sensorOrientation) {
+          renderer(profileValue.sensorOrientation) {
         std::string error;
         if (!source.openSnapshot(&error)) {
             __android_log_print(ANDROID_LOG_ERROR, "camera-provider",
@@ -506,10 +507,10 @@ struct CameraSession::Impl {
                 return;
             }
             error.clear();
-            if (!renderer.writeFrame(request.settings, timing,
-                                     request.frameNumber, buffer.stream,
-                                     buffer.view.buffer(), sourceFrame,
-                                     source.mode(), &error)) {
+            if (!renderer.writeFrame(
+                        request.settings, timing, request.frameNumber,
+                        buffer.stream, buffer.view.buffer(), sourceFrame,
+                        source.mode(), profile.flashAvailable, &error)) {
                 continue;
             }
             if (cancelInFlight.load(std::memory_order_acquire)) {
@@ -529,7 +530,8 @@ struct CameraSession::Impl {
         CameraMetadata metadata;
         error.clear();
         const bool metadataOk =
-                buildResultMetadata(request.settings, timing, &metadata, &error);
+                buildResultMetadata(
+                        profile, request.settings, timing, &metadata, &error);
 
         std::vector<NotifyMsg> messages;
         messages.reserve(1 + request.buffers.size() + (metadataOk ? 0 : 1));
@@ -636,6 +638,7 @@ struct CameraSession::Impl {
         if (release) release();
     }
 
+    const CameraProfile& profile;
     std::shared_ptr<camera::device::ICameraDeviceCallback> callback;
     std::function<void()> onClosed;
     std::mutex mutex;
@@ -670,12 +673,12 @@ struct CameraSession::Impl {
 };
 
 CameraSession::CameraSession(
-        int32_t sensorOrientation,
+        const CameraProfile& profile,
         std::shared_ptr<camera::device::ICameraDeviceCallback> callback,
         std::function<void()> onClosed) noexcept {
     try {
-        impl_ = std::make_unique<Impl>(sensorOrientation, std::move(callback),
-                                      std::move(onClosed));
+        impl_ = std::make_unique<Impl>(
+                profile, std::move(callback), std::move(onClosed));
     } catch (...) {
         impl_.reset();
     }
@@ -698,7 +701,8 @@ ScopedAStatus CameraSession::configureStreams(
     std::vector<camera::device::HalStream> halStreams;
     std::vector<StreamDescriptor> streamDescriptors;
     std::string error;
-    if (!validateStreamConfiguration(requestedConfiguration, true, &halStreams,
+    if (!validateStreamConfiguration(
+            impl_->profile, requestedConfiguration, true, &halStreams,
             &streamDescriptors, &error)) {
         __android_log_print(ANDROID_LOG_WARN, "camera-provider",
                 "rejected stream configuration: %s; %s", error.c_str(),
@@ -749,7 +753,7 @@ ScopedAStatus CameraSession::constructDefaultRequestSettings(
         }
     }
     std::string error;
-    if (!buildDefaultRequest(type, out, &error)) {
+    if (!buildDefaultRequest(impl_->profile, type, out, &error)) {
         out->metadata.clear();
         return halError(Status::ILLEGAL_ARGUMENT, error);
     }
@@ -935,7 +939,7 @@ ScopedAStatus CameraSession::processCaptureRequest(
             settings = &fmqSettings;
         }
         if (!parseRequestSettings(
-                    *settings,
+                    impl_->profile, *settings,
                     nextSettings ? &*nextSettings : nullptr,
                     &request.settings, &error)) {
             return halError(Status::ILLEGAL_ARGUMENT, error);

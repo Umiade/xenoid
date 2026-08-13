@@ -3,18 +3,24 @@ package org.example.cameraruntimeprobe;
 import android.Manifest;
 import android.app.Activity;
 import android.content.pm.PackageManager;
+import android.graphics.Rect;
 import android.graphics.ImageFormat;
 import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.StreamConfigurationMap;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.SystemClock;
+import android.util.Size;
+import android.util.SizeF;
 import android.view.Surface;
 
 import org.json.JSONArray;
@@ -24,16 +30,321 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Camera2ProbeActivity extends Activity {
     private HandlerThread callbacks;
     private Handler handler;
+    private static final long MIN_FRAME_DURATION_NS = 33_333_333L;
+
+    private static final class CameraContract {
+        final int lensFacing;
+        final int sensorOrientation;
+        final int pixelWidth;
+        final int pixelHeight;
+        final float physicalWidth;
+        final float physicalHeight;
+        final float focalLength;
+        final float aperture;
+        final boolean flashAvailable;
+        final int[][] jpegSizes;
+        final int[][] nonStallingSizes;
+        final long[] jpegStalls;
+
+        CameraContract(int lensFacing, int sensorOrientation,
+                int pixelWidth, int pixelHeight,
+                float physicalWidth, float physicalHeight,
+                float focalLength, float aperture, boolean flashAvailable,
+                int[][] jpegSizes, int[][] nonStallingSizes,
+                long[] jpegStalls) {
+            this.lensFacing = lensFacing;
+            this.sensorOrientation = sensorOrientation;
+            this.pixelWidth = pixelWidth;
+            this.pixelHeight = pixelHeight;
+            this.physicalWidth = physicalWidth;
+            this.physicalHeight = physicalHeight;
+            this.focalLength = focalLength;
+            this.aperture = aperture;
+            this.flashAvailable = flashAvailable;
+            this.jpegSizes = jpegSizes;
+            this.nonStallingSizes = nonStallingSizes;
+            this.jpegStalls = jpegStalls;
+        }
+    }
+
+    private static CameraContract contractFor(String id) {
+        if ("0".equals(id)) {
+            return new CameraContract(
+                    CameraCharacteristics.LENS_FACING_BACK, 90,
+                    4080, 3072, 9.792f, 7.3728f, 6.81f, 1.85f, true,
+                    new int[][] {{4080, 3072}, {3840, 2160}, {1920, 1080},
+                            {1280, 720}, {640, 480}, {320, 240}},
+                    new int[][] {{1920, 1080}, {1280, 720},
+                            {640, 480}, {320, 240}},
+                    new long[] {220_000_000L, 180_000_000L, 100_000_000L,
+                            70_000_000L, 30_000_000L, 15_000_000L});
+        }
+        if ("1".equals(id)) {
+            return new CameraContract(
+                    CameraCharacteristics.LENS_FACING_FRONT, 270,
+                    3840, 2880, 4.6848f, 3.5136f, 2.74f, 2.2f, false,
+                    new int[][] {{3840, 2880}, {1920, 1080}, {1280, 720},
+                            {640, 480}, {320, 240}},
+                    new int[][] {{1920, 1080}, {1280, 720},
+                            {640, 480}, {320, 240}},
+                    new long[] {200_000_000L, 100_000_000L, 70_000_000L,
+                            30_000_000L, 15_000_000L});
+        }
+        throw new IllegalArgumentException("unexpected camera id");
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) throw new IllegalStateException(message);
+    }
+
+    private static boolean close(float left, float right) {
+        return Math.abs(left - right) <= 0.0001f;
+    }
+
+    private static Set<String> sizeSet(Size[] sizes) {
+        Set<String> values = new HashSet<>();
+        if (sizes != null) {
+            for (Size size : sizes) {
+                values.add(size.getWidth() + "x" + size.getHeight());
+            }
+        }
+        return values;
+    }
+
+    private static Set<String> sizeSet(int[][] sizes) {
+        Set<String> values = new HashSet<>();
+        for (int[] size : sizes) values.add(size[0] + "x" + size[1]);
+        return values;
+    }
+
+    private static void validateCharacteristics(
+            CameraCharacteristics characteristics, CameraContract contract) {
+        Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+        Integer orientation = characteristics.get(
+                CameraCharacteristics.SENSOR_ORIENTATION);
+        Size pixelArray = characteristics.get(
+                CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+        SizeF physicalSize = characteristics.get(
+                CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+        Rect activeArray = characteristics.get(
+                CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        Rect preCorrectionArray = characteristics.get(
+                CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
+        float[] focalLengths = characteristics.get(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+        float[] apertures = characteristics.get(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES);
+        Boolean flashAvailable = characteristics.get(
+                CameraCharacteristics.FLASH_INFO_AVAILABLE);
+        int[] oisModes = characteristics.get(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION);
+        int[] stabilizationModes = characteristics.get(
+                CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES);
+        int[] capabilities = characteristics.get(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+        Integer hardwareLevel = characteristics.get(
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL);
+        Float minimumFocus = characteristics.get(
+                CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+        Float maximumZoom = characteristics.get(
+                CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+
+        require(facing != null && facing == contract.lensFacing,
+                "lens facing differs");
+        require(orientation != null && orientation == contract.sensorOrientation,
+                "sensor orientation differs");
+        require(pixelArray != null
+                        && pixelArray.getWidth() == contract.pixelWidth
+                        && pixelArray.getHeight() == contract.pixelHeight,
+                "pixel array differs");
+        require(physicalSize != null
+                        && close(physicalSize.getWidth(), contract.physicalWidth)
+                        && close(physicalSize.getHeight(), contract.physicalHeight),
+                "physical sensor size differs");
+        Rect expectedArray = new Rect(
+                0, 0, contract.pixelWidth, contract.pixelHeight);
+        require(expectedArray.equals(activeArray)
+                        && expectedArray.equals(preCorrectionArray),
+                "active arrays differ");
+        require(focalLengths != null && focalLengths.length == 1
+                        && close(focalLengths[0], contract.focalLength),
+                "focal length differs");
+        require(apertures != null && apertures.length == 1
+                        && close(apertures[0], contract.aperture),
+                "aperture differs");
+        require(flashAvailable != null
+                        && flashAvailable == contract.flashAvailable,
+                "flash availability differs");
+        require(oisModes != null && oisModes.length == 1
+                        && oisModes[0] == CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF,
+                "OIS modes differ");
+        require(stabilizationModes != null && stabilizationModes.length == 1
+                        && stabilizationModes[0]
+                        == CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
+                "video stabilization modes differ");
+        require(capabilities != null && capabilities.length == 1
+                        && capabilities[0]
+                        == CameraCharacteristics
+                        .REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE,
+                "camera capabilities differ");
+        require(hardwareLevel != null
+                        && hardwareLevel
+                        == CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED,
+                "hardware level differs");
+        require(characteristics.getPhysicalCameraIds().isEmpty(),
+                "unexpected physical camera ids");
+        require(minimumFocus != null && close(minimumFocus, 0.0f),
+                "focus distance differs");
+        require(maximumZoom != null && close(maximumZoom, 1.0f),
+                "digital zoom differs");
+
+        StreamConfigurationMap map = characteristics.get(
+                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        require(map != null, "stream configuration map missing");
+        Set<Integer> formats = new HashSet<>();
+        for (int format : map.getOutputFormats()) formats.add(format);
+        Set<Integer> expectedFormats = new HashSet<>(Arrays.asList(
+                ImageFormat.JPEG, ImageFormat.YUV_420_888, ImageFormat.PRIVATE));
+        require(formats.equals(expectedFormats), "output formats differ");
+        require(sizeSet(map.getOutputSizes(ImageFormat.JPEG))
+                        .equals(sizeSet(contract.jpegSizes)),
+                "JPEG sizes differ");
+        require(sizeSet(map.getOutputSizes(ImageFormat.YUV_420_888))
+                        .equals(sizeSet(contract.nonStallingSizes)),
+                "YUV sizes differ");
+        require(sizeSet(map.getOutputSizes(ImageFormat.PRIVATE))
+                        .equals(sizeSet(contract.nonStallingSizes)),
+                "private sizes differ");
+        for (int index = 0; index < contract.jpegSizes.length; ++index) {
+            Size size = new Size(
+                    contract.jpegSizes[index][0], contract.jpegSizes[index][1]);
+            require(map.getOutputMinFrameDuration(ImageFormat.JPEG, size)
+                            == MIN_FRAME_DURATION_NS,
+                    "JPEG minimum frame duration differs");
+            require(map.getOutputStallDuration(ImageFormat.JPEG, size)
+                            == contract.jpegStalls[index],
+                    "JPEG stall duration differs");
+        }
+        for (int[] dimensions : contract.nonStallingSizes) {
+            Size size = new Size(dimensions[0], dimensions[1]);
+            for (int format : new int[] {
+                    ImageFormat.YUV_420_888, ImageFormat.PRIVATE}) {
+                require(map.getOutputMinFrameDuration(format, size)
+                                == MIN_FRAME_DURATION_NS,
+                        "non-stalling minimum frame duration differs");
+                require(map.getOutputStallDuration(format, size) == 0,
+                        "non-stalling output has a stall duration");
+            }
+        }
+    }
+
+    private boolean probeTorch(
+            CameraManager manager, String id, boolean flashAvailable)
+            throws Exception {
+        if (!flashAvailable) {
+            boolean rejected = false;
+            try {
+                manager.setTorchMode(id, true);
+            } catch (CameraAccessException | IllegalArgumentException expected) {
+                rejected = true;
+            } finally {
+                if (!rejected) manager.setTorchMode(id, false);
+            }
+            return rejected;
+        }
+
+        CountDownLatch enabled = new CountDownLatch(1);
+        CountDownLatch disabled = new CountDownLatch(1);
+        AtomicInteger phase = new AtomicInteger();
+        CameraManager.TorchCallback callback = new CameraManager.TorchCallback() {
+            @Override public void onTorchModeChanged(String cameraId, boolean value) {
+                if (!id.equals(cameraId)) return;
+                if (phase.get() == 1 && value) enabled.countDown();
+                if (phase.get() == 2 && !value) disabled.countDown();
+            }
+        };
+        manager.registerTorchCallback(callback, handler);
+        try {
+            phase.set(1);
+            manager.setTorchMode(id, true);
+            boolean enabledObserved = enabled.await(5, TimeUnit.SECONDS);
+            phase.set(2);
+            manager.setTorchMode(id, false);
+            boolean disabledObserved = disabled.await(5, TimeUnit.SECONDS);
+            return enabledObserved && disabledObserved;
+        } finally {
+            try {
+                manager.setTorchMode(id, false);
+            } finally {
+                manager.unregisterTorchCallback(callback);
+            }
+        }
+    }
+
+    private static boolean captureResultMatches(
+            TotalCaptureResult result, CameraContract contract, boolean flashFired) {
+        Integer flashMode = result.get(CaptureResult.FLASH_MODE);
+        Integer flashState = result.get(CaptureResult.FLASH_STATE);
+        Integer oisMode = result.get(
+                CaptureResult.LENS_OPTICAL_STABILIZATION_MODE);
+        Float aperture = result.get(CaptureResult.LENS_APERTURE);
+        Float focalLength = result.get(CaptureResult.LENS_FOCAL_LENGTH);
+        Rect crop = result.get(CaptureResult.SCALER_CROP_REGION);
+        int expectedFlashMode = flashFired
+                ? CaptureRequest.FLASH_MODE_SINGLE : CaptureRequest.FLASH_MODE_OFF;
+        int expectedFlashState = contract.flashAvailable
+                ? flashFired
+                        ? CaptureResult.FLASH_STATE_FIRED
+                        : CaptureResult.FLASH_STATE_READY
+                : CaptureResult.FLASH_STATE_UNAVAILABLE;
+        return flashMode != null && flashMode == expectedFlashMode
+                && flashState != null && flashState == expectedFlashState
+                && oisMode != null
+                && oisMode == CaptureResult.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                && aperture != null && close(aperture, contract.aperture)
+                && focalLength != null && close(focalLength, contract.focalLength)
+                && new Rect(0, 0, contract.pixelWidth, contract.pixelHeight)
+                .equals(crop);
+    }
+
+    private boolean captureMaximumJpeg(
+            CameraDevice device, CameraContract contract) throws Exception {
+        int width = contract.jpegSizes[0][0];
+        int height = contract.jpegSizes[0][1];
+        try (CameraSupport.FrameReader reader = new CameraSupport.FrameReader(
+                width, height, ImageFormat.JPEG, 2, handler)) {
+            CameraCaptureSession session = CameraSupport.configure(
+                    device, Collections.singletonList(reader.surface()), handler);
+            try {
+                CaptureRequest.Builder request = device.createCaptureRequest(
+                        CameraDevice.TEMPLATE_STILL_CAPTURE);
+                request.addTarget(reader.surface());
+                TotalCaptureResult capture = CameraSupport.captureResult(
+                        session, request.build(), handler);
+                Long timestamp = capture.get(CaptureResult.SENSOR_TIMESTAMP);
+                CameraSupport.Frame frame = reader.take();
+                return timestamp != null && timestamp == frame.timestamp
+                        && frame.bytes > 0 && frame.jpegValid
+                        && frame.jpegExifValid
+                        && captureResultMatches(capture, contract, false);
+            } finally {
+                session.close();
+            }
+        }
+    }
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -54,6 +365,10 @@ public final class Camera2ProbeActivity extends Activity {
             JSONArray cameras = new JSONArray();
             boolean allOk = true;
             CameraManager manager = getSystemService(CameraManager.class);
+            Set<String> cameraIds = new HashSet<>(
+                    Arrays.asList(manager.getCameraIdList()));
+            require(cameraIds.equals(new HashSet<>(Arrays.asList("0", "1"))),
+                    "published camera IDs differ");
             for (String id : new String[] {"0", "1"}) {
                 JSONObject camera = probeCamera(manager, id, referencePhoto);
                 cameras.put(camera);
@@ -75,16 +390,18 @@ public final class Camera2ProbeActivity extends Activity {
             throws Exception {
         JSONObject result = new JSONObject();
         result.put("id", id);
+        CameraContract contract = contractFor(id);
         CameraCharacteristics characteristics = manager.getCameraCharacteristics(id);
-        Integer sensorOrientation = characteristics.get(
-                CameraCharacteristics.SENSOR_ORIENTATION);
-        int referenceRotation = sensorOrientation == null
-                ? 0 : (360 - sensorOrientation) % 360;
+        validateCharacteristics(characteristics, contract);
+        boolean torchContract = probeTorch(
+                manager, id, contract.flashAvailable);
+        int sensorOrientation = contract.sensorOrientation;
+        int referenceRotation = (360 - sensorOrientation) % 360;
         byte[] yuvReference = referencePhoto == null ? null
                 : CameraSupport.referencePhotoSample(
                         referencePhoto, 320, 240, referenceRotation);
-        boolean jpegSwapsAxes = sensorOrientation != null
-                && (sensorOrientation == 90 || sensorOrientation == 270);
+        boolean jpegSwapsAxes =
+                sensorOrientation == 90 || sensorOrientation == 270;
         byte[] jpegReference = referencePhoto == null ? null
                 : CameraSupport.referencePhotoSample(referencePhoto,
                         jpegSwapsAxes ? 240 : 320,
@@ -101,13 +418,15 @@ public final class Camera2ProbeActivity extends Activity {
                     Arrays.asList(yuv.surface(), jpeg.surface(), opaque.surface()), handler);
             CaptureRequest.Builder all = device.createCaptureRequest(
                     CameraDevice.TEMPLATE_STILL_CAPTURE);
-            if (sensorOrientation != null) {
-                all.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation);
-            }
+            all.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation);
             all.addTarget(yuv.surface());
             all.addTarget(jpeg.surface());
             all.addTarget(opaque.surface());
-            long allTimestamp = CameraSupport.capture(session, all.build(), handler);
+            TotalCaptureResult allResult = CameraSupport.captureResult(
+                    session, all.build(), handler);
+            Long allTimestampValue = allResult.get(CaptureResult.SENSOR_TIMESTAMP);
+            require(allTimestampValue != null, "capture timestamp missing");
+            long allTimestamp = allTimestampValue;
             CameraSupport.Frame yuvFrame = yuv.take();
             CameraSupport.Frame jpegFrame = jpeg.take();
             CameraSupport.Frame privateFrame = opaque.take();
@@ -122,6 +441,25 @@ public final class Camera2ProbeActivity extends Activity {
                     && jpegFrame.timestamp == allTimestamp
                     && privateFrame.timestamp == allTimestamp
                     && referenceContentMatched;
+            boolean resultMetadata =
+                    captureResultMatches(allResult, contract, false);
+            boolean flashCapture = true;
+            if (contract.flashAvailable) {
+                CaptureRequest.Builder flash = device.createCaptureRequest(
+                        CameraDevice.TEMPLATE_STILL_CAPTURE);
+                flash.set(CaptureRequest.FLASH_MODE,
+                        CaptureRequest.FLASH_MODE_SINGLE);
+                flash.addTarget(yuv.surface());
+                TotalCaptureResult flashResult = CameraSupport.captureResult(
+                        session, flash.build(), handler);
+                Long flashTimestamp = flashResult.get(
+                        CaptureResult.SENSOR_TIMESTAMP);
+                CameraSupport.Frame flashFrame = yuv.take();
+                flashCapture = flashTimestamp != null
+                        && flashTimestamp == flashFrame.timestamp
+                        && flashFrame.bytes > 0
+                        && captureResultMatches(flashResult, contract, true);
+            }
             yuv.clear();
             opaque.clear();
             CountDownLatch repeating = new CountDownLatch(4);
@@ -180,9 +518,8 @@ public final class Camera2ProbeActivity extends Activity {
             jpeg.clear();
             CaptureRequest.Builder flushBuilder = device.createCaptureRequest(
                     CameraDevice.TEMPLATE_STILL_CAPTURE);
-            if (sensorOrientation != null) {
-                flushBuilder.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation);
-            }
+            flushBuilder.set(
+                    CaptureRequest.JPEG_ORIENTATION, sensorOrientation);
             flushBuilder.addTarget(jpeg.surface());
             List<CaptureRequest> pending = new ArrayList<>();
             for (int index = 0; index < 12; ++index) pending.add(flushBuilder.build());
@@ -272,6 +609,8 @@ public final class Camera2ProbeActivity extends Activity {
                     changedSession.close();
                 }
             }
+            SystemClock.sleep(100L);
+            boolean maximumJpeg = captureMaximumJpeg(device, contract);
 
             device.close();
             device = null;
@@ -280,6 +619,11 @@ public final class Camera2ProbeActivity extends Activity {
             result.put("multiOutput", multiOutput);
             result.put("jpegExif", jpegFrame.jpegExifValid);
             result.put("referenceContentMatched", referenceContentMatched);
+            result.put("characteristics", true);
+            result.put("torch", torchContract);
+            result.put("resultMetadata", resultMetadata);
+            result.put("flashCapture", flashCapture);
+            result.put("maximumJpeg", maximumJpeg);
             result.put("repeating", repeatingCompleted && monotonic.get()
                     && repeatingYuv >= 4 && repeatingPrivate >= 4);
             result.put("burst", burstCallbacks && !burstFailed.get()
@@ -299,9 +643,12 @@ public final class Camera2ProbeActivity extends Activity {
             result.put("flushImageQueueSettled", imageQueueSettled);
             result.put("flushRecovery", flushRecovery);
             result.put("closeReopen", reopened);
-            result.put("ok", multiOutput && repeatingCompleted && monotonic.get()
+            result.put("ok", multiOutput && torchContract
+                    && resultMetadata && flashCapture && maximumJpeg
+                    && repeatingCompleted && monotonic.get()
                     && repeatingYuv >= 4 && repeatingPrivate >= 4
-                    && burstCallbacks && !burstFailed.get() && burstImages == burst.size()
+                    && burstCallbacks && !burstFailed.get()
+                    && burstImages == burst.size()
                     && reconfigured && flushMs < 1000L && flushTerminal
                     && ownershipCallbacks && flushSummary.ownershipResolved
                     && completedImagesValid && flushRecovery && reopened);

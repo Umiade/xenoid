@@ -23,11 +23,15 @@ Each instance is a logical device with three persistent components:
 
 1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
 2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
-3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 `xenoid-data.img` that is bind-mounted as the container's `/data`.
+3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a grow-only sparse ext4 backing image (`xenoid-data.img`) that is bind-mounted as the container's `/data`.
 
 `stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
 
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
+
+The canonical Raven profile requests a 128,000,000,000-byte logical data device and an Android-facing f2fs contract. Xenoid grows an existing smaller ext4 backing image transactionally before startup, preserves its filesystem UUID and data, and resumes or rolls back an interrupted host-side growth transaction. It never shrinks, recreates, or silently replaces a committed image. After profile convergence, `/proc/partitions`, `/proc/diskstats`, `/dev/block/sda`, the Raven userdata by-name alias, block sysfs, mount records, and unprivileged libc/raw-syscall filesystem magic must agree. Privileged maintenance still sees ext4.
+
+Sparse capacity is not host-space preallocation. `doctor` reports conservative Docker/Colima backing-store headroom; if the backing filesystem is exhausted, Android writes fail with `ENOSPC` while the image and UUID remain intact. The 12 GiB Android memory view is likewise independent of the lower host/Colima runtime allocation.
 
 ## Multi-instance operation
 
@@ -265,12 +269,12 @@ python -m pip install frida-tools
 
 ```bash
 ./xenoid device collect --out /tmp/device-profile.json
-./xenoid device apply examples/fingerprints/sample-profile.json
-./xenoid device apply examples/fingerprints/sample-profile.json --keep-unique
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json --keep-unique
 ./xenoid profile status
 ```
 
-Profile application converges SettingsProvider, property-area state, native runtime helpers, and reboot-persistent data. Recollect the complete profile after a change.
+The production template is Android 13 Pixel 6 Pro `raven`, model `G8V0U`, build `TP1A.221005.002`/`9012097`, shipping API 31. Profile application converges SettingsProvider, partition/property-area identity, display/input, native sensor and camera HAL inputs, battery, memory/storage, and reboot-persistent data. Recollect the complete profile after a change.
 
 ## Applications, input, and automation
 

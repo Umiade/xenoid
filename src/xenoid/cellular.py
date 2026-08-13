@@ -26,6 +26,12 @@ _PROFILE_KEYS = {
 _DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "cellular" / "carriers.json"
 _DATASET_SHA256 = "3aa19173c09f91921b51ebb78b5a46a2319573d06cb68b2918e83ef1b84df8f1"
 _CALLING_CODE = re.compile(r"^\+[1-9][0-9]{0,3}$", re.ASCII)
+# Official Pixel 6 Pro G8V0U LTE hardware matrix. The current RIL is LTE-only,
+# so NR and mmWave bands are deliberately not represented as active capability.
+_G8V0U_LTE_BANDS = frozenset({
+    1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18, 19, 20, 25, 26, 28, 29,
+    30, 32, 38, 39, 40, 41, 42, 46, 48, 66, 71,
+})
 
 
 class CellularError(ValueError):
@@ -225,6 +231,10 @@ def _validate_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
     bands = carrier.get("bands")
     if not isinstance(bands, list) or not bands or sorted(bands) != sorted(known.get("bands")):
         raise CellularError("carrier_band_invalid")
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in bands):
+        raise CellularError("carrier_band_invalid")
+    if not set(bands) <= _G8V0U_LTE_BANDS:
+        raise CellularError("carrier_band_invalid")
     band = cell.get("band")
     if not isinstance(band, int) or band not in bands:
         raise CellularError("cellular_band_invalid")
@@ -300,7 +310,12 @@ def generate_cellular_profile(country: str, seed: bytes) -> dict[str, Any]:
     iccid = iccid_body + _luhn_digit(iccid_body)
     msisdn = _generate_msisdn(seed, dataset)
     bands = selected.get("bands")
-    if not isinstance(bands, list) or not bands or any(not isinstance(item, int) for item in bands):
+    if (
+        not isinstance(bands, list)
+        or not bands
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in bands)
+        or not set(bands) <= _G8V0U_LTE_BANDS
+    ):
         raise CellularError("carrier_band_invalid")
     band = bands[_bounded_number(seed, "band", 0, len(bands) - 1)]
     # LTE EARFCN downlink ranges per 3GPP TS 36.101, mirroring the AOSP

@@ -62,11 +62,13 @@ Each Xenoid instance is a logical device with three persistent components:
 
 1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
 2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
-3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 `xenoid-data.img` that is bind-mounted as the container's `/data`.
+3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 backing image (`xenoid-data.img`) that is bind-mounted as the container's `/data`.
 
 `stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
 
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
+
+The backing image stays ext4 to preserve the established grow/recovery contract. The unprivileged Android Raven view is f2fs: profile data, mount tables, the userdata by-name alias, libc `statfs`/`fstatfs`, and direct raw syscalls all report the Raven filesystem contract. Privileged maintenance commands continue to observe the real backing filesystem.
 
 ### Multi-instance operation
 
@@ -272,26 +274,28 @@ Collect the current profile:
 ./xenoid device collect --out /tmp/device-profile.json
 ```
 
-Apply a profile and regenerate unique identifiers:
+Apply the canonical Android 13 Pixel 6 Pro (`raven`) profile and regenerate unique identifiers:
 
 ```bash
-./xenoid device apply examples/fingerprints/sample-profile.json
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json
 ```
 
 Apply the profile's explicit unique identifiers without generating replacement values:
 
 ```bash
-./xenoid device apply examples/fingerprints/sample-profile.json --keep-unique
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json --keep-unique
 ```
 
 Generate app-layer and service-layer Frida profiles:
 
 ```bash
-./xenoid device generate-frida examples/fingerprints/sample-profile.json --out /tmp/device-profile.js
-./xenoid device generate-service-frida examples/fingerprints/sample-profile.json --out /tmp/service-profile.js
+./xenoid device generate-frida examples/fingerprints/pixel-raven-android13.json --out /tmp/device-profile.js
+./xenoid device generate-service-frida examples/fingerprints/pixel-raven-android13.json --out /tmp/service-profile.js
 ```
 
-`device apply` synchronizes daemon profile state, SettingsProvider, property-area state, and reboot-persistent data. After changing profiles, cold-start the target application and recollect the complete profile; one `getprop` value is not sufficient evidence.
+The production profile is Google Pixel 6 Pro model `G8V0U`, build `TP1A.221005.002`/`9012097`, shipping API 31, with a 1440 x 3120 60/120 Hz display, 12 GiB device memory view, and sparse 128,000,000,000-byte UFS 3.1 data image. Android-facing `/proc/partitions`, `/proc/diskstats`, `/dev/block/sda`, `/dev/block/platform/14700000.ufs/by-name/userdata`, block sysfs, f2fs mount records, and raw filesystem magic derive from the same profile contract. Its `provenance` object distinguishes Google/AOSP facts from community-derived sensor and camera geometry.
+
+`device apply` synchronizes daemon profile state, SettingsProvider, property-area state, native HAL inputs, and reboot-persistent data. PackageManager advertises only camera and sensor capabilities implemented by the runtime; NFC, UWB, fingerprint/UDFPS, true NR, full/manual/RAW camera, HiFi sensor, and head-tracker claims remain absent. After changing profiles, cold-start the target application and recollect the complete profile; one `getprop` value is not sufficient evidence.
 
 ## Optional Google Play runtime
 

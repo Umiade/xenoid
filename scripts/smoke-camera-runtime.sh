@@ -953,11 +953,16 @@ markers = (
 )
 standard_injection_interface = (
     b'android.hardware.camera.device.icamerainjectionsession')
-for name in sys.argv[1:]:
+gralloc_profile_path = b'/data/local/tmp/xenoid-profile'
+for index, name in enumerate(sys.argv[1:], start=1):
     payload = open(name, 'rb').read().lower()
     if not payload:
         raise SystemExit(1)
     payload = payload.replace(standard_injection_interface, b'')
+    if index == 2:
+        if payload.count(gralloc_profile_path) != 1:
+            raise SystemExit(1)
+        payload = payload.replace(gralloc_profile_path, b'')
     if any(marker in payload for marker in markers):
         raise SystemExit(1)
 PY

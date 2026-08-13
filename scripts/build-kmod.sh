@@ -63,10 +63,10 @@ if [[ "$MODE" == "colima" ]]; then
   run_ssh sh -c "cd $BUILD_DIR && make"
   run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then if test -f '$LKG_DIR/xenoid_kmod.ko'; then sudo cp '$LKG_DIR/xenoid_kmod.ko' '$BUILD_DIR/xenoid_kmod.lkg'; else echo 'xenoid_kmod is loaded but no last-known-good module exists' >&2; exit 1; fi; fi"
   run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then sudo rmmod xenoid_kmod; fi"
-  if run_ssh sh -c "cd $BUILD_DIR && sudo insmod xenoid_kmod.ko && test -d /sys/module/xenoid_kmod"; then
+  if run_ssh sh -c "cd $BUILD_DIR && statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod xenoid_kmod.ko statfs_symbol=\"\$statfs_symbol\" && test -d /sys/module/xenoid_kmod"; then
     run_ssh sh -c "sudo cp '$BUILD_DIR/xenoid_kmod.ko' '$LKG_DIR/xenoid_kmod.ko'"
   else
-    run_ssh sh -c "if test -f '$BUILD_DIR/xenoid_kmod.lkg'; then sudo insmod '$BUILD_DIR/xenoid_kmod.lkg' && test -d /sys/module/xenoid_kmod; fi" || true
+    run_ssh sh -c "if test -f '$BUILD_DIR/xenoid_kmod.lkg'; then statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod '$BUILD_DIR/xenoid_kmod.lkg' statfs_symbol=\"\$statfs_symbol\" || sudo insmod '$BUILD_DIR/xenoid_kmod.lkg'; test -d /sys/module/xenoid_kmod; fi" || true
     echo '{"ok":false,"error":"kernel module load failed; last-known-good restore attempted"}'
     exit 1
   fi
@@ -87,10 +87,10 @@ elif [[ "$MODE" == "ssh" ]]; then
   run_ssh sh -c "cd $BUILD_DIR && make"
   run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then if test -f '$LKG_DIR/xenoid_kmod.ko'; then sudo cp '$LKG_DIR/xenoid_kmod.ko' '$BUILD_DIR/xenoid_kmod.lkg'; else echo 'xenoid_kmod is loaded but no last-known-good module exists' >&2; exit 1; fi; fi"
   run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then sudo rmmod xenoid_kmod; fi"
-  if run_ssh sh -c "cd $BUILD_DIR && sudo insmod xenoid_kmod.ko && test -d /sys/module/xenoid_kmod"; then
+  if run_ssh sh -c "cd $BUILD_DIR && statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod xenoid_kmod.ko statfs_symbol=\"\$statfs_symbol\" && test -d /sys/module/xenoid_kmod"; then
     run_ssh sh -c "sudo cp '$BUILD_DIR/xenoid_kmod.ko' '$LKG_DIR/xenoid_kmod.ko'"
   else
-    run_ssh sh -c "if test -f '$BUILD_DIR/xenoid_kmod.lkg'; then sudo insmod '$BUILD_DIR/xenoid_kmod.lkg' && test -d /sys/module/xenoid_kmod; fi" || true
+    run_ssh sh -c "if test -f '$BUILD_DIR/xenoid_kmod.lkg'; then statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod '$BUILD_DIR/xenoid_kmod.lkg' statfs_symbol=\"\$statfs_symbol\" || sudo insmod '$BUILD_DIR/xenoid_kmod.lkg'; test -d /sys/module/xenoid_kmod; fi" || true
     echo "{\"ok\":false,\"error\":\"kernel module load failed; last-known-good restore attempted\",\"ssh\":\"$SSH_TARGET\"}"
     exit 1
   fi
@@ -98,7 +98,7 @@ elif [[ "$MODE" == "ssh" ]]; then
   echo "{\"ok\":true,\"platform\":\"remote-ssh\",\"ssh\":\"$SSH_TARGET\",\"note\":\"module built and loaded on docker engine host\"}"
 else
   if [[ "$DRY" == 1 ]]; then
-    echo "+ make -C $SRC && sudo insmod $SRC/xenoid_kmod.ko"
+    echo "+ make -C $SRC && statfs_symbol=<resolved-vfs_statfs-symbol> sudo insmod $SRC/xenoid_kmod.ko"
   else
     mkdir -p "$LKG_DIR"
     ( cd "$SRC" && make )
@@ -107,11 +107,13 @@ else
       cp "$LKG_DIR/xenoid_kmod.ko" "$SRC/xenoid_kmod.lkg"
       sudo rmmod xenoid_kmod
     fi
-    if sudo insmod "$SRC/xenoid_kmod.ko" && test -d /sys/module/xenoid_kmod; then
+    statfs_symbol="$(awk '$3 ~ /^vfs_statfs\./ { print $3; exit }' /proc/kallsyms)"
+    [[ -n "$statfs_symbol" ]] || statfs_symbol=vfs_statfs
+    if sudo insmod "$SRC/xenoid_kmod.ko" statfs_symbol="$statfs_symbol" && test -d /sys/module/xenoid_kmod; then
       cp "$SRC/xenoid_kmod.ko" "$LKG_DIR/xenoid_kmod.ko"
     else
       if [[ -f "$SRC/xenoid_kmod.lkg" ]]; then
-        sudo insmod "$SRC/xenoid_kmod.lkg" || true
+        sudo insmod "$SRC/xenoid_kmod.lkg" statfs_symbol="$statfs_symbol" || sudo insmod "$SRC/xenoid_kmod.lkg" || true
         test -d /sys/module/xenoid_kmod || true
       fi
       echo '{"ok":false,"error":"kernel module load failed; last-known-good restore attempted"}'

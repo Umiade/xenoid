@@ -26,7 +26,8 @@ TX_A = "20000000-0000-4000-8000-000000000001"
 TX_B = "20000000-0000-4000-8000-000000000002"
 FS_A = "11111111-1111-4111-8111-111111111111"
 FS_B = "22222222-2222-4222-8222-222222222222"
-SIZE = storage.DEFAULT_DATA_SIZE_BYTES
+SIZE = storage.CANONICAL_DATA_SIZE_BYTES
+SMALL_SIZE = 8 * 1024 * 1024 * 1024
 
 
 class ContractFailure(AssertionError):
@@ -87,20 +88,59 @@ def volume_record(manager: backend.RuntimeManager, name: str) -> dict[str, Any]:
         "Mountpoint": f"/engine/volumes/{name}/_data",
     }
 
+def image_record(
+    filesystem_uuid: str,
+    logical_size: int = SIZE,
+    filesystem_size: int | None = None,
+    payload: str = "",
+) -> dict[str, Any]:
+    filesystem_size = logical_size if filesystem_size is None else filesystem_size
+    return {
+        "filesystemUuid": filesystem_uuid,
+        "logicalSizeBytes": logical_size,
+        "filesystemSizeBytes": filesystem_size,
+        "allocatedBytes": max(4096, logical_size // 32),
+        "backingTotalBytes": 256 * 1024**3,
+        "backingAvailableBytes": 96 * 1024**3,
+        "backingPressure": False,
+        "payload": payload,
+    }
+
+
+def owned_container_record(
+    manager: backend.RuntimeManager,
+    container_id: str = "container-id",
+    *,
+    running: bool = True,
+) -> dict[str, Any]:
+    return {
+        "Id": container_id,
+        "Name": f"/{manager.lease.container_name}",
+        "Config": {"Labels": dict(manager.lease.owner_labels)},
+        "State": {"Running": running},
+    }
+
 
 class FakeRuntime(backend.RuntimeManager):
     def __init__(self, context, cfg, lease):
         self.volumes: dict[str, dict[str, Any]] = {}
-        self.images: dict[tuple[str, str], tuple[str, int]] = {}
+        self.images: dict[tuple[str, str], dict[str, Any]] = {}
         self.attachments: dict[str, list[tuple[str, str]]] = {}
+        self.containers: dict[str, dict[str, Any]] = {}
         self.actions: list[str] = []
         self.initializations = 0
+        self.proxy_captures = 0
+        self.container_removals = 0
         super().__init__(context, cfg, lease)
 
     def _inspect_docker_object(self, object_type: str, name: str):
         if object_type == "volume":
-            return self.volumes.get(name), subprocess.CompletedProcess([], 0, "", "")
-        return None, subprocess.CompletedProcess([], 1, "", "missing")
+            value = self.volumes.get(name)
+        elif object_type == "container":
+            value = self.containers.get(name)
+        else:
+            value = None
+        return value, subprocess.CompletedProcess([], 0 if value is not None else 1, "", "")
 
     def ensure_volume(self) -> dict[str, Any]:
         existing = self.volumes.get(self.lease.volume_name)
@@ -114,13 +154,7 @@ class FakeRuntime(backend.RuntimeManager):
         value = self.images.get((str(volume["Name"]), image_name))
         if value is None:
             return {"ok": False, "error": "storage_image_invalid"}
-        filesystem_uuid, size_bytes = value
-        return {
-            "ok": True,
-            "filesystemUuid": filesystem_uuid,
-            "sizeBytes": size_bytes,
-            "image": image_name,
-        }
+        return {"ok": True, **value, "image": image_name}
 
     def _run_storage_image_action(
         self,
@@ -137,29 +171,72 @@ class FakeRuntime(backend.RuntimeManager):
         if action == "initialize":
             if target_key not in self.images:
                 self.initializations += 1
-                self.images[target_key] = (FS_A, SIZE)
+                self.images[target_key] = image_record(FS_A)
+            else:
+                current = self.images[target_key]
+                self.images[target_key] = image_record(
+                    current["filesystemUuid"],
+                    payload=str(current.get("payload", "")),
+                )
         elif action == "migrate":
             source = self.images.get((legacy_volume, storage.DATA_IMAGE_NAME))
-            if source is None or source[0] != expected_uuid:
+            if source is None or source["filesystemUuid"] != expected_uuid:
                 return {"ok": False, "error": "storage_image_invalid"}
+            if source["logicalSizeBytes"] > SIZE:
+                return {"ok": False, "error": "storage_size_unsafe"}
             target = self.images.get(target_key)
-            if target is not None and target[0] != source[0]:
-                if not backup_image or target[0] != backup_uuid:
+            if target is not None and target["filesystemUuid"] != source["filesystemUuid"]:
+                if not backup_image or target["filesystemUuid"] != backup_uuid:
                     return {"ok": False, "error": "storage_identity_mismatch"}
-                self.images[(self.lease.volume_name, backup_image)] = target
-            self.images[target_key] = source
+                self.images[(self.lease.volume_name, backup_image)] = dict(target)
+            self.images[target_key] = image_record(
+                source["filesystemUuid"],
+                payload=str(source.get("payload", "")),
+            )
+        elif action == "grow":
+            current = self.images.get(target_key)
+            if (
+                current is None
+                or current["filesystemUuid"] != expected_uuid
+                or current["logicalSizeBytes"] > SIZE
+                or current["filesystemSizeBytes"] > current["logicalSizeBytes"]
+            ):
+                return {"ok": False, "error": "storage_size_unsafe"}
+            self.images[target_key] = image_record(
+                expected_uuid,
+                payload=str(current.get("payload", "")),
+            )
         value = self.images.get(target_key)
-        if value is None or (expected_uuid and action == "preserve" and value[0] != expected_uuid):
+        if (
+            value is None
+            or (
+                expected_uuid
+                and action == "preserve"
+                and value["filesystemUuid"] != expected_uuid
+            )
+            or (
+                action == "preserve"
+                and (
+                    value["logicalSizeBytes"] != SIZE
+                    or value["filesystemSizeBytes"] != SIZE
+                )
+            )
+        ):
             return {"ok": False, "error": "storage_image_invalid"}
-        return {
-            "ok": True,
-            "filesystemUuid": value[0],
-            "sizeBytes": value[1],
-            "action": action,
-        }
+        return {"ok": True, **value, "action": action}
 
-    def _legacy_volume_attachments(self, volume_name: str):
+    def _volume_attachments(self, volume_name: str):
         return list(self.attachments.get(volume_name, [])), {"ok": True}
+
+    def _capture_proxy_desired_for_update(self) -> dict[str, Any]:
+        self.proxy_captures += 1
+        return {"ok": True, "captured": True, "configured": True}
+
+    def _remove_owned_container(self, container: dict[str, Any]) -> dict[str, Any]:
+        self.container_removals += 1
+        self.attachments[self.lease.volume_name] = []
+        self.containers.pop(str(container["Id"]), None)
+        return {"ok": True}
 
     def _remove_legacy_container(self, container_id: str, expected_name: str, expected_volume: str):
         self.attachments[expected_volume] = []
@@ -170,6 +247,7 @@ def transfer_engine_state(source: FakeRuntime, target: FakeRuntime) -> None:
     target.volumes = source.volumes
     target.images = source.images
     target.attachments = source.attachments
+    target.containers = source.containers
 
 
 @contract_case("freshInitializesExactlyOnce")
@@ -199,7 +277,7 @@ def pending_initialization_resumes() -> None:
         pending = store.pending("fresh", transaction_id="3" * 32)
         runtime = FakeRuntime(context, cfg, lease)
         runtime.volumes[lease.volume_name] = volume_record(runtime, lease.volume_name)
-        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = (FS_A, SIZE)
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(FS_A)
         result = runtime.ensure_instance_storage()
         require(result["ok"] is True)
         require(runtime.initializations == 0)
@@ -214,13 +292,102 @@ def tagged_image_is_adopted() -> None:
         context, cfg, lease = initialize(project, state, "phone-a")
         runtime = FakeRuntime(context, cfg, lease)
         runtime.volumes[lease.volume_name] = volume_record(runtime, lease.volume_name)
-        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = (FS_B, SIZE)
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(FS_B)
         result = runtime.ensure_instance_storage()
         require(result["ok"] is True)
         require(runtime.initializations == 0)
         committed = storage.StorageStateStore(context, lease).load()
         require(committed is not None and committed["source"] == "adopted")
         require(committed["filesystemUuid"] == FS_B)
+
+
+@contract_case("taggedSmallImageGrowsWithoutChangingUuidOrPayload")
+def tagged_small_image_grows_without_changing_uuid_or_payload() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        runtime.volumes[lease.volume_name] = volume_record(runtime, lease.volume_name)
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(
+            FS_B,
+            SMALL_SIZE,
+            SMALL_SIZE,
+            "sentinel",
+        )
+        runtime.containers["container-id"] = owned_container_record(runtime)
+        runtime.attachments[lease.volume_name] = [("container-id", lease.container_name)]
+
+        result = runtime.ensure_instance_storage()
+        require(result["ok"] is True)
+        require(runtime.actions == ["grow"])
+        require(runtime.proxy_captures == 1)
+        require(runtime.container_removals == 1)
+        image = runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)]
+        require(image["logicalSizeBytes"] == SIZE)
+        require(image["filesystemSizeBytes"] == SIZE)
+        require(image["filesystemUuid"] == FS_B)
+        require(image["payload"] == "sentinel")
+        committed = storage.StorageStateStore(context, lease).load()
+        require(committed is not None and committed["source"] == "adopted")
+        require(committed["state"] == "committed")
+        require(committed["observedFilesystemSizeBytes"] == SIZE)
+
+
+@contract_case("pendingGrowthRecoversIdempotently")
+def pending_growth_recovers_idempotently() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        runtime.volumes[lease.volume_name] = volume_record(runtime, lease.volume_name)
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(
+            FS_B,
+            SMALL_SIZE,
+            SMALL_SIZE,
+            "sentinel",
+        )
+        store = storage.StorageStateStore(context, lease)
+        store.pending(
+            "adopted",
+            transaction_id=TX_A.replace("-", ""),
+            filesystem_uuid=FS_B,
+            observed_logical_size_bytes=SMALL_SIZE,
+            observed_filesystem_size_bytes=SMALL_SIZE,
+            host_allocated_bytes=SMALL_SIZE // 32,
+            growth=True,
+        )
+        first = runtime.ensure_instance_storage()
+        require(first["ok"] is True)
+        require(runtime.actions == ["grow"])
+        image = runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)]
+        require(image["payload"] == "sentinel")
+        require(image["filesystemUuid"] == FS_B)
+        require(image["filesystemSizeBytes"] == SIZE)
+
+        second = runtime.ensure_instance_storage()
+        require(second["ok"] is True)
+        require(runtime.actions == ["grow", "preserve"])
+        require(runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)]["payload"] == "sentinel")
+
+
+@contract_case("growthRejectsOversizedFilesystem")
+def growth_rejects_oversized_filesystem() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        runtime.volumes[lease.volume_name] = volume_record(runtime, lease.volume_name)
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(
+            FS_B,
+            SMALL_SIZE,
+            SIZE + 4096,
+            "sentinel",
+        )
+        result = runtime.ensure_instance_storage()
+        require(result["ok"] is False)
+        require(result["error"] == "storage_size_unsafe")
+        require(runtime.actions == [])
+        require(
+            runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)]["payload"]
+            == "sentinel"
+        )
 
 
 @contract_case("committedMissingImageFailsClosed")
@@ -242,7 +409,7 @@ def committed_uuid_mismatch_fails_closed() -> None:
         context, cfg, lease = initialize(project, state, "phone-a")
         runtime = FakeRuntime(context, cfg, lease)
         require(runtime.ensure_instance_storage()["ok"] is True)
-        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = (FS_B, SIZE)
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(FS_B)
         result = runtime.ensure_instance_storage()
         require(result["ok"] is False)
         require(result["error"] == "storage_identity_mismatch")
@@ -262,11 +429,11 @@ def legacy_image_migrates_and_source_remains() -> None:
         write_legacy(context)
         runtime = FakeRuntime(context, cfg, lease)
         runtime.volumes["xenoid-data"] = volume_record(runtime, "xenoid-data")
-        runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] = (FS_B, SIZE)
+        runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] = image_record(FS_B)
         result = runtime.ensure_instance_storage()
         require(result["ok"] is True)
-        require(runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] == (FS_B, SIZE))
-        require(runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] == (FS_B, SIZE))
+        require(runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] == image_record(FS_B))
+        require(runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] == image_record(FS_B))
         committed = storage.StorageStateStore(context, lease).load()
         require(committed is not None and committed["source"] == "legacy")
         require(committed["legacyVolume"] == "xenoid-data")
@@ -279,16 +446,16 @@ def legacy_migration_preserves_tagged_backup() -> None:
         write_legacy(context)
         runtime = FakeRuntime(context, cfg, lease)
         runtime.volumes["xenoid-data"] = volume_record(runtime, "xenoid-data")
-        runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] = (FS_B, SIZE)
+        runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] = image_record(FS_B)
         runtime.volumes[lease.volume_name] = volume_record(runtime, lease.volume_name)
-        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = (FS_A, SIZE)
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(FS_A)
         result = runtime.ensure_instance_storage()
         require(result["ok"] is True)
         committed = storage.StorageStateStore(context, lease).load()
         require(committed is not None and committed["backupFilesystemUuid"] == FS_A)
         backup_key = (lease.volume_name, committed["backupImage"])
-        require(runtime.images[backup_key] == (FS_A, SIZE))
-        require(runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] == (FS_B, SIZE))
+        require(runtime.images[backup_key] == image_record(FS_A))
+        require(runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] == image_record(FS_B))
 
 
 @contract_case("legacyUnknownAttachmentIsRejected")
@@ -298,7 +465,7 @@ def legacy_unknown_attachment_is_rejected() -> None:
         write_legacy(context)
         runtime = FakeRuntime(context, cfg, lease)
         runtime.volumes["xenoid-data"] = volume_record(runtime, "xenoid-data")
-        runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] = (FS_B, SIZE)
+        runtime.images[("xenoid-data", storage.DATA_IMAGE_NAME)] = image_record(FS_B)
         runtime.attachments["xenoid-data"] = [("foreign-id", "foreign-container")]
         result = runtime.ensure_instance_storage()
         require(result["ok"] is False)
@@ -382,8 +549,7 @@ def two_instance_storage_is_isolated() -> None:
         require(runtime_a.ensure_instance_storage()["ok"] is True)
         runtime_b._run_storage_image_action = lambda action, **kwargs: {  # type: ignore[method-assign]
             "ok": True,
-            "filesystemUuid": FS_B,
-            "sizeBytes": SIZE,
+            **image_record(FS_B),
             "action": action,
         }
         require(runtime_b.ensure_instance_storage()["ok"] is True)

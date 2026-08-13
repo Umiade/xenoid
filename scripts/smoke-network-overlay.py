@@ -9,7 +9,7 @@ netctl = (root / "native/xenoid-netctl/xenoid_netctl.c").read_text()
 daemon = (root / "daemon/app/src/main/java/dev/xenoid/daemon/DeviceProfileManager.java").read_text()
 backend = (root / "src/xenoid/backend.py").read_text()
 proxy = (root / "scripts/xenoid-proxy-engine.py").read_text()
-template = json.loads((root / "examples/fingerprints/pixel-husky-template.json").read_text())
+template = json.loads((root / "examples/fingerprints/pixel-raven-android13.json").read_text())
 checks = {
     "early_rtnetlink_rename": "RTM_SETLINK" in netctl and 'new_name = "rmnet_data0"' in netctl,
     "real_sysfs_state": "/sys/class/net/eth0" not in overlay and "/sys/class/net/rmnet_data0" not in overlay,

@@ -388,7 +388,7 @@ public class XenoidDaemonService extends Service {
             if (path.equals("/profile/helper/env")) return RootHelper.profileEnv();
             if (path.equals("/profile/helper/dump")) return RootHelper.profileDump();
             if (path.equals("/fingerprint/collect")) { Map<String,Object> m = FingerprintCollector.collect(this); m.put("ok", true); return m; }
-            if (path.equals("/fingerprint/apply")) return DeviceProfileManager.apply(body, SimpleJson.boolValue(body, "regenerateUnique", true));
+            if (path.equals("/fingerprint/apply")) return DeviceProfileManager.apply(this, body, SimpleJson.boolValue(body, "regenerateUnique", true));
             if (path.equals("/fingerprint/set")) return DeviceProfileManager.setField(SimpleJson.stringValue(body, "field", "raw"), SimpleJson.stringValue(body, "value", body));
             if (path.equals("/automation/run")) return AutomationEngine.run(this, SimpleJson.stringValue(body, "name", "task"), body);
             if (path.equals("/frida/start")) return RootHelper.startFrida(SimpleJson.intValue(body, "port", 27042));

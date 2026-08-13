@@ -227,6 +227,11 @@ def cmd_build_gralloc(args: argparse.Namespace) -> int:
     print_json(result)
     return 0 if result.get("ok") else 1
 
+def cmd_build_hwcomposer(args: argparse.Namespace) -> int:
+    result = run_script(args, "build-hwcomposer.sh")
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
 
 def cmd_build_ril(args: argparse.Namespace) -> int:
     result = run_script(args, "build-ril.sh")
@@ -282,6 +287,7 @@ def cmd_build_all(args: argparse.Namespace) -> int:
         ("zygote", [root / "scripts" / "build-native-zygote.sh", "arm64"]),
         ("sensorsHal", [root / "scripts" / "build-sensors-hal.sh", "arm64"]),
         ("gralloc", [root / "scripts" / "build-gralloc.sh", "arm64"]),
+        ("hwcomposer", [root / "scripts" / "build-hwcomposer.sh", "arm64"]),
         ("cameraProvider", [root / "scripts" / "build-camera-hal.sh", "arm64"]),
         ("ril", [root / "scripts" / "build-ril.sh", "arm64"]),
         ("radioConfig", [root / "scripts" / "build-radio-config.sh", "arm64"]),
@@ -2202,6 +2208,8 @@ def build_parser() -> argparse.ArgumentParser:
     bn.set_defaults(func=cmd_build_netctl)
     bg = bsub.add_parser("gralloc")
     bg.set_defaults(func=cmd_build_gralloc)
+    bhwc = bsub.add_parser("hwcomposer")
+    bhwc.set_defaults(func=cmd_build_hwcomposer)
     br = bsub.add_parser("ril")
     br.set_defaults(func=cmd_build_ril)
     brc = bsub.add_parser("radio-config")
