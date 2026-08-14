@@ -42,11 +42,15 @@ struct CameraProfile {
     int32_t jpegMaxSize;
 };
 
-inline constexpr std::array<CameraOutputSize, 6> kRearOutputSizes = {{
+inline constexpr std::array<CameraOutputSize, 10> kRearOutputSizes = {{
         {4080, 3072, 220'000'000LL, kOutputBlob},
         {3840, 2160, 180'000'000LL, kOutputBlob},
         {1920, 1080, 100'000'000LL, kOutputAll},
+        {1440, 1080, 90'000'000LL, kOutputAll},
+        {1280, 960, 80'000'000LL, kOutputAll},
         {1280, 720, 70'000'000LL, kOutputAll},
+        {1024, 768, 50'000'000LL, kOutputAll},
+        {800, 600, 40'000'000LL, kOutputAll},
         {640, 480, 30'000'000LL, kOutputAll},
         {320, 240, 15'000'000LL, kOutputAll},
 }};

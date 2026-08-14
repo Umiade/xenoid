@@ -6,8 +6,6 @@ if [[ "${XENOID_UP_LOCKED:-0}" != 1 ]]; then
   exec python3 "$ROOT/scripts/with-up-lock.py" "$0" "$@"
 fi
 cd "$ROOT"
-# Full startup requires the image-bound zygote preload layer.
-export XENOID_ZYGOTE_PRELOAD=1
 DRY=0
 SKIP_BUILD=0
 REUSE_RUNTIME=0
@@ -195,8 +193,10 @@ else
 fi
 if [[ "$REUSE_RUNTIME" != 1 ]]; then
   xenoid_cli start "${START_COLIMA[@]}" --recreate --no-adb-root --defer-proxy --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
-else
-  reuse_runtime_preflight
+elif ! reuse_runtime_preflight; then
+  # --reuse-runtime means preserve a matching live container when possible,
+  # not fail if the owned runtime is currently stopped.
+  xenoid_cli start "${START_COLIMA[@]}" --no-adb-root --defer-proxy --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
 fi
 # Full startup uses rootd and avoids restarting adbd as root. Another adbd
 # restart could expose port 5555 again after the internal port was hidden.

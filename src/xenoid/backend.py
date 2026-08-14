@@ -454,9 +454,9 @@ class RuntimeManager:
             "grep -q '^service vendor.camera-provider-aidl ' "
             "/system/etc/init/android.hardware.camera.provider-service-aidl.rc && "
             "test -r /system/lib64/libpiex_shim.so && "
-            "test -r /system/lib64/libxenoid_core.so && "
-            "grep -q '/system/lib64/libpiex_shim.so:/system/lib64/libxenoid_core.so' "
-            "/system/etc/init/hw/init.zygote64.rc && "
+            "test ! -e /system/lib64/libxenoid_core.so && "
+            "grep -a -q 'libpiex_shim.so' /system/bin/app_process64 && "
+            "! grep -q 'setenv LD_PRELOAD' /system/etc/init/hw/init.zygote64.rc && "
             "test \"$(getprop init.svc.xenoid-sensorshal)\" = running && "
             "test \"$(getprop init.svc.vendor.camera-provider-aidl)\" = running && "
             "test \"$(getprop ro.hardware)\" = raven && "
@@ -471,7 +471,7 @@ class RuntimeManager:
         result["components"] = [
             "property-area",
             "overlay",
-            "zygote-preload",
+            "zygote-compatibility",
             "sensor-hal",
             "camera-provider",
         ]
@@ -1786,17 +1786,42 @@ class RuntimeManager:
         desired = str(self.lease.android_adb_port)
         if desired == "5555":
             return {"ok": True, "skipped": True}
+        # Container creation already passes service.adb.tcp.port. A listening
+        # daemon on that exact port is ready; restarting it here races the host
+        # transport and PackageManager calls immediately after adb_wait().
+        current = self.docker_exec(["getprop", "service.adb.tcp.port"])
+        listener_current = self.docker_exec(
+            ["sh", "-c", "ss -ltn 2>/dev/null | grep ':" + desired + "' || true"],
+            timeout=10,
+        )
+        if desired in str(listener_current.get("stdout", "")):
+            return {
+                "ok": True,
+                "already": True,
+                "port": desired,
+                "getprop": current,
+                "listener": listener_current,
+            }
         setp = self.docker_exec(["sh", "-c", "setprop service.adb.tcp.port " + desired])
         restart = self.docker_exec(["sh", "-c", "setprop ctl.restart adbd"])
         deadline = time.time() + 30
         listen: dict[str, Any] = {}
         while time.time() < deadline:
-            listen = self.docker_exec(["sh", "-c", "ss -ltn 2>/dev/null | grep ':" + desired + "' || true"], timeout=10)
+            listen = self.docker_exec(
+                ["sh", "-c", "ss -ltn 2>/dev/null | grep ':" + desired + "' || true"],
+                timeout=10,
+            )
             if desired in str(listen.get("stdout", "")):
                 break
             time.sleep(1)
         ok = desired in str(listen.get("stdout", ""))
-        return {"ok": ok, "port": desired, "setprop": setp, "restart": restart, "listener": listen}
+        return {
+            "ok": ok,
+            "port": desired,
+            "setprop": setp,
+            "restart": restart,
+            "listener": listen,
+        }
 
     def runtime_preflight(self) -> dict[str, Any]:
         script = self.context.project_root / "scripts" / "redroid-preflight.sh"
@@ -2776,8 +2801,9 @@ class RuntimeManager:
                 result["dockerAdbPortSwitch"] = self.switch_adbd_port_via_docker()
                 required.append(result["dockerAdbPortSwitch"])
             if not already_running:
+                # Stale-transport cleanup is idempotent: "no such device" means
+                # there is nothing to clean and must not fail convergence.
                 result["adbDisconnectStale"] = self.adb_disconnect()
-                required.append(result["adbDisconnectStale"])
             result["adbConnect"] = self.adb_connect()
             result["adbWait"] = self.adb_wait(timeout_sec=90)
             if self.lease.android_adb_port != 5555 and not result["adbWait"].get("ok"):
@@ -3830,6 +3856,10 @@ class RuntimeManager:
             except Exception as error:
                 health_after = {"ok": False, "error": str(error)}
                 client = None
+                # A transport reconnect can discard adb forwards after the
+                # initial setup. Recreate the owned forward before retrying
+                # instead of waiting the full readiness window on a dead port.
+                steps["forwardRetry"] = self.forward_daemon_port()
             health_attempts.append(health_after)
             if health_after.get("ok"):
                 break

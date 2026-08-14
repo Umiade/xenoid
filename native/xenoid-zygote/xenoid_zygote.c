@@ -1,7 +1,7 @@
-// libxenoid_zygote.c — system-wide framework spoofing injected into zygote via
-// LD_PRELOAD (setenv in init.zygote64.rc). Every app forked from zygote inherits
-// it. No Magisk, no frida-server, no ptrace — a plain bionic interposition, so
-// there is no hook framework artifact for risk SDKs to find.
+// libxenoid_zygote.c — zygote framework and process-surface compatibility.
+// The production app_process64 loads this together with xenoid_shim.c as an
+// ordinary leading DT_NEEDED dependency. This keeps linker preload state empty
+// while preserving one process-wide implementation for zygote descendants.
 //
 // Layering rule: ro.hardware=raven is correct before zygote startup because the
 // runtime image publishes the base graphics implementation under Raven HAL
@@ -28,14 +28,18 @@ typedef int (*spg_t)(const char*, char*);
 typedef const void *(*spf_t)(const char*);
 typedef void (*rcb_cb_t)(void*, const char*, const char*, uint32_t);
 typedef void (*rcb_t)(const void*, rcb_cb_t, void*);
+#ifndef XENOID_COMBINED_SHIM
 typedef int (*statfs_t)(const char*, struct statfs*);
+#endif
 typedef long (*syscall_t)(long, unsigned long, unsigned long, unsigned long,
                           unsigned long, unsigned long, unsigned long);
 
 static spg_t real_get;
 static spf_t real_find;
 static rcb_t real_rcb;
+#ifndef XENOID_COMBINED_SHIM
 static statfs_t real_statfs;
+#endif
 static syscall_t real_syscall;
 static __thread dev_t last_data_statfs_device;
 static __thread int data_statfs_device_valid;
@@ -136,6 +140,7 @@ static int path_is_data(const char *path){
   return !strcmp(path, "/data") || !strncmp(path, "/data/", 6);
 }
 
+#ifndef XENOID_COMBINED_SHIM
 int statfs(const char *path, struct statfs *buf){
   if (!real_statfs) real_statfs = (statfs_t)dlsym(RTLD_NEXT, "statfs");
   if (!real_statfs) { errno = ENOSYS; return -1; }
@@ -151,6 +156,7 @@ int statfs(const char *path, struct statfs *buf){
   }
   return rc;
 }
+#endif
 
 long syscall(long number, ...){
   __builtin_va_list ap;
@@ -178,7 +184,6 @@ long syscall(long number, ...){
   return rc;
 }
 
-extern char **environ;
 
 static void apply_zygote_mount_view(void){
   if (getuid() != 0) return;
@@ -188,24 +193,18 @@ static void apply_zygote_mount_view(void){
           (char *)NULL);
     _exit(127);
   }
-  if (pid > 0) {
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-    }
-  }
+  if (pid < 0) _exit(127);
+
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    _exit(127);
 }
 
 __attribute__((constructor)) static void xenoid_zygote_init(void){
-  /* /proc/pid/environ dumps the exec-time env region (mm->env_start..env_end),
-     so unsetenv() alone cannot hide LD_PRELOAD. Scrub the raw bytes in place,
-     then drop it from getenv() too. Children inherit the scrubbed region. */
-  for (char **e = environ; e && *e; ++e) {
-    if (strncmp(*e, "LD_PRELOAD=", 11) == 0) {
-      memset(*e, ' ', strlen(*e));
-      break;
-    }
-  }
-  unsetenv("LD_PRELOAD");
   /* Android creates a private mount namespace for zygote. Mounting only from
      init leaves raw app syscalls on the unmodified proc/sysfs view. Apply the
      same overlays here before app_process forks system_server or app children. */

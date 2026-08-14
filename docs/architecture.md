@@ -40,7 +40,7 @@ Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Li
 
 Auto-built runtime images are tagged per instance (`<configured-tag>-<resource-tag>`), so one instance can never retag the image used by a sibling. Full `up` convergence is serialized per project because native generated sources are shared; already-running instances remain concurrent. Rootfs extraction streams directly to the Docker engine host and uses an invocation-private work directory instead of staging a multi-gigabyte tar on the CLI host.
 
-Kernel protection is engine-host scoped and is loaded once, then reused while instances are running. Each Android overlay helper makes its `/sys` mount private before applying sysfs identity binds, preventing one instance's battery, thermal, or SELinux views from propagating into a sibling container.
+Kernel protection is engine-host scoped and is loaded once, then reused while instances are running. SELinux compatibility nodes and application permission gates are owned once by kmod/eBPF. Each Android overlay helper makes its `/sys` mount private before applying per-instance device-identity binds, preventing battery, thermal, and other profile views from propagating into a sibling container.
 
 ```bash
 ./xenoid --instance phone-a init --config examples/config-macos-colima.json
@@ -131,7 +131,7 @@ The engine installs a quarantine before configuration or lifecycle changes and o
 ./xenoid hide apply examples/hide/default-policy.json
 ```
 
-The daemon exposes the stable host/MCP policy facade. Runtime hiding is enforced by prop-area, bind overlays, kmod/eBPF, and zygote preload; Magisk/Zygisk is not part of the production path.
+The daemon exposes the stable host/MCP policy facade. Runtime hiding is enforced by prop-area, bind overlays, kmod/eBPF, and the ordinary `app_process64` compatibility dependency; Magisk/Zygisk and linker preload state are not part of the production path.
 
 ## Backend modes
 

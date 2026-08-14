@@ -112,8 +112,8 @@ static bool current_is_android_app(void)
     return appid >= 10000 && appid < 100000;
 }
 
-/* Scope the compatibility permission gates to the Android runtime's network
- * namespace. Host init_net and unrelated containers do not own rmnet_data0. */
+/* Scope every Android compatibility hook to the runtime's network namespace.
+ * Host init_net and unrelated containers do not own rmnet_data0. */
 static bool net_is_xenoid_android_runtime(struct net *net)
 {
     bool present;
@@ -131,6 +131,12 @@ static bool current_net_is_xenoid_android_runtime(void)
     if (!current->nsproxy)
         return false;
     return net_is_xenoid_android_runtime(current->nsproxy->net_ns);
+}
+
+static bool current_is_xenoid_android_app(void)
+{
+    return current_is_android_app() &&
+           current_net_is_xenoid_android_runtime();
 }
 
 
@@ -210,7 +216,16 @@ struct statfs_ctx {
 static bool dentry_is_android_data(const struct dentry *dentry)
 {
 	const struct dentry *cursor = dentry;
+	const struct super_block *sb = dentry ? dentry->d_sb : NULL;
 
+	/*
+	 * The Android runtime's writable ext4 mounts all come from its userdata
+	 * volume. Raven exposes that volume as F2FS. The optimized vfs_statfs
+	 * clone receives only the vfsmount root, so the writable superblock is
+	 * the stable identity for direct /data and its bind mounts.
+	 */
+	if (sb && READ_ONCE(sb->s_magic) == EXT4_SUPER_MAGIC && !sb_rdonly(sb))
+		return true;
 	while (cursor) {
 		if (cursor->d_name.len == 4 &&
 		    !memcmp(cursor->d_name.name, "data", 4) &&
@@ -305,8 +320,9 @@ static bool path_hidden(const char *path)
 {
     if (!path) return false;
     /* Privileged side (system/shell/root: our daemon, PackageManager scans,
-       adbd tooling) always sees real paths; unprivileged apps get -ENOENT. */
-    if (current_android_appid() < 10000) return false;
+       adbd tooling) and unrelated namespaces always see real paths;
+       unprivileged runtime apps get -ENOENT. */
+    if (!current_is_xenoid_android_app()) return false;
     /* Stock Android policy keeps the adbd control socket outside app domains. */
     if (!strcmp(path, "/dev/socket/adbd"))
         return true;
@@ -386,7 +402,10 @@ static int open_post_handler(struct kretprobe_instance *ri, struct pt_regs *regs
     if (buf) {
         path = d_path(&f->f_path, buf, 512);
         if (!IS_ERR(path)) {
-            hidden = path_hidden(path);
+            /* proc-fd memfds are executable capabilities, not filesystem
+             * paths. Frida uses one for explicit inspection; filtering its
+             * backing name here breaks dlopen("/proc/self/fd/N"). */
+            hidden = strncmp(path, "/memfd:", 7) && path_hidden(path);
             if (hidden) {
                 fput(f);
                 close_fd((unsigned int)retval);
@@ -477,6 +496,50 @@ static bool bounded_has(const char *buf, size_t len, const char *needle)
             return true;
     return false;
 }
+static char *bounded_find(char *buf, size_t len, const char *needle)
+{
+    size_t needle_len;
+    size_t i;
+
+    if (!buf || !needle) return NULL;
+    needle_len = strlen(needle);
+    if (!needle_len || len < needle_len) return NULL;
+    for (i = 0; i + needle_len <= len; i++)
+        if (!memcmp(buf + i, needle, needle_len))
+            return buf + i;
+    return NULL;
+}
+
+/* ART materializes part of the boot image through sealed memfds on hosts
+ * without ashmem. Expose those mappings under their logical Android system
+ * artifact paths rather than leaking the backing implementation. */
+static size_t normalize_art_boot_memfd(char *record, size_t len)
+{
+    static const char prefix[] = "/memfd:/system/framework/arm64/boot-";
+    static const char deleted_suffix[] = " (deleted)";
+    char *path;
+    char *deleted;
+    size_t offset;
+
+    path = bounded_find(record, len, prefix);
+    if (!path ||
+        (!bounded_has(path, len - (size_t)(path - record), ".oat (deleted)") &&
+         !bounded_has(path, len - (size_t)(path - record), ".vdex (deleted)") &&
+         !bounded_has(path, len - (size_t)(path - record), ".art (deleted)")))
+        return len;
+
+    offset = (size_t)(path - record);
+    memmove(path, path + 7, len - offset - 7);
+    len -= 7;
+    deleted = bounded_find(record + offset, len - offset, deleted_suffix);
+    if (!deleted)
+        return len;
+    offset = (size_t)(deleted - record);
+    memmove(deleted, deleted + sizeof(deleted_suffix) - 1,
+            len - offset - (sizeof(deleted_suffix) - 1));
+    return len - (sizeof(deleted_suffix) - 1);
+}
+
 
 /* Keep Android linker text mappings consistent with executable ELF
  * permissions without changing mapped bytes. */
@@ -500,7 +563,7 @@ static int maps_seq_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct maps_seq_ctx *ctx = (void *)ri->data;
     struct seq_file *seq = (struct seq_file *)regs->regs[0];
 
-    if (current_android_appid() < 10000 || !seq)
+    if (!current_is_xenoid_android_app() || !seq)
         return 1;
     ctx->seq = seq;
     ctx->count = seq->count;
@@ -518,12 +581,16 @@ static int maps_seq_post(struct kretprobe_instance *ri, struct pt_regs *regs)
         return 0;
     record = seq->buf + ctx->count;
     record_len = seq->count - ctx->count;
-    if (bounded_has(record, record_len, "[anon:swiftshader_jit]"))
+    if (bounded_has(record, record_len, "[anon:swiftshader_jit]")) {
         seq->count = ctx->count;
-    else
-        normalize_linker_text_perm(record, record_len);
+        return 0;
+    }
+    normalize_linker_text_perm(record, record_len);
+    record_len = normalize_art_boot_memfd(record, record_len);
+    seq->count = ctx->count + record_len;
     return 0;
 }
+
 
 static struct kretprobe maps_seq_kp = {
     .handler = maps_seq_post,
@@ -540,11 +607,70 @@ static struct kretprobe smaps_seq_kp = {
     .kp = { .symbol_name = "show_smap" },
     .maxactive = 64,
 };
+/* Protection files are mounted from a daemon-owned private staging tree.
+ * Keep those implementation mounts out of application procfs views while
+ * preserving the underlying Android partition mounts. */
+static int mount_seq_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct maps_seq_ctx *ctx = (void *)ri->data;
+    struct seq_file *seq = (struct seq_file *)regs->regs[0];
 
-/* Capture readlinkat paths at entry and apply path policy at return. */
+    if (!current_is_android_app() || !current_net_is_xenoid_android_runtime() ||
+        !seq)
+        return 1;
+    ctx->seq = seq;
+    ctx->count = seq->count;
+    return 0;
+}
+
+static int mount_seq_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct maps_seq_ctx *ctx = (void *)ri->data;
+    struct seq_file *seq = ctx->seq;
+    char *record;
+    size_t record_len;
+
+    if (!seq || !seq->buf || seq->count <= ctx->count)
+        return 0;
+    record = seq->buf + ctx->count;
+    record_len = seq->count - ctx->count;
+    if (bounded_has(record, record_len, " /overlay.d/") ||
+        bounded_has(record, record_len, " /data/system/.core/"))
+        seq->count = ctx->count;
+    return 0;
+}
+
+static struct kretprobe mountinfo_seq_kp = {
+    .handler = mount_seq_post,
+    .entry_handler = mount_seq_pre,
+    .data_size = sizeof(struct maps_seq_ctx),
+    .kp = { .symbol_name = "show_mountinfo" },
+    .maxactive = 64,
+};
+
+static struct kretprobe mounts_seq_kp = {
+    .handler = mount_seq_post,
+    .entry_handler = mount_seq_pre,
+    .data_size = sizeof(struct maps_seq_ctx),
+    .kp = { .symbol_name = "show_vfsmnt" },
+    .maxactive = 64,
+};
+
+static struct kretprobe mountstats_seq_kp = {
+    .handler = mount_seq_post,
+    .entry_handler = mount_seq_pre,
+    .data_size = sizeof(struct maps_seq_ctx),
+    .kp = { .symbol_name = "show_vfsstat" },
+    .maxactive = 64,
+};
+
+
+/* Capture readlinkat paths at entry and apply path policy at return.
+ * Do not inspect or suppress anonymous-fd targets: those are process-owned
+ * capabilities, not hidden filesystem paths, and explicit Frida inspection
+ * injects through /proc/self/fd/N. */
 struct readlink_saved_args {
     int hide_path;
-    int deny_memfd;
 };
 static int readlink_pre_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -552,14 +678,8 @@ static int readlink_pre_handler(struct kretprobe_instance *ri, struct pt_regs *r
     struct pt_regs *sr = (struct pt_regs *)regs->regs[0];
     const char __user *upath = sr ? (const char __user *)sr->regs[1] : NULL;
     char path[128];
-    char *fdtext;
-    long fd;
-    struct file *f;
-    char *target;
-    bool benign = false;
 
     saved->hide_path = 0;
-    saved->deny_memfd = 0;
     if (!upath)
         return 0;
     memset(path, 0, sizeof(path));
@@ -567,51 +687,12 @@ static int readlink_pre_handler(struct kretprobe_instance *ri, struct pt_regs *r
         return 0;
     if (path_hidden(path))
         saved->hide_path = 1;
-    if (!current->cred || current->cred->uid.val < 10000)
-        return 0;
-    if (!strncmp(path, "/proc/self/fd/", 14))
-        fdtext = path + 14;
-    else if (!strncmp(path, "/proc/", 6)) {
-        char *fdpart = strstr(path + 6, "/fd/");
-        if (!fdpart)
-            return 0;
-        fdtext = fdpart + 4;
-    } else {
-        return 0;
-    }
-    if (kstrtol(fdtext, 10, &fd) || fd < 0)
-        return 0;
-    f = fget((unsigned int)fd);
-    if (!f)
-        return 0;
-    target = kmalloc(512, GFP_ATOMIC);
-    if (target) {
-        char *p = d_path(&f->f_path, target, 512);
-        if (!IS_ERR(p)) {
-            if (strstr(p, "memfd:fontMap") || strstr(p, "memfd:shared_memory/") ||
-                strstr(p, "memfd:gralloc-buffer"))
-                benign = true;
-            if (!benign && strstr(p, "memfd:") && strstr(p, "(deleted)")) {
-                const char *q = strstr(p, "memfd:") + 6;
-                int hex = 0, dash = 0;
-                for (; *q; q++) {
-                    if (*q == '-') dash++;
-                    else if ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f') || (*q >= 'A' && *q <= 'F')) hex++;
-                    else break;
-                }
-                benign = dash >= 4 && hex >= 20;
-            }
-        }
-        kfree(target);
-    }
-    fput(f);
-    saved->deny_memfd = benign ? 1 : 0;
     return 0;
 }
 static int readlink_post_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct readlink_saved_args *saved = (struct readlink_saved_args *)ri->data;
-    if (saved->hide_path || saved->deny_memfd)
+    if (saved->hide_path)
         regs_set_return_value(regs, -ENOENT);
     return 0;
 }
@@ -659,14 +740,91 @@ static bool inode_name_matches(struct inode *inode, const char *value, bool suff
 	spin_unlock(&inode->i_lock);
 	return matches;
 }
-
-static const char *proc_label_for_inode(struct inode *inode)
+static bool dentry_name_is_decimal(const struct dentry *d)
 {
-	if (inode_name_matches(inode, "current", false) ||
+	size_t i;
+
+	if (!d->d_name.len)
+		return false;
+	for (i = 0; i < d->d_name.len; i++) {
+		if (d->d_name.name[i] < '0' || d->d_name.name[i] > '9')
+			return false;
+	}
+	return true;
+}
+
+static bool dentry_name_matches(const struct dentry *dentry, const char *name)
+{
+	size_t length;
+
+	if (!dentry || !dentry->d_name.name || !name)
+		return false;
+	length = strlen(name);
+	return dentry->d_name.len == length &&
+	       !memcmp(dentry->d_name.name, name, length);
+}
+
+static bool inode_has_decimal_name(struct inode *inode)
+{
+	struct dentry *d;
+	bool matches = false;
+
+	if (!inode || !spin_trylock(&inode->i_lock))
+		return false;
+	hlist_for_each_entry(d, &inode->i_dentry, d_u.d_alias) {
+		bool decimal;
+
+		if (!spin_trylock(&d->d_lock))
+			continue;
+		decimal = dentry_name_is_decimal(d);
+		spin_unlock(&d->d_lock);
+		if (decimal) {
+			matches = true;
+			break;
+		}
+	}
+	spin_unlock(&inode->i_lock);
+	return matches;
+}
+
+static const char *domain_for_uid(uid_t uid, char *buf, size_t buflen);
+
+
+static const char *proc_label_for_inode(struct inode *inode,
+					char *buf, size_t buflen)
+{
+	uid_t uid;
+
+	if (inode_name_matches(inode, "attr", false) ||
+	    inode_name_matches(inode, "current", false) ||
 	    inode_name_matches(inode, "exec", false) ||
-	    inode_name_matches(inode, "prev", false) ||
-	    inode_name_matches(inode, "attr", false))
+	    inode_name_matches(inode, "prev", false))
 		return "u:object_r:proc_security:s0";
+	if (inode_has_decimal_name(inode)) {
+		uid = i_uid_read(inode);
+		return domain_for_uid(uid, buf, buflen);
+	}
+	return "u:object_r:proc:s0";
+}
+
+static const char *proc_label_for_dentry(struct dentry *dentry,
+					 char *buf, size_t buflen)
+{
+	struct inode *inode;
+	uid_t uid;
+
+	if (dentry_name_matches(dentry, "attr") ||
+	    dentry_name_matches(dentry, "current") ||
+	    dentry_name_matches(dentry, "exec") ||
+	    dentry_name_matches(dentry, "prev"))
+		return "u:object_r:proc_security:s0";
+	if (dentry_name_is_decimal(dentry)) {
+		inode = d_inode(dentry);
+		if (!inode)
+			return NULL;
+		uid = i_uid_read(inode);
+		return domain_for_uid(uid, buf, buflen);
+	}
 	return "u:object_r:proc:s0";
 }
 
@@ -686,7 +844,13 @@ static bool is_android_data_apk(struct inode *inode)
 }
 
 /* security_inode_getsecurity(idmap, inode, name, &buffer, alloc) */
-struct igs_ctx { struct inode *inode; const char *name; void **buffer; bool alloc; };
+struct igs_ctx {
+	struct inode *inode;
+	const char *name;
+	void **buffer;
+	bool alloc;
+	bool android_runtime;
+};
 static int igs_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct igs_ctx *c = (void *)ri->data;
@@ -694,6 +858,7 @@ static int igs_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 	c->name = (const char *)regs->regs[2];
 	c->buffer = (void **)regs->regs[3];
 	c->alloc = regs->regs[4] != 0;
+	c->android_runtime = current_net_is_xenoid_android_runtime();
 	return 0;
 }
 static int igs_post(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -701,9 +866,10 @@ static int igs_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct igs_ctx *c = (void *)ri->data;
 	long ret = (long)(int)regs_return_value(regs);
 	const char *fsname, *label = NULL;
-	int len;
+	char tmp[64];
+	size_t len;
 
-	if (ret >= 0 || !c->name || !c->buffer)
+	if (!c->android_runtime || ret >= 0 || !c->name || !c->buffer)
 		return 0;
 	if (strcmp(c->name, "selinux") != 0)
 		return 0;
@@ -713,7 +879,7 @@ static int igs_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!fsname)
 		return 0;
 	if (!strcmp(fsname, "proc"))
-		label = proc_label_for_inode(c->inode);
+		label = proc_label_for_inode(c->inode, tmp, sizeof(tmp));
 	else if (!strcmp(fsname, "sysfs"))
 		label = "u:object_r:sysfs:s0";
 	else if (is_android_data_apk(c->inode))
@@ -739,19 +905,27 @@ static struct kretprobe igs_kp = {
 };
 
 /* security_getprocattr(task, name, &value) */
-struct gpa_ctx { struct task_struct *task; const char *name; char **value; };
+struct gpa_ctx {
+	struct task_struct *task;
+	const char *name;
+	char **value;
+	bool android_runtime;
+};
 static int gpa_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gpa_ctx *c = (void *)ri->data;
 	c->task = (struct task_struct *)regs->regs[0];
 	c->name = (const char *)regs->regs[1];
 	c->value = (char **)regs->regs[2];
+	c->android_runtime = current_net_is_xenoid_android_runtime();
 	return 0;
 }
 
 static const char *domain_for_uid(uid_t uid, char *buf, size_t buflen)
 {
 	unsigned int appid;
+	unsigned int userid = uid / 100000;
+	unsigned int category;
 	switch (uid) {
 	case 0: return "u:r:init:s0";
 	case 1000: return "u:r:system_server:s0";
@@ -772,11 +946,17 @@ static const char *domain_for_uid(uid_t uid, char *buf, size_t buflen)
 	}
 	appid = uid % 100000;
 	if (appid >= 90000 && appid < 100000) {
-		snprintf(buf, buflen, "u:r:isolated_app:s0:c%u,c256,c512,c768", appid - 90000);
+		category = appid - 90000;
+		snprintf(buf, buflen, "u:r:isolated_app:s0:c%u,c%u,c%u,c%u",
+			 category & 0xff, 256 + ((category >> 8) & 0xff),
+			 512 + (userid & 0xff), 768 + ((userid >> 8) & 0xff));
 		return buf;
 	}
 	if (appid >= 10000 && appid < 90000) {
-		snprintf(buf, buflen, "u:r:untrusted_app:s0:c%u,c256,c512,c768", appid);
+		category = appid - 10000;
+		snprintf(buf, buflen, "u:r:untrusted_app:s0:c%u,c%u,c%u,c%u",
+			 category & 0xff, 256 + ((category >> 8) & 0xff),
+			 512 + (userid & 0xff), 768 + ((userid >> 8) & 0xff));
 		return buf;
 	}
 	return "u:r:unconfined:s0";
@@ -789,6 +969,7 @@ struct vfs_xattr_ctx {
 	const char *name;
 	void *value;
 	size_t size;
+	bool android_runtime;
 };
 
 static int vfs_xattr_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -799,6 +980,7 @@ static int vfs_xattr_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 	c->name = (const char *)regs->regs[2];
 	c->value = (void *)regs->regs[3];
 	c->size = (size_t)regs->regs[4];
+	c->android_runtime = current_net_is_xenoid_android_runtime();
 	return 0;
 }
 
@@ -806,21 +988,31 @@ static int vfs_xattr_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct vfs_xattr_ctx *c = (void *)ri->data;
 	long ret = (long)(int)regs_return_value(regs);
+	const char *label = NULL;
 	char tmp[64];
-	const char *label;
-	uid_t uid;
 	size_t len;
 
-	if (ret < 0 || !c->dentry || !c->name)
+	if (!c->android_runtime || ret < 0 || !c->dentry || !c->name ||
+	    strcmp(c->name, "security.selinux") != 0)
 		return 0;
-	if (strcmp(c->name, "security.selinux") != 0 ||
-	    !c->dentry->d_name.name ||
-	    strcmp(c->dentry->d_name.name, "exe") != 0)
-		return 0;
+	if (c->dentry->d_name.name &&
+	    !strcmp(c->dentry->d_name.name, "exe")) {
+		uid_t uid = from_kuid_munged(current_user_ns(), current_euid());
 
-	uid = from_kuid_munged(current_user_ns(), current_euid());
-	label = domain_for_uid(uid, tmp, sizeof(tmp));
-	len = strlen(label);
+		label = domain_for_uid(uid, tmp, sizeof(tmp));
+	} else if (c->dentry->d_sb && c->dentry->d_sb->s_type &&
+		   !strcmp(c->dentry->d_sb->s_type->name, "proc")) {
+		label = proc_label_for_dentry(c->dentry, tmp, sizeof(tmp));
+	} else if (c->dentry->d_sb && c->dentry->d_sb->s_type &&
+		   !strcmp(c->dentry->d_sb->s_type->name, "sysfs") &&
+		   dentry_name_matches(c->dentry, "selinux")) {
+		label = "u:object_r:selinuxfs:s0";
+	}
+	if (!label)
+		return 0;
+	/* SELinux xattrs include the trailing NUL in their byte count. Keep the
+	 * size probe and an exact-sized read consistent. */
+	len = strlen(label) + 1;
 	if (c->value && c->size) {
 		if (c->size < len) {
 			regs_set_return_value(regs, -ERANGE);
@@ -851,11 +1043,18 @@ static int gpa_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	int len;
 	char *old, *newv;
 
-	if (!c->value || !c->task)
-		return 0;
-	if (!c->name || (strcmp(c->name, "current") && strcmp(c->name, "exec") && strcmp(c->name, "prev")))
+	if (!c->android_runtime || !c->value || !c->task || !c->name)
 		return 0;
 	old = *c->value;
+	if (!strcmp(c->name, "exec")) {
+		if (ret > 0 && old)
+			kfree(old);
+		*c->value = NULL;
+		regs_set_return_value(regs, 0);
+		return 0;
+	}
+	if (strcmp(c->name, "current") && strcmp(c->name, "prev"))
+		return 0;
 	if (ret > 0) {
 		/* an LSM answered: only override the "unconfined" fallback label */
 		if (!old)
@@ -896,16 +1095,15 @@ static struct kretprobe aa_gpa_kp = {
 };
 
 /* A real Android SELinux policy denies TIOCSTI with EACCES. Ubuntu's
- * legacy-TIOCSTI gate returns EPERM first; normalize only Android app UIDs so
- * the observable ioctl result matches an enforcing Android device. */
+ * legacy-TIOCSTI gate returns EPERM first; normalize only Xenoid Android app
+ * calls so the observable ioctl result matches an enforcing Android device. */
 struct tiocsti_ctx { unsigned int command; bool android_app; };
 static int tiocsti_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct tiocsti_ctx *c = (void *)ri->data;
-	uid_t uid = from_kuid_munged(current_user_ns(), current_euid());
 
 	c->command = (unsigned int)regs->regs[1];
-	c->android_app = uid >= 10000 && uid < 100000;
+	c->android_app = current_is_xenoid_android_app();
 	return 0;
 }
 static int tiocsti_post(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -956,6 +1154,36 @@ static struct kretprobe socket_create_kp = {
 	.entry_handler = socket_create_pre,
 	.data_size = sizeof(struct socket_create_ctx),
 	.kp = { .symbol_name = "security_socket_create" },
+	.maxactive = 32,
+};
+
+/* Android isolates untrusted services from ptrace even when both tasks share
+ * the same isolated UID. Enforce that domain boundary at the LSM decision
+ * point so libc and direct-syscall callers observe the same result. */
+struct ptrace_access_ctx { bool deny; };
+static int ptrace_access_pre(struct kretprobe_instance *ri,
+			     struct pt_regs *regs)
+{
+	struct ptrace_access_ctx *c = (void *)ri->data;
+
+	c->deny = current_is_isolated_android_app() &&
+		  current_net_is_xenoid_android_runtime();
+	return 0;
+}
+static int ptrace_access_post(struct kretprobe_instance *ri,
+			      struct pt_regs *regs)
+{
+	struct ptrace_access_ctx *c = (void *)ri->data;
+
+	if (c->deny && (long)regs_return_value(regs) == 0)
+		regs_set_return_value(regs, -EPERM);
+	return 0;
+}
+static struct kretprobe ptrace_access_kp = {
+	.handler = ptrace_access_post,
+	.entry_handler = ptrace_access_pre,
+	.data_size = sizeof(struct ptrace_access_ctx),
+	.kp = { .symbol_name = "security_ptrace_access_check" },
 	.maxactive = 32,
 };
 
@@ -1030,9 +1258,8 @@ static int binder_transaction_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct binder_transaction_data *transaction =
 		(struct binder_transaction_data *)regs->regs[2];
-	uid_t uid = from_kuid_munged(current_user_ns(), current_euid());
 
-	if (uid < 10000 || uid >= 100000 || !transaction)
+	if (!current_is_xenoid_android_app() || !transaction)
 		return 0;
 	if (READ_ONCE(transaction->code) != XENOID_SHELL_COMMAND_TRANSACTION)
 		return 0;
@@ -1044,9 +1271,14 @@ static struct kprobe binder_transaction_kp = {
 	.symbol_name = "binder_transaction",
 };
 
-/* Provide the SELinux status files expected by the Android framework. */
+/* Provide the SELinux status nodes expected by the Android framework. The
+ * context node retains bounded validation for trusted diagnostics; Android
+ * application opens are denied by the production eBPF policy. */
 #include <linux/kobject.h>
+#include <linux/kernfs.h>
 static struct kobject *xenoid_selinux_kobj;
+static struct kobject *xenoid_selinux_class_kobj;
+static struct kobj_attribute context_attr;
 static ssize_t enforce_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
 	return sprintf(buf, "1\n");
@@ -1055,17 +1287,321 @@ static ssize_t policyvers_show(struct kobject *kobj, struct kobj_attribute *attr
 {
 	return sprintf(buf, "33\n");
 }
-static ssize_t permissive_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t mls_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "1\n");
+}
+static ssize_t checkreqprot_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
 	return sprintf(buf, "0\n");
 }
+static bool selinux_context_authorized(const char *context)
+{
+	static const char * const categories[] = {
+		"s0", "s0:c0", "s0:c0,c1", "s0:c0,c1,c2,c3",
+		"s0:c0,c1,c2,c3,c10,c20,c30,c40",
+	};
+	static const char * const types[] = {
+		"app_zygote", "dex2oat", "init", "isolated_app", "kernel",
+		"logd", "nobody", "radio", "shell", "system_server",
+		"untrusted_app", "usb", "wifi", "zygote",
+	};
+	static const char * const files[] = {
+		"adb_data_file", "apk_data_file", "dex2oat_exec", "proc",
+		"proc_process", "proc_security", "rootfs", "selinuxfs",
+		"system_data_file", "system_file", "tmpfs",
+	};
+	char role[16];
+	char type[96];
+	const char *category;
+	const char *cursor;
+	size_t i, length;
+
+	if (strncmp(context, "u:", 2))
+		return false;
+	cursor = strchr(context + 2, ':');
+	if (!cursor || cursor == context + 2)
+		return false;
+	length = cursor - (context + 2);
+	if (length >= sizeof(role))
+		return false;
+	memcpy(role, context + 2, length);
+	role[length] = '\0';
+
+	cursor++;
+	category = strchr(cursor, ':');
+	if (!category || category == cursor)
+		return false;
+	length = category - cursor;
+	if (length >= sizeof(type))
+		return false;
+	memcpy(type, cursor, length);
+	type[length] = '\0';
+	category++;
+
+	if (!strcmp(role, "r")) {
+		for (i = 0; i < ARRAY_SIZE(types); i++) {
+			if (!strcmp(type, types[i]))
+				goto found;
+		}
+		return false;
+	}
+	if (strcmp(role, "object_r"))
+		return false;
+	for (i = 0; i < ARRAY_SIZE(files); i++) {
+		if (!strcmp(type, files[i]))
+			goto found;
+	}
+	return false;
+found:
+	for (i = 0; i < ARRAY_SIZE(categories); i++) {
+		if (!strcmp(category, categories[i]))
+			return true;
+	}
+	return false;
+}
+static ssize_t context_store(struct kobject *kobj, struct kobj_attribute *attr,
+			     const char *buf, size_t count)
+{
+	char context[128];
+	size_t length = min(count, sizeof(context) - 1);
+	bool authorized;
+
+	if (count == 0)
+		return 0;
+	memcpy(context, buf, length);
+	context[length] = '\0';
+	strim(context);
+	authorized = selinux_context_authorized(context);
+	return authorized ? (ssize_t)count : -EINVAL;
+}
+static int selinux_context_create_file(void)
+{
+	int ret;
+
+	ret = sysfs_create_file_ns(xenoid_selinux_kobj, &context_attr.attr, NULL);
+	if (ret)
+		return ret;
+	ret = sysfs_chmod_file(xenoid_selinux_kobj, &context_attr.attr, 0666);
+	if (ret)
+		sysfs_remove_file_ns(xenoid_selinux_kobj, &context_attr.attr, NULL);
+	return ret;
+}
+static void selinux_context_remove_file(void)
+{
+	sysfs_remove_file_ns(xenoid_selinux_kobj, &context_attr.attr, NULL);
+}
+static struct kobj_attribute context_attr = __ATTR_WO(context);
+
+struct selinux_named_attr {
+	struct kobj_attribute kattr;
+	const char *text;
+};
+static ssize_t selinux_class_show(struct kobject *kobj, struct kobj_attribute *attr,
+				  char *buf)
+{
+	struct selinux_named_attr *named =
+		container_of(attr, struct selinux_named_attr, kattr);
+
+	return sysfs_emit(buf, "%s", named->text);
+}
+#define SELINUX_CLASS_ATTR(_name, _text) \
+	static struct selinux_named_attr selinux_attr_##_name = { \
+		.kattr = { \
+			.attr = { .name = __stringify(_name), .mode = 0444 }, \
+			.show = selinux_class_show, \
+			.store = NULL, \
+		}, \
+		.text = _text \
+	}
+SELINUX_CLASS_ATTR(search, "7\n");
+SELINUX_CLASS_ATTR(open, "11\n");
+SELINUX_CLASS_ATTR(read, "1\n");
+SELINUX_CLASS_ATTR(write, "2\n");
+SELINUX_CLASS_ATTR(execute, "4\n");
+SELINUX_CLASS_ATTR(execute_no_trans, "9\n");
+SELINUX_CLASS_ATTR(associate, "9\n");
+SELINUX_CLASS_ATTR(setcurrent, "11\n");
+SELINUX_CLASS_ATTR(execmem, "14\n");
+SELINUX_CLASS_ATTR(transition, "8\n");
+SELINUX_CLASS_ATTR(check_context, "7\n");
+#define SELINUX_INDEX_ATTR(_name, _text) \
+	static struct selinux_named_attr selinux_index_##_name = { \
+		.kattr = { \
+			.attr = { .name = "index", .mode = 0444 }, \
+			.show = selinux_class_show, \
+			.store = NULL, \
+		}, \
+		.text = _text \
+	}
+SELINUX_INDEX_ATTR(dir, "5\n");
+SELINUX_INDEX_ATTR(fifo_file, "8\n");
+SELINUX_INDEX_ATTR(file, "16\n");
+SELINUX_INDEX_ATTR(filesystem, "32\n");
+SELINUX_INDEX_ATTR(process, "51\n");
+SELINUX_INDEX_ATTR(security, "58\n");
+struct selinux_class_dir {
+	const char *name;
+	struct attribute *index;
+	struct attribute **attrs;
+	struct kobject *kobj;
+	struct kobject *perms;
+};
+static struct attribute *selinux_perm_dir_attrs[] = {
+	&selinux_attr_search.kattr.attr, NULL,
+};
+static struct attribute *selinux_perm_fifo_attrs[] = {
+	&selinux_attr_open.kattr.attr, NULL,
+};
+static struct attribute *selinux_perm_file_attrs[] = {
+	&selinux_attr_read.kattr.attr,
+	&selinux_attr_write.kattr.attr,
+	&selinux_attr_execute.kattr.attr,
+	&selinux_attr_execute_no_trans.kattr.attr,
+	NULL,
+};
+static struct attribute *selinux_perm_filesystem_attrs[] = {
+	&selinux_attr_associate.kattr.attr, NULL,
+};
+static struct attribute *selinux_perm_process_attrs[] = {
+	&selinux_attr_setcurrent.kattr.attr,
+	&selinux_attr_execmem.kattr.attr,
+	&selinux_attr_transition.kattr.attr,
+	NULL,
+};
+static struct attribute *selinux_perm_security_attrs[] = {
+	&selinux_attr_check_context.kattr.attr, NULL,
+};
+static struct selinux_class_dir selinux_class_dirs[] = {
+	{ "dir", &selinux_index_dir.kattr.attr, selinux_perm_dir_attrs, NULL, NULL },
+	{ "fifo_file", &selinux_index_fifo_file.kattr.attr, selinux_perm_fifo_attrs, NULL, NULL },
+	{ "file", &selinux_index_file.kattr.attr, selinux_perm_file_attrs, NULL, NULL },
+	{ "filesystem", &selinux_index_filesystem.kattr.attr, selinux_perm_filesystem_attrs, NULL, NULL },
+	{ "process", &selinux_index_process.kattr.attr, selinux_perm_process_attrs, NULL, NULL },
+	{ "security", &selinux_index_security.kattr.attr, selinux_perm_security_attrs, NULL, NULL },
+};
+
+/*
+ * The host has no loaded SELinux policy, so this node is metadata only.
+ * Production eBPF denies Android application opens with EACCES, matching
+ * AOSP's untrusted_app neverallow. Trusted callers receive EOPNOTSUPP rather
+ * than fabricated access-vector decisions.
+ */
+static ssize_t selinux_access_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return 0;
+}
+static ssize_t selinux_access_store(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    const char *buf, size_t count)
+{
+	return -EOPNOTSUPP;
+}
+static struct kobj_attribute selinux_access_attr =
+	__ATTR(access, 0644, selinux_access_show, selinux_access_store);
+static int selinux_access_create_file(void)
+{
+	int ret;
+
+	ret = sysfs_create_file_ns(xenoid_selinux_kobj,
+				   &selinux_access_attr.attr, NULL);
+	if (ret)
+		return ret;
+	ret = sysfs_chmod_file(xenoid_selinux_kobj, &selinux_access_attr.attr,
+			       0666);
+	if (ret)
+		sysfs_remove_file_ns(xenoid_selinux_kobj,
+				     &selinux_access_attr.attr, NULL);
+	return ret;
+}
+static void selinux_access_remove_file(void)
+{
+	sysfs_remove_file_ns(xenoid_selinux_kobj, &selinux_access_attr.attr,
+			     NULL);
+}
+static void selinux_class_remove_dirs(void);
+static int selinux_class_create_dirs(void)
+{
+	unsigned int i;
+	int ret;
+
+	xenoid_selinux_class_kobj = kobject_create_and_add("class",
+							 xenoid_selinux_kobj);
+	if (!xenoid_selinux_class_kobj)
+		return -ENOMEM;
+	for (i = 0; i < ARRAY_SIZE(selinux_class_dirs); i++) {
+		struct selinux_class_dir *dir = &selinux_class_dirs[i];
+		struct kobject *perms;
+
+		dir->kobj = kobject_create_and_add(dir->name,
+						   xenoid_selinux_class_kobj);
+		if (!dir->kobj) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		ret = sysfs_create_file(dir->kobj, dir->index);
+		if (ret)
+			goto fail;
+		perms = kobject_create_and_add("perms", dir->kobj);
+		if (!perms) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		dir->perms = perms;
+		ret = sysfs_create_files(perms,
+					 (const struct attribute * const *)dir->attrs);
+		if (ret)
+			goto fail;
+	}
+	return 0;
+
+fail:
+	selinux_class_remove_dirs();
+	return ret;
+}
+static void selinux_class_remove_dirs(void)
+{
+	unsigned int i;
+
+	for (i = ARRAY_SIZE(selinux_class_dirs); i > 0; i--) {
+		struct selinux_class_dir *dir = &selinux_class_dirs[i - 1];
+
+		if (!dir->kobj)
+			continue;
+		if (dir->perms) {
+			sysfs_remove_files(dir->perms,
+					   (const struct attribute * const *)dir->attrs);
+			kobject_put(dir->perms);
+			dir->perms = NULL;
+		}
+		sysfs_remove_file(dir->kobj, dir->index);
+		kobject_put(dir->kobj);
+		dir->kobj = NULL;
+	}
+	if (xenoid_selinux_class_kobj) {
+		kobject_put(xenoid_selinux_class_kobj);
+		xenoid_selinux_class_kobj = NULL;
+	}
+}
+static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	u32 values[5] = { 1, 0, 1, 1, 0 };
+
+	memcpy(buf, values, sizeof(values));
+	return sizeof(values);
+}
 static struct kobj_attribute enforce_attr = __ATTR_RO(enforce);
 static struct kobj_attribute policyvers_attr = __ATTR_RO(policyvers);
-static struct kobj_attribute permissive_attr = __ATTR_RO(permissive);
+static struct kobj_attribute mls_attr = __ATTR_RO(mls);
+static struct kobj_attribute checkreqprot_attr = __ATTR_RO(checkreqprot);
+static struct kobj_attribute status_attr = __ATTR_RO(status);
 static struct attribute *xenoid_selinux_attrs[] = {
 	&enforce_attr.attr,
 	&policyvers_attr.attr,
-	&permissive_attr.attr,
+	&mls_attr.attr,
+	&checkreqprot_attr.attr,
+	&status_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(xenoid_selinux);
@@ -1174,17 +1710,21 @@ static struct power_supply *xb_psy;
 static struct kretprobe *rprobes[] = {
     &open_kp, &stat_kp, &statx_kp, &access_kp,
     &faccessat_kp, &unlinkat_kp, &readlink_kp, &maps_seq_kp, &smaps_seq_kp,
+    &mountinfo_seq_kp, &mounts_seq_kp, &mountstats_seq_kp,
     &affinity_kp, &statfs_kp,
 };
 static struct kretprobe *seclabel_rprobes[] = {
     &igs_kp, &vfs_xattr_kp, &gpa_kp, &aa_gpa_kp, &tiocsti_kp,
-    &socket_create_kp, &netlink_send_kp,
+    &socket_create_kp, &ptrace_access_kp, &netlink_send_kp,
 };
 static unsigned int rprobes_registered;
 static unsigned int seclabel_rprobes_registered;
 static struct kretprobe *sysinfo_registered;
 static bool binder_transaction_registered;
 static bool selinux_groups_registered;
+static bool selinux_context_registered;
+static bool selinux_access_registered;
+static bool selinux_class_registered;
 
 static void unregister_protection(void)
 {
@@ -1208,7 +1748,19 @@ static void unregister_protection(void)
         seclabel_rprobes_registered--;
         unregister_kretprobe(seclabel_rprobes[seclabel_rprobes_registered]);
     }
+    if (selinux_class_registered) {
+        selinux_class_remove_dirs();
+        selinux_class_registered = false;
+    }
     if (xenoid_selinux_kobj) {
+        if (selinux_access_registered) {
+            selinux_access_remove_file();
+            selinux_access_registered = false;
+        }
+        if (selinux_context_registered) {
+            selinux_context_remove_file();
+            selinux_context_registered = false;
+        }
         if (selinux_groups_registered) {
             sysfs_remove_groups(xenoid_selinux_kobj, xenoid_selinux_groups);
             selinux_groups_registered = false;
@@ -1252,6 +1804,24 @@ static int __init xenoid_kmod_init(void)
         goto fail;
     }
     selinux_groups_registered = true;
+    ret = selinux_context_create_file();
+    if (ret) {
+        pr_err("xenoid_kmod: required selinux context node failed: %d\n", ret);
+        goto fail;
+    }
+    selinux_context_registered = true;
+    ret = selinux_access_create_file();
+    if (ret) {
+        pr_err("xenoid_kmod: required selinux access node failed: %d\n", ret);
+        goto fail;
+    }
+    selinux_access_registered = true;
+    ret = selinux_class_create_dirs();
+    if (ret) {
+        pr_err("xenoid_kmod: required selinux class nodes failed: %d\n", ret);
+        goto fail;
+    }
+    selinux_class_registered = true;
     statfs_cloned_abi = strcmp(statfs_symbol, "vfs_statfs") != 0;
     statfs_needs_clone_success =
         !strstr(statfs_symbol, ".part.") && !strstr(statfs_symbol, ".constprop.");

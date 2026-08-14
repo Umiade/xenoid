@@ -94,6 +94,10 @@ require(value.get('schema') == 'dev.xenoid.filesystem-runtime-probe/v1', 'schema
 require(value.get('ok') is True, f'probe failed: {value}')
 ordinary = value['ordinary']
 require(10000 <= ordinary['uid'] % 100000 < 90000, 'ordinary probe did not use an app UID')
+require(ordinary.get('cryptoState') == 'encrypted',
+        f"ordinary ro.crypto.state mismatch: {ordinary.get('cryptoState')!r}")
+require(ordinary.get('cryptoType') == 'file',
+        f"ordinary ro.crypto.type mismatch: {ordinary.get('cryptoType')!r}")
 require_path(ordinary['data'], F2FS, 'ordinary /data', False)
 require_path(ordinary['appData'], F2FS, 'ordinary app data', True)
 require_path(ordinary['system'], EXT4, 'ordinary /system', True)
@@ -102,6 +106,10 @@ require(isolated.get('ok') is True, f'isolated probe failed: {isolated}')
 isolated_native = isolated['native']
 require(90000 <= isolated_native['uid'] % 100000 < 100000,
         'isolated probe did not use an isolated UID')
+require(isolated_native.get('cryptoState') == 'encrypted',
+        f"isolated ro.crypto.state mismatch: {isolated_native.get('cryptoState')!r}")
+require(isolated_native.get('cryptoType') == 'file',
+        f"isolated ro.crypto.type mismatch: {isolated_native.get('cryptoType')!r}")
 require_path(isolated_native['data'], F2FS, 'isolated /data', False)
 require(ordinary['uid'] != isolated_native['uid'], 'isolated UID was not distinct')
 print(json.dumps({
@@ -112,6 +120,8 @@ print(json.dumps({
     'dataMagic': ordinary['data']['raw']['type'],
     'appDataFdMagic': ordinary['appData']['rawFd']['type'],
     'systemMagic': ordinary['system']['raw']['type'],
+    'cryptoState': ordinary['cryptoState'],
+    'cryptoType': ordinary['cryptoType'],
     'mountSource': '/dev/block/platform/14700000.ufs/by-name/userdata',
 }, sort_keys=True))
 PY

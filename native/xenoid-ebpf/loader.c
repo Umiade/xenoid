@@ -18,6 +18,7 @@
 
 #define PIN_DIR "/sys/fs/bpf/xenoid"
 #define PIN_LINK PIN_DIR "/pathhide_link"
+#define PIN_PERMISSION_LINK PIN_DIR "/selinux_permission_link"
 #define PIN_MAP PIN_DIR "/deny_count"
 #define PIN_UNAME_LINK PIN_DIR "/uname_link"
 #define PIN_UNAME_K_LINK PIN_DIR "/uname_k_link"
@@ -47,13 +48,14 @@ static void emit_json(int ok, int loaded, const char *attach, const char *note,
 	char ebuf[320];
 	json_escape(ebuf, sizeof(ebuf), error);
 	printf("{\"ok\":%s,\"loaded\":%s,\"attach\":\"%s\",\"pinDir\":\"%s\","
-	       "\"links\":{\"path\":%s,\"unameEntry\":%s,\"unameReturn\":%s},"
+	       "\"links\":{\"path\":%s,\"selinuxPermission\":%s,\"unameEntry\":%s,\"unameReturn\":%s},"
 	       "\"denyCount\":%llu,\"note\":\"%s\",\"error\":%s}\n",
 	       ok ? "true" : "false",
 	       loaded ? "true" : "false",
 	       attach ? attach : "",
 	       PIN_DIR,
 	       access(PIN_LINK, F_OK) == 0 ? "true" : "false",
+	       access(PIN_PERMISSION_LINK, F_OK) == 0 ? "true" : "false",
 	       access(PIN_UNAME_K_LINK, F_OK) == 0 ? "true" : "false",
 	       access(PIN_UNAME_LINK, F_OK) == 0 ? "true" : "false",
 	       denies,
@@ -99,14 +101,38 @@ static unsigned long long read_deny_count(void)
 	return (unsigned long long)val;
 }
 
+static int bpf_lsm_active(void)
+{
+	FILE *f;
+	char active[512] = {};
+	char *entry;
+
+	f = fopen("/sys/kernel/security/lsm", "r");
+	if (!f)
+		return 0;
+	if (!fgets(active, sizeof(active), f)) {
+		fclose(f);
+		return 0;
+	}
+	fclose(f);
+	for (entry = strtok(active, ",\n"); entry; entry = strtok(NULL, ",\n")) {
+		if (!strcmp(entry, "bpf"))
+			return 1;
+	}
+	return 0;
+}
+
 static int already_loaded(char *attach_out, size_t n)
 {
+	FILE *f;
+
 	if (access(PIN_LINK, F_OK) != 0 ||
+	    access(PIN_PERMISSION_LINK, F_OK) != 0 ||
 	    access(PIN_UNAME_K_LINK, F_OK) != 0 ||
 	    access(PIN_UNAME_LINK, F_OK) != 0 ||
 	    access(PIN_MAP, F_OK) != 0)
 		return 0;
-	FILE *f = fopen(STATE_PATH, "r");
+	f = fopen(STATE_PATH, "r");
 	if (f) {
 		char buf[256] = {};
 		if (fgets(buf, sizeof(buf), f)) {
@@ -123,11 +149,14 @@ static int already_loaded(char *attach_out, size_t n)
 	}
 	if (!attach_out[0])
 		snprintf(attach_out, n, "pinned");
+	if (!strcmp(attach_out, "lsm/file_open") && !bpf_lsm_active())
+		return 0;
 	return 1;
 }
 
 static void clear_pins(void)
 {
+	unlink(PIN_PERMISSION_LINK);
 	unlink(PIN_LINK);
 	unlink(PIN_MAP);
 	unlink(PIN_UNAME_LINK);
@@ -145,7 +174,9 @@ static int try_one_mode(enum attach_mode mode, const char **attach_name, const c
 {
 	struct xenoid_pathhide_bpf *skel;
 	struct bpf_link *link = NULL;
+	struct bpf_link *permission_link = NULL;
 	struct bpf_program *prog = NULL;
+	struct bpf_program *permission_prog = NULL;
 	int err;
 
 	skel = xenoid_pathhide_bpf__open();
@@ -155,6 +186,9 @@ static int try_one_mode(enum attach_mode mode, const char **attach_name, const c
 	bpf_program__set_autoload(skel->progs.xenoid_lsm_file_open, mode == MODE_LSM);
 	bpf_program__set_autoload(skel->progs.xenoid_fmod_security_file_open, mode == MODE_FMOD);
 	bpf_program__set_autoload(skel->progs.xenoid_kprobe_security_file_open, mode == MODE_KPROBE);
+	bpf_program__set_autoload(skel->progs.xenoid_lsm_inode_permission, mode == MODE_LSM);
+	bpf_program__set_autoload(skel->progs.xenoid_fmod_security_inode_permission, mode == MODE_FMOD);
+	bpf_program__set_autoload(skel->progs.xenoid_kprobe_security_inode_permission, mode == MODE_KPROBE);
 
 	err = xenoid_pathhide_bpf__load(skel);
 	if (err) {
@@ -165,16 +199,19 @@ static int try_one_mode(enum attach_mode mode, const char **attach_name, const c
 	switch (mode) {
 	case MODE_LSM:
 		prog = skel->progs.xenoid_lsm_file_open;
+		permission_prog = skel->progs.xenoid_lsm_inode_permission;
 		*attach_name = "lsm/file_open";
 		*note = "LSM BPF attach ok";
 		break;
 	case MODE_FMOD:
 		prog = skel->progs.xenoid_fmod_security_file_open;
+		permission_prog = skel->progs.xenoid_fmod_security_inode_permission;
 		*attach_name = "fmod_ret/security_file_open";
 		*note = "LSM BPF inactive or unavailable; attached via fmod_ret";
 		break;
 	case MODE_KPROBE:
 		prog = skel->progs.xenoid_kprobe_security_file_open;
+		permission_prog = skel->progs.xenoid_kprobe_security_inode_permission;
 		*attach_name = "kprobe/security_file_open";
 		*note = "Attached via kprobe override (CONFIG_BPF_KPROBE_OVERRIDE)";
 		break;
@@ -186,16 +223,26 @@ static int try_one_mode(enum attach_mode mode, const char **attach_name, const c
 		xenoid_pathhide_bpf__destroy(skel);
 		return err;
 	}
+	permission_link = bpf_program__attach(permission_prog);
+	err = libbpf_get_error(permission_link);
+	if (err) {
+		bpf_link__destroy(link);
+		xenoid_pathhide_bpf__destroy(skel);
+		return err;
+	}
 
 	switch (mode) {
 	case MODE_LSM:
 		skel->links.xenoid_lsm_file_open = link;
+		skel->links.xenoid_lsm_inode_permission = permission_link;
 		break;
 	case MODE_FMOD:
 		skel->links.xenoid_fmod_security_file_open = link;
+		skel->links.xenoid_fmod_security_inode_permission = permission_link;
 		break;
 	case MODE_KPROBE:
 		skel->links.xenoid_kprobe_security_file_open = link;
+		skel->links.xenoid_kprobe_security_inode_permission = permission_link;
 		break;
 	}
 
@@ -223,6 +270,8 @@ static int try_one_mode(enum attach_mode mode, const char **attach_name, const c
 	err = bpf_link__pin(skel->links.xenoid_k_newuname, PIN_UNAME_K_LINK);
 	if (!err)
 		err = bpf_link__pin(skel->links.xenoid_kret_newuname, PIN_UNAME_LINK);
+	if (!err)
+		err = bpf_link__pin(permission_link, PIN_PERMISSION_LINK);
 	if (!err)
 		err = bpf_link__pin(link, PIN_LINK);
 	if (!err)
@@ -283,6 +332,9 @@ static int cmd_load(void)
 	for (mode = MODE_LSM; mode <= MODE_KPROBE; mode++) {
 		const char *a = "none";
 		const char *n = "";
+
+		if (mode == MODE_LSM && !bpf_lsm_active())
+			continue;
 		err = try_one_mode(mode, &a, &n);
 		if (err == 0) {
 			attach = a;

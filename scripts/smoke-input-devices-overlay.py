@@ -10,7 +10,7 @@ checks = {
     "touch_name": "sec_touchscreen" in src,
     "key_devices": "gpio-keys" in src and "qpnp_pon" in src,
     "optional_mount": "overlay_text_optional" in src,
-    "profile_input_name": "input_name" in src and profile.get("input_name") == "sec_touchscreen",
+    "profile_input_name": "input_name" in src and profile.get("input", {}).get("name") == "sec_touchscreen",
     "apply_calls": "input_devices=ok" in src,
 }
 # Keep input-helper marker smoke here too because this overlay is meant to hide enumeration-level markers.

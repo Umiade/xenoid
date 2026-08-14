@@ -6,6 +6,10 @@ src = (ROOT / "native/xenoid-hide/xenoid_overlay.c").read_text()
 checks = {
     "sidecar_marker": "target_marker_path" in src and "marker_mounted" in src and "mark_mounted" in src,
     "status_uses_resolved_mountinfo": "resolve_overlay_target(overlay_targets[i]" in src and "count_in_mountinfo(mi, t)" in src,
+    "mountinfo_read_fails_closed": "static char *read_mountinfo(void)" in src
+    and "if (!mi) return -1;" in src,
+    "private_mount_failure_rolls_back": "if (mount(NULL, t, NULL, MS_PRIVATE, NULL) != 0)" in src
+    and "umount2(t, MNT_DETACH)" in src,
     "overlay_function": "overlay_mount_namespace_texts" in src,
     "stale_marker_repair": "Stale-marker repair" in src,
     "self_views_excluded_by_design": "/proc/{self,net}" in src,

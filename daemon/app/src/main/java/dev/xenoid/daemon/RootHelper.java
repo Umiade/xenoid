@@ -2,31 +2,19 @@ package dev.xenoid.daemon;
 
 import java.io.*;
 import java.util.*;
-import java.util.concurrent.*;
 import java.net.*;
 
 final class RootHelper {
     private static String cachedRootdToken = "";
 
     static Map<String,Object> status() {
-        Map<String,Object> out = exec("id; which su || true; getenforce 2>/dev/null || true");
+        Map<String,Object> out = execRootd("id; getenforce 2>/dev/null || true");
         out.put("root", String.valueOf(out.get("stdout")).contains("uid=0"));
         return out;
     }
 
     static Map<String,Object> exec(String command) {
-        Map<String,Object> viaRootd = execRootd(command);
-        if (Boolean.TRUE.equals(viaRootd.get("ok")) || viaRootd.containsKey("rootdReachable")) return viaRootd;
-        Map<String,Object> out = new LinkedHashMap<>();
-        try {
-            Process p = new ProcessBuilder("su", "-c", command).redirectErrorStream(false).start();
-            boolean done = p.waitFor(20, TimeUnit.SECONDS);
-            out.put("ok", done && p.exitValue() == 0);
-            out.put("exit", done ? p.exitValue() : -1);
-            out.put("stdout", read(p.getInputStream())); out.put("stderr", read(p.getErrorStream()));
-            if (!done) p.destroyForcibly();
-        } catch (Exception e) { out.put("ok", false); out.put("error", e.toString()); }
-        return out;
+        return execRootd(command);
     }
 
     /** The service injects its app-private daemon token; it is never staged in /data/local/tmp. */
@@ -255,7 +243,7 @@ final class RootHelper {
         return path != null && path.matches("/data/local/tmp/\\.camera-upload-[0-9a-f]{32}");
     }
     static Map<String,Object> startFrida(int port) {
-        return execRootd("pidof .fs64 >/dev/null 2>&1 || (test -x /data/system/.core/svc.bin && ln -sf /data/system/.core/svc.bin /data/local/tmp/.fs64 && nohup /data/local/tmp/.fs64 -l 127.0.0.1:" + port + " </dev/null >/dev/null 2>&1 &); sleep 1; pidof .fs64 >/dev/null");
+        return execRootd("pidof .fs64 >/dev/null 2>&1 || (test -x /data/system/.core/svc.bin && ln -sf /data/system/.core/svc.bin /data/local/tmp/.fs64 && /data/local/tmp/.fs64 -D -l 127.0.0.1:" + port + " </dev/null >/dev/null 2>&1); sleep 1; pidof .fs64 >/dev/null");
     }
     static Map<String,Object> stopFrida() { return execRootd("pkill frida-server 2>/dev/null || true; pkill svc.bin 2>/dev/null || true; pkill .fs64 2>/dev/null || true"); }
     static Map<String,Object> fridaStatus() { return execRootd("pidof .fs64 >/dev/null 2>&1 && ps -A | grep '[.]fs64'"); }

@@ -44,6 +44,7 @@ cat > "$TMP/surfaces.c" <<'C'
 #include <sys/sysinfo.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+#include <sys/xattr.h>
 static int bad=0;
 static void check(int cond, const char*name, const char*detail){ printf("%s=%s %s\n",name,cond?"ok":"bad",detail?detail:""); if(!cond) bad=1; }
 static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data){ (void)size; (void)data; const char*n=info->dlpi_name?info->dlpi_name:""; if(strstr(n,"xenoid")||strstr(n,"frida")||strstr(n,"shim")||strstr(n,".fs64")) bad=1; return 0; }
@@ -64,6 +65,12 @@ int main(){
         && (unsigned long long)si.freeram*si.mem_unit==6442450944ULL
         && si.totalswap==0,"sysinfo_memory","12GiB/6GiB/0swap");
   unsigned long p=getauxval(AT_PLATFORM); check(p && strcmp((char*)p,"aarch64")==0,"getauxval_platform",p?(char*)p:"null");
+  ssize_t xattr_size=getxattr("/proc/self","security.selinux",NULL,0);
+  char selinux_context[128]={0};
+  ssize_t xattr_read=xattr_size>0 && xattr_size<=(ssize_t)sizeof(selinux_context)
+    ? getxattr("/proc/self","security.selinux",selinux_context,(size_t)xattr_size) : -1;
+  check(xattr_size>0 && xattr_read==xattr_size && selinux_context[xattr_read-1]=='\0',
+        "selinux_xattr_sizing",xattr_read>0?selinux_context:"");
   return bad?1:0;
 }
 C

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build libxenoid_zygote.so — the zygote LD_PRELOAD framework-spoof library.
+# Build the ordinary app_process64 dependency used by every zygote descendant.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCH="${1:-arm64}"
@@ -15,5 +15,10 @@ fi
 [[ -n "$BIN" ]] || { echo "$TOOL not found" >&2; exit 1; }
 SUF=""; [[ "$ARCH" == x86_64 ]] && SUF="-x86_64"
 OUT="$ROOT/native/xenoid-zygote/libxenoid_zygote$SUF.so"
-"$BIN" -O2 -fPIC -shared -fstack-protector-strong -D_FORTIFY_SOURCE=2 -o "$OUT" "$ROOT/native/xenoid-zygote/xenoid_zygote.c"
+"$BIN" -O2 -fPIC -shared -Wall -Wextra -fstack-protector-strong \
+  -Wl,-z,global -D_FORTIFY_SOURCE=2 -DXENOID_COMBINED_SHIM \
+  -o "$OUT" \
+  "$ROOT/native/xenoid-zygote/xenoid_zygote.c" \
+  "$ROOT/native/xenoid-shim/xenoid_shim.c" \
+  -ldl
 echo "$OUT"

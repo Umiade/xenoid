@@ -38,6 +38,7 @@ def source_checks() -> dict:
         "c_exec_auth": "authorized" in c and "/exec" in c,
         "java_header": "X-Xenoid-Token" in java,
         "java_token_private": "setRootdToken" in java and "/data/local/tmp/.xenoid-rootd.token" not in java,
+        "java_no_su_fallback": "su -c" not in java and "which su" not in java,
         "backend_provision": "XENOID_ROOTD_TOKEN" in py and ".xenoid-rootd.token" in py,
         "backend_reuse_daemon_token": "daemon.token" in py and "ensure_rootd_root" in py,
     }

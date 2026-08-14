@@ -5,6 +5,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -41,6 +42,28 @@ static std::string operationJson(const Operation &operation) {
             + ",\"errno\":" + std::to_string(operation.error)
             + ",\"type\":" + quote(type) + "}";
 }
+static long directSyscall(long number, long arg0, long arg1,
+                          long arg2 = 0, long arg3 = 0) {
+#if defined(__aarch64__)
+    register long x0 asm("x0") = arg0;
+    register long x1 asm("x1") = arg1;
+    register long x2 asm("x2") = arg2;
+    register long x3 asm("x3") = arg3;
+    register long x8 asm("x8") = number;
+    asm volatile("svc #0"
+                 : "+r"(x0)
+                 : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                 : "memory", "cc");
+    return x0;
+#else
+    return syscall(number, arg0, arg1, arg2, arg3);
+#endif
+}
+
+static bool rawError(long result) {
+    return result < 0 && result >= -4095;
+}
+
 
 static Operation libcStatfs(const char *path) {
     Operation operation;
@@ -55,30 +78,34 @@ static Operation libcStatfs(const char *path) {
 static Operation rawStatfs(const char *path) {
     Operation operation;
     struct statfs value{};
-    errno = 0;
-    operation.result = syscall(__NR_statfs, path, &value);
-    operation.error = operation.result == 0 ? 0 : errno;
-    if (operation.result == 0) operation.type = static_cast<unsigned long>(value.f_type);
+    long result = directSyscall(__NR_statfs, reinterpret_cast<long>(path),
+                                reinterpret_cast<long>(&value));
+    if (rawError(result)) {
+        operation.error = static_cast<int>(-result);
+        return operation;
+    }
+    operation.result = result;
+    operation.type = static_cast<unsigned long>(value.f_type);
     return operation;
 }
 
 static Operation rawFstatfs(const char *path) {
     Operation operation;
-    errno = 0;
-    int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, path,
-                                      O_RDONLY | O_CLOEXEC | O_DIRECTORY, 0));
-    if (fd < 0) {
-        operation.error = errno;
+    long fd = directSyscall(__NR_openat, AT_FDCWD, reinterpret_cast<long>(path),
+                            O_RDONLY | O_CLOEXEC | O_DIRECTORY, 0);
+    if (rawError(fd)) {
+        operation.error = static_cast<int>(-fd);
         return operation;
     }
     struct statfs value{};
-    errno = 0;
-    operation.result = syscall(__NR_fstatfs, fd, &value);
-    operation.error = operation.result == 0 ? 0 : errno;
-    if (operation.result == 0) operation.type = static_cast<unsigned long>(value.f_type);
-    int saved = operation.error;
-    syscall(__NR_close, fd);
-    errno = saved;
+    long result = directSyscall(__NR_fstatfs, fd, reinterpret_cast<long>(&value));
+    if (rawError(result)) {
+        operation.error = static_cast<int>(-result);
+    } else {
+        operation.result = result;
+        operation.type = static_cast<unsigned long>(value.f_type);
+    }
+    directSyscall(__NR_close, fd, 0);
     return operation;
 }
 
@@ -103,7 +130,13 @@ Java_org_example_filesystemruntimeprobe_ProbeActivity_nativeProbe(
         JNIEnv *env, jclass, jstring appDataPath) {
     const char *appData = appDataPath == nullptr
             ? "/data" : env->GetStringUTFChars(appDataPath, nullptr);
+    char cryptoState[PROP_VALUE_MAX] = {};
+    char cryptoType[PROP_VALUE_MAX] = {};
+    __system_property_get("ro.crypto.state", cryptoState);
+    __system_property_get("ro.crypto.type", cryptoType);
     std::string result = "{\"uid\":" + std::to_string(getuid())
+            + ",\"cryptoState\":" + quote(cryptoState)
+            + ",\"cryptoType\":" + quote(cryptoType)
             + ",\"appData\":" + pathJson(appData)
             + ",\"data\":" + dataPathJson("/data")
             + ",\"system\":" + pathJson("/system") + "}";

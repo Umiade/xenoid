@@ -8,8 +8,11 @@
 char LICENSE[] SEC("license") = "GPL";
 
 #define ENOENT 2
+#define EACCES 13
 #define PATH_BUF 128
 #define APP_UID_MIN 10000
+#define MAY_WRITE 2
+#define MAY_READ 4
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -99,6 +102,72 @@ static __always_inline bool path_hidden(const char *path)
 	       contains(path, "tricky_store") ||
 	       contains(path, "trickystore");
 }
+static __always_inline bool path_is_selinux_control(const char *path)
+{
+	return contains(path, "/sys/fs/selinux/");
+}
+
+static __always_inline bool name_is(const char *address, const char *expected,
+				    int length)
+{
+	char name[8] = {};
+	int i;
+
+	if (!address || length <= 0 || length >= sizeof(name))
+		return false;
+	if (bpf_probe_read_kernel_str(name, sizeof(name), address) < 0)
+		return false;
+	for (i = 0; i < 8; i++) {
+		if (i == length)
+			return name[i] == 0;
+		if (name[i] != expected[i])
+			return false;
+	}
+	return false;
+}
+
+static __always_inline bool inode_is_selinux_control(struct inode *inode)
+{
+	struct super_block *sb;
+	struct file_system_type *type;
+	struct kernfs_node *node;
+	const char *name;
+	int i;
+
+	if (!inode)
+		return false;
+	sb = BPF_CORE_READ(inode, i_sb);
+	if (!sb)
+		return false;
+	type = BPF_CORE_READ(sb, s_type);
+	if (!type)
+		return false;
+	name = BPF_CORE_READ(type, name);
+	if (!name_is(name, "sysfs", 5))
+		return false;
+	node = BPF_CORE_READ(inode, i_private);
+#pragma unroll
+	for (i = 0; i < 8; i++) {
+		if (!node)
+			return false;
+		name = BPF_CORE_READ(node, name);
+		if (name_is(name, "selinux", 7))
+			return true;
+		node = BPF_CORE_READ(node, parent);
+	}
+	return false;
+}
+
+static __always_inline int should_deny_inode(struct inode *inode, int mask)
+{
+	__u32 uid = (__u32)bpf_get_current_uid_gid();
+	if (uid < APP_UID_MIN || !(mask & (MAY_READ | MAY_WRITE)))
+		return 0;
+	if (!inode_is_selinux_control(inode))
+		return 0;
+	bump_deny();
+	return -EACCES;
+}
 
 static __always_inline int should_deny_file(struct file *file)
 {
@@ -118,11 +187,20 @@ static __always_inline int should_deny_file(struct file *file)
 	n = bpf_d_path(&file->f_path, path, sizeof(path));
 	if (n < 0)
 		return 0;
-	path[PATH_BUF - 1] = 0;
-	if (!path_hidden(path))
+	/* Anonymous executable descriptors are process capabilities rather than
+	 * filesystem paths. Explicit Frida inspection loads its agent this way. */
+	if (path[0] == '/' && path[1] == 'm' && path[2] == 'e' &&
+	    path[3] == 'm' && path[4] == 'f' && path[5] == 'd' &&
+	    path[6] == ':')
 		return 0;
-	bump_deny();
-	return -ENOENT;
+	path[PATH_BUF - 1] = 0;
+	if (path_is_selinux_control(path))
+		return -EACCES;
+	if (path_hidden(path)) {
+		bump_deny();
+		return -ENOENT;
+	}
+	return 0;
 }
 
 SEC("lsm/file_open")
@@ -136,6 +214,21 @@ int BPF_PROG(xenoid_fmod_security_file_open, struct file *file)
 {
 	return should_deny_file(file);
 }
+SEC("lsm/inode_permission")
+int BPF_PROG(xenoid_lsm_inode_permission, struct inode *inode, int mask)
+{
+	return should_deny_inode(inode, mask);
+}
+
+SEC("fmod_ret/security_inode_permission")
+int BPF_PROG(xenoid_fmod_security_inode_permission, struct inode *inode,
+	     int mask, int ret)
+{
+	if (ret)
+		return ret;
+	return should_deny_inode(inode, mask);
+}
+
 
 /* Rewrite application-visible uname fields to the configured Android kernel
  * identity. bpf_probe_write_user is available to this GPL program. */
@@ -200,6 +293,17 @@ SEC("kprobe/security_file_open")
 int BPF_KPROBE(xenoid_kprobe_security_file_open, struct file *file)
 {
 	int ret = should_deny_file(file);
+
+	if (ret)
+		bpf_override_return(ctx, (unsigned long)ret);
+	return 0;
+}
+
+SEC("kprobe/security_inode_permission")
+int BPF_KPROBE(xenoid_kprobe_security_inode_permission, struct inode *inode,
+	       int mask)
+{
+	int ret = should_deny_inode(inode, mask);
 
 	if (ret)
 		bpf_override_return(ctx, (unsigned long)ret);

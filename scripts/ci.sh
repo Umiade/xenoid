@@ -91,6 +91,7 @@ STATIC_SMOKES=(
   smoke-rootd-auth.py
   smoke-hook-surfaces.py
   smoke-frida-install.py
+  smoke-app-process-needed.py
   smoke-install-runtime.py
   smoke-idstore-helper.py
   smoke-input-profile.py

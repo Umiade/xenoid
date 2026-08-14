@@ -114,14 +114,17 @@ contracts = {
         "facing": "Back",
         "jpeg": [
             (4080, 3072), (3840, 2160), (1920, 1080),
-            (1280, 720), (640, 480), (320, 240),
+            (1440, 1080), (1280, 960), (1280, 720),
+            (1024, 768), (800, 600), (640, 480), (320, 240),
         ],
         "nonstall": [
-            (1920, 1080), (1280, 720), (640, 480), (320, 240),
+            (1920, 1080), (1440, 1080), (1280, 960),
+            (1280, 720), (1024, 768), (800, 600),
+            (640, 480), (320, 240),
         ],
         "blobStalls": [
-            220000000, 180000000, 100000000,
-            70000000, 30000000, 15000000,
+            220000000, 180000000, 100000000, 90000000, 80000000,
+            70000000, 50000000, 40000000, 30000000, 15000000,
         ],
     },
     "1": {
@@ -433,7 +436,7 @@ if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(LD_PRELOAD=/data/local/tmp/.ld/cor
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test ! -e /system/xbin/su && test ! -e /system/bin/su && ! ls /data/local/tmp/libxenoid_*.so >/dev/null 2>&1' >/tmp/xenoid-smoke-leak-surfaces.out 2>&1; then add hide_leak_surfaces true "su paths and retired top-level libraries absent"; else add hide_leak_surfaces false "$(cat /tmp/xenoid-smoke-leak-surfaces.out)"; fi
 
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'test "$(getprop ro.oem_unlock_supported)" = 1 && test "$(getprop sys.oem_unlock_allowed)" = 0 && test "$(getprop ro.boot.warranty_bit)" = 0 && test "$(getprop ro.warranty_bit)" = 0 && test "$(getprop ro.build.version.security_patch)" = 2022-10-05 && test "$(getprop ro.vendor.build.security_patch)" = 2022-10-05' >/tmp/xenoid-smoke-oem.out 2>&1; then add oem_unlock_attestation_props true "oem_unlock_supported=1 oem_unlock_allowed=0 warranty=0 security_patch=2022-10-05"; else add oem_unlock_attestation_props false "$(cat /tmp/xenoid-smoke-oem.out)"; fi
-if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /sys/fs/selinux/enforce ]; then test "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = 1 && test "$(cat /sys/fs/selinux/policyvers 2>/dev/null)" = 33; else exit 77; fi' >/tmp/xenoid-smoke-selinux.out 2>&1; then add selinuxfs true "enforce=1 policyvers=33"; else rc=$?; if [ "$rc" = 77 ]; then add selinuxfs true "no /sys/fs/selinux on this runtime; skip"; else add selinuxfs false "$(cat /tmp/xenoid-smoke-selinux.out)"; fi; fi
+if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /sys/fs/selinux/enforce ]; then test "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = 1 && test "$(cat /sys/fs/selinux/policyvers 2>/dev/null)" = 33 && test "$(cat /sys/fs/selinux/class/process/index 2>/dev/null)" = 51 && test "$(cat /sys/fs/selinux/class/security/index 2>/dev/null)" = 58 && test ! -e /sys/fs/selinux/class/index/process && printf "%s" "u:r:app_zygote:s0" > /sys/fs/selinux/context && ! printf "%s" "u:r:adbroot:s0" > /sys/fs/selinux/context; else exit 77; fi' >/tmp/xenoid-smoke-selinux.out 2>&1; then add selinuxfs true "enforce=1 policyvers=33 class indices at stock paths and context controls agree"; else rc=$?; if [ "$rc" = 77 ]; then add selinuxfs true "no /sys/fs/selinux on this runtime; skip"; else add selinuxfs false "$(cat /tmp/xenoid-smoke-selinux.out)"; fi; fi
 
 if "$ADB_BIN" -s "$ADB_TARGET" shell '! grep -q :15B3 /proc/net/tcp /proc/net/tcp6 2>/dev/null' >/tmp/xenoid-smoke-proc-5555.out 2>&1; then add proc_tcp_5555_hidden true "no :15B3"; else add proc_tcp_5555_hidden false "$(cat /tmp/xenoid-smoke-proc-5555.out)"; fi
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'if [ -e /proc/sys/kernel/random/entropy_avail ]; then test "$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null)" = 4096 && test "$(cat /proc/sys/kernel/random/poolsize 2>/dev/null)" = 4096 && test "$(cat /proc/sys/kernel/random/urandom_min_reseed_secs 2>/dev/null)" = 60; else exit 77; fi' >/tmp/xenoid-smoke-random-sysctl.out 2>&1; then add random_sysctls true "random entropy/pool/reseed sanitized"; else rc=$?; if [ "$rc" = 77 ]; then add random_sysctls true "no random sysctl files on this runtime; skip"; else add random_sysctls false "$(cat /tmp/xenoid-smoke-random-sysctl.out)"; fi; fi

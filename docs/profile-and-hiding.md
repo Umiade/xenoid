@@ -91,7 +91,9 @@ Policy surfaces include:
 - debug/test-key properties
 - package visibility
 
-Global hiding is enforced by prop-area, bind overlays, kmod/eBPF, and the zygote preload layer; the daemon, CLI, and MCP expose one policy contract.
+Global hiding is enforced by prop-area, bind overlays, kmod/eBPF, and the ordinary `app_process64` compatibility dependency; the daemon, CLI, and MCP expose one policy contract.
+
+The engine host does not pretend to run Android's SELinux policy. Kmod owns compatibility labels and SELinuxfs metadata; eBPF denies ordinary Android application reads and writes to those control nodes with `EACCES`, matching the Android 13 application boundary. Isolated applications are also denied ptrace and non-Unix socket creation at the corresponding kernel security hooks. These controls preserve application-visible isolation without claiming that the host kernel can answer arbitrary Android SELinux policy-oracle queries.
 
 ## Native hide helper
 
@@ -102,7 +104,7 @@ xenoid-hide status
 xenoid-hide apply [policy.json]
 ```
 
-The daemon calls `/data/local/tmp/xenoid-hide-helper status/apply` when deployed. This provides native surface inspection and policy staging; enforcement lives in prop-area, overlay, kmod/eBPF and the zygote preload shim.
+The daemon calls `/data/local/tmp/xenoid-hide-helper status/apply` when deployed. This provides native surface inspection and policy staging; enforcement lives in prop-area, overlay, kmod/eBPF, and the zygote compatibility shim.
 
 ## Frida app-process hiding
 

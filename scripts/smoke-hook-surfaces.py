@@ -244,7 +244,15 @@ checks = {
     ),
     **sensor_checks,
     "ebpf_bpf_source": "file_open" in ebpf_bpf,
-    "ebpf_loader": len(ebpf_loader) > 0,
+    "ebpf_preserves_anonymous_fds": (
+        "Anonymous executable descriptors" in ebpf_bpf
+        and "path[6] == ':'" in ebpf_bpf
+    ),
+    "ebpf_loader": (
+        "bpf_lsm_active" in ebpf_loader
+        and 'strcmp(attach_out, "lsm/file_open")' in ebpf_loader
+        and "mode == MODE_LSM && !bpf_lsm_active()" in ebpf_loader
+    ),
     "ebpf_scripts": (
         (ROOT / "scripts/build-ebpf.sh").exists()
         and (ROOT / "scripts/load-ebpf.sh").exists()

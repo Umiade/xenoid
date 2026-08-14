@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -12,6 +13,7 @@
 #endif
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
 #include "xenoid_power_supply.h"
 
@@ -100,14 +102,33 @@ static char *first_or_default(const char *path, const char *fallback) {
 
 
 
-static char *read_mountinfo_limited(void) {
-  int fd=open("/proc/self/mountinfo",O_RDONLY|O_CLOEXEC); if(fd<0) return strdup("");
-  size_t cap=1<<20, n=0; char *b=calloc(1,cap+1); if(!b){close(fd); return strdup("");}
-  /* Read to EOF with a growing buffer: a 1 MiB cap silently truncated large
-     mount tables and made count_in_mountinfo return 0 for mounted targets,
-     which led apply() to stack duplicate bind mounts (~98k after repeats). */
-  for(;;){ if(n==cap){ cap*=2; char *nb=realloc(b,cap+1); if(!nb){break;} b=nb; } ssize_t r=read(fd,b+n,cap-n); if(r<=0) break; n+=(size_t)r; }
-  close(fd); b[n]=0; return b;
+static char *read_mountinfo(void) {
+  int fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return NULL;
+  size_t cap = 1 << 20, n = 0;
+  char *b = calloc(1, cap + 1);
+  if (!b) { close(fd); return NULL; }
+  for (;;) {
+    if (n == cap) {
+      if (cap > SIZE_MAX / 2 - 1) { free(b); close(fd); errno = EOVERFLOW; return NULL; }
+      cap *= 2;
+      char *nb = realloc(b, cap + 1);
+      if (!nb) { free(b); close(fd); return NULL; }
+      b = nb;
+    }
+    ssize_t r = read(fd, b + n, cap - n);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      free(b);
+      close(fd);
+      return NULL;
+    }
+    if (r == 0) break;
+    n += (size_t)r;
+  }
+  close(fd);
+  b[n] = 0;
+  return b;
 }
 
 static const char *overlay_targets[] = {
@@ -147,6 +168,7 @@ static const char *overlay_targets[] = {
   "/sys/kernel/debug/tracing/uprobe_events", "/sys/kernel/debug/tracing/trace", "/sys/kernel/tracing/available_filter_functions",
   "/sys/kernel/tracing/enabled_functions", "/sys/kernel/tracing/kprobe_events", "/sys/kernel/tracing/uprobe_events", "/sys/kernel/tracing/trace",
   "/sys/fs/selinux/enforce", "/sys/fs/selinux/policyvers", "/sys/fs/selinux/mls",
+  "/sys/fs/selinux/checkreqprot", "/sys/fs/selinux/status",
   "/sys/devices/virtual/dmi/id/product_name", "/sys/devices/virtual/dmi/id/sys_vendor", "/sys/hypervisor/type",
   "/etc/hosts", "/proc/sys/kernel/hostname", "/proc/sys/kernel/domainname", "/proc/sys/kernel/tainted",
   "/sys/class/power_supply/battery",
@@ -195,7 +217,8 @@ static int resolve_overlay_target(const char *target, char *resolved, size_t n) 
 }
 
 static int status_json(void) {
-  char *mi=read_mountinfo_limited();
+  char *mi=read_mountinfo();
+  if (!mi) { fprintf(stderr, "mountinfo read failed: %s\n", strerror(errno)); return 1; }
   int expected_count=0, active_count=0, missing=0, duplicates=0;
   for(int i=0; overlay_targets[i]; i++){
     char resolved[PATH_MAX];
@@ -244,7 +267,8 @@ static int cleanup_legacy_cpu_detail_mounts(const char *mi) {
 }
 static int cleanup(void) {
   int fail=0;
-  char *mi=read_mountinfo_limited();
+  char *mi=read_mountinfo();
+  if (!mi) { fprintf(stderr, "mountinfo read failed: %s\n", strerror(errno)); return 1; }
   fail += cleanup_legacy_cpu_detail_mounts(mi);
   for(int i=0; overlay_targets[i]; i++){
     char resolved[PATH_MAX];
@@ -262,8 +286,8 @@ static int cleanup(void) {
 }
 
 static int target_mounted(const char *target) {
-  char *mi = read_mountinfo_limited();
-  if (!mi || !mi[0]) { free(mi); return 0; }
+  char *mi = read_mountinfo();
+  if (!mi) return -1;
   char pat[512]; snprintf(pat, sizeof(pat), " %s ", target);
   int found = strstr(mi, pat) != NULL;
   free(mi); return found;
@@ -297,7 +321,9 @@ static int bind_file(const char *fake, const char *target) {
      the resolved target. */
   char resolved[PATH_MAX];
   const char *t = resolve_overlay_target(target, resolved, sizeof(resolved)) ? resolved : target;
-  if (target_mounted(t)) {
+  int mounted = target_mounted(t);
+  if (mounted < 0) return -1;
+  if (mounted) {
     mark_mounted(t);
     return 0;
   }
@@ -309,14 +335,18 @@ static int bind_file(const char *fake, const char *target) {
      dentry that vanishes with the helper. Prefer NOSYMFOLLOW for /proc paths. */
   unsigned long flags = MS_BIND;
   if (strncmp(t, "/proc/", 6) == 0) flags |= MS_NOSYMFOLLOW;
-  if (mount(fake, t, NULL, flags, NULL) == 0) {
-    /* Stop shared-peer-group propagation: /data on redroid sits in a shared
-       group, and a bind without MS_PRIVATE propagates into thousands of peer
-       mounts (observed 4096 stacked copies per target). */
-    mount(NULL, t, NULL, MS_PRIVATE, NULL);
-    mark_mounted(t); return 0;
+  if (mount(fake, t, NULL, flags, NULL) != 0) return -1;
+  /* Stop shared-peer-group propagation: /data on redroid sits in a shared
+     group, and a bind without MS_PRIVATE propagates into thousands of peer
+     mounts (observed 4096 stacked copies per target). */
+  if (mount(NULL, t, NULL, MS_PRIVATE, NULL) != 0) {
+    int saved_errno = errno;
+    umount2(t, MNT_DETACH);
+    errno = saved_errno;
+    return -1;
   }
-  return -1;
+  mark_mounted(t);
+  return 0;
 }
 
 static int overlay_text(const char *name, const char *target, const char *content) {
@@ -533,13 +563,6 @@ static int overlay_kernel_device_tables(void) {
   return fail ? -1 : 0;
 }
 
-static int overlay_selinuxfs(void) {
-  int fail = 0;
-  fail += overlay_text_optional("selinux_enforce", "/sys/fs/selinux/enforce", "1\n") != 0;
-  fail += overlay_text_optional("selinux_policyvers", "/sys/fs/selinux/policyvers", "33\n") != 0;
-  fail += overlay_text_optional("selinux_mls", "/sys/fs/selinux/mls", "1\n") != 0;
-  return fail ? -1 : 0;
-}
 
 static int overlay_rtc_sysfs(void) {
   int fail = 0;
@@ -1027,7 +1050,17 @@ static int overlay_memory_proc_details(void) {
 
 static int overlay_cpu_proc_stats(void) {
   int fail = 0;
-  const char *stat =
+  struct timespec realtime;
+  struct timespec boottime;
+  char stat[1024];
+  long long boot_epoch;
+  int written;
+  if (clock_gettime(CLOCK_REALTIME, &realtime) ||
+      clock_gettime(CLOCK_BOOTTIME, &boottime)) return -1;
+  boot_epoch = (long long)realtime.tv_sec - (long long)boottime.tv_sec -
+    (realtime.tv_nsec < boottime.tv_nsec);
+  written = snprintf(
+    stat, sizeof(stat),
     "cpu  120000 800 45000 900000 1200 0 4000 0 0 0\n"
     "cpu0 15000 100 5600 112000 150 0 500 0 0 0\n"
     "cpu1 14800 100 5500 113000 140 0 480 0 0 0\n"
@@ -1039,10 +1072,12 @@ static int overlay_cpu_proc_stats(void) {
     "cpu7 12800 110 5100 116500 160 0 440 0 0 0\n"
     "intr 1234567\n"
     "ctxt 3456789\n"
-    "btime 1715040000\n"
+    "btime %lld\n"
     "processes 12345\n"
     "procs_running 1\n"
-    "procs_blocked 0\n";
+    "procs_blocked 0\n",
+    boot_epoch);
+  if (written < 0 || (size_t)written >= sizeof(stat)) return -1;
   const char *softirqs =
     "                    CPU0       CPU1       CPU2       CPU3       CPU4       CPU5       CPU6       CPU7\n"
     "          HI:          0          0          0          0          0          0          0          0\n"
@@ -1072,7 +1107,6 @@ static int overlay_cpu_proc_stats(void) {
 
 static int overlay_kernel_proc_misc(void) {
   int fail = 0;
-  fail += overlay_text_optional("proc_uptime", "/proc/uptime", "86400.00 86000.00\n") != 0;
   fail += overlay_text_optional("proc_loadavg", "/proc/loadavg", "0.42 0.38 0.31 1/812 12345\n") != 0;
   fail += overlay_text_optional("proc_swaps", "/proc/swaps", "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n") != 0;
   fail += overlay_text_optional("proc_filesystems", "/proc/filesystems",
@@ -1567,7 +1601,6 @@ static int apply(void) {
   if (overlay_cpu_sysfs()) { printf("cpu_sysfs=fail:%s\n", strerror(errno)); fail++; } else printf("cpu_sysfs=ok\n");
   if (overlay_storage_proc()) { printf("storage_proc=fail:%s\n", strerror(errno)); fail++; } else printf("storage_proc=ok\n");
   if (overlay_block_sysfs()) { printf("block_sysfs=fail:%s\n", strerror(errno)); fail++; } else printf("block_sysfs=ok\n");
-  if (overlay_selinuxfs()) { printf("selinuxfs=fail:%s\n", strerror(errno)); fail++; } else printf("selinuxfs=ok\n");
   if (overlay_kallsyms_tracing()) { printf("kallsyms_tracing=fail:%s\n", strerror(errno)); fail++; } else printf("kallsyms_tracing=ok\n");
   if (overlay_kernel_virtualization_texts()) { printf("virtualization_texts=fail:%s\n", strerror(errno)); fail++; } else printf("virtualization_texts=ok\n");
   if (overlay_kernel_device_tables()) { printf("kernel_device_tables=fail:%s\n", strerror(errno)); fail++; } else printf("kernel_device_tables=ok\n");
@@ -1587,7 +1620,8 @@ static int apply(void) {
 }
 static int revert(void) {
   int fail = 0;
-  char *mi = read_mountinfo_limited();
+  char *mi = read_mountinfo();
+  if (!mi) { fprintf(stderr, "mountinfo read failed: %s\n", strerror(errno)); return 1; }
   fail += cleanup_legacy_cpu_detail_mounts(mi);
   free(mi);
   for (int i=0; overlay_targets[i]; ++i) { if (umount2(overlay_targets[i], MNT_DETACH) && errno != EINVAL) { printf("%s=umount_fail:%s\n", overlay_targets[i], strerror(errno)); fail++; } else { unmark_mounted(overlay_targets[i]); printf("%s=umount_ok\n", overlay_targets[i]); } }

@@ -298,7 +298,7 @@ The daemon requires the init-managed native input service. Its persistent profil
 ./xenoid ebpf status
 ```
 
-Production protection combines image state, property-area normalization, mount overlays, the zygote preload layer, eBPF/kernel enforcement, and framework/HAL services. `up` owns deployment and activation; individual build/load commands are for diagnosis and development.
+Production protection combines image state, property-area normalization, mount overlays, the zygote compatibility layer, eBPF/kernel enforcement, and framework/HAL services. Kmod/eBPF own SELinux compatibility metadata, ordinary-app access denial, and isolated-app ptrace parity; per-instance overlays do not remount SELinux controls. `up` owns deployment and activation; individual build/load commands are for diagnosis and development.
 
 ## Build and release
 

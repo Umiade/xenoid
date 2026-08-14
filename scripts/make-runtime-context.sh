@@ -24,7 +24,6 @@ PROFILE="$ROOT/native/xenoid-profile/xenoid-profile"
 NETCTL="$ROOT/native/xenoid-netctl/xenoid-netctl"
 PROP_AREA="$ROOT/native/xenoid-hide/xenoid-prop-area"
 ZYGOTE="$ROOT/native/xenoid-zygote/libxenoid_zygote.so"
-SHIM="$ROOT/native/xenoid-shim/libxenoid_shim-arm64.so"
 PIVOT="$ROOT/native/xenoid-pivot/xenoid-pivot"
 SENSORSHAL="$ROOT/native/xenoid-sensorshal/xenoid-sensorshal"
 CAMERA_PROVIDER="$ROOT/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
@@ -48,7 +47,6 @@ python3 "$ROOT/scripts/smoke-hardware-features.py" --contract "$HARDWARE_FEATURE
 [[ -f "$PROP_AREA" ]] || "$ROOT/scripts/build-native-for-arch.sh" xenoid-prop-area "$ROOT/native/xenoid-hide/xenoid_prop_area.c" "$PROP_AREA" arm64 >/dev/null
 [[ -f "$PIVOT" ]] || "$ROOT/scripts/build-native-for-arch.sh" xenoid-pivot "$ROOT/native/xenoid-pivot/xenoid_pivot.c" "$PIVOT" arm64 static >/dev/null
 [[ -f "$ZYGOTE" ]] || "$ROOT/scripts/build-native-zygote.sh" arm64 >/dev/null
-[[ -f "$SHIM" ]] || "$ROOT/scripts/build-native-shim.sh" arm64 prop >/dev/null
 [[ -f "$SENSORSHAL" ]] || "$ROOT/scripts/build-sensors-hal.sh" arm64 >/dev/null
 [[ -f "$GRALLOC" ]] || "$ROOT/scripts/build-gralloc.sh" arm64 >/dev/null
 [[ -f "$HWCOMPOSER" ]] || "$ROOT/scripts/build-hwcomposer.sh" arm64 >/dev/null
@@ -99,16 +97,9 @@ cmp -s "$HARDWARE_FEATURES" "$OUT/payload/xenoid-hardware-features.xml" || {
   exit 1
 }
 cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/privapp-permissions-xenoid.xml" "$OUT/payload/privapp-permissions-xenoid.xml"
-if [[ "${XENOID_ZYGOTE_PRELOAD:-1}" == "0" ]]; then
-  # Explicit source experiments may disable the preload; production acceptance requires it.
-  rm -f "$OUT/payload/libpiex_shim.so"
-else
-  cp "$ZYGOTE" "$OUT/payload/libpiex_shim.so"
-  cp "$SHIM" "$OUT/payload/libxenoid_core.so"
-fi
-# Inject the zygote LD_PRELOAD spoof lib: take the base image's zygote rc and add a
-# setenv so every app forked from zygote inherits the interposition (system-wide
-# Build/sensor spoofing with no Magisk/frida footprint).
+cp "$ZYGOTE" "$OUT/payload/libpiex_shim.so"
+# app_process64 loads the compatibility layer as an ordinary leading
+# dependency. Unlike LD_PRELOAD this does not populate bionic's preload vector.
 if command -v docker >/dev/null 2>&1; then
   _cid=$("${DOCKER[@]}" create "$IMAGE" 2>/dev/null || true)
   if [[ -n "$_cid" ]]; then "${DOCKER[@]}" cp "$_cid:/system/etc/init/hw/init.zygote64.rc" "$OUT/payload/init.zygote64.rc" >/dev/null 2>&1 || true
@@ -129,6 +120,7 @@ if command -v docker >/dev/null 2>&1; then
     # Preserve the base image's redroid implementations under those names so
     # the canonical hardware identity is correct before graphics initialization.
     _required_extract_ok=1
+    "${DOCKER[@]}" cp "$_cid:/system/bin/app_process64" "$OUT/payload/app_process64" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libui.so" "$OUT/payload/libui.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libselinux.so" "$OUT/payload/libselinux.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/hw/gralloc.redroid.so" "$OUT/payload/gralloc.base.redroid.so" >/dev/null || _required_extract_ok=0
@@ -151,6 +143,7 @@ if command -v docker >/dev/null 2>&1; then
       _props_args+=(--setupwizard-mode DISABLED)
     fi
     python3 "${_props_args[@]}"
+    python3 "$ROOT/scripts/patch-app-process-needed.py" "$OUT/payload/app_process64"
     python3 "$ROOT/scripts/patch-runtime-libselinux.py" "$OUT/payload/libselinux.so"
     python3 "$ROOT/scripts/patch-telephony-legacy-lte-band.py"       "$OUT/payload/telephony-common.base.jar" "$OUT/payload/telephony-common.jar"
     rm -f "$OUT/payload/telephony-common.base.jar"
@@ -198,7 +191,7 @@ for offset, original, replacement in patches:
     )
     data[offset:offset + len(original)] = replacement
 keymaster.write_bytes(data)
-print("verified base-image graphics ABI and patched SoftKeymaster RootOfTrust")
+print("verified graphics ABI and retained SoftKeymaster software security level")
 PY3
     rm -f "$OUT/payload/gralloc.base.redroid.so"
     python3 - "$OUT/payload/libandroid_runtime.so" <<'PY2'
@@ -263,28 +256,6 @@ PY4
 else
   echo "docker is required to extract runtime payloads from $IMAGE" >&2
   exit 1
-fi
-if [[ "${XENOID_ZYGOTE_PRELOAD:-1}" == "1" ]] && [[ -s "$OUT/payload/init.zygote64.rc" ]]; then
-  python3 - "$OUT/payload/init.zygote64.rc" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-lines = path.read_text().splitlines(keepends=True)
-required = ["/system/lib64/libpiex_shim.so", "/system/lib64/libxenoid_core.so"]
-for index, line in enumerate(lines):
-    stripped = line.strip()
-    if not stripped.startswith("setenv LD_PRELOAD "):
-        continue
-    current = stripped.removeprefix("setenv LD_PRELOAD ").split(":")
-    value = ":".join([*required, *(item for item in current if item and item not in required)])
-    indent = line[: len(line) - len(line.lstrip())]
-    lines[index] = f"{indent}setenv LD_PRELOAD {value}\n"
-    break
-else:
-    lines.insert(1 if lines else 0, f"    setenv LD_PRELOAD {':'.join(required)}\n")
-path.write_text("".join(lines))
-PY
 fi
 cat > "$OUT/payload/xenoid.rc" <<'RC'
 on early-init
@@ -453,8 +424,8 @@ COPY --chmod=644 payload/libpuresoftkeymasterdevice.so /vendor/lib64/libpuresoft
 COPY --chmod=644 payload/services.jar /system/framework/services.jar
 # Legacy HIDL LTE identities derive bands from EARFCN and use profile bandwidth.
 COPY --chmod=644 payload/telephony-common.jar /system/framework/telephony-common.jar
-__PRELOAD_COPY__
-__CORE_COPY__
+COPY --chmod=755 payload/app_process64 /system/bin/app_process64
+COPY --chmod=644 payload/libpiex_shim.so /system/lib64/libpiex_shim.so
 COPY payload/props/system_build.prop /system/build.prop
 COPY payload/props/vendor_build.prop /vendor/build.prop
 COPY payload/props/product_build.prop /system/product/etc/build.prop
@@ -466,13 +437,12 @@ COPY payload/props/odm_dlkm_build.prop /vendor/odm_dlkm/etc/build.prop
 COPY payload/XenoidDaemon /system/priv-app/XenoidDaemon
 COPY payload/xenoid-daemon.apk /data/local/tmp/xenoid-daemon.apk
 DOCKER
-python3 - "$OUT/Dockerfile" "${XENOID_ZYGOTE_PRELOAD:-1}" "$GOOGLE_PROVIDER" "$GOOGLE_RELEASE" "$GOOGLE_SPEC_SHA256" "$GOOGLE_DATA_COMPAT_SHA256" <<'PY'
+python3 - "$OUT/Dockerfile" "$GOOGLE_PROVIDER" "$GOOGLE_RELEASE" "$GOOGLE_SPEC_SHA256" "$GOOGLE_DATA_COMPAT_SHA256" <<'PY'
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
-preload_enabled = sys.argv[2] == "1"
-provider, release, spec_sha256, data_compat_sha256 = sys.argv[3:7]
+provider, release, spec_sha256, data_compat_sha256 = sys.argv[2:6]
 values = (provider, release, spec_sha256, data_compat_sha256)
 google_enabled = any(values)
 if google_enabled and (
@@ -498,18 +468,6 @@ if google_enabled:
 text = path.read_text()
 text = text.replace("__GOOGLE_LABELS__", google_labels)
 text = text.replace("__GOOGLE_COPY__", google_copy)
-text = text.replace(
-    "__PRELOAD_COPY__",
-    "COPY payload/libpiex_shim.so /system/lib64/libpiex_shim.so"
-    if preload_enabled
-    else "",
-)
-text = text.replace(
-    "__CORE_COPY__",
-    "COPY --chmod=755 payload/libxenoid_core.so /system/lib64/libxenoid_core.so"
-    if preload_enabled
-    else "",
-)
 path.write_text(text)
 PY
 cat >> "$OUT/Dockerfile" <<'DOCKER'
