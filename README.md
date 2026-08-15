@@ -91,7 +91,7 @@ Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Li
 ./xenoid --instance phone-a stop
 ```
 
-Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity.
+Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity. `./xenoid device regenerate` goes further: it rotates the stable identifiers, the lease network epoch (container MAC), the boot-scoped values, the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country) on a live instance — and on GMS instances clears the Google services apps so the app-readable advertising ID regenerates — then recreates the container and re-converges through the standard `up` pipeline, making the instance present as a brand-new same-model device while preserving user data and the location country/carrier.
 
 The "equivalent to a unique real device" acceptance scope is Android user/data/keystore/account-facing state and instance identity/lifecycle. Xenoid does not simulate physical telephony, SMS, or hardware sensors that the host does not provide.
 
@@ -173,7 +173,7 @@ The device location is an explicit, proxy-independent identity: country, system 
 ./xenoid location set US
 ```
 
-Re-selecting the current country is a no-op. Switching countries recreates the owned Android container exactly once; hardware identifiers (IMEI, serial, Android ID, MAC/IP lease) do not change, and switching back to a previously used country restores that country's original SIM, phone number, and cell identity. A `./xenoid location set` that rotates the country performs its own container recreate; run `./xenoid up` afterwards to re-validate the complete production state. Phone numbers are stable synthetic identities shaped from pinned libphonenumber country metadata; they are not real assigned numbers and carry no voice/SMS service. The global proxy never reads or changes this identity, and proxy mutations never restart the runtime.
+Re-selecting the current country is a no-op. Switching countries recreates the owned Android container exactly once; hardware identifiers (IMEI, serial, Android ID, MAC/IP lease) do not change, and switching back to a previously used country restores that country's SIM, phone number, and cell identity within the same SIM epoch; `device regenerate` rotates the SIM epoch (a fresh SIM for the current country). A `./xenoid location set` that rotates the country performs its own container recreate; run `./xenoid up` afterwards to re-validate the complete production state. Phone numbers are stable synthetic identities shaped from pinned libphonenumber country metadata; they are not real assigned numbers and carry no voice/SMS service. The global proxy never reads or changes this identity, and proxy mutations never restart the runtime.
 
 ## Global proxy
 
@@ -285,6 +285,14 @@ Apply the profile's explicit unique identifiers without generating replacement v
 ```bash
 ./xenoid device apply examples/fingerprints/pixel-raven-android13.json --keep-unique
 ```
+
+Rotate every per-device uniqueness factor on a running instance and re-converge it as a brand-new same-model device:
+
+```bash
+./xenoid device regenerate
+```
+
+`device regenerate` rotates the stable identifiers (Android ID, serial, IMEI/IMEISV with the pinned raven TAC), the lease network epoch (container MAC), the boot-scoped values (`boot_id`, `random_uuid`), the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country), then recreates the container and re-runs the standard `up` convergence and validation; on GMS instances it also clears the Google services apps so the app-readable advertising ID regenerates (this removes Google account sign-in state, so signing in again is required). User data, installed apps, keystore state, and the location country/carrier are preserved (new phone, new SIM, restored data). `--skip-build` and `--dry-run` behave like their `up` counterparts. An interrupted regenerate is journaled: `start`/`up` fail closed with `device_regeneration_pending` until `device regenerate` is re-run to completion.
 
 Generate app-layer and service-layer Frida profiles:
 

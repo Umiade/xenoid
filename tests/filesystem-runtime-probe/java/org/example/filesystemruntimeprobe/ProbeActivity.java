@@ -89,6 +89,17 @@ public final class ProbeActivity extends Activity {
             result = errorObject(error);
         }
         Log.i(TAG, result.toString());
+        // logcat truncates long lines; the result file is the lossless channel.
+        try {
+            java.io.File dir = getExternalFilesDir(null);
+            java.io.FileOutputStream stream = new java.io.FileOutputStream(
+                    new java.io.File(dir, "probe-result.json"));
+            stream.write(result.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            stream.getFD().sync();
+            stream.close();
+        } catch (Exception writeFailure) {
+            Log.w(TAG, "file write failed", writeFailure);
+        }
         try { unbindService(connection); } catch (Exception ignored) { }
         finish();
     }

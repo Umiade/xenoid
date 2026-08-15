@@ -16,6 +16,8 @@ from .config import InstanceContext, InstanceError
 
 IDENTITY_SCHEMA = "dev.xenoid.device-identity/v1"
 STATE_FILENAME = "device-identity.json"
+REGENERATE_SCHEMA = "dev.xenoid.device-regenerate/v1"
+REGENERATE_FILENAME = "device-regenerate.json"
 _EPOCH_DOMAIN = b"xenoid-device-epoch/v1\0"
 _ANDROID_ID = re.compile(r"^[0-9a-f]{16}$")
 _SERIAL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,31}$")
@@ -26,6 +28,7 @@ _EPOCH = re.compile(r"^[0-9a-f]{64}$")
 _STABLE_KEYS = {"androidId", "serial", "imei", "imeisv"}
 _BOOT_KEYS = {"containerEpoch", "bootId", "randomUuid", "phase", "createdAt"}
 _STATE_KEYS = {"schema", "instanceId", "stable", "active", "pending", "updatedAt"}
+_SEED_EPOCH = "0" * 64
 _FIELD_MAP = {
     "android_id": "androidId",
     "settings.secure.android_id": "androidId",
@@ -83,9 +86,13 @@ def _valid_imei(value: str) -> bool:
     return bool(_IMEI.fullmatch(value)) and _imei_check_digit(value[:14]) == value[14]
 
 
+_IMEI_TAC = "35180461"  # Google Pixel 6 Pro (G8V0U) Type Allocation Code
+
+
 def _generate_stable() -> dict[str, str]:
-    first_fourteen = str(secrets.randbelow(9) + 1) + "".join(
-        str(secrets.randbelow(10)) for _ in range(13)
+    # TAC is a same-model constant; only the 6-digit serial section rotates.
+    first_fourteen = _IMEI_TAC + "".join(
+        str(secrets.randbelow(10)) for _ in range(6)
     )
     return {
         "androidId": secrets.token_hex(8),
@@ -147,6 +154,71 @@ def _validate_boot(raw: Any, expected_phase: str) -> Optional[dict[str, Any]]:
         "phase": expected_phase,
         "createdAt": created,
     }
+
+
+class RegenerationJournal:
+    """Crash journal for an in-flight `device regenerate`.
+
+    Marked before the first mutation and cleared only after the storage
+    identity commits. While present, runtime startup fails closed with
+    `device_regeneration_pending` so an interrupted regenerate can never
+    silently converge into a half-rotated device; re-running
+    `device regenerate` resumes and completes it.
+    """
+
+    def __init__(self, context: InstanceContext):
+        self.context = context
+        self.path = context.state_root / REGENERATE_FILENAME
+
+    def pending(self) -> bool:
+        return self.path.is_file()
+
+    def mark(self) -> None:
+        self.context.state_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.context.state_root.chmod(0o700)
+        payload = (
+            json.dumps(
+                {
+                    "schema": REGENERATE_SCHEMA,
+                    "instanceId": self.context.instance_id,
+                    "startedAt": _now(),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.context.state_root)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb", closefd=True) as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            self.path.chmod(0o600)
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def clear(self) -> None:
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return
+        directory_fd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 class DeviceIdentityStore:
@@ -269,6 +341,13 @@ class DeviceIdentityStore:
         active = state["active"]
         if pending is not None and pending["containerEpoch"] == epoch:
             return state, pending
+        if pending is not None and pending["containerEpoch"] == _SEED_EPOCH:
+            # Offline-seeded values bind to the first epoch they converge into,
+            # so the values written into the data image before boot match the
+            # ones applied after it.
+            boot = {**pending, "containerEpoch": epoch}
+            state = self.save({**state, "pending": boot, "updatedAt": _now()})
+            return state, state["pending"]
         if active is not None and active["containerEpoch"] == epoch:
             return state, active
         boot = {
@@ -280,6 +359,26 @@ class DeviceIdentityStore:
         }
         state = self.save({**state, "pending": boot, "updatedAt": _now()})
         return state, state["pending"]
+
+    def seed_next_boot(self) -> dict[str, Any]:
+        """Pre-seed the boot-scoped values the next new container epoch will use.
+
+        `start()` calls this on every container creation and writes the values
+        into the offline data image before first boot, so the zygote boot
+        snapshot and the post-boot live apply agree.
+        """
+        state = self.load()
+        if state is None:
+            raise IdentityError("device_identity_not_initialized", "device identity is not initialized")
+        boot = {
+            "containerEpoch": _SEED_EPOCH,
+            "bootId": _uuid4(),
+            "randomUuid": _uuid4(),
+            "phase": "pending",
+            "createdAt": _now(),
+        }
+        state = self.save({**state, "pending": boot, "updatedAt": _now()})
+        return state["pending"]
 
     def mark_applied(self, epoch: str) -> dict[str, Any]:
         state = self.load()

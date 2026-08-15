@@ -33,23 +33,26 @@ from .cellular import (
     validate_profile,
 )
 
-LOCATION_SCHEMA = "dev.xenoid.location-state/v1"
+LOCATION_SCHEMA = "dev.xenoid.location-state/v2"
+_V1_LOCATION_SCHEMA = "dev.xenoid.location-state/v1"
 STAGE_SCHEMA = "dev.xenoid.location-stage/v1"
 DEFAULT_COUNTRY = "SG"
 STATE_FILENAME = "location-identity.json"
 LEGACY_STATE_FILENAME = "regional-identity.json"
 _SEED_DOMAIN = "xenoid-location-profile/v1:"
+_SEED_DOMAIN_EPOCH = "xenoid-location-profile/v2:"
 _EPOCH_DOMAIN = "xenoid-location-epoch/v1:"
 _COUNTRY = re.compile(r"^[A-Z]{2}$", re.ASCII)
 _EPOCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$", re.ASCII)
+_SIM_EPOCH = re.compile(r"^[0-9a-f]{32}$", re.ASCII)
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _STATE_KEYS = {
     "schema", "instanceId", "masterSeed", "desiredCountry",
-    "profiles", "active", "pending", "updatedAt",
+    "profiles", "active", "pending", "updatedAt", "simEpoch",
 }
-_PROFILE_ENTRY_KEYS = {"country", "profile", "profileDigest", "datasetVersion", "createdAt"}
-_ACTIVE_KEYS = {"country", "profileDigest", "appliedAt", "lastValidatedRuntimeEpoch"}
+_PROFILE_ENTRY_KEYS = {"country", "profile", "profileDigest", "datasetVersion", "createdAt", "simEpoch"}
+_ACTIVE_KEYS = {"country", "profileDigest", "appliedAt", "lastValidatedRuntimeEpoch", "simEpoch"}
 _PENDING_KEYS = {
     "country", "profileDigest", "phase", "stagedRuntimeEpoch",
     "restartFromEpoch", "restartCompletedEpoch", "createdAt",
@@ -135,7 +138,13 @@ def supported_countries() -> list[dict[str, Any]]:
     return result
 
 
-def _derive_seed(master_seed: bytes, country: str) -> bytes:
+def _derive_seed(master_seed: bytes, country: str, sim_epoch: str = "") -> bytes:
+    if sim_epoch:
+        return hmac.new(
+            master_seed,
+            (_SEED_DOMAIN_EPOCH + country + ":" + sim_epoch).encode("ascii"),
+            hashlib.sha256,
+        ).digest()
     return hmac.new(
         master_seed, (_SEED_DOMAIN + country).encode("ascii"), hashlib.sha256,
     ).digest()
@@ -163,6 +172,22 @@ class LocationStateStore:
             raise
         except (OSError, ValueError, UnicodeError) as exc:
             raise LocationError("location_state_invalid") from exc
+        if isinstance(raw, dict) and raw.get("schema") == _V1_LOCATION_SCHEMA:
+            raw = {
+                **raw,
+                "schema": LOCATION_SCHEMA,
+                "simEpoch": "",
+                "profiles": {
+                    country: {**entry, "simEpoch": ""}
+                    for country, entry in raw.get("profiles", {}).items()
+                    if isinstance(entry, dict)
+                },
+                "active": (
+                    {**raw["active"], "simEpoch": ""}
+                    if isinstance(raw.get("active"), dict)
+                    else None
+                ),
+            }
         return self._validate_state(raw)
 
     def save(self, state: Mapping[str, Any]) -> None:
@@ -220,6 +245,11 @@ class LocationStateStore:
         if len(master_seed) != 32:
             raise LocationError("location_state_invalid")
         desired = normalize_country(raw.get("desiredCountry"))
+        sim_epoch = raw.get("simEpoch")
+        if sim_epoch != "" and (
+            not isinstance(sim_epoch, str) or _SIM_EPOCH.fullmatch(sim_epoch) is None
+        ):
+            raise LocationError("location_state_invalid")
         profiles_raw = raw.get("profiles")
         if not isinstance(profiles_raw, dict):
             raise LocationError("location_state_invalid")
@@ -230,6 +260,11 @@ class LocationStateStore:
                 raise LocationError("location_state_invalid")
             if entry.get("country") != country:
                 raise LocationError("location_state_invalid")
+            entry_epoch = entry.get("simEpoch")
+            if entry_epoch != "" and (
+                not isinstance(entry_epoch, str) or _SIM_EPOCH.fullmatch(entry_epoch) is None
+            ):
+                raise LocationError("location_state_invalid")
             profile = validate_profile(entry.get("profile"))
             if profile["locationKey"] != f"{country}/{profile['timezone']}":
                 raise LocationError("location_state_invalid")
@@ -239,7 +274,7 @@ class LocationStateStore:
                 raise LocationError("location_dataset_version_changed")
             _timestamp(entry.get("createdAt"))
             profiles[country] = dict(entry, profile=profile)
-        active = self._validate_active(raw.get("active"), profiles)
+        active = self._validate_active(raw.get("active"), profiles, sim_epoch)
         pending = self._validate_pending(raw.get("pending"), profiles)
         if active is None and pending is None and desired not in profiles:
             raise LocationError("location_state_invalid")
@@ -249,13 +284,14 @@ class LocationStateStore:
         state = dict(raw)
         state["instanceId"] = instance_id
         state["desiredCountry"] = desired
+        state["simEpoch"] = sim_epoch
         state["profiles"] = profiles
         state["active"] = active
         state["pending"] = pending
         return state
 
     def _validate_active(
-        self, value: Any, profiles: Mapping[str, Any],
+        self, value: Any, profiles: Mapping[str, Any], current_epoch: str = "",
     ) -> Optional[dict[str, Any]]:
         if value is None:
             return None
@@ -263,8 +299,17 @@ class LocationStateStore:
             raise LocationError("location_state_invalid")
         country = normalize_country(value.get("country"))
         digest = _digest_text(value.get("profileDigest"))
+        active_epoch = value.get("simEpoch")
+        if active_epoch != "" and (
+            not isinstance(active_epoch, str) or _SIM_EPOCH.fullmatch(active_epoch) is None
+        ):
+            raise LocationError("location_state_invalid")
         entry = profiles.get(country)
-        if entry is None or entry["profileDigest"] != digest:
+        if entry is None:
+            raise LocationError("location_state_invalid")
+        if entry["profileDigest"] != digest and active_epoch == current_epoch:
+            # A digest mismatch is only tolerable for a superseded active record
+            # (its SIM epoch was rotated; the fresh pending transaction takes over).
             raise LocationError("location_state_invalid")
         _timestamp(value.get("appliedAt"))
         _epoch_text(value.get("lastValidatedRuntimeEpoch"))
@@ -317,13 +362,14 @@ class LocationStateStore:
             return existing, False
         target = normalize_country(country) if country is not None else DEFAULT_COUNTRY
         master_seed = secrets.token_bytes(32)
-        profile = generate_cellular_profile(target, _derive_seed(master_seed, target))
+        profile = generate_cellular_profile(target, _derive_seed(master_seed, target, ""))
         now = int(time.time())
         state = {
             "schema": LOCATION_SCHEMA,
             "instanceId": instance_id,
             "masterSeed": base64.b64encode(master_seed).decode("ascii"),
             "desiredCountry": target,
+            "simEpoch": "",
             "profiles": {
                 target: {
                     "country": target,
@@ -331,6 +377,7 @@ class LocationStateStore:
                     "profileDigest": profile["identityDigest"],
                     "datasetVersion": dataset_version(),
                     "createdAt": now,
+                    "simEpoch": "",
                 },
             },
             "active": None,
@@ -361,15 +408,20 @@ class LocationStateStore:
         state["desiredCountry"] = target
         state["profiles"] = dict(state["profiles"])
         entry = state["profiles"].get(target)
-        if entry is None:
+        if entry is None or entry["simEpoch"] != state["simEpoch"]:
+            # No cached profile, or the SIM epoch rotated under this country:
+            # derive a fresh SIM identity for the current epoch.
             master_seed = base64.b64decode(state["masterSeed"], validate=True)
-            profile = generate_cellular_profile(target, _derive_seed(master_seed, target))
+            profile = generate_cellular_profile(
+                target, _derive_seed(master_seed, target, state["simEpoch"])
+            )
             entry = {
                 "country": target,
                 "profile": profile,
                 "profileDigest": profile["identityDigest"],
                 "datasetVersion": dataset_version(),
                 "createdAt": int(time.time()),
+                "simEpoch": state["simEpoch"],
             }
             state["profiles"][target] = entry
         state["pending"] = {
@@ -382,6 +434,61 @@ class LocationStateStore:
             "createdAt": int(time.time()),
         }
         return self._write(state), True
+
+    def rotate_sim_identity(self) -> dict[str, Any]:
+        """Rotate the SIM epoch: the current country gets a brand-new SIM
+        (IMSI/ICCID/MSISDN/cell) while country, locale, and carrier facts stay.
+
+        One atomic state write rotates the epoch, re-derives the desired
+        country's profile, and (when a location is active) opens a fresh
+        pending transaction so the standard convergence restages, recreates
+        once for the RIL reload, verifies, and promotes. Profiles for other
+        countries are re-derived lazily on next selection.
+        """
+        state = self.load()
+        if state is None:
+            raise LocationError("location_state_missing")
+        master_seed = base64.b64decode(state["masterSeed"], validate=True)
+        epoch = secrets.token_hex(16)
+        while epoch == state["simEpoch"]:
+            epoch = secrets.token_hex(16)
+        state = dict(state)
+        state["simEpoch"] = epoch
+        state["profiles"] = dict(state["profiles"])
+        target = state["desiredCountry"]
+        profile = generate_cellular_profile(target, _derive_seed(master_seed, target, epoch))
+        entry = {
+            "country": target,
+            "profile": profile,
+            "profileDigest": profile["identityDigest"],
+            "datasetVersion": dataset_version(),
+            "createdAt": int(time.time()),
+            "simEpoch": epoch,
+        }
+        state["profiles"][target] = entry
+        pending = state["pending"]
+        if pending is not None:
+            # A country switch is in flight; restart it under the new epoch.
+            state["pending"] = {
+                "country": pending["country"],
+                "profileDigest": entry["profileDigest"],
+                "phase": "new",
+                "stagedRuntimeEpoch": "",
+                "restartFromEpoch": "",
+                "restartCompletedEpoch": "",
+                "createdAt": int(time.time()),
+            }
+        elif state["active"] is not None and state["active"]["country"] == target:
+            state["pending"] = {
+                "country": target,
+                "profileDigest": entry["profileDigest"],
+                "phase": "new",
+                "stagedRuntimeEpoch": "",
+                "restartFromEpoch": "",
+                "restartCompletedEpoch": "",
+                "createdAt": int(time.time()),
+            }
+        return self._write(state)
 
     def mark_staged(self, runtime_epoch: str) -> dict[str, Any]:
         state = self.load()
@@ -444,6 +551,7 @@ class LocationStateStore:
             "profileDigest": pending["profileDigest"],
             "appliedAt": now,
             "lastValidatedRuntimeEpoch": epoch,
+            "simEpoch": state["simEpoch"],
         }
         state["pending"] = None
         state["desiredCountry"] = pending["country"]

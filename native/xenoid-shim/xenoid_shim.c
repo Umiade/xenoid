@@ -759,6 +759,10 @@ typedef int (*statfs_t)(const char *, struct statfs *);
 #define XENOID_F2FS_SUPER_MAGIC 0xF2F52010L
 #define XENOID_OVERLAYFS_SUPER_MAGIC 0x794c7630
 #define XENOID_FUSE_SUPER_MAGIC 0x65735546
+#define XENOID_DATA_BLOCK_SIZE 4096ULL
+#define XENOID_DATA_BLOCKS 31250000ULL
+#define XENOID_DATA_NAME_MAX 255ULL
+#define XENOID_DATA_STATFS_FLAGS 0x426ULL
 
 static int path_has_component_prefix(const char *path, const char *prefix) {
   size_t size;
@@ -786,11 +790,45 @@ static long shaped_statfs_type(const char *path, long type) {
     return XENOID_EXT4_SUPER_MAGIC;
   return type;
 }
+static unsigned long long scale_data_statfs_value(
+    unsigned long long value, unsigned long long total) {
+  unsigned long long quotient;
+  unsigned long long remainder;
+  while(total > UINT32_MAX) {
+    value >>= 1;
+    total >>= 1;
+  }
+  if(!total) return 0;
+  quotient=value/total;
+  remainder=value%total;
+  return quotient*XENOID_DATA_BLOCKS
+      + remainder*XENOID_DATA_BLOCKS/total;
+}
+#define XENOID_SHAPE_DATA_STATFS(buf) do { \
+  unsigned long long real_blocks=(unsigned long long)(buf)->f_blocks; \
+  unsigned long long real_bfree=(unsigned long long)(buf)->f_bfree; \
+  unsigned long long real_bavail=(unsigned long long)(buf)->f_bavail; \
+  unsigned long long real_files=(unsigned long long)(buf)->f_files; \
+  unsigned long long real_ffree=(unsigned long long)(buf)->f_ffree; \
+  if(real_blocks) { \
+    (buf)->f_type=XENOID_F2FS_SUPER_MAGIC; \
+    (buf)->f_bsize=XENOID_DATA_BLOCK_SIZE; \
+    (buf)->f_blocks=XENOID_DATA_BLOCKS; \
+    (buf)->f_bfree=scale_data_statfs_value(real_bfree,real_blocks); \
+    (buf)->f_bavail=scale_data_statfs_value(real_bavail,real_blocks); \
+    (buf)->f_files=scale_data_statfs_value(real_files,real_blocks); \
+    (buf)->f_ffree=scale_data_statfs_value(real_ffree,real_blocks); \
+    (buf)->f_namelen=XENOID_DATA_NAME_MAX; \
+    (buf)->f_flags=XENOID_DATA_STATFS_FLAGS; \
+  } \
+} while(0)
 int statfs(const char *path, struct statfs *buf) {
   statfs_t real=(statfs_t)dlsym(RTLD_NEXT,"statfs");
   int r=real?real(path,buf):-1;
-  if(r==0 && buf && xenoid_reader_is_app_uid())
-    buf->f_type=shaped_statfs_type(path,buf->f_type);
+  if(r==0 && buf && xenoid_reader_is_app_uid()) {
+    if(path_is_android_data(path)) XENOID_SHAPE_DATA_STATFS(buf);
+    else buf->f_type=shaped_statfs_type(path,buf->f_type);
+  }
   return r;
 }
 
@@ -798,8 +836,10 @@ typedef int (*statfs64_t)(const char *, struct statfs64 *);
 int statfs64(const char *path, struct statfs64 *buf) {
   statfs64_t real=(statfs64_t)dlsym(RTLD_NEXT,"statfs64");
   int r=real?real(path,buf):-1;
-  if(r==0 && buf && xenoid_reader_is_app_uid())
-    buf->f_type=shaped_statfs_type(path,buf->f_type);
+  if(r==0 && buf && xenoid_reader_is_app_uid()) {
+    if(path_is_android_data(path)) XENOID_SHAPE_DATA_STATFS(buf);
+    else buf->f_type=shaped_statfs_type(path,buf->f_type);
+  }
   return r;
 }
 
@@ -807,8 +847,10 @@ typedef int (*fstatfs_t)(int, struct statfs *);
 int fstatfs(int fd, struct statfs *buf) {
   fstatfs_t real=(fstatfs_t)dlsym(RTLD_NEXT,"fstatfs");
   int r=real?real(fd,buf):-1;
-  if(r==0 && buf && xenoid_reader_is_app_uid())
-    buf->f_type=shaped_statfs_type(fd_is_android_data(fd)?"/data":NULL,buf->f_type);
+  if(r==0 && buf && xenoid_reader_is_app_uid()) {
+    if(fd_is_android_data(fd)) XENOID_SHAPE_DATA_STATFS(buf);
+    else buf->f_type=shaped_statfs_type(NULL,buf->f_type);
+  }
   return r;
 }
 
@@ -816,8 +858,10 @@ typedef int (*fstatfs64_t)(int, struct statfs64 *);
 int fstatfs64(int fd, struct statfs64 *buf) {
   fstatfs64_t real=(fstatfs64_t)dlsym(RTLD_NEXT,"fstatfs64");
   int r=real?real(fd,buf):-1;
-  if(r==0 && buf && xenoid_reader_is_app_uid())
-    buf->f_type=shaped_statfs_type(fd_is_android_data(fd)?"/data":NULL,buf->f_type);
+  if(r==0 && buf && xenoid_reader_is_app_uid()) {
+    if(fd_is_android_data(fd)) XENOID_SHAPE_DATA_STATFS(buf);
+    else buf->f_type=shaped_statfs_type(NULL,buf->f_type);
+  }
   return r;
 }
 #endif /* __linux__ */

@@ -60,7 +60,7 @@ cd xenoid
 ./xenoid --instance phone-a stop
 ```
 
-设备标识（Android ID、serial、IMEI/IMEISV）每个实例生成一次，持久化在 `~/.xenoid/instances/<UUID>/device-identity.json`。容器重建时只轮换 boot-scoped 值（`boot_id`、`random_uuid`）。显式轮换通过 `device apply --keep-unique` 或 `device set` 更新同一宿主状态，避免下一次 `up` 回滚。
+设备标识（Android ID、serial、IMEI/IMEISV）每个实例生成一次，持久化在 `~/.xenoid/instances/<UUID>/device-identity.json`。容器重建时只轮换 boot-scoped 值（`boot_id`、`random_uuid`）。显式轮换通过 `device apply --keep-unique` 或 `device set` 更新同一宿主状态，避免下一次 `up` 回滚。`./xenoid device regenerate`（一键新机）更进一步：在运行中的实例上轮换稳定标识、租约网络 epoch（容器 MAC）、boot-scoped 值、data/rootfs 文件系统 UUID、每应用 SSAID 存储以及 SIM 身份（同国家换新卡：新 IMSI/ICCID/手机号/小区）;GMS 实例还会清除 Google 服务应用数据以重新生成应用可读的广告 ID;然后重建容器并经由标准 `up` 管线重新收敛，使实例呈现为一台全新的同型号设备，同时保留用户数据与位置国家/运营商。
 
 本次“等同唯一真实设备”的验收范围是 Android 用户/数据/keystore/账户状态与实例标识/生命周期。Xenoid 不模拟宿主机不存在的物理电话、短信或硬件传感器能力。
 
@@ -164,7 +164,7 @@ Linux 主机必须向 redroid 暴露 binderfs 设备。ARM64 主机必须使用 
 ./xenoid location set US
 ```
 
-重复选择当前国家是幂等操作。切换国家会对受管理的 Android 容器执行恰好一次重建；硬件标识（IMEI、serial、Android ID、MAC/IP 租约）保持不变，切回曾经使用过的国家会恢复该国原来的 SIM、手机号和小区身份。`./xenoid location set` 切换国家时会自行完成这次容器重建，之后请再运行 `./xenoid up` 重新验证完整生产状态。手机号是按冻结的 libphonenumber 国家元数据生成的稳定合成身份，不是真实分配的号码，也不提供电话/SMS 能力。全局代理不读取也不修改这套身份，代理变更永远不会重启运行时。
+重复选择当前国家是幂等操作。切换国家会对受管理的 Android 容器执行恰好一次重建；硬件标识（IMEI、serial、Android ID、MAC/IP 租约）保持不变，切回曾经使用过的国家会在同一 SIM epoch 内恢复该国的 SIM、手机号和小区身份;`device regenerate` 会轮换 SIM epoch(当前国家换新卡)。`./xenoid location set` 切换国家时会自行完成这次容器重建，之后请再运行 `./xenoid up` 重新验证完整生产状态。手机号是按冻结的 libphonenumber 国家元数据生成的稳定合成身份，不是真实分配的号码，也不提供电话/SMS 能力。全局代理不读取也不修改这套身份，代理变更永远不会重启运行时。
 
 ## 全局代理
 
@@ -276,6 +276,24 @@ Frida 适合应用进程动态分析与 app-layer hook。文件系统、mount、
 ```bash
 ./xenoid device apply examples/fingerprints/pixel-raven-android13.json --keep-unique
 ```
+
+**一键新机**:在运行中的实例上把全部唯一性因子换成一套新值，使其呈现为一台全新的同型号设备（当前即一台全新的 Pixel 6 Pro):
+
+```bash
+./xenoid device regenerate
+```
+
+一键新机会做的事：
+
+- 换稳定标识：Android ID、serial、IMEI/IMEISV（IMEI 的 TAC 钉住 raven 真实分配段，仅序列段随机）;
+- 换容器真实 MAC(kernel 层，应用经 netlink/sysfs/ioctl 读到的都变）;
+- 换 boot-scoped 值（`boot_id`、`random_uuid`）与 data/rootfs 文件系统 UUID;
+- 重置每应用 SSAID 存储（应用经 `Settings.Secure.ANDROID_ID` 读到的新值）;
+- 同国家换一张新 SIM 卡：新 IMSI/ICCID/手机号/注册小区，国家、locale、时区、运营商不变;
+- GMS 实例清空 Google 服务应用数据（gms/gsf/vending)，应用可读的广告 ID（GAID）随之重新生成；**注意这会同时清除 Google 账号登录态,之后需要重新登录**;
+- 用户数据、已安装应用、keystore 与位置国家/运营商**保留** —— 语义是"换新手机、换新卡、恢复数据",不是恢复出厂。
+
+执行过程类似给手机关机再开机：实例会先停机删除容器，离线完成镜像手术，然后经标准 `up` 管线重建并验证（因 SIM 资料变化，RIL 重载会再多做一次容器重建，全程约两次 Android 重启），所有应用随后冷启动。整程约 **5~8 分钟**（源码构建机器；`--skip-build` 用预构建产物会更快）。中断是安全的：中断会留下 journal,`start`/`up` 以 `device_regeneration_pending` 拒绝启动，重新运行 `device regenerate` 至完成即可。`--dry-run` 只打印计划不做任何变更。
 
 生成应用层与服务层 Frida profile：
 

@@ -30,6 +30,7 @@ from .daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS, PROXY_MAX_SOURCE_BYT
 from .device_identity import (
     DeviceIdentityStore,
     IdentityError,
+    RegenerationJournal,
     public_identity_state,
 )
 from .google_services import (
@@ -65,6 +66,8 @@ from .storage import (
     backup_image_name,
     parse_storage_result,
     public_storage_state,
+    storage_rotation_target,
+    storage_transaction_id,
 )
 from .util import host_info, run, which
 
@@ -964,6 +967,200 @@ class RuntimeManager:
         })
         return result
 
+    def _run_storage_identity_rotation(
+        self,
+        expected_uuid: str,
+        *,
+        target_uuid: str,
+        target_rootfs_uuid: str,
+    ) -> dict[str, Any]:
+        script = self.context.project_root / "scripts" / "rotate-storage-identity.sh"
+        command = [
+            str(script),
+            self.lease.volume_name,
+            expected_uuid,
+            target_uuid,
+            target_rootfs_uuid,
+        ]
+        env = self.docker_env()
+        ssh_cmd = self.remote_docker_ssh_cmd()
+        if ssh_cmd:
+            env["XENOID_ENGINE_SSH"] = ssh_cmd[-1]
+            if "-p" in ssh_cmd:
+                env["XENOID_ENGINE_SSH_PORT"] = ssh_cmd[ssh_cmd.index("-p") + 1]
+        proc = run(command, timeout=1800, env=env)
+        result: dict[str, Any] = {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "command": command,
+            "stdout": proc.stdout.strip()[-2000:],
+            "stderr": proc.stderr.strip()[-2000:],
+        }
+        if proc.returncode != 0:
+            result["error"] = (
+                "storage_identity_mismatch"
+                if proc.returncode == 42
+                else (
+                    "storage_image_invalid"
+                    if proc.returncode in (41, 58, 59, 60, 63)
+                    else "storage_rotation_failed"
+                )
+            )
+            result["message"] = (
+                "data image identity matches neither the pending expectation nor the rotation target"
+                if proc.returncode == 42
+                else "instance storage identity rotation failed"
+            )
+            return result
+        try:
+            geometry = parse_storage_result(proc.stdout)
+        except StorageError as exc:
+            return {**result, **exc.as_dict(), "ok": False}
+        rotated = any(
+            line.strip() == "XENOID_DATA_ROTATED=1" for line in proc.stdout.splitlines()
+        )
+        result.update({**geometry, "rotated": rotated})
+        return result
+
+    def rotate_storage_identity(self) -> dict[str, Any]:
+        """Rotate data/rootfs filesystem UUIDs and per-app SSAID state offline.
+
+        The owned container must be absent. One pending in-place storage
+        transaction wraps the engine-host script, which is idempotent: retry
+        after a crash adopts an already-rotated image or finishes the pending
+        rotation, then commits the observed identity. Boot-scoped values are
+        pre-seeded separately by start() on every container creation.
+        """
+        self.ensure_instance_lease()
+        container, error = self._owned_container_record()
+        if container is not None:
+            return {
+                "ok": False,
+                "error": "storage_rotation_requires_stop",
+                "message": "the owned Android container must be stopped before storage identity rotation",
+            }
+        if error != "instance container does not exist":
+            return {
+                "ok": False,
+                "error": "resource_conflict",
+                "message": error,
+            }
+        store = StorageStateStore(self.context, self.lease)
+        try:
+            state = store.load()
+            if state is None or (state["state"] == "pending" and state["temporaryImage"]):
+                raise StorageError(
+                    "storage_not_initialized",
+                    "instance storage is not committed",
+                )
+            if state["state"] == "committed":
+                transaction_id = storage_transaction_id()
+                pending = store.pending(
+                    str(state["source"]),
+                    transaction_id=transaction_id,
+                    filesystem_uuid=str(state["filesystemUuid"]),
+                    observed_logical_size_bytes=int(state["observedLogicalSizeBytes"]),
+                    observed_filesystem_size_bytes=int(state["observedFilesystemSizeBytes"]),
+                    host_allocated_bytes=int(state["hostAllocatedBytes"]),
+                    legacy_volume=str(state["legacyVolume"]),
+                    legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
+                    backup_image=str(state["backupImage"]),
+                    backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
+                    backup_size_bytes=int(state["backupSizeBytes"]),
+                    growth=True,
+                    rotation_target_uuid=storage_rotation_target(transaction_id),
+                )
+            elif state["rotationTargetUuid"]:
+                pending = state
+            else:
+                # Adopt a plain interrupted growth into the rotation so a crash
+                # from here on still fails closed for plain `up`.
+                pending = store.pending(
+                    str(state["source"]),
+                    transaction_id=str(state["transactionId"]),
+                    filesystem_uuid=str(state["filesystemUuid"]),
+                    observed_logical_size_bytes=int(state["observedLogicalSizeBytes"]),
+                    observed_filesystem_size_bytes=int(state["observedFilesystemSizeBytes"]),
+                    host_allocated_bytes=int(state["hostAllocatedBytes"]),
+                    legacy_volume=str(state["legacyVolume"]),
+                    legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
+                    backup_image=str(state["backupImage"]),
+                    backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
+                    backup_size_bytes=int(state["backupSizeBytes"]),
+                    growth=True,
+                    rotation_target_uuid=storage_rotation_target(str(state["transactionId"])),
+                )
+        except StorageError as exc:
+            return exc.as_dict()
+        action = self._run_storage_identity_rotation(
+            str(pending["filesystemUuid"]),
+            target_uuid=str(pending["rotationTargetUuid"]),
+            target_rootfs_uuid=storage_rotation_target(str(pending["transactionId"]), rootfs=True),
+        )
+        if not action.get("ok"):
+            return action
+        try:
+            committed = store.commit(
+                pending,
+                {
+                    "filesystemUuid": action["filesystemUuid"],
+                    "logicalSizeBytes": action["logicalSizeBytes"],
+                    "filesystemSizeBytes": action["filesystemSizeBytes"],
+                    "allocatedBytes": action["allocatedBytes"],
+                },
+            )
+        except StorageError as exc:
+            return exc.as_dict()
+        return {
+            "ok": True,
+            "rotated": action["rotated"],
+            "filesystemUuid": committed["filesystemUuid"],
+            "previousFilesystemUuid": pending["filesystemUuid"],
+            "imageAction": action,
+        }
+
+    def _run_boot_identity_seed(self, boot_id: str, random_uuid: str) -> dict[str, Any]:
+        script = self.context.project_root / "scripts" / "seed-boot-identity.sh"
+        command = [str(script), self.lease.volume_name, boot_id, random_uuid]
+        env = self.docker_env()
+        ssh_cmd = self.remote_docker_ssh_cmd()
+        if ssh_cmd:
+            env["XENOID_ENGINE_SSH"] = ssh_cmd[-1]
+            if "-p" in ssh_cmd:
+                env["XENOID_ENGINE_SSH_PORT"] = ssh_cmd[ssh_cmd.index("-p") + 1]
+        proc = run(command, timeout=900, env=env)
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "command": command,
+            "stdout": proc.stdout.strip()[-2000:],
+            "stderr": proc.stderr.strip()[-2000:],
+            "skipped": "XENOID_BOOT_SEED=skipped" in proc.stdout,
+        }
+
+    def _seed_boot_identity_into_image(self) -> dict[str, Any]:
+        """Pre-seed boot-scoped identity into the data image of a container that
+        is about to be created, so the zygote boot snapshot matches the values
+        the identity store applies after boot (single writer for all recreates).
+        """
+        store = DeviceIdentityStore(self.context)
+        try:
+            state = store.load()
+            if state is None:
+                return {"ok": True, "skipped": True, "reason": "device_identity_uninitialized"}
+            seeded = store.seed_next_boot()
+        except IdentityError as exc:
+            return exc.as_dict()
+        result = self._run_boot_identity_seed(str(seeded["bootId"]), str(seeded["randomUuid"]))
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": "device_boot_seed_failed",
+                "message": "cannot pre-seed boot identity into the persistent data image",
+                "imageAction": result,
+            }
+        return {"ok": True, "skipped": bool(result.get("skipped"))}
+
     def _legacy_engine_record(self) -> Optional[dict[str, str]]:
         path = self.context.state_root / "legacy-engine.json"
         try:
@@ -1293,6 +1490,19 @@ class RuntimeManager:
             and state["state"] == "pending"
             and state["temporaryImage"] == ""
         ):
+            if state.get("rotationTargetUuid"):
+                # An interrupted identity rotation is not an ordinary growth in
+                # either window (image still old, or already at the target):
+                # fail closed and let `device regenerate` resume and commit it.
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "interrupted storage identity rotation; re-run `./xenoid device regenerate` to resume and commit it",
+                    storage=public_storage_state(
+                        state,
+                        healthy=False,
+                        error="storage_identity_mismatch",
+                    ),
+                )
             if volume is None:
                 return self._storage_error(
                     "storage_volume_missing",
@@ -2509,6 +2719,13 @@ class RuntimeManager:
             if preflight is not None:
                 plan["preflight"] = preflight
             return {"dry_run": True, "plan": plan}
+        if RegenerationJournal(self.context).pending():
+            return {
+                "ok": False,
+                "error": "device_regeneration_pending",
+                "message": "an interrupted device regenerate is pending; re-run `./xenoid device regenerate` to complete it before starting the runtime",
+                "plan": plan,
+            }
         if which("docker") is None:
             return {"ok": False, "error": "docker not found", "plan": plan}
         endpoint = self.docker_endpoint_host()
@@ -2736,6 +2953,15 @@ class RuntimeManager:
             plan["proxyCleanupBeforeCreate"] = cleanup
             if cleanup.get("ok") is not True:
                 return {"ok": False, "error": "proxy_cleanup_failed", "plan": plan}
+            boot_seed = self._seed_boot_identity_into_image()
+            plan["bootIdentitySeed"] = boot_seed
+            if not boot_seed.get("ok"):
+                return {
+                    "ok": False,
+                    "error": "device_boot_seed_failed",
+                    "message": boot_seed.get("message", "boot identity seeding failed"),
+                    "plan": plan,
+                }
             proc = run(docker_cmd, env=self.docker_env())
             result: dict[str, Any] = {
                 "ok": proc.returncode == 0,

@@ -47,7 +47,7 @@ Source-based `up` operations for the same project wait on one build/convergence 
 ./xenoid --instance phone-a stop
 ```
 
-Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity.
+Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity. `./xenoid device regenerate` goes further: it rotates the stable identifiers, the lease network epoch (container MAC), the boot-scoped values, the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country) on a live instance — and on GMS instances clears the Google services apps so the app-readable advertising ID regenerates — then recreates the container and re-converges through the standard `up` pipeline, making the instance present as a brand-new same-model device while preserving user data and the location country/carrier.
 
 ## Linux ARM
 
@@ -175,7 +175,7 @@ One persistent per-instance profile owns the country, system locale list, IANA t
 ./xenoid location set US            # select a country and converge
 ```
 
-A new instance applies Singapore on the first `./xenoid up`; later runs keep the persisted selection. Re-selecting the current country is a no-op. Changing the country stages the new profile and recreates the owned container exactly once — the restart is atomic across crashes, so retrying a failed `location set` resumes the same pending identity instead of generating a new one or restarting twice. Each used country's identity is cached from the instance master seed, so returning to a previous country restores its original SIM, phone number, and cell. Hardware identifiers never change with location. Numbers follow pinned libphonenumber mobile metadata for shape and length; they are synthetic and cannot originate calls or SMS. A standalone `./xenoid location set` performs its own container recreate; run `./xenoid up` afterwards for a full production validation. Location never reads proxy egress, and proxy operations never read or mutate the location identity.
+A new instance applies Singapore on the first `./xenoid up`; later runs keep the persisted selection. Re-selecting the current country is a no-op. Changing the country stages the new profile and recreates the owned container exactly once — the restart is atomic across crashes, so retrying a failed `location set` resumes the same pending identity instead of generating a new one or restarting twice. Each used country's identity is cached from the instance master seed, so returning to a previous country restores its SIM, phone number, and cell within the same SIM epoch; `device regenerate` rotates the SIM epoch (a fresh SIM for the current country). Hardware identifiers never change with location. Numbers follow pinned libphonenumber mobile metadata for shape and length; they are synthetic and cannot originate calls or SMS. A standalone `./xenoid location set` performs its own container recreate; run `./xenoid up` afterwards for a full production validation. Location never reads proxy egress, and proxy operations never read or mutate the location identity.
 
 ## Global proxy
 
@@ -271,10 +271,13 @@ python -m pip install frida-tools
 ./xenoid device collect --out /tmp/device-profile.json
 ./xenoid device apply examples/fingerprints/pixel-raven-android13.json
 ./xenoid device apply examples/fingerprints/pixel-raven-android13.json --keep-unique
+./xenoid device regenerate
 ./xenoid profile status
 ```
 
 The production template is Android 13 Pixel 6 Pro `raven`, model `G8V0U`, build `TP1A.221005.002`/`9012097`, shipping API 31. Profile application converges SettingsProvider, partition/property-area identity, display/input, native sensor and camera HAL inputs, battery, memory/storage, and reboot-persistent data. Recollect the complete profile after a change.
+
+`device regenerate` performs the one-shot new-device rotation on a live instance: stable identifiers, the lease network epoch (container MAC), boot-scoped values, data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell, same country) all rotate; on GMS instances the Google services apps are cleared so the advertising ID regenerates. The container is recreated and the full `up` convergence and validation re-run. User data, installed apps, keystore state, and the location country/carrier are preserved. An interrupted regenerate is journaled: `start`/`up` fail closed with `device_regeneration_pending` until `device regenerate` is re-run to completion.
 
 ## Applications, input, and automation
 

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import stat
@@ -31,6 +32,8 @@ LEASE_SCHEMA_VERSION = 1
 INSTANCE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 RESOURCE_TAG_RE = re.compile(r"^[0-9a-f]{12}$")
 _RESOURCE_TAG_DOMAIN = b"xenoid-instance/v1\0"
+_LEASE_EPOCH_DOMAIN = b"xenoid-lease-network-epoch/v1\0"
+_NETWORK_EPOCH_RE = re.compile(r"^[0-9a-f]{32}$")
 _LEASE_SLOTS = 1000
 _ADB_PORT_BASE = 5555
 _DAEMON_PORT_BASE = 18765
@@ -222,6 +225,7 @@ class InstanceLease:
     mark_mask: int
     route_tables: tuple[int, int, int, int]
     rule_priorities: tuple[int, int, int, int]
+    network_epoch: str = ""
 
     @property
     def owner_labels(self) -> dict[str, str]:
@@ -356,7 +360,15 @@ def _validate_lease(lease: InstanceLease) -> None:
         raise InstanceError("instance_tag_collision", "instance resource tag mismatch")
     if lease.slot < 0 or lease.slot >= _LEASE_SLOTS:
         raise InstanceError("resource_pool_exhausted", "invalid lease slot")
-    expected = _lease_for_slot(lease.instance_name, instance_id, lease.slot, lease.transaction_id)
+    if lease.network_epoch and _NETWORK_EPOCH_RE.fullmatch(lease.network_epoch) is None:
+        raise InstanceError("resource_conflict", "invalid lease network epoch")
+    expected = _lease_for_slot(
+        lease.instance_name,
+        instance_id,
+        lease.slot,
+        lease.transaction_id,
+        network_epoch=lease.network_epoch,
+    )
     for key, expected_value in asdict(expected).items():
         if key == "state":
             continue
@@ -372,6 +384,7 @@ def _lease_for_slot(
     slot: int,
     transaction_id: Optional[str] = None,
     state: str = "committed",
+    network_epoch: str = "",
 ) -> InstanceLease:
     tag = _resource_tag(instance_id)
     v4_base = int(ipaddress.ip_address("172.31.0.0")) + slot * 16
@@ -380,7 +393,19 @@ def _lease_for_slot(
     transfer_network = ipaddress.ip_network((transfer_base, 30))
     ipv6_network = ipaddress.ip_network(f"fd78:656e:6f69:{slot:x}::/64")
     transfer_ipv6 = ipaddress.ip_network(f"fd78:7072:6f78:{slot:x}::/126")
-    digest = bytearray(hashlib.sha256(instance_id.encode("ascii")).digest()[:6])
+    if network_epoch:
+        # Rotated network identity: same slot/subnet, fresh locally administered
+        # MAC derived from the persisted per-instance epoch.
+        digest = bytearray(
+            hashlib.sha256(
+                _LEASE_EPOCH_DOMAIN
+                + instance_id.encode("ascii")
+                + b":"
+                + network_epoch.encode("ascii")
+            ).digest()[:6]
+        )
+    else:
+        digest = bytearray(hashlib.sha256(instance_id.encode("ascii")).digest()[:6])
     digest[0] = (digest[0] & 0xFC) | 0x02
     mac = ":".join(f"{byte:02x}" for byte in digest)
     return InstanceLease(
@@ -419,6 +444,7 @@ def _lease_for_slot(
         mark_mask=0xFFFFFF00,
         route_tables=tuple(20000 + slot * 4 + offset for offset in range(4)),
         rule_priorities=tuple(30000 + slot * 4 + offset for offset in range(4)),
+        network_epoch=network_epoch,
     )
 
 
@@ -551,13 +577,42 @@ def _recover_pending_locked(registry_root: Path, registry: dict[str, Any]) -> No
         if (
             cfg.instance_name != lease.instance_name
             or cfg.instance_id != lease.instance_id
-            or replace(allocation, state="pending") != lease
         ):
             raise InstanceError("resource_conflict", "pending instance transaction disagrees")
         committed = replace(lease, state="committed")
         existing = registry["leases"].get(lease.instance_id)
-        if existing is not None and InstanceLease.from_dict(existing) != committed:
+        if existing is None:
+            # Instance-creation recovery: the allocation must hold the journaled
+            # pending lease exactly.
+            if replace(allocation, state="pending") != lease:
+                raise InstanceError("resource_conflict", "pending instance transaction disagrees")
+            _atomic_json(allocation_path, asdict(committed))
+            registry["leases"][lease.instance_id] = asdict(committed)
+            registry["pending"].pop(transaction_id)
+            changed = True
+            continue
+        current = InstanceLease.from_dict(existing)
+        if current == committed:
+            # Fully committed already; repair a stale allocation and drop the journal.
+            if allocation != committed:
+                _atomic_json(allocation_path, asdict(committed))
+            registry["pending"].pop(transaction_id)
+            changed = True
+            continue
+        # Network-epoch rotation recovery: the journaled candidate may differ
+        # from the committed lease only in the epoch and its derived MAC, and
+        # the allocation must still hold one of the two agreed states. Rolling
+        # forward is safe because the candidate was fully determined before the
+        # journal write.
+        diff = {
+            key
+            for key in asdict(committed)
+            if asdict(committed)[key] != asdict(current)[key]
+        }
+        if not diff <= {"network_epoch", "mac_address"}:
             raise InstanceError("resource_conflict", "pending instance lease conflicts")
+        if allocation != current and allocation != committed:
+            raise InstanceError("resource_conflict", "pending instance transaction disagrees")
         _atomic_json(allocation_path, asdict(committed))
         registry["leases"][lease.instance_id] = asdict(committed)
         registry["pending"].pop(transaction_id)
@@ -726,6 +781,55 @@ def _write_instance_transaction(
             except FileNotFoundError:
                 pass
         raise
+
+
+def rotate_instance_network(context: InstanceContext) -> InstanceLease:
+    """Rotate the instance's network identity epoch and persist the new lease.
+
+    Slot, subnets, ports, and resource names stay fixed so multi-instance
+    allocation invariants and the docker network remain untouched; only the
+    container-visible MAC is re-derived from a fresh epoch. The rotation is one
+    journaled registry transaction: the pending candidate is written first,
+    then the allocation file, then the committed registry lease. A crash in
+    any gap is rolled forward by the standard pending-transaction recovery on
+    the next registry read.
+    """
+    allocation_path = context.state_root / "allocation.json"
+    registry_path = context.registry_root / "registry.json"
+    with _registry_lock(context.registry_root):
+        registry = _read_registry(context.registry_root)
+        raw = registry["leases"].get(context.instance_id)
+        if raw is None:
+            raise InstanceError("resource_conflict", "client registry lease is missing")
+        current = InstanceLease.from_dict(raw)
+        if current.instance_name != context.instance_name:
+            raise InstanceError("instance_identity_mismatch", "registry identity mismatch")
+        candidate: Optional[InstanceLease] = None
+        for _ in range(64):
+            epoch = secrets.token_hex(16)
+            proposal = _lease_for_slot(
+                current.instance_name,
+                current.instance_id,
+                current.slot,
+                current.transaction_id,
+                network_epoch=epoch,
+            )
+            if proposal.mac_address != current.mac_address:
+                candidate = proposal
+                break
+        if candidate is None:
+            raise InstanceError("resource_pool_exhausted", "cannot derive a distinct network identity")
+        registry["pending"][candidate.transaction_id] = {
+            "lease": asdict(replace(candidate, state="pending")),
+            "configPath": str(context.config_path),
+            "stateRoot": str(context.state_root),
+        }
+        _atomic_json(registry_path, registry)
+        _atomic_json(allocation_path, asdict(candidate))
+        registry["leases"][context.instance_id] = asdict(candidate)
+        registry["pending"].pop(candidate.transaction_id, None)
+        _atomic_json(registry_path, registry)
+        return candidate
 
 
 def _config_template_overrides(raw: Any) -> dict[str, Any]:

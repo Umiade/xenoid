@@ -178,6 +178,115 @@ def context_config_state_and_tag() -> None:
             require(stat.S_IMODE(private_file.stat().st_mode) == 0o600)
 
 
+@contract_case("networkEpochRotation")
+def network_epoch_rotation() -> None:
+    with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
+        context, _, lease = initialize(roots, "phone-a")
+        require(lease.network_epoch == "")
+        rotated = config.rotate_instance_network(context)
+        require(rotated.network_epoch != "")
+        require(rotated.mac_address != lease.mac_address)
+        require(
+            (rotated.slot, rotated.ipv4_address, rotated.ipv6_address)
+            == (lease.slot, lease.ipv4_address, lease.ipv6_address)
+        )
+        require(
+            (rotated.host_adb_port, rotated.host_daemon_port, rotated.transaction_id)
+            == (lease.host_adb_port, lease.host_daemon_port, lease.transaction_id)
+        )
+        first_octet = int(rotated.mac_address.split(":", 1)[0], 16)
+        require(first_octet & 0x03 == 0x02)
+        require(resolve(roots, "phone-a")[2] == rotated)
+        again = config.rotate_instance_network(context)
+        require(again.network_epoch != rotated.network_epoch)
+        require(again.mac_address != rotated.mac_address)
+        require(resolve(roots, "phone-a")[2] == again)
+
+
+def _crash_rotation_at_write(target_write: int) -> Callable[[Any, Any, int], Any]:
+    calls = {"count": 0}
+    real_atomic = config._atomic_json
+
+    def flaky(path: Any, data: Any, mode: int = 0o600) -> Any:
+        calls["count"] += 1
+        if calls["count"] == target_write:
+            raise RuntimeError("simulated power loss")
+        return real_atomic(path, data, mode)
+
+    return flaky
+
+
+def _require_rotation_recovered(
+    roots: Roots,
+    context: config.InstanceContext,
+    original: config.InstanceLease,
+) -> None:
+    resolved = resolve(roots, "phone-a")[2]
+    require(resolved.network_epoch != "")
+    require(resolved.mac_address != original.mac_address)
+    require(resolved.slot == original.slot)
+    require(resolved.ipv4_address == original.ipv4_address)
+    registry = json.loads((roots.state / "registry.json").read_text())
+    require(registry["pending"] == {})
+    require(
+        config.InstanceLease.from_dict(registry["leases"][context.instance_id])
+        == resolved
+    )
+    allocation = config.InstanceLease.from_dict(
+        json.loads((context.state_root / "allocation.json").read_text())
+    )
+    require(allocation == resolved)
+
+
+@contract_case("networkEpochRotationCrashBeforeAllocation")
+def network_epoch_rotation_crash_before_allocation() -> None:
+    with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
+        context, _, lease = initialize(roots, "phone-a")
+        with mock.patch.object(
+            config, "_atomic_json", side_effect=_crash_rotation_at_write(2)
+        ):
+            try:
+                config.rotate_instance_network(context)
+            except RuntimeError:
+                pass
+            else:
+                raise ContractFailure
+        _require_rotation_recovered(roots, context, lease)
+
+
+@contract_case("networkEpochRotationCrashBeforeCommit")
+def network_epoch_rotation_crash_before_commit() -> None:
+    with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
+        context, _, lease = initialize(roots, "phone-a")
+        with mock.patch.object(
+            config, "_atomic_json", side_effect=_crash_rotation_at_write(3)
+        ):
+            try:
+                config.rotate_instance_network(context)
+            except RuntimeError:
+                pass
+            else:
+                raise ContractFailure
+        _require_rotation_recovered(roots, context, lease)
+
+
+@contract_case("networkEpochRotationRejectsTamperedPending")
+def network_epoch_rotation_rejects_tampered_pending() -> None:
+    with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
+        context, _, lease = initialize(roots, "phone-a")
+        config.rotate_instance_network(context)
+        registry_path = roots.state / "registry.json"
+        registry = json.loads(registry_path.read_text())
+        forged = config._lease_for_slot("phone-a", ID_A, 1, TX_A)
+        registry["pending"][TX_A] = {
+            "lease": asdict(replace(forged, state="pending")),
+            "configPath": str(context.config_path),
+            "stateRoot": str(context.state_root),
+        }
+        registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n")
+        require_error("resource_conflict", lambda: resolve(roots, "phone-a"))
+
+
 @contract_case("independentStableLeases")
 def independent_stable_leases() -> None:
     with isolated_roots() as roots, fixed_uuids(ID_A, TX_A, ID_B, TX_B):

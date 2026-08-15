@@ -597,6 +597,20 @@ def fresh_instance_identities_are_distinct() -> None:
         require(stat.S_IMODE((context_a.state_root / device_identity.STATE_FILENAME).stat().st_mode) == 0o600)
 
 
+@contract_case("generatedImeiUsesRavenTac")
+def generated_imei_uses_raven_tac() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, _, _ = initialize(project, state, "phone-a")
+        identity = device_identity.DeviceIdentityStore(context).load()
+        require(identity is not None)
+        imei = identity["stable"]["imei"]
+        require(imei.startswith(device_identity._IMEI_TAC))
+        require(device_identity._valid_imei(imei))
+        rotated = device_identity.DeviceIdentityStore(context).rotate_stable()
+        require(rotated["stable"]["imei"].startswith(device_identity._IMEI_TAC))
+        require(rotated["stable"]["imei"] != imei)
+
+
 @contract_case("legacyIdentityAdoptsPersistedValues")
 def legacy_identity_adopts_persisted_values() -> None:
     with roots() as (project, state), fixed_uuids(ID_A, TX_A):
@@ -678,6 +692,26 @@ def explicit_rotation_updates_stable_owner() -> None:
             require(first_client.profiles[0]["ids"][key] != second_client.profiles[0]["ids"][key])
 
 
+@contract_case("seededBootBindsToNextEpoch")
+def seeded_boot_binds_to_next_epoch() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, _, _ = initialize(project, state, "phone-a")
+        store = device_identity.DeviceIdentityStore(context)
+        seeded = store.seed_next_boot()
+        runtime = IdentityRuntimeStub("a" * 64)
+        client = FingerprintClientStub()
+        result = device_identity.converge_instance_identity(context, runtime, client, {})
+        require(result["ok"] is True)
+        ids = client.profiles[0]["ids"]
+        require(ids["boot_id"] == seeded["bootId"])
+        require(ids["random_uuid"] == seeded["randomUuid"])
+        final = store.load()
+        require(final is not None and final["pending"] is None)
+        require(final["active"] is not None)
+        require(final["active"]["bootId"] == seeded["bootId"])
+        require(final["active"]["containerEpoch"] != seeded["containerEpoch"])
+
+
 @contract_case("liveSentinelBindsInstanceAndFilesystem")
 def live_sentinel_binds_instance_and_filesystem() -> None:
     with roots() as (project, state), fixed_uuids(ID_A, TX_A):
@@ -701,6 +735,290 @@ def live_sentinel_binds_instance_and_filesystem() -> None:
         require(context.instance_id in commands[0] and FS_A in commands[0])
         require(".storage-sentinel.new" in commands[0])
         require(".storage-sentinel.new" not in commands[1])
+
+
+def fake_identity_rotation(runtime: FakeRuntime):
+    def _impl(
+        expected_uuid: str,
+        *,
+        target_uuid: str,
+        target_rootfs_uuid: str,
+    ) -> dict[str, Any]:
+        key = (runtime.lease.volume_name, storage.DATA_IMAGE_NAME)
+        current = runtime.images[key]
+        rotated = current["filesystemUuid"] == expected_uuid
+        if rotated:
+            runtime.images[key] = image_record(
+                target_uuid,
+                payload=str(current.get("payload", "")),
+            )
+        elif current["filesystemUuid"] != target_uuid:
+            return {"ok": False, "error": "storage_identity_mismatch"}
+        return {"ok": True, **runtime.images[key], "rotated": rotated}
+
+    return _impl
+
+
+@contract_case("storageRotationTargetIsDeterministic")
+def storage_rotation_target_is_deterministic() -> None:
+    first = storage.storage_rotation_target("4" * 32)
+    require(first == storage.storage_rotation_target("4" * 32))
+    require(first != storage.storage_rotation_target("4" * 32, rootfs=True))
+    require(first != storage.storage_rotation_target("5" * 32))
+    require(storage._UUID.fullmatch(first) is not None)
+
+
+@contract_case("storageIdentityRotationCommitsNewUuid")
+def storage_identity_rotation_commits_new_uuid() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        require(runtime.ensure_instance_storage()["ok"] is True)
+        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
+        result = runtime.rotate_storage_identity()
+        require(result["ok"] is True)
+        require(result["rotated"] is True)
+        require(result["filesystemUuid"] != FS_A)
+        require(result["previousFilesystemUuid"] == FS_A)
+        committed = storage.StorageStateStore(context, lease).load()
+        require(committed is not None and committed["state"] == "committed")
+        require(committed["filesystemUuid"] == result["filesystemUuid"])
+        require(committed["source"] == "fresh")
+        followup = FakeRuntime(context, cfg, lease)
+        transfer_engine_state(runtime, followup)
+        require(followup.ensure_instance_storage()["ok"] is True)
+        require(followup.actions == ["preserve"])
+
+
+@contract_case("storageIdentityRotationRequiresStoppedContainer")
+def storage_identity_rotation_requires_stopped_container() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        require(runtime.ensure_instance_storage()["ok"] is True)
+        runtime.containers[lease.container_name] = owned_container_record(runtime)
+        result = runtime.rotate_storage_identity()
+        require(result["ok"] is False)
+        require(result["error"] == "storage_rotation_requires_stop")
+        committed = storage.StorageStateStore(context, lease).load()
+        require(committed is not None and committed["state"] == "committed")
+        require(committed["filesystemUuid"] == FS_A)
+
+
+@contract_case("storageIdentityRotationResumesAfterCrash")
+def storage_identity_rotation_resumes_after_crash() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        require(runtime.ensure_instance_storage()["ok"] is True)
+        store = storage.StorageStateStore(context, lease)
+        committed = store.load()
+        require(committed is not None)
+        target = storage.storage_rotation_target("4" * 32)
+        pending = store.pending(
+            "fresh",
+            transaction_id="4" * 32,
+            filesystem_uuid=FS_A,
+            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
+            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
+            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
+            growth=True,
+            rotation_target_uuid=target,
+        )
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(target)
+        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
+        result = runtime.rotate_storage_identity()
+        require(result["ok"] is True)
+        require(result["rotated"] is False)
+        require(result["filesystemUuid"] == target)
+        require(result["previousFilesystemUuid"] == pending["filesystemUuid"])
+        final = store.load()
+        require(final is not None and final["state"] == "committed")
+        require(final["filesystemUuid"] == target)
+        require(final["rotationTargetUuid"] == "")
+
+
+@contract_case("storageIdentityRotationRejectsReplacedImage")
+def storage_identity_rotation_rejects_replaced_image() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        require(runtime.ensure_instance_storage()["ok"] is True)
+        store = storage.StorageStateStore(context, lease)
+        committed = store.load()
+        require(committed is not None)
+        store.pending(
+            "fresh",
+            transaction_id="4" * 32,
+            filesystem_uuid=FS_A,
+            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
+            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
+            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
+            growth=True,
+            rotation_target_uuid=storage.storage_rotation_target("4" * 32),
+        )
+        # The image is neither the pending expectation nor the rotation target:
+        # a replaced/tampered image must fail closed instead of being adopted.
+        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(FS_B)
+        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
+        result = runtime.rotate_storage_identity()
+        require(result["ok"] is False)
+        require(result["error"] == "storage_identity_mismatch")
+        state = store.load()
+        require(state is not None and state["state"] == "pending")
+        require(state["transactionId"] == "4" * 32)
+        require(state["filesystemUuid"] == FS_A)
+
+
+@contract_case("upFailsClosedAcrossBothRotationWindows")
+def up_fails_closed_across_both_rotation_windows() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        require(runtime.ensure_instance_storage()["ok"] is True)
+        store = storage.StorageStateStore(context, lease)
+        committed = store.load()
+        require(committed is not None)
+        target = storage.storage_rotation_target("4" * 32)
+        store.pending(
+            "fresh",
+            transaction_id="4" * 32,
+            filesystem_uuid=FS_A,
+            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
+            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
+            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
+            growth=True,
+            rotation_target_uuid=target,
+        )
+        # Pre-mutation window: image still holds the old UUID.
+        pre_mutation = FakeRuntime(context, cfg, lease)
+        transfer_engine_state(runtime, pre_mutation)
+        result = pre_mutation.ensure_instance_storage()
+        require(result["ok"] is False)
+        require(result["error"] == "storage_identity_mismatch")
+        require("device regenerate" in str(result.get("message")))
+        # Post-mutation window: image already carries the rotation target.
+        post_mutation = FakeRuntime(context, cfg, lease)
+        transfer_engine_state(runtime, post_mutation)
+        post_mutation.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(target)
+        result = post_mutation.ensure_instance_storage()
+        require(result["ok"] is False)
+        require(result["error"] == "storage_identity_mismatch")
+        require("device regenerate" in str(result.get("message")))
+        # State is untouched in both windows; the rotation can still be resumed.
+        pending = store.load()
+        require(pending is not None and pending["state"] == "pending")
+        require(pending["rotationTargetUuid"] == target)
+
+
+@contract_case("plainGrowthPendingHasNoRotationMarker")
+def plain_growth_pending_has_no_rotation_marker() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        require(runtime.ensure_instance_storage()["ok"] is True)
+        store = storage.StorageStateStore(context, lease)
+        committed = store.load()
+        require(committed is not None)
+        store.pending(
+            "fresh",
+            transaction_id="4" * 32,
+            filesystem_uuid=FS_A,
+            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
+            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
+            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
+            growth=True,
+        )
+        pending_runtime = FakeRuntime(context, cfg, lease)
+        transfer_engine_state(runtime, pending_runtime)
+        require(pending_runtime.ensure_instance_storage()["ok"] is True)
+        final = store.load()
+        require(final is not None and final["state"] == "committed")
+        require(final["rotationTargetUuid"] == "")
+
+
+@contract_case("v2StorageStateMigratesWithoutMarker")
+def v2_storage_state_migrates_without_marker() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        require(runtime.ensure_instance_storage()["ok"] is True)
+        store = storage.StorageStateStore(context, lease)
+        committed = store.load()
+        require(committed is not None)
+        v2 = {k: v for k, v in committed.items() if k != "rotationTargetUuid"}
+        v2["schema"] = "dev.xenoid.instance-storage/v2"
+        (context.state_root / storage.STATE_FILENAME).write_text(
+            json.dumps(v2, sort_keys=True) + "\n"
+        )
+        migrated = store.load()
+        require(migrated is not None and migrated["state"] == "committed")
+        require(migrated["rotationTargetUuid"] == "")
+        require(migrated["filesystemUuid"] == FS_A)
+
+
+@contract_case("regenerateJournalLifecycle")
+def regenerate_journal_lifecycle() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, _, _ = initialize(project, state, "phone-a")
+        journal = device_identity.RegenerationJournal(context)
+        require(journal.pending() is False)
+        journal.clear()
+        journal.mark()
+        require(journal.pending() is True)
+        require(stat.S_IMODE(journal.path.stat().st_mode) == 0o600)
+        payload = json.loads(journal.path.read_text())
+        require(payload["schema"] == "dev.xenoid.device-regenerate/v1")
+        require(payload["instanceId"] == context.instance_id)
+        journal.clear()
+        require(journal.pending() is False)
+        journal.clear()
+
+
+@contract_case("regenerateJournalBlocksStart")
+def regenerate_journal_blocks_start() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        journal = device_identity.RegenerationJournal(context)
+        with mock.patch.object(backend, "which", return_value=None):
+            unblocked = runtime.start()
+            require(unblocked.get("error") == "docker not found")
+            journal.mark()
+            blocked = runtime.start()
+            require(blocked.get("ok") is False)
+            require(blocked.get("error") == "device_regeneration_pending")
+            journal.clear()
+            cleared = runtime.start()
+            require(cleared.get("error") == "docker not found")
+
+
+@contract_case("startSeedsBootIdentityBeforeCreate")
+def start_seeds_boot_identity_before_create() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = FakeRuntime(context, cfg, lease)
+        captured: list[tuple[str, str]] = []
+
+        def capture(boot_id: str, random_uuid: str) -> dict[str, Any]:
+            captured.append((boot_id, random_uuid))
+            return {"ok": True}
+
+        runtime._run_boot_identity_seed = capture  # type: ignore[method-assign]
+        result = runtime._seed_boot_identity_into_image()
+        require(result["ok"] is True)
+        require(len(captured) == 1)
+        store = device_identity.DeviceIdentityStore(context)
+        pending = store.load()["pending"]
+        require(pending is not None)
+        require(pending["bootId"] == captured[0][0])
+        require(pending["randomUuid"] == captured[0][1])
+        # The seeded values bind to the next container epoch verbatim.
+        runtime_stub = IdentityRuntimeStub("c" * 64)
+        client = FingerprintClientStub()
+        require(device_identity.converge_instance_identity(context, runtime_stub, client, {})["ok"] is True)
+        require(client.profiles[0]["ids"]["boot_id"] == captured[0][0])
+        require(client.profiles[0]["ids"]["random_uuid"] == captured[0][1])
 
 
 def main() -> int:

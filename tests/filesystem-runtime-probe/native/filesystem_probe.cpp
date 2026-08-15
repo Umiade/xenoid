@@ -17,6 +17,15 @@ struct Operation {
     long result = -1;
     int error = 0;
     unsigned long type = 0;
+    unsigned long bsize = 0;
+    unsigned long blocks = 0;
+    unsigned long bfree = 0;
+    unsigned long bavail = 0;
+    unsigned long files = 0;
+    unsigned long ffree = 0;
+    unsigned long namelen = 0;
+    unsigned long flags = 0;
+    int fsid[2] = {0, 0};
 };
 
 static std::string quote(const char *value) {
@@ -38,9 +47,25 @@ static std::string quote(const char *value) {
 static std::string operationJson(const Operation &operation) {
     char type[32];
     std::snprintf(type, sizeof(type), "0x%lx", operation.type);
-    return "{\"return\":" + std::to_string(operation.result)
+    std::string out = "{\"return\":" + std::to_string(operation.result)
             + ",\"errno\":" + std::to_string(operation.error)
-            + ",\"type\":" + quote(type) + "}";
+            + ",\"type\":" + quote(type);
+    if (operation.result == 0) {
+        char fsid[24];
+        std::snprintf(fsid, sizeof(fsid), "%08x%08x",
+                      static_cast<unsigned int>(operation.fsid[0]),
+                      static_cast<unsigned int>(operation.fsid[1]));
+        out += ",\"bsize\":" + std::to_string(operation.bsize)
+             + ",\"blocks\":" + std::to_string(operation.blocks)
+             + ",\"bfree\":" + std::to_string(operation.bfree)
+             + ",\"bavail\":" + std::to_string(operation.bavail)
+             + ",\"files\":" + std::to_string(operation.files)
+             + ",\"ffree\":" + std::to_string(operation.ffree)
+             + ",\"namelen\":" + std::to_string(operation.namelen)
+             + ",\"flags\":" + std::to_string(operation.flags)
+             + ",\"fsid\":" + quote(fsid);
+    }
+    return out + "}";
 }
 static long directSyscall(long number, long arg0, long arg1,
                           long arg2 = 0, long arg3 = 0) {
@@ -65,6 +90,19 @@ static bool rawError(long result) {
 }
 
 
+static void fillStatfsDetail(Operation &operation, const struct statfs &value) {
+    if (operation.result != 0) return;
+    operation.bsize = static_cast<unsigned long>(value.f_bsize);
+    operation.blocks = static_cast<unsigned long>(value.f_blocks);
+    operation.bfree = static_cast<unsigned long>(value.f_bfree);
+    operation.bavail = static_cast<unsigned long>(value.f_bavail);
+    operation.files = static_cast<unsigned long>(value.f_files);
+    operation.ffree = static_cast<unsigned long>(value.f_ffree);
+    operation.namelen = static_cast<unsigned long>(value.f_namelen);
+    operation.flags = static_cast<unsigned long>(value.f_flags);
+    memcpy(operation.fsid, &value.f_fsid, sizeof(operation.fsid));
+}
+
 static Operation libcStatfs(const char *path) {
     Operation operation;
     struct statfs value{};
@@ -72,6 +110,7 @@ static Operation libcStatfs(const char *path) {
     operation.result = statfs(path, &value);
     operation.error = operation.result == 0 ? 0 : errno;
     if (operation.result == 0) operation.type = static_cast<unsigned long>(value.f_type);
+    fillStatfsDetail(operation, value);
     return operation;
 }
 
@@ -86,6 +125,7 @@ static Operation rawStatfs(const char *path) {
     }
     operation.result = result;
     operation.type = static_cast<unsigned long>(value.f_type);
+    fillStatfsDetail(operation, value);
     return operation;
 }
 
@@ -104,9 +144,40 @@ static Operation rawFstatfs(const char *path) {
     } else {
         operation.result = result;
         operation.type = static_cast<unsigned long>(value.f_type);
+        fillStatfsDetail(operation, value);
     }
     directSyscall(__NR_close, fd, 0);
     return operation;
+}
+
+static std::string rawReadFile(const char *path) {
+    std::string out;
+    long fd = directSyscall(__NR_openat, AT_FDCWD, reinterpret_cast<long>(path),
+                            O_RDONLY | O_CLOEXEC, 0);
+    if (rawError(fd)) return out;
+    char buffer[4096];
+    for (;;) {
+        long count = directSyscall(__NR_read, fd, reinterpret_cast<long>(buffer),
+                                   sizeof(buffer));
+        if (count <= 0) break;
+        out.append(buffer, static_cast<size_t>(count));
+        if (out.size() > (1u << 20)) break;
+    }
+    directSyscall(__NR_close, fd, 0);
+    return out;
+}
+
+static std::string dataMountLine(const char *path) {
+    std::string text = rawReadFile(path);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(pos, end - pos);
+        if (line.find(" /data ") != std::string::npos) return line;
+        pos = end + 1;
+    }
+    return "";
 }
 
 
@@ -139,7 +210,9 @@ Java_org_example_filesystemruntimeprobe_ProbeActivity_nativeProbe(
             + ",\"cryptoType\":" + quote(cryptoType)
             + ",\"appData\":" + pathJson(appData)
             + ",\"data\":" + dataPathJson("/data")
-            + ",\"system\":" + pathJson("/system") + "}";
+            + ",\"system\":" + pathJson("/system")
+            + ",\"mountinfoData\":" + quote(dataMountLine("/proc/self/mountinfo").c_str())
+            + ",\"mountsData\":" + quote(dataMountLine("/proc/self/mounts").c_str()) + "}";
     if (appDataPath != nullptr) env->ReleaseStringUTFChars(appDataPath, appData);
     return env->NewStringUTF(result.c_str());
 }

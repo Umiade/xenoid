@@ -1,6 +1,7 @@
 """Crash-safe ownership state for one instance's persistent Android /data image."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -11,7 +12,8 @@ from typing import Any, Mapping, Optional
 
 from .config import InstanceContext, InstanceLease
 
-STORAGE_SCHEMA = "dev.xenoid.instance-storage/v2"
+STORAGE_SCHEMA = "dev.xenoid.instance-storage/v3"
+_V2_STORAGE_SCHEMA = "dev.xenoid.instance-storage/v2"
 LEGACY_STORAGE_SCHEMA = "dev.xenoid.instance-storage/v1"
 STATE_FILENAME = "storage.json"
 DATA_IMAGE_NAME = "xenoid-data.img"
@@ -24,6 +26,8 @@ _TEMPORARY_IMAGE = re.compile(r"^\.xenoid-data\.img\.[0-9a-f]{32}\.new$")
 _VOLUME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SOURCES = frozenset({"fresh", "adopted", "legacy"})
 _STATES = frozenset({"pending", "committed"})
+_ROTATION_TARGET_DOMAIN = b"xenoid-storage-rotation-target/v1\0"
+_ROTATION_ROOTFS_DOMAIN = b"xenoid-storage-rotation-rootfs/v1\0"
 _KEYS = {
     "schema",
     "instanceId",
@@ -44,6 +48,7 @@ _KEYS = {
     "backupImage",
     "backupFilesystemUuid",
     "backupSizeBytes",
+    "rotationTargetUuid",
 }
 _LEGACY_KEYS = {
     "schema",
@@ -100,6 +105,23 @@ def storage_transaction_id() -> str:
     return secrets.token_hex(16)
 
 
+def storage_rotation_target(transaction_id: str, *, rootfs: bool = False) -> str:
+    """Deterministic rotation target UUID for one storage transaction.
+
+    The pending transaction ID is already persisted, so the target identity
+    the engine-host script must converge to can be re-derived after any
+    crash: the script accepts only old→target, and every other observed UUID
+    is a hard mismatch instead of a silent adoption.
+    """
+    transaction = _strict_text(transaction_id, _TRANSACTION, "storage_state_invalid")
+    domain = _ROTATION_ROOTFS_DOMAIN if rootfs else _ROTATION_TARGET_DOMAIN
+    digest = bytearray(hashlib.sha256(domain + transaction.encode("ascii")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    text = digest.hex()
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
+
+
 def temporary_image_name(transaction_id: str) -> str:
     transaction = _strict_text(transaction_id, _TRANSACTION, "storage_state_invalid")
     return f".{DATA_IMAGE_NAME}.{transaction}.new"
@@ -133,6 +155,8 @@ class StorageStateStore:
             raise StorageError("storage_state_invalid", "invalid instance storage state") from exc
         if isinstance(raw, Mapping) and raw.get("schema") == LEGACY_STORAGE_SCHEMA:
             raw = self._migrate_v1(raw)
+        if isinstance(raw, Mapping) and raw.get("schema") == _V2_STORAGE_SCHEMA:
+            raw = {**raw, "schema": STORAGE_SCHEMA, "rotationTargetUuid": ""}
         return self.validate(raw)
 
     def _migrate_v1(self, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -161,6 +185,7 @@ class StorageStateStore:
             "backupImage": raw.get("backupImage"),
             "backupFilesystemUuid": raw.get("backupFilesystemUuid"),
             "backupSizeBytes": raw.get("backupSizeBytes"),
+            "rotationTargetUuid": "",
         }
 
     def save(self, state: Mapping[str, Any]) -> dict[str, Any]:
@@ -208,6 +233,7 @@ class StorageStateStore:
         backup_filesystem_uuid: str = "",
         backup_size_bytes: int = 0,
         growth: bool = False,
+        rotation_target_uuid: str = "",
     ) -> dict[str, Any]:
         transaction = transaction_id or storage_transaction_id()
         state = {
@@ -232,6 +258,7 @@ class StorageStateStore:
             "backupImage": backup_image,
             "backupFilesystemUuid": backup_filesystem_uuid,
             "backupSizeBytes": backup_size_bytes,
+            "rotationTargetUuid": rotation_target_uuid,
         }
         return self.save(state)
 
@@ -251,6 +278,7 @@ class StorageStateStore:
             "hostAllocatedBytes": int(image["allocatedBytes"]),
             "state": "committed",
             "temporaryImage": "",
+            "rotationTargetUuid": "",
         }
         return self.save(committed)
 
@@ -304,6 +332,7 @@ class StorageStateStore:
         legacy_uuid = _optional_text(state["legacyFilesystemUuid"], _UUID, "storage_state_invalid")
         backup = _optional_text(state["backupImage"], _IMAGE, "storage_state_invalid")
         backup_uuid = _optional_text(state["backupFilesystemUuid"], _UUID, "storage_state_invalid")
+        rotation_target = _optional_text(state["rotationTargetUuid"], _UUID, "storage_state_invalid")
         desired = _size(state["desiredLogicalSizeBytes"])
         observed = _size(state["observedLogicalSizeBytes"], allow_zero=True)
         filesystem_size = _size(state["observedFilesystemSizeBytes"], allow_zero=True)
@@ -322,6 +351,13 @@ class StorageStateStore:
                 raise StorageError("storage_state_invalid", "invalid pending storage transaction")
         elif not filesystem_uuid or temporary or observed == 0 or filesystem_size == 0:
             raise StorageError("storage_state_invalid", "invalid committed storage transaction")
+        # The rotation marker is only legal on a pending in-place (growth-shaped)
+        # transaction and must point at a different identity than the recorded one.
+        if status != "pending" or temporary != "":
+            if rotation_target:
+                raise StorageError("storage_state_invalid", "unexpected storage rotation target")
+        elif rotation_target and rotation_target == filesystem_uuid:
+            raise StorageError("storage_state_invalid", "storage rotation target matches the pending identity")
         if source == "legacy":
             if not legacy_volume or not legacy_uuid:
                 raise StorageError("storage_state_invalid", "legacy storage source is incomplete")
@@ -340,6 +376,7 @@ class StorageStateStore:
             "legacyFilesystemUuid": legacy_uuid,
             "backupImage": backup,
             "backupFilesystemUuid": backup_uuid,
+            "rotationTargetUuid": rotation_target,
             "desiredLogicalSizeBytes": desired,
             "observedLogicalSizeBytes": observed,
             "observedFilesystemSizeBytes": filesystem_size,
@@ -402,6 +439,11 @@ def public_storage_state(state: Optional[Mapping[str, Any]], *, healthy: bool, e
         "observedLogicalSizeBytes": state.get("observedLogicalSizeBytes"),
         "observedFilesystemSizeBytes": state.get("observedFilesystemSizeBytes"),
         "hostAllocatedBytes": state.get("hostAllocatedBytes"),
+        **(
+            {"rotationPending": True}
+            if state.get("rotationTargetUuid")
+            else {}
+        ),
         "backup": (
             {
                 "image": state.get("backupImage"),

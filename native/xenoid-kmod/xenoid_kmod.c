@@ -28,6 +28,7 @@
 #include <linux/mount.h>
 #include <linux/statfs.h>
 #include <linux/magic.h>
+#include <linux/math64.h>
 #include <linux/utsname.h>
 #include <linux/mm.h>
 #include <linux/un.h>
@@ -208,6 +209,11 @@ static struct kretprobe sysinfo_kprobes[] = {
 #define F2FS_SUPER_MAGIC 0xF2F52010
 #endif
 
+#define XENOID_DATA_BLOCK_SIZE 4096ULL
+#define XENOID_DATA_BLOCKS 31250000ULL
+#define XENOID_DATA_NAME_MAX 255ULL
+#define XENOID_DATA_STATFS_FLAGS 0x426ULL
+
 struct statfs_ctx {
 	struct kstatfs *buf;
 	bool shape;
@@ -238,6 +244,52 @@ static bool dentry_is_android_data(const struct dentry *dentry)
 	return false;
 }
 
+/*
+ * The live Raven data image is 31,250,000 blocks, so its divisor fits in u32.
+ * Keep a bounded fallback for larger backing filesystems by reducing both
+ * ratio terms before using the kernel's overflow-safe u64*u32 helper.
+ */
+static u64 scale_data_statfs_value(u64 value, u64 total)
+{
+	while (total > U32_MAX) {
+		value >>= 1;
+		total >>= 1;
+	}
+	if (!total)
+		return 0;
+	return mul_u64_u32_div(value, (u32)XENOID_DATA_BLOCKS, (u32)total);
+}
+
+static void shape_data_statfs(struct kstatfs *buf)
+{
+	u64 real_blocks = READ_ONCE(buf->f_blocks);
+	u64 real_bfree;
+	u64 real_bavail;
+	u64 real_files;
+	u64 real_ffree;
+
+	if (!real_blocks)
+		return;
+	real_bfree = READ_ONCE(buf->f_bfree);
+	real_bavail = READ_ONCE(buf->f_bavail);
+	real_files = READ_ONCE(buf->f_files);
+	real_ffree = READ_ONCE(buf->f_ffree);
+
+	WRITE_ONCE(buf->f_type, F2FS_SUPER_MAGIC);
+	WRITE_ONCE(buf->f_bsize, XENOID_DATA_BLOCK_SIZE);
+	WRITE_ONCE(buf->f_blocks, XENOID_DATA_BLOCKS);
+	WRITE_ONCE(buf->f_bfree,
+		   scale_data_statfs_value(real_bfree, real_blocks));
+	WRITE_ONCE(buf->f_bavail,
+		   scale_data_statfs_value(real_bavail, real_blocks));
+	WRITE_ONCE(buf->f_files,
+		   scale_data_statfs_value(real_files, real_blocks));
+	WRITE_ONCE(buf->f_ffree,
+		   scale_data_statfs_value(real_ffree, real_blocks));
+	WRITE_ONCE(buf->f_namelen, XENOID_DATA_NAME_MAX);
+	WRITE_ONCE(buf->f_flags, XENOID_DATA_STATFS_FLAGS);
+}
+
 static bool statfs_cloned_abi;
 static bool statfs_needs_clone_success;
 
@@ -264,7 +316,7 @@ static int statfs_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!ctx->shape || !ctx->buf ||
 	    (statfs_needs_clone_success && (long)regs_return_value(regs) != 0))
 		return 0;
-	WRITE_ONCE(ctx->buf->f_type, F2FS_SUPER_MAGIC);
+	shape_data_statfs(ctx->buf);
 	return 0;
 }
 
@@ -609,7 +661,20 @@ static struct kretprobe smaps_seq_kp = {
 };
 /* Protection files are mounted from a daemon-owned private staging tree.
  * Keep those implementation mounts out of application procfs views while
- * preserving the underlying Android partition mounts. */
+ * preserving the underlying Android partition mounts. The staged Raven
+ * profile validates mountSource/filesystem against these canonical values;
+ * show handlers cannot sleep to read the staged files, so use that same fixed
+ * contract here and retain the live mount's IDs and device number. */
+#define XENOID_DATA_MOUNT_SOURCE \
+    "/dev/block/platform/14700000.ufs/by-name/userdata"
+#define XENOID_DATA_MOUNT_OPTIONS \
+    "rw,seclabel,nosuid,nodev,noatime"
+#define XENOID_DATA_F2FS_OPTIONS \
+    "discard,inlinecrypt,atgc,checkpoint_merge,reserve_root=32768," \
+    "resgid=1065,fsync_mode=nobarrier"
+#define XENOID_DATA_SUPER_OPTIONS \
+    "rw," XENOID_DATA_F2FS_OPTIONS
+
 static int mount_seq_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct maps_seq_ctx *ctx = (void *)ri->data;
@@ -623,25 +688,144 @@ static int mount_seq_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
     return 0;
 }
 
-static int mount_seq_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+static bool mount_seq_record(struct maps_seq_ctx *ctx, struct seq_file **seq_out,
+                             char **record_out, size_t *record_len_out)
 {
-    struct maps_seq_ctx *ctx = (void *)ri->data;
     struct seq_file *seq = ctx->seq;
     char *record;
     size_t record_len;
 
     if (!seq || !seq->buf || seq->count <= ctx->count)
-        return 0;
+        return false;
     record = seq->buf + ctx->count;
     record_len = seq->count - ctx->count;
     if (bounded_has(record, record_len, " /overlay.d/") ||
-        bounded_has(record, record_len, " /data/system/.core/"))
+        bounded_has(record, record_len, " /data/system/.core/")) {
         seq->count = ctx->count;
+        return false;
+    }
+    *seq_out = seq;
+    *record_out = record;
+    *record_len_out = record_len;
+    return true;
+}
+
+static bool parse_mount_uint(const char **cursor, const char *end, u32 *value)
+{
+    const char *p = *cursor;
+    u32 parsed = 0;
+
+    if (p >= end || *p < '0' || *p > '9')
+        return false;
+    do {
+        u32 digit = (u32)(*p - '0');
+
+        if (parsed > (U32_MAX - digit) / 10U)
+            return false;
+        parsed = parsed * 10U + digit;
+        p++;
+    } while (p < end && *p >= '0' && *p <= '9');
+    *cursor = p;
+    *value = parsed;
+    return true;
+}
+
+static bool parse_mountinfo_identity(const char *record, size_t record_len,
+                                     u32 *mount_id, u32 *parent_id,
+                                     u32 *dev_major, u32 *dev_minor)
+{
+    const char *cursor = record;
+    const char *end = record + record_len;
+
+    if (!parse_mount_uint(&cursor, end, mount_id) ||
+        cursor >= end || *cursor++ != ' ' ||
+        !parse_mount_uint(&cursor, end, parent_id) ||
+        cursor >= end || *cursor++ != ' ' ||
+        !parse_mount_uint(&cursor, end, dev_major) ||
+        cursor >= end || *cursor++ != ':' ||
+        !parse_mount_uint(&cursor, end, dev_minor) ||
+        cursor >= end || *cursor != ' ')
+        return false;
+    return true;
+}
+
+static bool vfsmnt_record_is_data(const char *record, size_t record_len)
+{
+    const char *space = memchr(record, ' ', record_len);
+    size_t remaining;
+
+    if (!space)
+        return false;
+    space++;
+    remaining = record_len - (size_t)(space - record);
+    return remaining >= 6 && !memcmp(space, "/data ", 6);
+}
+
+static int mountinfo_seq_post(struct kretprobe_instance *ri,
+                              struct pt_regs *regs)
+{
+    struct maps_seq_ctx *ctx = (void *)ri->data;
+    struct seq_file *seq;
+    char *record;
+    size_t record_len;
+    u32 mount_id;
+    u32 parent_id;
+    u32 dev_major;
+    u32 dev_minor;
+
+    (void)regs;
+    if (!mount_seq_record(ctx, &seq, &record, &record_len) ||
+        !bounded_has(record, record_len, " / /data ") ||
+        !parse_mountinfo_identity(record, record_len, &mount_id, &parent_id,
+                                  &dev_major, &dev_minor))
+        return 0;
+    seq->count = ctx->count;
+    seq_printf(seq,
+        "%u %u %u:%u / /data " XENOID_DATA_MOUNT_OPTIONS
+        " - f2fs " XENOID_DATA_MOUNT_SOURCE " "
+        XENOID_DATA_SUPER_OPTIONS "\n",
+        mount_id, parent_id, dev_major, dev_minor);
+    return 0;
+}
+
+static int mounts_seq_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct maps_seq_ctx *ctx = (void *)ri->data;
+    struct seq_file *seq;
+    char *record;
+    size_t record_len;
+
+    (void)regs;
+    if (!mount_seq_record(ctx, &seq, &record, &record_len) ||
+        !vfsmnt_record_is_data(record, record_len))
+        return 0;
+    seq->count = ctx->count;
+    seq_printf(seq, XENOID_DATA_MOUNT_SOURCE " /data f2fs "
+               XENOID_DATA_MOUNT_OPTIONS ","
+               XENOID_DATA_F2FS_OPTIONS " 0 0\n");
+    return 0;
+}
+
+static int mountstats_seq_post(struct kretprobe_instance *ri,
+                               struct pt_regs *regs)
+{
+    struct maps_seq_ctx *ctx = (void *)ri->data;
+    struct seq_file *seq;
+    char *record;
+    size_t record_len;
+
+    (void)regs;
+    if (!mount_seq_record(ctx, &seq, &record, &record_len) ||
+        !bounded_has(record, record_len, " mounted on /data "))
+        return 0;
+    seq->count = ctx->count;
+    seq_printf(seq, "device " XENOID_DATA_MOUNT_SOURCE
+               " mounted on /data with fstype f2fs\n");
     return 0;
 }
 
 static struct kretprobe mountinfo_seq_kp = {
-    .handler = mount_seq_post,
+    .handler = mountinfo_seq_post,
     .entry_handler = mount_seq_pre,
     .data_size = sizeof(struct maps_seq_ctx),
     .kp = { .symbol_name = "show_mountinfo" },
@@ -649,7 +833,7 @@ static struct kretprobe mountinfo_seq_kp = {
 };
 
 static struct kretprobe mounts_seq_kp = {
-    .handler = mount_seq_post,
+    .handler = mounts_seq_post,
     .entry_handler = mount_seq_pre,
     .data_size = sizeof(struct maps_seq_ctx),
     .kp = { .symbol_name = "show_vfsmnt" },
@@ -657,7 +841,7 @@ static struct kretprobe mounts_seq_kp = {
 };
 
 static struct kretprobe mountstats_seq_kp = {
-    .handler = mount_seq_post,
+    .handler = mountstats_seq_post,
     .entry_handler = mount_seq_pre,
     .data_size = sizeof(struct maps_seq_ctx),
     .kp = { .symbol_name = "show_vfsstat" },

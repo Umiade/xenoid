@@ -48,6 +48,8 @@ echo "[ci] static: instance identity and lease contracts"
 run_py test-proxy.py
 echo "[ci] static: instance storage and lifecycle contracts"
 run_py test-instance-storage.py
+echo "[ci] static: location cellular identity contracts"
+run_py test-cellular-profile.py
 echo "[ci] static: pinned Google runtime contracts"
 run_py test-google-services.py
 echo "[ci] static: proxy compiler and authenticated control contracts"
@@ -109,6 +111,7 @@ STATIC_SMOKES=(
   smoke-memory-proc-overlay.py
   smoke-power-supply-overlay.py
   smoke-proc-identity-overlay.py
+  smoke-statfs-coherence.py
   smoke-random-sysctl-overlay.py
   smoke-selinux-overlay.py
   smoke-input-devices-overlay.py

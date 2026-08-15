@@ -16,6 +16,7 @@ import java.util.*;
 
 final class DeviceProfileManager {
     private static final SecureRandom RNG = new SecureRandom();
+    private static final String IMEI_TAC = "35180461"; // Pixel 6 Pro (G8V0U) Type Allocation Code
     private static final String BATTERY_HEALTH_REFRESH =
         "stop vendor.health-default >/dev/null 2>&1 || true; "
         + "start vendor.health-default >/dev/null 2>&1 || true; "
@@ -743,7 +744,9 @@ final class DeviceProfileManager {
     }
     private static String randomSerial() { return hex(8).toUpperCase(Locale.ROOT); }
     private static String randomImei() {
-        StringBuilder first = new StringBuilder(String.valueOf(RNG.nextInt(9) + 1));
+        // TAC is a same-model constant (Pixel 6 Pro G8V0U); only the 6-digit
+        // serial section rotates, then the Luhn check digit.
+        StringBuilder first = new StringBuilder(IMEI_TAC);
         while (first.length() < 14) first.append(RNG.nextInt(10));
         int total = 0;
         for (int i = 0; i < first.length(); i++) {

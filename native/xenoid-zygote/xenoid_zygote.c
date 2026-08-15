@@ -41,8 +41,6 @@ static rcb_t real_rcb;
 static statfs_t real_statfs;
 #endif
 static syscall_t real_syscall;
-static __thread dev_t last_data_statfs_device;
-static __thread int data_statfs_device_valid;
 
 static const char *spoof_value(const char *name){
   if (!name) return NULL;
@@ -140,20 +138,59 @@ static int path_is_data(const char *path){
   return !strcmp(path, "/data") || !strncmp(path, "/data/", 6);
 }
 
+#define XENOID_F2FS_SUPER_MAGIC 0xF2F52010L
+#define XENOID_DATA_BLOCK_SIZE 4096ULL
+#define XENOID_DATA_BLOCKS 31250000ULL
+#define XENOID_DATA_NAME_MAX 255ULL
+#define XENOID_DATA_STATFS_FLAGS 0x426ULL
+
+static unsigned long long scale_data_statfs_value(
+    unsigned long long value, unsigned long long total) {
+  unsigned long long quotient;
+  unsigned long long remainder;
+  while(total > UINT32_MAX) {
+    value >>= 1;
+    total >>= 1;
+  }
+  if(!total) return 0;
+  quotient=value/total;
+  remainder=value%total;
+  return quotient*XENOID_DATA_BLOCKS
+      + remainder*XENOID_DATA_BLOCKS/total;
+}
+#define XENOID_SHAPE_DATA_STATFS(buf) do { \
+  unsigned long long real_blocks=(unsigned long long)(buf)->f_blocks; \
+  unsigned long long real_bfree=(unsigned long long)(buf)->f_bfree; \
+  unsigned long long real_bavail=(unsigned long long)(buf)->f_bavail; \
+  unsigned long long real_files=(unsigned long long)(buf)->f_files; \
+  unsigned long long real_ffree=(unsigned long long)(buf)->f_ffree; \
+  if(real_blocks) { \
+    (buf)->f_type=XENOID_F2FS_SUPER_MAGIC; \
+    (buf)->f_bsize=XENOID_DATA_BLOCK_SIZE; \
+    (buf)->f_blocks=XENOID_DATA_BLOCKS; \
+    (buf)->f_bfree=scale_data_statfs_value(real_bfree,real_blocks); \
+    (buf)->f_bavail=scale_data_statfs_value(real_bavail,real_blocks); \
+    (buf)->f_files=scale_data_statfs_value(real_files,real_blocks); \
+    (buf)->f_ffree=scale_data_statfs_value(real_ffree,real_blocks); \
+    (buf)->f_namelen=XENOID_DATA_NAME_MAX; \
+    (buf)->f_flags=XENOID_DATA_STATFS_FLAGS; \
+  } \
+} while(0)
+
+static int fd_is_data_device(int fd) {
+  struct stat data_stat;
+  struct stat fd_stat;
+  return lstat("/data", &data_stat) == 0 && fstat(fd, &fd_stat) == 0
+      && fd_stat.st_dev == data_stat.st_dev;
+}
+
 #ifndef XENOID_COMBINED_SHIM
 int statfs(const char *path, struct statfs *buf){
   if (!real_statfs) real_statfs = (statfs_t)dlsym(RTLD_NEXT, "statfs");
   if (!real_statfs) { errno = ENOSYS; return -1; }
   int app_data = getuid() >= 10000 && path_is_data(path);
   int rc = real_statfs(path, buf);
-  if (rc == 0 && app_data) {
-    buf->f_type = 0xF2F52010;
-    struct stat st;
-    data_statfs_device_valid = lstat(path, &st) == 0;
-    if (data_statfs_device_valid) last_data_statfs_device = st.st_dev;
-  } else {
-    data_statfs_device_valid = 0;
-  }
+  if (rc == 0 && app_data && buf) XENOID_SHAPE_DATA_STATFS(buf);
   return rc;
 }
 #endif
@@ -171,15 +208,11 @@ long syscall(long number, ...){
   if (number == __NR_statfs && rc == 0 && getuid() >= 10000) {
     const char *path = (const char *)args[0];
     struct statfs *buf = (struct statfs *)args[1];
-    if (buf && path_is_data(path)) buf->f_type = 0xF2F52010;
-    data_statfs_device_valid = 0;
-  } else if (number == __NR_fstatfs && rc == 0 && getuid() >= 10000 &&
-             data_statfs_device_valid) {
-    struct stat st;
+    if (buf && path_is_data(path)) XENOID_SHAPE_DATA_STATFS(buf);
+  } else if (number == __NR_fstatfs && rc == 0 && getuid() >= 10000) {
     struct statfs *buf = (struct statfs *)args[1];
-    if (buf && fstat((int)args[0], &st) == 0 &&
-        st.st_dev == last_data_statfs_device)
-      buf->f_type = 0xF2F52010;
+    if (buf && fd_is_data_device((int)args[0]))
+      XENOID_SHAPE_DATA_STATFS(buf);
   }
   return rc;
 }

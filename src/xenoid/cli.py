@@ -26,6 +26,7 @@ from .config import (
     merge_config,
     resolve_instance,
     resolve_project_root,
+    rotate_instance_network,
     save_config,
     select_instance_name,
 )
@@ -37,6 +38,7 @@ from .daemon_client import (
 from .doctor import build_doctor_report
 from .device_identity import (
     DeviceIdentityStore,
+    RegenerationJournal,
     converge_instance_identity,
     identity_field_key,
     public_identity_state,
@@ -64,6 +66,7 @@ from .location import (
     supported_countries,
 )
 from .proxy_controller import ProxyController
+from .storage import StorageError, StorageStateStore
 from .util import json_dumps, read_json_file, write_json_file
 
 
@@ -1914,6 +1917,204 @@ def cmd_device_set(args: argparse.Namespace) -> int:
     return 0 if result.get("ok", False) else 1
 
 
+def cmd_device_regenerate(args: argparse.Namespace) -> int:
+    """Rotate every per-device uniqueness factor and re-converge the runtime.
+
+    Crash-safe ordering: persist the rotated stable identity and network
+    epoch first, stop the owned container, rotate filesystem identity
+    offline, then let the standard up pipeline rebuild the container from
+    the rotated state and validate the production runtime.
+    """
+    context = args.context
+    store = DeviceIdentityStore(context)
+    journal = RegenerationJournal(context)
+    manager = runtime(args)
+    container_id = manager.location_runtime_container_id()
+    if args.dry_run:
+        state = store.load()
+        print_json({
+            "ok": True,
+            "dryRun": True,
+            "runtimeRunning": container_id is not None,
+            "identity": (
+                public_identity_state(state) if state is not None else {"initialized": False}
+            ),
+            "network": {"macAddress": args.lease.mac_address, "epoch": args.lease.network_epoch or None},
+            "actions": [
+                "rotate stable identity (android_id, serial, IMEI/IMEISV)",
+                "rotate the lease network epoch (container MAC)",
+                "stop the owned Android container",
+                "rotate data/rootfs filesystem UUIDs and reset the per-app SSAID store offline",
+                "rotate the SIM epoch (new IMSI/ICCID/MSISDN/cell for the same country)",
+                "rebuild and validate the runtime through the standard up pipeline",
+                "clear Google services app data so the app-readable advertising ID regenerates (GMS instances)",
+            ],
+        })
+        return 0
+    if not container_id:
+        # An interrupted regenerate can leave the container already removed
+        # with the journal and/or a marked pending storage transaction; allow
+        # resuming that instead of deadlocking against up's fail-closed checks.
+        try:
+            storage_state = StorageStateStore(context, args.lease).load()
+        except StorageError:
+            storage_state = None
+        resumable = journal.pending() or (
+            storage_state is not None
+            and storage_state["state"] == "pending"
+            and storage_state["temporaryImage"] == ""
+            and bool(storage_state["rotationTargetUuid"])
+        )
+        if not resumable:
+            print_json({
+                "ok": False,
+                "error": "device_runtime_not_running",
+                "message": "start the instance with ./xenoid up before regenerating its device identity",
+            })
+            return 1
+    journal.mark()
+    try:
+        state = store.load()
+        if state is None:
+            state = store.initialize()
+        store.rotate_stable()
+    except InstanceError as exc:
+        result = exc.as_dict()
+        result["message"] = str(exc)
+        print_json(result)
+        return 1
+    # Stop with the CURRENT lease first: proxy cleanup/owner state is bound to
+    # its lease digest, so the network epoch may rotate only after the engine
+    # state is wiped.
+    stopped = manager.stop()
+    if not isinstance(stopped, dict) or stopped.get("ok") is not True:
+        print_json({
+            "ok": False,
+            "error": "device_regenerate_stop_failed",
+            "stop": stopped,
+            "nextActions": [f"./xenoid --instance {context.instance_name} device regenerate"],
+        })
+        return 1
+    try:
+        rotate_instance_network(context)
+        args.context, args.config, args.lease = resolve_instance(
+            args.instance_name,
+            project_root=args.project_root,
+        )
+    except InstanceError as exc:
+        print_json(exc.as_dict())
+        return 1
+    # Rotate the SIM epoch so the same country gets a new SIM (IMSI, ICCID,
+    # MSISDN, cell identity); the up pipeline's location apply restages and
+    # verifies it through the existing crash-safe transaction.
+    sim_rotation: dict[str, Any]
+    try:
+        location_store = LocationStateStore(context.state_root)
+        if location_store.load() is None:
+            sim_rotation = {"ok": True, "skipped": True, "reason": "location_uninitialized"}
+        else:
+            location_store.rotate_sim_identity()
+            sim_rotation = {"ok": True, "rotated": True}
+    except LocationError as exc:
+        print_json({"ok": False, "error": exc.code, "message": str(exc)})
+        return 1
+    manager = runtime(args)
+    surgery = manager.rotate_storage_identity()
+    if not isinstance(surgery, dict) or surgery.get("ok") is not True:
+        print_json({
+            "ok": False,
+            "error": "device_regenerate_storage_failed",
+            "storage": surgery,
+            "nextActions": [
+                f"./xenoid --instance {context.instance_name} device regenerate",
+            ],
+        })
+        return 1
+    # Every rotation is now committed in its own store (identity, lease,
+    # storage), so the standard up pipeline converges coherently from here;
+    # clear the crash journal before invoking it (up/start fail closed while
+    # the journal is present).
+    journal.clear()
+    script = context.project_root / "scripts" / "xenoid-up.sh"
+    cmd = [str(script), "--instance", context.instance_name]
+    if args.skip_build:
+        cmd.append("--skip-build")
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        cwd=str(context.project_root),
+        env=command_env(args),
+    )
+    google_wipe: dict[str, Any] = {"ok": True, "skipped": True, "reason": "google_services_disabled"}
+    if (
+        proc.returncode == 0
+        and args.config.google_services_provider == PROVIDER_MINDTHEGAPPS
+    ):
+        # Verified on this runtime from a third-party app UID: the GMS
+        # advertising ID is app-readable, so a new device must regenerate it.
+        # The GSF Android ID is not third-party readable (READ_GSERVICES is
+        # signature-held); it is cleared anyway for one coherent Google state.
+        cleared_packages: list[str] = []
+        failed_packages: list[str] = []
+        for package in (
+            "com.google.android.gms",
+            "com.google.android.gsf",
+            "com.android.vending",
+        ):
+            cleared = manager.adb(
+                ["shell", "pm", "clear", "--user", "0", package],
+                timeout=60,
+            )
+            if (
+                isinstance(cleared, dict)
+                and cleared.get("ok") is True
+                and "Success" in str(cleared.get("stdout", ""))
+            ):
+                cleared_packages.append(package)
+            else:
+                failed_packages.append(package)
+        post_clear = build_doctor_report(
+            args.context,
+            args.config,
+            args.lease,
+            require_runtime=True,
+        )
+        google_wipe = {
+            "ok": not failed_packages and post_clear.get("ok") is True,
+            "cleared": cleared_packages,
+            "failed": failed_packages,
+            "doctor": {
+                "ok": post_clear.get("ok"),
+                "complete": post_clear.get("complete"),
+            },
+        }
+    final_state = store.load()
+    result = {
+        "ok": proc.returncode == 0 and google_wipe.get("ok") is True,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "script": str(script),
+        "regenerated": proc.returncode == 0,
+        "identity": (
+            public_identity_state(final_state)
+            if final_state is not None
+            else {"initialized": False}
+        ),
+        "network": {"macAddress": args.lease.mac_address, "epoch": args.lease.network_epoch},
+        "storage": {
+            "filesystemUuid": surgery.get("filesystemUuid"),
+            "previousFilesystemUuid": surgery.get("previousFilesystemUuid"),
+            "ssaidStore": "reset",
+        },
+        "sim": sim_rotation,
+        "googleWipe": google_wipe,
+    }
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
 def cmd_automation_plan(args: argparse.Namespace) -> int:
     result = runtime(args).automation_plan(args.script)
     print_json(result)
@@ -2594,6 +2795,13 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("field")
     st.add_argument("value")
     st.set_defaults(func=cmd_device_set)
+    rg = dev.add_parser(
+        "regenerate",
+        help="rotate every per-device uniqueness factor (IDs, MAC, filesystem identity, per-app SSAID) and re-converge the runtime",
+    )
+    rg.add_argument("--skip-build", action="store_true", help="validate prebuilt artifacts instead of rebuilding (same as up --skip-build)")
+    rg.add_argument("--dry-run", action="store_true", help="show the rotation plan without changing anything")
+    rg.set_defaults(func=cmd_device_regenerate)
 
     s = sub.add_parser("automation", help="automation tasks")
     aut = s.add_subparsers(required=True)

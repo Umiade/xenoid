@@ -207,6 +207,54 @@ def test_rotation_and_cached_restore() -> None:
                 b"xenoid-location-profile/v1:US", __import__("hashlib").sha256).digest()))
 
 
+def test_sim_epoch_rotation_renews_same_country() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = _pending_store(directory)
+        store.mark_staged(EPOCH_1)
+        store.arm_restart()
+        store.mark_restarted(EPOCH_2)
+        store.promote(EPOCH_2)
+        # Derive and cache US before any rotation: legacy epochless formula.
+        state, _ = store.set_desired("US")
+        us_legacy = state["profiles"]["US"]["profile"]
+        import hashlib
+        import hmac
+        require(us_legacy == generate_cellular_profile(
+            "US", hmac.new(
+                base64.b64decode(state["masterSeed"]),
+                b"xenoid-location-profile/v1:US", hashlib.sha256).digest()))
+        store.set_desired("SG")
+        before = store.load()
+        sg_profile = before["profiles"]["SG"]["profile"]
+        rotated = store.rotate_sim_identity()
+        require(rotated["simEpoch"] != "")
+        pending = rotated["pending"]
+        require(pending is not None and pending["phase"] == "new")
+        require(pending["country"] == "SG")
+        new_profile = rotated["profiles"]["SG"]["profile"]
+        require(pending["profileDigest"] == new_profile["identityDigest"])
+        for field in ("imsi", "iccid", "msisdn"):
+            require(new_profile["sim"][field] != sg_profile["sim"][field])
+        require(new_profile["cell"]["eci"] != sg_profile["cell"]["eci"])
+        require(new_profile["sim"]["imsi"].startswith("525"))
+        require(new_profile["carrier"] == sg_profile["carrier"])
+        require(new_profile["timezone"] == sg_profile["timezone"])
+        # The superseded active record keeps its epoch and still validates.
+        require(rotated["active"]["profileDigest"] == sg_profile["identityDigest"])
+        # Same-epoch restore across a country round trip; US re-derived.
+        store.set_desired("US")
+        us_rotated = store.load()["profiles"]["US"]["profile"]
+        require(us_rotated["sim"]["imsi"] != us_legacy["sim"]["imsi"])
+        store.set_desired("SG")
+        require(store.load()["profiles"]["SG"]["profile"]["sim"]["imsi"]
+                == new_profile["sim"]["imsi"])
+        # A stale-epoch active record tolerates the refreshed entry.
+        current = dict(store.load())
+        current["pending"] = None
+        store._write(current)
+        store.set_desired("SG")
+
+
 def test_state_permissions_and_corruption() -> None:
     with tempfile.TemporaryDirectory() as directory:
         store = _pending_store(directory)
@@ -302,6 +350,7 @@ def main() -> int:
     test_first_boot_creates_sg_pending()
     test_crash_safe_recreate_exactly_once()
     test_rotation_and_cached_restore()
+    test_sim_epoch_rotation_renews_same_country()
     test_state_permissions_and_corruption()
     test_public_summary_masks_secrets()
     test_legacy_state_cleanup()

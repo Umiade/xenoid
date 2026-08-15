@@ -87,6 +87,7 @@ cmds+=(
   "./xenoid --instance $INSTANCE adb push <runtime-abi SSAID helper> /data/local/tmp/xenoid-ssaid"
   "./xenoid --instance $INSTANCE profile deploy-helper <runtime-abi profile helper>"
   "./xenoid --instance $INSTANCE device apply $ROOT/examples/fingerprints/pixel-raven-android13.json --instance-identity"
+  "./xenoid --instance $INSTANCE start <one extra recreate when first convergence skipped the offline boot seed>"
   "./xenoid --instance $INSTANCE adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_FINE_LOCATION"
   "./xenoid --instance $INSTANCE adb shell pm grant --user 0 dev.xenoid.daemon android.permission.ACCESS_BACKGROUND_LOCATION"
   "./xenoid --instance $INSTANCE location apply --default SG <explicit location identity; one-time recreate on change>"
@@ -191,8 +192,20 @@ else
   xenoid_cli build all
   ./scripts/build-native-shim.sh arm64 prop >/dev/null
 fi
+FIRST_BOOT_SEED_SKIPPED=0
 if [[ "$REUSE_RUNTIME" != 1 ]]; then
-  xenoid_cli start "${START_COLIMA[@]}" --recreate --no-adb-root --defer-proxy --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
+  START_OUT="$(mktemp "${TMPDIR:-/tmp}/xenoid-start.XXXXXX")"
+  xenoid_cli start "${START_COLIMA[@]}" --recreate --no-adb-root --defer-proxy --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk" | tee "$START_OUT"
+  if python3 - "$START_OUT" <<'PY'
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    raise SystemExit(1)
+seed = (doc.get('plan') or {}).get('bootIdentitySeed') or {}
+raise SystemExit(0 if seed.get('skipped') is True else 1)
+PY
+  then FIRST_BOOT_SEED_SKIPPED=1; fi
 elif ! reuse_runtime_preflight; then
   # --reuse-runtime means preserve a matching live container when possible,
   # not fail if the owned runtime is currently stopped.
@@ -258,6 +271,14 @@ xenoid_cli profile deploy-helper "$PROFILE_BIN"
 # Stage the canonical Raven profile with host-owned stable and boot-scoped identity.
 # Retry within the same container epoch reuses the persisted pending values.
 xenoid_cli device apply "$ROOT/examples/fingerprints/pixel-raven-android13.json" --instance-identity
+# On a never-converged image the offline boot-identity seed is skipped (no
+# staged profile directory yet); the first device apply just created it.
+# Recreate exactly once so the next boot seeds offline and the zygote snapshot
+# matches the applied values even for a fresh instance's first up.
+if [[ "$FIRST_BOOT_SEED_SKIPPED" == 1 ]]; then
+  echo "[up] first convergence: reseeding boot identity with one extra recreate"
+  xenoid_cli start "${START_COLIMA[@]}" --recreate --no-adb-root --defer-proxy --install-daemon "$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
+fi
 # The daemon reads cell info from a background UID during location verify, so
 # both location permissions must land before any location apply; on a fresh
 # instance anything later deadlocks the first up.

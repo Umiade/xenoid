@@ -39,11 +39,15 @@ APK="$(tests/filesystem-runtime-probe/build.sh)"
 INSTALLED=true
 "$ADB_BIN" -s "$ADB_TARGET" logcat -c
 "$ADB_BIN" -s "$ADB_TARGET" shell am start -W -n "$PACKAGE/.ProbeActivity" >/dev/null
-for _ in $(seq 1 30); do
+for _ in $(seq 1 90); do
+  "$ADB_BIN" -s "$ADB_TARGET" shell \
+    "cat /sdcard/Android/data/$PACKAGE/files/probe-result.json 2>/dev/null" > "$RESULT" 2>/dev/null || true
+  if grep -q 'dev.xenoid.filesystem-runtime-probe' "$RESULT" 2>/dev/null; then break; fi
   "$ADB_BIN" -s "$ADB_TARGET" logcat -d -s XenoidFilesystemProbe:I > "$LOG"
-  if grep -q 'dev.xenoid.filesystem-runtime-probe/v1' "$LOG"; then break; fi
+  if grep -q 'dev.xenoid.filesystem-runtime-probe' "$LOG"; then break; fi
   sleep 1
 done
+if ! grep -q 'dev.xenoid.filesystem-runtime-probe' "$RESULT" 2>/dev/null; then
 python3 - "$LOG" "$RESULT" <<'PY'
 import json
 import pathlib
@@ -51,11 +55,18 @@ import sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
 marker = 'XenoidFilesystemProbe: '
 rows = [line.split(marker, 1)[1] for line in text.splitlines() if marker in line]
-if not rows:
+value = None
+for row in reversed(rows):
+    try:
+        value = json.loads(row)
+        break
+    except json.JSONDecodeError:
+        continue
+if value is None:
     raise SystemExit('filesystem probe did not emit a result')
-value = json.loads(rows[-1])
 pathlib.Path(sys.argv[2]).write_text(json.dumps(value, sort_keys=True), encoding='utf-8')
 PY
+fi
 
 "$ADB_BIN" -s "$ADB_TARGET" shell '
   test -L /dev/block/platform/14700000.ufs/by-name/userdata &&
@@ -101,6 +112,50 @@ require(ordinary.get('cryptoType') == 'file',
 require_path(ordinary['data'], F2FS, 'ordinary /data', False)
 require_path(ordinary['appData'], F2FS, 'ordinary app data', True)
 require_path(ordinary['system'], EXT4, 'ordinary /system', True)
+
+# Full-field f2fs normalization for /data (libc and raw syscall views agree).
+def require_data_fields(surface, label, channels):
+    fsid_seen = None
+    for channel in channels:
+        op = surface.get(channel)
+        require(isinstance(op, dict), f'{label} {channel} missing: {surface}')
+        require(op.get('return') == 0, f'{label} {channel} failed: {op}')
+        require(op.get('bsize') == 4096, f'{label} {channel} bsize mismatch: {op}')
+        require(op.get('blocks') == 31250000, f'{label} {channel} blocks mismatch: {op}')
+        require(op.get('namelen') == 255, f'{label} {channel} namelen mismatch: {op}')
+        require(op.get('flags') == 0x426, f'{label} {channel} flags mismatch: {op}')
+        require(op.get('blocks', 0) >= op.get('bfree', -1) >= 0,
+                f'{label} {channel} free-space inversion: {op}')
+        require(op.get('bfree', -1) >= op.get('bavail', -2) >= 0,
+                f'{label} {channel} avail inversion: {op}')
+        require(op.get('files', 0) >= op.get('ffree', -1) >= 0,
+                f'{label} {channel} inode inversion: {op}')
+        fsid = op.get('fsid')
+        require(isinstance(fsid, str) and len(fsid) == 16 and fsid != '0' * 16,
+                f'{label} {channel} fsid missing: {op}')
+        if fsid_seen is None:
+            fsid_seen = fsid
+        require(fsid == fsid_seen,
+                f'{label} fsid diverges across channels: {channel} {op}')
+    return fsid_seen
+
+data_fsid = require_data_fields(ordinary['data'], 'ordinary /data', ('libc', 'raw'))
+appdata_fsid = require_data_fields(ordinary['appData'], 'ordinary app data', ('libc', 'raw', 'rawFd'))
+require(data_fsid == appdata_fsid, 'fsid diverges between /data and app data')
+system_blocks = ordinary['system']['raw'].get('blocks')
+require(system_blocks != 31250000 or ordinary['system']['raw'].get('bsize') != 4096
+        or ordinary['system']['raw'].get('flags') != 0x426,
+        '/system must not be f2fs-normalized')
+
+# Raw-syscall mount records from the app context must show the f2fs contract.
+mountinfo_line = ordinary.get('mountinfoData') or ''
+mounts_line = ordinary.get('mountsData') or ''
+require(' - f2fs /dev/block/platform/14700000.ufs/by-name/userdata ' in mountinfo_line,
+        f'raw mountinfo /data record mismatch: {mountinfo_line!r}')
+require('ext4' not in mountinfo_line and 'overlay' not in mountinfo_line,
+        f'raw mountinfo /data leaks real fs: {mountinfo_line!r}')
+require(mounts_line.startswith('/dev/block/platform/14700000.ufs/by-name/userdata /data f2fs '),
+        f'raw mounts /data record mismatch: {mounts_line!r}')
 isolated = value['isolated']
 require(isolated.get('ok') is True, f'isolated probe failed: {isolated}')
 isolated_native = isolated['native']
@@ -120,6 +175,7 @@ print(json.dumps({
     'dataMagic': ordinary['data']['raw']['type'],
     'appDataFdMagic': ordinary['appData']['rawFd']['type'],
     'systemMagic': ordinary['system']['raw']['type'],
+    'dataFsid': data_fsid,
     'cryptoState': ordinary['cryptoState'],
     'cryptoType': ordinary['cryptoType'],
     'mountSource': '/dev/block/platform/14700000.ufs/by-name/userdata',

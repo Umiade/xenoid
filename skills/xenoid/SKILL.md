@@ -55,7 +55,7 @@ Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Li
 ./xenoid --instance phone-a stop
 ```
 
-Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity.
+Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity. `./xenoid device regenerate` goes further: it rotates the stable identifiers, the lease network epoch (container MAC), the boot-scoped values, the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country) on a live instance — and on GMS instances clears the Google services apps so the app-readable advertising ID regenerates — then recreates the container and re-converges through the standard `up` pipeline, making the instance present as a brand-new same-model device while preserving user data and the location country/carrier.
 
 ## Runtime inspection
 
@@ -89,12 +89,13 @@ Never download the payload implicitly, pass import paths through MCP, copy priva
 ```bash
 ./xenoid device collect --out .xenoid/current-device.json
 ./xenoid device apply examples/fingerprints/pixel-raven-android13.json
+./xenoid device regenerate
 ./xenoid app install /path/on/host/app.apk
 ./xenoid app launch com.example.app/.MainActivity
 ./xenoid app uninstall com.example.app
 ```
 
-Profile application regenerates unique identifiers unless `--keep-unique` is selected.
+Profile application regenerates unique identifiers unless `--keep-unique` is selected. `device regenerate` rotates every per-device uniqueness factor (stable IDs, container MAC, boot values, filesystem UUIDs, per-app SSAID, SIM identity for the same country, and on GMS instances the advertising ID state) on a live instance and re-converges it as a brand-new same-model device; user data and the location country/carrier are preserved. If it is interrupted, `start`/`up` fail closed with `device_regeneration_pending` until `device regenerate` is re-run to completion.
 
 ## Location identity
 
@@ -104,7 +105,7 @@ Profile application regenerates unique identifiers unless `--keep-unique` is sel
 ./xenoid location set US
 ```
 
-Location selects the device's country profile (locale, timezone, USIM, carrier, LTE cell) and is fully independent of the global proxy. A fresh instance defaults to Singapore on the first `up`. Re-selecting the current country is a no-op; changing it recreates the owned container exactly once and restores the original identity when switching back to a previously used country. After a standalone `location set`, run `up` again for full production validation. Proxy operations never change location, and location changes never inspect proxy egress.
+Location selects the device's country profile (locale, timezone, USIM, carrier, LTE cell) and is fully independent of the global proxy. A fresh instance defaults to Singapore on the first `up`. Re-selecting the current country is a no-op; changing it recreates the owned container exactly once and restores the identity of a previously used country within the same SIM epoch (`device regenerate` rotates the SIM epoch). After a standalone `location set`, run `up` again for full production validation. Proxy operations never change location, and location changes never inspect proxy egress.
 
 ## Camera media
 
