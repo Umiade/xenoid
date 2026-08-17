@@ -2,8 +2,27 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-0.1.0}"
-DIST="$ROOT/dist/ota/xenoid-$VERSION"
-BUNDLE="$ROOT/dist/ota/xenoid-$VERSION.tar.gz"
+if [[ ${#VERSION} -gt 64 || ! "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "release_version_invalid" >&2
+  exit 64
+fi
+OTA_ROOT="$ROOT/dist/ota"
+DIST="$OTA_ROOT/xenoid-$VERSION"
+BUNDLE="$OTA_ROOT/xenoid-$VERSION.tar.gz"
+if ! python3 - "$OTA_ROOT" "$DIST" "$BUNDLE" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+for raw in sys.argv[2:]:
+    target = Path(raw).resolve()
+    if target == root or root not in target.parents:
+        raise SystemExit(1)
+PY
+then
+  echo "release_version_invalid" >&2
+  exit 64
+fi
 DAEMON_APK="$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
 INPUT_HELPER="$ROOT/native/xenoid-input/xenoid-input"
 HIDE_HELPER="$ROOT/native/xenoid-hide/xenoid-hide"

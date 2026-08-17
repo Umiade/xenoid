@@ -164,6 +164,38 @@ docker context create linux-arm --docker host=ssh://user@server
 
 With `backend=linux-docker`, Xenoid prepares binder and runtime protection on the selected Docker engine host and does not start local Colima.
 
+## Remote Xenoid service
+
+A remote Docker context is a backend transport for a trusted local CLI; it does
+not publish a Xenoid API. To let remote users or model clients operate every
+initialized instance on the Mac/Linux ARM host, run `xenoid-service` on that
+host under the same operator user and `HOME` as the CLI:
+
+```bash
+./xenoid-service token create \
+  --name operator --all-instances --scope read --scope control
+./xenoid-service serve --bind 127.0.0.1 --port 8765
+```
+
+Use loopback through SSH/VPN or a trusted TLS/OAuth gateway. Direct non-loopback
+listeners require a TLS certificate/key and an explicit Host allowlist by
+default. Temporary trusted-network cleartext testing additionally requires
+`--allow-insecure-http`; its bearer tokens and requests are unencrypted. Browser
+Origins are denied unless explicitly allowed. Token grants can target immutable
+instance UUIDs or an all-instance wildcard, and `root`/`inspect` remain separate
+from ordinary control.
+
+The service manages one fixed project and only instances already initialized in
+that project. It re-resolves state for every request and serializes mutations per
+instance. Use the remote `xenoid_up` tool for complete production convergence;
+lower-level status/control calls never mean the full `up` contract succeeded.
+
+On macOS, install it as a user LaunchAgent so it retains access to the user's
+Colima VM and `~/.xenoid`. On Linux ARM64, set the systemd `User`, `HOME`, and
+`WorkingDirectory` to the existing Xenoid operator. Full unit examples, token
+rotation, protocol headers, and reverse-proxy guidance are in
+[`remote-service.md`](remote-service.md).
+
 ## Location identity
 
 One persistent per-instance profile owns the country, system locale list, IANA timezone, single USIM, carrier, APN, and registered LTE cell. The legacy vendor RIL and the RadioConfig HAL are the only producers of radio data; the daemon publishes the profile, converges provisioning and the APN, and verifies framework, subscription, cell, and connectivity surfaces before the identity counts as active.
@@ -329,4 +361,8 @@ Release bundles include the CLI, MCP server, non-proprietary runtime assets, dae
 ./xenoid-mcp
 ```
 
-MCP uses the same backend, token, and runtime preconditions as the CLI. See [`mcp-tools.md`](mcp-tools.md) for the complete tool contract.
+`xenoid-mcp` is a trusted-local, fixed-instance stdio adapter. The networked,
+scope-filtered multi-instance adapter is `xenoid-service` at `POST /mcp`. Both
+use the same backend, daemon token, and runtime preconditions as the CLI. See
+[`mcp-tools.md`](mcp-tools.md) for the tool contract and
+[`remote-service.md`](remote-service.md) for remote deployment.

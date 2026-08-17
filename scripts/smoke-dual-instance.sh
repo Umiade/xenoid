@@ -6,14 +6,134 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 INSTANCE_A="${1:-phone-a}"
 INSTANCE_B="${2:-phone-b}"
-OUT_DIR="${XENOID_STATE_ROOT:-$HOME/.xenoid/instances}/dual-instance-evidence"
-mkdir -p "$OUT_DIR"
-REPORT="$OUT_DIR/report.json"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/xenoid-dual-instance.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 log() { echo "[dual-instance] $*"; }
 fail() { echo "[dual-instance] FAIL: $*" >&2; exit 1; }
+
+verify_inspect() {
+  local inspect_path="$1" expected_volume="$2"
+  python3 - "$inspect_path" "$expected_volume" <<'PY'
+import json
+import pathlib
+import sys
+
+raw = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+decoder = json.JSONDecoder()
+labels, offset = decoder.raw_decode(raw)
+remaining = raw[offset:]
+leading = len(remaining) - len(remaining.lstrip())
+mounts, offset = decoder.raw_decode(raw, offset + leading)
+if raw[offset:].strip():
+    raise SystemExit("unexpected trailing Docker inspect data")
+required = ["dev.xenoid.owner", "dev.xenoid.instance_id", "dev.xenoid.resource_tag"]
+if not isinstance(labels, dict) or not all(labels.get(key) for key in required):
+    raise SystemExit("missing instance owner labels")
+volume = sys.argv[2]
+if not isinstance(mounts, list) or not any(
+    isinstance(mount, dict)
+    and mount.get("Type") == "volume"
+    and mount.get("Name") == volume
+    and mount.get("Destination") == "/data"
+    for mount in mounts
+):
+    raise SystemExit("expected instance data volume is not mounted")
+PY
+}
+
+write_report() {
+  python3 - "$@" <<'PY'
+import json
+import pathlib
+import sys
+
+if len(sys.argv) != 16:
+    raise SystemExit("invalid dual-instance report arguments")
+(
+    report_path,
+    instance_a,
+    instance_b,
+    container_a,
+    container_b,
+    volume_a,
+    volume_b,
+    network_a,
+    network_b,
+    adb_a,
+    adb_b,
+    binder_a,
+    binder_b,
+    marker_a,
+    marker_b,
+) = sys.argv[1:]
+report = {
+    "ok": True,
+    "instanceA": instance_a,
+    "instanceB": instance_b,
+    "containerA": container_a,
+    "containerB": container_b,
+    "volumeA": volume_a,
+    "volumeB": volume_b,
+    "networkA": network_a,
+    "networkB": network_b,
+    "adbPortA": adb_a,
+    "adbPortB": adb_b,
+    "binderSuperblockA": binder_a,
+    "binderSuperblockB": binder_b,
+    "appMarkerA": marker_a,
+    "appMarkerB": marker_b,
+    "stopA_bStillReady": True,
+    "restartA_dataPreserved": True,
+}
+payload = json.dumps(report, indent=2) + "\n"
+pathlib.Path(report_path).write_text(payload, encoding="utf-8")
+print(payload, end="")
+PY
+}
+
+report_contract_test() {
+  local inspect_path="$TMP/inspect.json"
+  local report_path="$TMP/report.json"
+  printf '%s\n' \
+    '{"dev.xenoid.owner":"xenoid","dev.xenoid.instance_id":"00000000-0000-4000-8000-000000000001","dev.xenoid.resource_tag":"0123456789ab"} [{"Type":"volume","Name":"contract-volume","Destination":"/data"}]' \
+    > "$inspect_path"
+  verify_inspect "$inspect_path" contract-volume
+  if verify_inspect "$inspect_path" wrong-volume >/dev/null 2>&1; then
+    fail "inspect contract accepted the wrong volume"
+  fi
+  write_report \
+    "$report_path" phone-a phone-b container-a container-b \
+    volume-a volume-b network-a network-b 5555 5556 \
+    binder-a binder-b marker-a marker-b >/dev/null
+  python3 - "$report_path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+if not (
+    path.is_file()
+    and report.get("ok") is True
+    and report.get("instanceA") == "phone-a"
+    and report.get("volumeB") == "volume-b"
+    and report.get("appMarkerA") == "marker-a"
+    and report.get("restartA_dataPreserved") is True
+):
+    raise SystemExit("dual-instance report contract failed")
+PY
+  printf '%s\n' '{"ok":true,"contract":"dual-instance-report"}'
+}
+
+if [[ "${1:-}" == "--report-contract-test" ]]; then
+  report_contract_test
+  exit 0
+fi
+
+OUT_DIR="${XENOID_STATE_ROOT:-$HOME/.xenoid/instances}/dual-instance-evidence"
+mkdir -p "$OUT_DIR"
+REPORT="$OUT_DIR/report.json"
 
 xenoid_a() { ./xenoid --instance "$INSTANCE_A" "$@"; }
 xenoid_b() { ./xenoid --instance "$INSTANCE_B" "$@"; }
@@ -70,28 +190,8 @@ B_CTX="$(docker_context "$INSTANCE_B")"
 log "verifying owner labels and mounts"
 docker --context "$A_CTX" inspect "$A_CONTAINER" --format '{{json .Config.Labels}} {{json .Mounts}}' > "$TMP/a-inspect.json" || fail "cannot inspect $INSTANCE_A"
 docker --context "$B_CTX" inspect "$B_CONTAINER" --format '{{json .Config.Labels}} {{json .Mounts}}' > "$TMP/b-inspect.json" || fail "cannot inspect $INSTANCE_B"
-
-python3 - "$TMP/a-inspect.json" "$A_VOLUME" <<'PY'
-import json, sys
-labels, mounts = json.loads(sys.stdin.read().split(' ', 1)[0]), json.loads(sys.stdin.read().split(' ', 1)[1])
-required = ["dev.xenoid.owner", "dev.xenoid.instance_id", "dev.xenoid.resource_tag"]
-if not all(labels.get(k) for k in required):
-    raise SystemExit(1)
-volume = sys.argv[2]
-if not any(m.get("Type") == "volume" and m.get("Name") == volume and m.get("Destination") == "/data" for m in mounts):
-    raise SystemExit(1)
-PY
-
-python3 - "$TMP/b-inspect.json" "$B_VOLUME" <<'PY'
-import json, sys
-labels, mounts = json.loads(sys.stdin.read().split(' ', 1)[0]), json.loads(sys.stdin.read().split(' ', 1)[1])
-required = ["dev.xenoid.owner", "dev.xenoid.instance_id", "dev.xenoid.resource_tag"]
-if not all(labels.get(k) for k in required):
-    raise SystemExit(1)
-volume = sys.argv[2]
-if not any(m.get("Type") == "volume" and m.get("Name") == volume and m.get("Destination") == "/data" for m in mounts):
-    raise SystemExit(1)
-PY
+verify_inspect "$TMP/a-inspect.json" "$A_VOLUME"
+verify_inspect "$TMP/b-inspect.json" "$B_VOLUME"
 
 log "verifying distinct binder superblocks"
 A_BINDER="$(binder_superblock "$A_CONTAINER" "$A_CTX")"
@@ -124,28 +224,9 @@ if [[ "$A_MARKER" != "unavailable" && "$A_AFTER" != "unavailable" ]]; then
   [[ "$A_AFTER" == "$A_MARKER" ]] || fail "app marker changed after stop/up on $INSTANCE_A"
 fi
 
-python3 - "$REPORT" <<PY
-import json, sys
-report = {
-    "ok": True,
-    "instanceA": "$INSTANCE_A",
-    "instanceB": "$INSTANCE_B",
-    "containerA": "$A_CONTAINER",
-    "containerB": "$B_CONTAINER",
-    "volumeA": "$A_VOLUME",
-    "volumeB": "$B_VOLUME",
-    "networkA": "$A_NETWORK",
-    "networkB": "$B_NETWORK",
-    "adbPortA": "$A_ADB",
-    "adbPortB": "$B_ADB",
-    "binderSuperblockA": "$A_BINDER",
-    "binderSuperblockB": "$B_BINDER",
-    "appMarkerA": "$A_MARKER",
-    "appMarkerB": "$B_MARKER",
-    "stopA_bStillReady": True,
-    "restartA_dataPreserved": True,
-}
-print(json.dumps(report, indent=2))
-PY
+write_report \
+  "$REPORT" "$INSTANCE_A" "$INSTANCE_B" "$A_CONTAINER" "$B_CONTAINER" \
+  "$A_VOLUME" "$B_VOLUME" "$A_NETWORK" "$B_NETWORK" "$A_ADB" "$B_ADB" \
+  "$A_BINDER" "$B_BINDER" "$A_MARKER" "$B_MARKER"
 
 log "dual-instance isolation evidence written to $REPORT"

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional, Sequence, Union
 
 from .config import InstanceContext, InstanceError, InstanceLease
+from .util import bounded_timeout
 
 # A source import can spend up to five sequential 600-second rootd phases on
 # copy, publication, rollback/cleanup, and staging cleanup. Keep the host
@@ -237,7 +238,7 @@ class DaemonClient:
                 ],
                 text=True,
                 capture_output=True,
-                timeout=10,
+                timeout=bounded_timeout(10),
             )
             token = result.stdout.strip()
             if result.returncode == 0 and token:
@@ -276,7 +277,9 @@ class DaemonClient:
             try:
                 with urllib.request.urlopen(
                     request,
-                    timeout=self.timeout if timeout is None else timeout,
+                    timeout=bounded_timeout(
+                        self.timeout if timeout is None else timeout
+                    ),
                 ) as response:
                     raw = response.read().decode()
                     result = json.loads(raw) if raw else {"ok": True}
@@ -343,7 +346,9 @@ class DaemonClient:
             try:
                 with urllib.request.urlopen(
                     request,
-                    timeout=self.timeout if timeout is None else timeout,
+                    timeout=bounded_timeout(
+                        self.timeout if timeout is None else timeout
+                    ),
                 ) as response:
                     raw = response.read(PROXY_MAX_RESPONSE_BYTES + 1)
                     if len(raw) > PROXY_MAX_RESPONSE_BYTES:

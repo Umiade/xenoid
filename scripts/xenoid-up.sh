@@ -43,6 +43,7 @@ PY
 }
 START_COLIMA=()
 if start_colima_flag; then START_COLIMA=(--start-colima); fi
+COLIMA_START_COMMAND=(colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8)
 reuse_runtime_preflight() {
   local status_file
   status_file="$(mktemp "${TMPDIR:-/tmp}/xenoid-reuse-status.XXXXXX")"
@@ -67,6 +68,9 @@ PY
 }
 
 cmds=()
+if [[ ${#START_COLIMA[@]} -gt 0 ]]; then
+  cmds+=("${COLIMA_START_COMMAND[*]} <ensure Docker host before build>")
+fi
 if [[ "$SKIP_BUILD" == 1 ]]; then
   cmds+=("validate prebuilt runtime artifacts")
 else
@@ -124,6 +128,10 @@ diagnose_failure() {
   exit "$rc"
 }
 trap diagnose_failure ERR
+if [[ ${#START_COLIMA[@]} -gt 0 ]]; then
+  echo "[up] ensuring local Colima before build"
+  "${COLIMA_START_COMMAND[@]}"
+fi
 if [[ "$SKIP_BUILD" == 1 ]]; then
   echo "[up] --skip-build: validating prebuilt artifacts"
   APK="$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"

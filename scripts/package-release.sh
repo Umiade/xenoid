@@ -2,8 +2,27 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-dev}"
-REL="$ROOT/dist/release/xenoid-$VERSION"
-ARCHIVE="$ROOT/dist/release/xenoid-$VERSION.tar.gz"
+if [[ ${#VERSION} -gt 64 || ! "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "release_version_invalid" >&2
+  exit 64
+fi
+RELEASE_ROOT="$ROOT/dist/release"
+REL="$RELEASE_ROOT/xenoid-$VERSION"
+ARCHIVE="$RELEASE_ROOT/xenoid-$VERSION.tar.gz"
+if ! python3 - "$RELEASE_ROOT" "$REL" "$ARCHIVE" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+for raw in sys.argv[2:]:
+    target = Path(raw).resolve()
+    if target == root or root not in target.parents:
+        raise SystemExit(1)
+PY
+then
+  echo "release_version_invalid" >&2
+  exit 64
+fi
 rm -rf "$REL"
 mkdir -p "$REL" "$REL/bin" "$REL/artifacts" "$REL/config" "$REL/docs" "$REL/skills" "$REL/examples"
 cd "$ROOT"
@@ -75,7 +94,7 @@ for relative, expected_sha256 in registered_google.items():
     if actual_sha256 != expected_sha256:
         raise SystemExit(f"registered Google release metadata mismatch: {relative}")
 PY
-cp xenoid xenoid-mcp "$REL/bin/"
+cp xenoid xenoid-mcp xenoid-service "$REL/bin/"
 mkdir -p "$REL/daemon/app/build/outputs/apk/debug"
 cp daemon/app/build/outputs/apk/debug/app-debug.apk "$REL/daemon/app/build/outputs/apk/debug/app-debug.apk"
 cp daemon/app/build/outputs/apk/debug/app-debug.apk "$REL/artifacts/xenoid-daemon.apk"
@@ -149,6 +168,18 @@ cp config/config-linux-arm.json .xenoid/config.json
 sudo scripts/setup-linux-binderfs.sh
 ./bin/xenoid up --skip-build
 ```
+
+4. Start the authenticated multi-instance service:
+
+```bash
+./bin/xenoid-service token create \
+  --name operator --all-instances --scope read --scope control
+./bin/xenoid-service serve --bind 127.0.0.1 --port 8765
+```
+
+The token is shown once. Keep the default loopback binding behind SSH/VPN or a
+trusted TLS/OAuth gateway. See docs/remote-service.md before using a non-loopback
+listener.
 RUNBOOK
 REL="$REL" python3 - <<'PY' > "$REL/manifest.json"
 import hashlib, json, os, pathlib, time

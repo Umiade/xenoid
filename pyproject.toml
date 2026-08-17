@@ -8,6 +8,7 @@ dependencies = []
 [project.scripts]
 xenoid = "xenoid.cli:main"
 xenoid-mcp = "xenoid.mcp_server:main"
+xenoid-service = "xenoid.remote_service:main"
 
 [build-system]
 requires = ["setuptools>=68"]

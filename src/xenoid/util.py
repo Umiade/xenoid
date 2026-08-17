@@ -3,11 +3,29 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
+
+
+_RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_COMMAND_DEADLINE: ContextVar[Optional[float]] = ContextVar(
+    "xenoid_command_deadline",
+    default=None,
+)
+
+
+def validate_release_version(value: Any) -> str:
+    """Return one path-safe release/OTA version or raise a stable error."""
+    if not isinstance(value, str) or _RELEASE_VERSION_RE.fullmatch(value) is None:
+        raise ValueError("release_version_invalid")
+    return value
 
 
 def android_sdk_dir() -> Optional[Path]:
@@ -58,8 +76,37 @@ def which(name: str) -> Optional[str]:
     return None
 
 
+@contextmanager
+def command_timeout(seconds: float) -> Iterator[None]:
+    """Apply one absolute command deadline to the current request context."""
+
+    if seconds <= 0:
+        raise ValueError("command_timeout_invalid")
+    deadline = time.monotonic() + seconds
+    inherited = _COMMAND_DEADLINE.get()
+    if inherited is not None:
+        deadline = min(deadline, inherited)
+    token = _COMMAND_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _COMMAND_DEADLINE.reset(token)
+
+
+def bounded_timeout(timeout: Optional[float] = None) -> Optional[float]:
+    """Cap a subprocess/socket timeout by the active absolute deadline."""
+
+    deadline = _COMMAND_DEADLINE.get()
+    if deadline is None:
+        return timeout
+    remaining = max(0.001, deadline - time.monotonic())
+    if timeout is None:
+        return remaining
+    return min(float(timeout), remaining)
+
+
 def run(cmd: list[str], *, check: bool = False, capture: bool = True, timeout=None, stdin=None, env=None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, check=check, text=True, capture_output=capture, timeout=timeout, stdin=stdin, env=env)
+    return subprocess.run(cmd, check=check, text=True, capture_output=capture, timeout=bounded_timeout(timeout), stdin=stdin, env=env)
 
 
 def host_info() -> dict[str, str]:

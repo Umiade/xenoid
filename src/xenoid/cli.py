@@ -13,8 +13,9 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 from .backend import RuntimeManager
@@ -65,9 +66,21 @@ from .location import (
     public_summary,
     supported_countries,
 )
+from .operation_lock import (
+    EXPECTED_INSTANCE_ID_ENV,
+    OPERATION_LOCK_ENV,
+    OPERATION_LOCK_TIMEOUT_ENV,
+    instance_operation_lock,
+    operation_lock_is_held,
+)
 from .proxy_controller import ProxyController
 from .storage import StorageError, StorageStateStore
-from .util import json_dumps, read_json_file, write_json_file
+from .util import (
+    json_dumps,
+    read_json_file,
+    validate_release_version,
+    write_json_file,
+)
 
 
 
@@ -91,11 +104,42 @@ def daemon(
 
 
 def command_env(args: argparse.Namespace) -> dict[str, str]:
-    return {
+    environment = {
         **os.environ,
         "XENOID_PROJECT": str(args.project_root),
         "XENOID_INSTANCE": args.instance_name,
     }
+    if getattr(args, "_operation_lock_held", False):
+        environment[OPERATION_LOCK_ENV] = args.context.instance_id
+        environment[EXPECTED_INSTANCE_ID_ENV] = args.context.instance_id
+    return environment
+
+
+@contextmanager
+def cli_operation_lock(args: argparse.Namespace) -> Iterator[None]:
+    if (
+        getattr(args, "_operation_lock_held", False)
+        or operation_lock_is_held(args.context.instance_id)
+    ):
+        yield
+        return
+    timeout: Optional[float] = None
+    raw_timeout = os.environ.get(OPERATION_LOCK_TIMEOUT_ENV)
+    if raw_timeout is not None:
+        try:
+            timeout = float(raw_timeout)
+        except ValueError as exc:
+            raise InstanceError(
+                "instance_lock_timeout_invalid",
+                "instance operation lock timeout is invalid",
+            ) from exc
+        if timeout < 0 or timeout > 300:
+            raise InstanceError(
+                "instance_lock_timeout_invalid",
+                "instance operation lock timeout is invalid",
+            )
+    with instance_operation_lock(args.context.state_root, timeout_seconds=timeout):
+        yield
 
 
 def run_script(args: argparse.Namespace, name: str) -> dict[str, Any]:
@@ -150,13 +194,17 @@ def cmd_up(args: argparse.Namespace) -> int:
         cmd.append("--skip-build")
     if args.reuse_runtime:
         cmd.append("--reuse-runtime")
-    proc = subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-        cwd=str(args.context.project_root),
-        env=command_env(args),
-    )
+    with cli_operation_lock(args):
+        environment = command_env(args)
+        environment[OPERATION_LOCK_ENV] = args.context.instance_id
+        environment[EXPECTED_INSTANCE_ID_ENV] = args.context.instance_id
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            cwd=str(args.context.project_root),
+            env=environment,
+        )
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
     print_json(result)
     return 0 if result.get("ok") else 1
@@ -264,9 +312,18 @@ def cmd_verify_release(args: argparse.Namespace) -> int:
 
 
 def cmd_package_release(args: argparse.Namespace) -> int:
+    try:
+        version = validate_release_version(args.version)
+    except ValueError:
+        print_json({
+            "ok": False,
+            "code": "release_version_invalid",
+            "error": "release_version_invalid",
+        })
+        return 2
     script = args.project_root / "scripts" / "package-release.sh"
     proc = subprocess.run(
-        [str(script), args.version],
+        [str(script), version],
         text=True,
         capture_output=True,
         cwd=args.project_root,
@@ -500,13 +557,15 @@ def cmd_runtime_build_image(args: argparse.Namespace) -> int:
 
 def cmd_start(args: argparse.Namespace) -> int:
     mgr = runtime(args)
-    result = mgr.start(dry_run=args.dry_run, wait=not args.no_wait, install_daemon_apk=args.install_daemon, start_colima=args.start_colima, adb_root=not args.no_adb_root, skip_preflight=args.skip_preflight, recreate=args.recreate, defer_proxy=args.defer_proxy)
+    with cli_operation_lock(args):
+        result = mgr.start(dry_run=args.dry_run, wait=not args.no_wait, install_daemon_apk=args.install_daemon, start_colima=args.start_colima, adb_root=not args.no_adb_root, skip_preflight=args.skip_preflight, recreate=args.recreate, defer_proxy=args.defer_proxy)
     print_json(result)
     return 0 if result.get("ok") or args.dry_run else 1
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    result = runtime(args).stop()
+    with cli_operation_lock(args):
+        result = runtime(args).stop()
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -2336,13 +2395,28 @@ def cmd_ebpf_action(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp_config(args: argparse.Namespace) -> int:
+    project_root = args.context.project_root
+    launchers = (
+        project_root / "xenoid-mcp",
+        project_root / "bin" / "xenoid-mcp",
+    )
+    launcher = next(
+        (
+            candidate
+            for candidate in launchers
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    command = str(launcher) if launcher is not None else sys.executable
+    command_args = [] if launcher is not None else ["-m", "xenoid.mcp_server"]
     print_json({
         "mcpServers": {
             "xenoid": {
-                "command": sys.executable,
-                "args": ["-m", "xenoid.mcp_server"],
+                "command": command,
+                "args": command_args,
                 "env": {
-                    "XENOID_PROJECT": str(args.context.project_root),
+                    "XENOID_PROJECT": str(project_root),
                     "XENOID_INSTANCE": args.context.instance_name,
                 },
             }
@@ -2916,6 +2990,56 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+_READ_ONLY_INSTANCE_COMMANDS = frozenset({
+    "cmd_doctor",
+    "cmd_config_show",
+    "cmd_google_services_status",
+    "cmd_google_services_registry",
+    "cmd_logs",
+    "cmd_view",
+    "cmd_status",
+    "cmd_daemon_health",
+    "cmd_location_list",
+    "cmd_location_status",
+    "cmd_automation_plan",
+    "cmd_hide_overlay_status",
+    "cmd_mcp_config",
+})
+
+
+def _command_mutates_instance(args: argparse.Namespace) -> bool:
+    """Fail closed: every resolved command is serialized unless proven read-only."""
+
+    if not hasattr(args, "context"):
+        return False
+    handler_name = getattr(getattr(args, "func", None), "__name__", "")
+    if handler_name in _READ_ONLY_INSTANCE_COMMANDS:
+        return False
+    if handler_name == "cmd_proxy_status" and not bool(getattr(args, "check", False)):
+        return False
+    if (
+        handler_name == "cmd_ebpf_action"
+        and getattr(args, "ebpf_action", None) == "status"
+    ):
+        return False
+    return True
+
+
+def _refresh_instance_under_lock(args: argparse.Namespace) -> None:
+    initial_id = args.context.instance_id
+    context, config, lease = resolve_instance(
+        args.instance_name,
+        project_root=args.project_root,
+    )
+    expected_id = os.environ.get(EXPECTED_INSTANCE_ID_ENV) or initial_id
+    if context.instance_id != initial_id or context.instance_id != expected_id:
+        raise InstanceError(
+            "instance_identity_mismatch",
+            "instance identity changed during an operation",
+        )
+    args.context, args.config, args.lease = context, config, lease
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2935,6 +3059,26 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.instance_name,
                 project_root=args.project_root,
             )
+        expected_instance_id = os.environ.get(EXPECTED_INSTANCE_ID_ENV)
+        if expected_instance_id:
+            expected_context = (
+                args.context
+                if hasattr(args, "context")
+                else resolve_instance(
+                    args.instance_name,
+                    project_root=args.project_root,
+                )[0]
+            )
+            if expected_context.instance_id != expected_instance_id:
+                raise InstanceError(
+                    "instance_identity_mismatch",
+                    "instance identity changed during an operation",
+                )
+        if _command_mutates_instance(args):
+            with cli_operation_lock(args):
+                _refresh_instance_under_lock(args)
+                args._operation_lock_held = True
+                return int(args.func(args))
         return int(args.func(args))
     except InstanceError as exc:
         print_json(exc.as_dict())

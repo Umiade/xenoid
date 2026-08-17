@@ -165,7 +165,31 @@ Generate a stdio MCP configuration:
 ./xenoid mcp-config
 ```
 
-The MCP server exposes the same runtime and daemon boundaries as the CLI. Mutating calls require an explicit target and should not receive credentials or unrestricted host paths.
+The stdio MCP server is trusted-local and fixed to one instance. Use
+`xenoid_up`, not the lower-level `xenoid_start`, when the caller requires the
+complete production-ready contract.
+
+For remote multi-instance access, create a scoped token and keep the service on
+loopback behind SSH/VPN or a trusted TLS/OAuth gateway:
+
+```bash
+./xenoid-service token create \
+  --name operator --all-instances --scope read --scope control
+./xenoid-service serve --bind 127.0.0.1 --port 8765
+```
+
+Temporary testing on an explicitly trusted LAN may instead bind `0.0.0.0` with
+an exact `--allow-host` and `--allow-insecure-http`. This opt-in sends bearer
+tokens and MCP traffic in plaintext and is not a production deployment mode.
+
+The network catalog requires an explicit authorized `instance` for every
+instance tool and intentionally omits arbitrary host paths, host scripts,
+build/package/deploy, binderfs, and host protection operations. Grant `root` and
+`inspect` separately from ordinary `control`. Run the service as the same OS
+user/HOME as the CLI and Colima/Docker state; use a macOS user LaunchAgent or a
+Linux ARM64 systemd unit with that fixed identity. Follow
+[`docs/remote-service.md`](../../docs/remote-service.md) for TLS, Origin/Host,
+token rotation, and service-manager examples.
 
 ## Configuration and release
 

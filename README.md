@@ -375,6 +375,7 @@ Representative tools include:
 
 - `xenoid_doctor` with `full` and `requireRuntime`;
 - `xenoid_up_plan` for a non-mutating full-startup plan;
+- `xenoid_up` for the canonical full production convergence path;
 - `xenoid_stop` and `xenoid_status` for runtime lifecycle control;
 - `xenoid_google_services_status`, `xenoid_google_services_enable`, and `xenoid_google_services_disable`;
 - `xenoid_root_status` and `xenoid_root_exec`;
@@ -385,6 +386,27 @@ Representative tools include:
 MCP does not bypass daemon tokens, backend constraints, or runtime preconditions. Before granting an agent mutating tools, define the target runtime, package, and permitted operation scope.
 
 See [`docs/mcp-tools.md`](docs/mcp-tools.md) for the complete tool contract.
+
+### Remote multi-instance service
+
+`xenoid-service` exposes every initialized instance in one fixed Xenoid project
+through authenticated MCP 2026-07-28 Streamable HTTP. It requires an explicit
+instance on every instance tool, re-resolves instance state per request,
+serializes mutations per instance, and presents a scope-filtered remote catalog
+that excludes unrestricted host paths, builds, deployment, and host scripts.
+
+```bash
+./xenoid-service token create \
+  --name operator --all-instances --scope read --scope control
+./xenoid-service serve --bind 127.0.0.1 --port 8765
+```
+
+Loopback plus SSH/VPN or a trusted TLS/OAuth gateway is the recommended
+deployment. Non-loopback cleartext is rejected by default; temporary trusted-
+network testing requires the explicit `--allow-insecure-http` opt-in and an
+exact Host allowlist. A reverse-proxy deployment keeps the service listener on loopback. See
+[`docs/remote-service.md`](docs/remote-service.md) for macOS LaunchAgent, Linux
+ARM64 systemd, TLS, token scopes, and MCP client configuration.
 
 ## Configuration
 
@@ -430,4 +452,5 @@ Release bundles contain the CLI, MCP server, non-proprietary runtime assets, dae
 - [`docs/operations.md`](docs/operations.md): runtime, troubleshooting, and release operations;
 - [`docs/profile-and-hiding.md`](docs/profile-and-hiding.md): device profiles and environment hiding;
 - [`docs/build.md`](docs/build.md): build artifacts and dependencies;
-- [`docs/mcp-tools.md`](docs/mcp-tools.md): MCP tool parameters.
+- [`docs/mcp-tools.md`](docs/mcp-tools.md): MCP tool parameters;
+- [`docs/remote-service.md`](docs/remote-service.md): remote multi-instance deployment and security.

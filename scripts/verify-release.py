@@ -49,12 +49,14 @@ CAMERA_HARNESS_JAVA_PATHS = [
 
 REQUIRED = [
   'README.md', 'README_CN.md', 'RUNBOOK.md', 'doctor.json', 'manifest.json',
-  'bin/xenoid', 'bin/xenoid-mcp',
+  'docs/remote-service.md',
+  'bin/xenoid', 'bin/xenoid-mcp', 'bin/xenoid-service',
   'src/xenoid/__init__.py', 'src/xenoid/cli.py', 'src/xenoid/backend.py',
   'src/xenoid/config.py', 'src/xenoid/storage.py', 'src/xenoid/device_identity.py',
   'src/xenoid/util.py', 'src/xenoid/daemon_client.py',
   'src/xenoid/proxy_controller.py', 'src/xenoid/proxy_protocol.py',
   'src/xenoid/proxy_source.py', 'src/xenoid/mcp_server.py',
+  'src/xenoid/remote_service.py', 'src/xenoid/operation_lock.py',
   'src/xenoid/doctor.py', 'scripts/xenoid-up.sh',
   'src/xenoid/google_services.py',
   'scripts/make-runtime-context.sh', 'scripts/make-rootfs-image.sh',
@@ -143,6 +145,8 @@ REQUIRED = [
   'tests/cellular-runtime-probe/java/org/example/cellularruntimeprobe/ProbeActivity.java',
   'tests/cellular-runtime-probe/java/org/example/cellularruntimeprobe/IsolationProbeService.java',
   'skills/xenoid-development/SKILL.md',
+  'scripts/test-remote-service.py',
+  'scripts/test-mcp-contract.py',
   'artifacts/libxenoid-ril.so',
   'artifacts/android.hardware.radio.config-service.xenoid',
   'data/google-services/mindthegapps-13.0.0-arm64-20231025_200931.json',
@@ -192,6 +196,13 @@ def main():
             listed=req == 'manifest.json' or req in files
             ok=p.is_file() and listed
             out['checks'].append({'name':'required:'+req,'ok':ok,'detail':str(p),'listed':listed})
+        for rel in ('bin/xenoid', 'bin/xenoid-mcp', 'bin/xenoid-service'):
+            executable = root / rel
+            out['checks'].append({
+                'name': 'executable:' + rel,
+                'ok': executable.is_file() and bool(executable.stat().st_mode & 0o111),
+                'detail': str(executable),
+            })
         sandbox = root/'native/xenoid-proxy-sandbox/xenoid-proxy-sandbox'
         try:
             sandbox_data = sandbox.read_bytes()

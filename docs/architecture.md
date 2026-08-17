@@ -1,10 +1,11 @@
 # Xenoid Architecture
 
-Xenoid is split into three layers:
+Xenoid is split into four layers:
 
-1. **Host layer** (`src/xenoid`) — CLI and MCP server for local agents/users.
-2. **Runtime layer** — Android container backend through Docker/Colima on Apple Silicon macOS or Docker on Linux ARM.
-3. **Android control layer** (`daemon`) — daemon APK exposing authenticated JSON APIs for root, global proxy desired state, camera media, Frida, profiles, automation, and OTA.
+1. **Local host layer** (`src/xenoid`) — CLI and fixed-instance stdio MCP for trusted local agents/users.
+2. **Remote service layer** (`src/xenoid/remote_service.py`) — authenticated, scope-filtered multi-instance MCP Streamable HTTP for one fixed project.
+3. **Runtime layer** — Android container backend through Docker/Colima on Apple Silicon macOS or Docker on Linux ARM.
+4. **Android control layer** (`daemon`) — daemon APK exposing authenticated JSON APIs for root, global proxy desired state, camera media, Frida, profiles, automation, and OTA.
 
 ## Why a Linux VM on macOS
 
@@ -51,6 +52,47 @@ Kernel protection is engine-host scoped and is loaded once, then reused while in
 ```
 
 Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity. `./xenoid device regenerate` goes further: it rotates the stable identifiers, the lease network epoch (container MAC), the boot-scoped values, the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country) on a live instance — and on GMS instances clears the Google services apps so the app-readable advertising ID regenerates — then recreates the container and re-converges through the standard `up` pipeline, making the instance present as a brand-new same-model device while preserving user data and the location country/carrier.
+
+## Remote multi-instance control plane
+
+`xenoid-service` fixes its project root at process startup and enumerates only
+that project's `.xenoid/instances/` inventory. The global operator registry does
+not retain enough project identity to safely enumerate instances across unrelated
+projects, so cross-project discovery is intentionally not inferred.
+
+Access tokens are project-scoped, stored only as SHA-256 digests, and bind a set
+of scopes to exact instance UUIDs or an explicit all-instance wildcard. The
+remote tool catalog is derived from the local MCP catalog and then reduced by a
+static policy. Build/package, host-path, host-code, deployment, binderfs, and
+kernel protection operations stay local. Each advertised instance tool adds a
+required `instance` schema property; protocol parameter headers and the JSON body
+must agree before dispatch.
+
+The service holds no long-lived runtime manager, daemon client, config, or lease.
+It resolves them again for every call. Mutations take a per-instance process lock
+and a mode-`0600` `flock` under the immutable instance state root, then resolve
+again and verify the instance UUID inside the lock. The local CLI and mutating
+fixed-instance stdio MCP path use the same lock. CLI-backed `up`, Google-provider,
+and location mutations let the child own the lock for its entire process
+lifetime, including if the service parent exits. This prevents control paths
+from interleaving stop/recreate/state mutations while allowing different
+instances to progress concurrently. The canonical project `up` lock remains
+responsible for serializing shared build convergence.
+
+Remote reads do not implicitly repair or start the daemon. Clients explicitly
+call `xenoid_up` when full convergence is required. Network results pass through
+a redaction boundary before serialization, and the remote catalog excludes
+unrestricted host inputs even when equivalent trusted-local CLI/MCP tools exist.
+
+The HTTP adapter is stateless MCP 2026-07-28 at one `/mcp` POST endpoint. Its
+outer trust boundary requires a bearer grant, exact Host/Origin policy, bounded
+body/concurrency/rate and connection limits, short TLS/header deadlines, closed
+HTTP connections, absolute external-command budgets, and matching
+protocol/method/name/instance headers.
+Non-loopback listeners require TLS by default. An explicit test-only insecure
+HTTP opt-in retains authentication and Host/Origin guards but cannot provide
+transport confidentiality. See
+[`remote-service.md`](remote-service.md) for deployment and scope details.
 
 ## Host API
 

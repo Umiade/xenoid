@@ -48,12 +48,18 @@ echo "[ci] static: instance identity and lease contracts"
 run_py test-proxy.py
 echo "[ci] static: instance storage and lifecycle contracts"
 run_py test-instance-storage.py
+echo "[ci] static: dual-instance report generation contract"
+run_sh smoke-dual-instance.sh --report-contract-test
 echo "[ci] static: location cellular identity contracts"
 run_py test-cellular-profile.py
 echo "[ci] static: pinned Google runtime contracts"
 run_py test-google-services.py
 echo "[ci] static: proxy compiler and authenticated control contracts"
 run_py test-proxy-compiler.py
+echo "[ci] static: authenticated remote multi-instance service contracts"
+run_py test-remote-service.py
+echo "[ci] static: MCP registration, dispatch, up, and path-safety contracts"
+run_py test-mcp-contract.py
 
 CI_INSTANCE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/xenoid-ci-instance.XXXXXX")"
 trap 'rm -rf "$CI_INSTANCE_ROOT"' EXIT
@@ -72,7 +78,7 @@ if python3 - <<'PY'
 import json,sys
 lines=[json.loads(x) for x in open('/tmp/ci-mcp.jsonl') if x.strip()]
 tools={t['name'] for t in lines[1]['result']['tools']}
-need={'xenoid_doctor','xenoid_start','xenoid_up_plan','xenoid_device_apply','xenoid_hide_apply','xenoid_ebpf_status','xenoid_frida_load_script','xenoid_verify_release'}
+need={'xenoid_doctor','xenoid_start','xenoid_up_plan','xenoid_up','xenoid_device_apply','xenoid_hide_apply','xenoid_ebpf_status','xenoid_frida_load_script','xenoid_verify_release'}
 need.add('xenoid_frida_install')
 need.update({'xenoid_proxy_status','xenoid_proxy_check','xenoid_proxy_on','xenoid_proxy_off','xenoid_proxy_clear','xenoid_proxy_select'})
 need.update({'xenoid_location_list','xenoid_location_status','xenoid_location_set'})

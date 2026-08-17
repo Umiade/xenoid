@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Optional
 
 from .backend import RuntimeManager
 from .config import (
@@ -25,7 +26,25 @@ from .device_identity import (
     validate_identity_value,
 )
 from .proxy_controller import ProxyController
-from .util import read_json_file
+from .operation_lock import (
+    EXPECTED_INSTANCE_ID_ENV,
+    OPERATION_LOCK_ENV,
+    OPERATION_LOCK_TIMEOUT_ENV,
+    instance_operation_lock,
+)
+from .util import bounded_timeout, read_json_file, validate_release_version
+
+
+UP_TIMEOUT_SECONDS = 7200
+UP_TERMINATE_GRACE_SECONDS = 5
+CHILD_LOCK_TOOL_NAMES = frozenset({
+    "xenoid_google_services_enable",
+    "xenoid_google_services_disable",
+    "xenoid_location_set",
+    "xenoid_up",
+})
+
+
 @dataclass(frozen=True)
 class MCPRuntime:
     context: InstanceContext
@@ -33,6 +52,9 @@ class MCPRuntime:
     lease: InstanceLease
     manager: RuntimeManager
     daemon: DaemonClient
+    auto_ensure_daemon: bool = True
+    operation_lock_held: bool = False
+    operation_lock_timeout_seconds: Optional[float] = None
 
     @classmethod
     def resolve(cls) -> "MCPRuntime":
@@ -43,11 +65,23 @@ class MCPRuntime:
 
     @property
     def subprocess_env(self) -> dict[str, str]:
-        return {
+        environment = {
             **os.environ,
             "XENOID_PROJECT": str(self.context.project_root),
             "XENOID_INSTANCE": self.context.instance_name,
+            EXPECTED_INSTANCE_ID_ENV: self.context.instance_id,
         }
+        if self.operation_lock_held:
+            environment[OPERATION_LOCK_ENV] = self.context.instance_id
+        else:
+            environment.pop(OPERATION_LOCK_ENV, None)
+        if self.operation_lock_timeout_seconds is None:
+            environment.pop(OPERATION_LOCK_TIMEOUT_ENV, None)
+        else:
+            environment[OPERATION_LOCK_TIMEOUT_ENV] = str(
+                self.operation_lock_timeout_seconds
+            )
+        return environment
 
 
 
@@ -98,6 +132,14 @@ def tools() -> list[dict[str, Any]]:
         ),
         tool("xenoid_install_runtime_plan", "Dry-run macOS runtime dependency install plan"),
         tool("xenoid_up_plan", "Dry-run full Xenoid startup plan"),
+        tool(
+            "xenoid_up",
+            "Converge the complete selected Xenoid runtime and validate readiness",
+            {
+                "skipBuild": {"type": "boolean"},
+                "reuseRuntime": {"type": "boolean"},
+            },
+        ),
         tool("xenoid_start", "Start the low-level Android runtime without full Xenoid state convergence", {"dryRun": {"type": "boolean"}, "startColima": {"type": "boolean"}, "installDaemonApk": {"type": "string"}, "adbRoot": {"type": "boolean"}, "recreate": {"type": "boolean"}}),
         tool("xenoid_stop", "Stop Xenoid Android runtime"),
         tool("xenoid_logs", "Collect Docker/ADB runtime logs", {"outDir": {"type": "string"}}),
@@ -287,7 +329,7 @@ def _location_cli_result(runtime: MCPRuntime, command: list[str]) -> dict[str, A
             capture_output=True,
             cwd=runtime.context.project_root,
             env=runtime.subprocess_env,
-            timeout=3600,
+            timeout=bounded_timeout(3600),
         )
     except (OSError, subprocess.SubprocessError):
         return text_result({
@@ -327,7 +369,7 @@ def _google_services_cli_result(
             capture_output=True,
             cwd=runtime.context.project_root,
             env=runtime.subprocess_env,
-            timeout=3600,
+            timeout=bounded_timeout(3600),
         )
     except (OSError, subprocess.SubprocessError):
         return text_result(
@@ -348,6 +390,121 @@ def _google_services_cli_result(
     return text_result(data)
 
 
+def _run_up_cli_process(
+    command: list[str],
+    *,
+    cwd: Any,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(
+            timeout=bounded_timeout(UP_TIMEOUT_SECONDS)
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=UP_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _locked_runtime_mutation(
+    runtime: MCPRuntime,
+    operation: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    if runtime.operation_lock_held:
+        return operation()
+    with instance_operation_lock(runtime.context.state_root):
+        return operation()
+
+
+def _up_cli_result(runtime: MCPRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    skip_build = args.get("skipBuild", False)
+    reuse_runtime = args.get("reuseRuntime", False)
+    if not isinstance(skip_build, bool) or not isinstance(reuse_runtime, bool):
+        return text_result({
+            "ok": False,
+            "code": "invalid_request_schema",
+            "error": "invalid_request_schema",
+        })
+    cli = runtime.context.project_root / "xenoid"
+    command = [
+        str(cli),
+        "--instance",
+        runtime.context.instance_name,
+        "up",
+    ]
+    if skip_build:
+        command.append("--skip-build")
+    if reuse_runtime:
+        command.append("--reuse-runtime")
+    base = {
+        "instance": runtime.context.public_dict(),
+        "skipBuild": skip_build,
+        "reuseRuntime": reuse_runtime,
+    }
+    try:
+        proc = _run_up_cli_process(
+            command,
+            cwd=runtime.context.project_root,
+            env=runtime.subprocess_env,
+        )
+    except subprocess.TimeoutExpired:
+        return text_result({
+            "ok": False,
+            "code": "xenoid_up_timeout",
+            "error": "xenoid_up_timeout",
+            **base,
+        })
+    except Exception:
+        return text_result({
+            "ok": False,
+            "code": "xenoid_up_unavailable",
+            "error": "xenoid_up_unavailable",
+            **base,
+        })
+    result = {
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        **base,
+    }
+    if proc.returncode != 0:
+        stable_error = "xenoid_up_failed"
+        try:
+            child_result = json.loads(proc.stdout)
+        except Exception:
+            child_result = None
+        if (
+            isinstance(child_result, dict)
+            and child_result.get("error")
+            in {"instance_busy", "instance_identity_mismatch"}
+        ):
+            stable_error = str(child_result["error"])
+        result.update({
+            "code": stable_error,
+            "error": stable_error,
+        })
+    return text_result(result)
+
+
 def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     context = runtime.context
     cfg = runtime.config
@@ -355,13 +512,15 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     dc = runtime.daemon
 
     def edc() -> DaemonClient:
-        mgr.ensure_daemon()
+        if runtime.auto_ensure_daemon:
+            mgr.ensure_daemon()
         return dc
 
     def epc() -> ProxyController:
-        ensured = mgr.ensure_daemon()
-        if not isinstance(ensured, dict) or ensured.get("ok") is not True:
-            raise RuntimeError("daemon_unreachable")
+        if runtime.auto_ensure_daemon:
+            ensured = mgr.ensure_daemon()
+            if not isinstance(ensured, dict) or ensured.get("ok") is not True:
+                raise RuntimeError("daemon_unreachable")
         return ProxyController(context, cfg, runtime.lease, mgr, dc)
 
     if name == "xenoid_verify_release":
@@ -380,9 +539,20 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
         data["returncode"] = proc.returncode
         return text_result(data)
     if name == "xenoid_package_release":
+        try:
+            requested_version = args.get("version")
+            version = validate_release_version(
+                "dev" if requested_version is None else requested_version
+            )
+        except ValueError:
+            return text_result({
+                "ok": False,
+                "code": "release_version_invalid",
+                "error": "release_version_invalid",
+            })
         script = context.project_root / "scripts" / "package-release.sh"
         proc = subprocess.run(
-            [str(script), str(args.get("version") or "dev")],
+            [str(script), version],
             text=True,
             capture_output=True,
             cwd=context.project_root,
@@ -500,10 +670,15 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
         except Exception: data = {"ok": False, "stdout": proc.stdout, "stderr": proc.stderr}
         data["returncode"] = proc.returncode
         return text_result(data)
+    if name == "xenoid_up":
+        return _up_cli_result(runtime, args)
     if name == "xenoid_start":
-        return text_result(mgr.start(dry_run=bool(args.get("dryRun", False)), start_colima=bool(args.get("startColima", False)), install_daemon_apk=args.get("installDaemonApk"), adb_root=bool(args.get("adbRoot", True)), recreate=bool(args.get("recreate", False))))
+        return text_result(_locked_runtime_mutation(
+            runtime,
+            lambda: mgr.start(dry_run=bool(args.get("dryRun", False)), start_colima=bool(args.get("startColima", False)), install_daemon_apk=args.get("installDaemonApk"), adb_root=bool(args.get("adbRoot", True)), recreate=bool(args.get("recreate", False))),
+        ))
     if name == "xenoid_stop":
-        return text_result(mgr.stop())
+        return text_result(_locked_runtime_mutation(runtime, mgr.stop))
     if name == "xenoid_logs":
         return text_result(mgr.runtime_logs(args.get("outDir")))
     if name == "xenoid_view":
@@ -699,6 +874,20 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
         return text_result(mgr.overlay_status())
     if name == "xenoid_hide_cleanup_overlay":
         return text_result(mgr.overlay_cleanup())
+    if name == "xenoid_netctl_deploy":
+        return text_result(mgr.deploy_netctl_helper(
+            str(args["path"]),
+            str(args.get("remotePath") or "/data/local/tmp/xenoid-netctl"),
+        ))
+    if name == "xenoid_netctl_status":
+        return text_result(mgr.netctl_status(
+            str(args.get("ifname") or "rmnet_data0"),
+        ))
+    if name == "xenoid_netctl_set_mac":
+        return text_result(mgr.netctl_set_mac(
+            str(args["mac"]),
+            str(args.get("ifname") or "rmnet_data0"),
+        ))
     if name == "xenoid_hide_apply":
         policy = read_json_file(str(args["policyPath"])) if args.get("policyPath") else None
         return text_result(edc().hide_apply(policy))
@@ -775,7 +964,10 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
                 break
         return text_result(data)
     if name == "xenoid_ota_make":
-        return text_result(mgr.make_ota_bundle(str(args.get("version") or "0.1.0")))
+        requested_version = args.get("version")
+        return text_result(mgr.make_ota_bundle(
+            "0.1.0" if requested_version is None else requested_version
+        ))
     if name == "xenoid_ota_install_bundle":
         return text_result(mgr.apply_ota_bundle(str(args["bundle"])))
     if name == "xenoid_ota_check":
@@ -783,6 +975,65 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_ota_apply":
         return text_result(edc().ota_apply(str(args.get("channel") or "stable")))
     raise ValueError(f"unknown tool: {name}")
+
+
+_STDIO_READ_ONLY_TOOLS = frozenset({
+    "xenoid_config_show",
+    "xenoid_doctor",
+    "xenoid_google_services_status",
+    "xenoid_install_runtime_plan",
+    "xenoid_up_plan",
+    "xenoid_logs",
+    "xenoid_view",
+    "xenoid_status",
+    "xenoid_daemon_health",
+    "xenoid_location_list",
+    "xenoid_location_status",
+    "xenoid_hide_overlay_status",
+    "xenoid_netctl_status",
+})
+
+
+def _refresh_stdio_runtime(runtime: MCPRuntime) -> MCPRuntime:
+    context, config, lease = resolve_instance(
+        runtime.context.instance_name,
+        project_root=runtime.context.project_root,
+    )
+    manager = RuntimeManager(context, config, lease)
+    daemon = DaemonClient(context, lease, manager.docker_base_cmd())
+    return MCPRuntime(
+        context,
+        config,
+        lease,
+        manager,
+        daemon,
+        auto_ensure_daemon=runtime.auto_ensure_daemon,
+        operation_lock_timeout_seconds=runtime.operation_lock_timeout_seconds,
+    )
+
+
+def _call_stdio_tool(
+    runtime: MCPRuntime,
+    name: str,
+    arguments: dict[str, Any],
+) -> Any:
+    initial = _refresh_stdio_runtime(runtime)
+    # CLI-backed mutations delegate lock ownership to the child, so killing
+    # this stdio parent cannot unlock an operation that is still running.
+    if name in CHILD_LOCK_TOOL_NAMES or name in _STDIO_READ_ONLY_TOOLS:
+        return call_tool(initial, name, arguments)
+    with instance_operation_lock(initial.context.state_root):
+        current = _refresh_stdio_runtime(initial)
+        if current.context.instance_id != initial.context.instance_id:
+            raise InstanceError(
+                "instance_identity_mismatch",
+                "instance identity changed during an operation",
+            )
+        return call_tool(
+            replace(current, operation_lock_held=True),
+            name,
+            arguments,
+        )
 
 
 def handle(runtime: MCPRuntime, req: dict[str, Any]) -> None:
@@ -797,7 +1048,14 @@ def handle(runtime: MCPRuntime, req: dict[str, Any]) -> None:
     elif method == "tools/call":
         params = req.get("params", {})
         try:
-            respond(id_, call_tool(runtime, params.get("name"), params.get("arguments") or {}))
+            respond(
+                id_,
+                _call_stdio_tool(
+                    runtime,
+                    params.get("name"),
+                    params.get("arguments") or {},
+                ),
+            )
         except InstanceError as exc:
             respond(id_, error={"code": -32000, "message": exc.code, "data": exc.as_dict()})
         except Exception as exc:

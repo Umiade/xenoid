@@ -11,6 +11,7 @@ setup(
         "console_scripts": [
             "xenoid=xenoid.cli:main",
             "xenoid-mcp=xenoid.mcp_server:main",
+            "xenoid-service=xenoid.remote_service:main",
         ]
     },
 )

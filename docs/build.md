@@ -8,6 +8,23 @@ No external Python dependencies are required.
 ./xenoid doctor
 ```
 
+The remote service is also Python 3.9 standard-library only. Its runtime-free
+contracts cover access-store permissions, token/instance ACLs, scope-filtered
+catalogs, fresh instance resolution, same-instance locking, cross-instance
+parallelism, CLI/stdio lock sharing, MCP 2026-07-28 HTTP headers, Host/Origin
+checks, redaction, bounded command execution, connection/request admission,
+short-body rejection, deferred TLS handshakes, default non-loopback TLS guards,
+and the explicit insecure-HTTP test opt-in:
+
+```bash
+python3 scripts/test-mcp-contract.py
+python3 scripts/test-remote-service.py
+```
+
+The HTTP contract opens a temporary loopback listener. Sandboxed development
+environments must permit binding `127.0.0.1`; it never requires an Android
+runtime or an external network.
+
 ## Instance storage contracts
 
 ```bash
@@ -162,7 +179,7 @@ The generated ZIP, PEM, expanded payload, probe APK, and runtime context are pri
 
 - host dependencies and redroid preflight
 - Python compilation
-- CLI dry-run and MCP tool exposure
+- CLI dry-run, MCP tool/handler dispatch parity, and remote service contracts
 - mock daemon API contract
 - deterministic proxy source compilation, bounded subscription fetching, authenticated/replay-safe engine protocol, and fixed-instance controller race contracts
 - ADB/boot/daemon/root state when Android is running

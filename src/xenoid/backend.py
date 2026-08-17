@@ -69,7 +69,7 @@ from .storage import (
     storage_rotation_target,
     storage_transaction_id,
 )
-from .util import host_info, run, which
+from .util import bounded_timeout, host_info, run, validate_release_version, which
 
 
 _CAMERA_UPLOAD_MIN_BYTES_PER_SECOND = 512 * 1024
@@ -4449,6 +4449,14 @@ class RuntimeManager:
         return self.ensure_instance_storage()
 
     def make_ota_bundle(self, version: str = "0.1.0") -> dict[str, Any]:
+        try:
+            version = validate_release_version(version)
+        except ValueError:
+            return {
+                "ok": False,
+                "code": "release_version_invalid",
+                "error": "release_version_invalid",
+            }
         script = self.context.project_root / "scripts" / "make-ota-bundle.sh"
         output_root = self.context.state_root / "ota" / "bundles"
         env = self.docker_env()
@@ -4917,7 +4925,10 @@ class RuntimeManager:
         stderr_size = 0
         input_view = memoryview(payload) if payload is not None else None
         input_offset = 0
-        deadline = time.monotonic() + timeout
+        effective_timeout = bounded_timeout(timeout)
+        if effective_timeout is None:
+            effective_timeout = float(timeout)
+        deadline = time.monotonic() + effective_timeout
         try:
             proc = subprocess.Popen(
                 argv,
@@ -4947,10 +4958,10 @@ class RuntimeManager:
             while selector.get_map():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise subprocess.TimeoutExpired(argv, timeout)
+                    raise subprocess.TimeoutExpired(argv, effective_timeout)
                 events = selector.select(remaining)
                 if not events:
-                    raise subprocess.TimeoutExpired(argv, timeout)
+                    raise subprocess.TimeoutExpired(argv, effective_timeout)
                 for key, _ in events:
                     stream = key.fileobj
                     if key.data == "stdin":
@@ -4986,7 +4997,7 @@ class RuntimeManager:
                             raise InstanceError("engine_response_invalid", "proxy engine response exceeded its bound")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise subprocess.TimeoutExpired(argv, timeout)
+                raise subprocess.TimeoutExpired(argv, effective_timeout)
             returncode = proc.wait(timeout=remaining)
         except InstanceError:
             raise

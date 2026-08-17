@@ -376,6 +376,7 @@ OTA bundle 包含 daemon、native runtime helper 与 manifest/hash 元数据。F
 
 - `xenoid_doctor`，参数为 `full` 与 `requireRuntime`；
 - `xenoid_up_plan`，用于无副作用的完整启动计划；
+- `xenoid_up`，用于执行标准的完整生产收敛流程；
 - `xenoid_stop` 与 `xenoid_status`，用于运行时生命周期控制；
 - `xenoid_google_services_status`、`xenoid_google_services_enable` 与 `xenoid_google_services_disable`；
 - `xenoid_root_status` 与 `xenoid_root_exec`；
@@ -386,6 +387,25 @@ OTA bundle 包含 daemon、native runtime helper 与 manifest/hash 元数据。F
 MCP 不绕过 daemon token、backend 约束或运行时前置条件。向 agent 开放写操作前，应明确目标运行时、应用包名和允许的操作范围。
 
 完整工具契约见 [`docs/mcp-tools.md`](docs/mcp-tools.md)。
+
+### 远端多实例服务
+
+`xenoid-service` 通过带认证的 MCP 2026-07-28 Streamable HTTP 暴露一个固定
+Xenoid 项目中的所有已初始化实例。每个实例工具都必须显式指定
+`instance`；服务会逐请求重新解析实例状态、按实例串行写操作，并按令牌
+scope 返回远端安全工具集，不开放任意宿主路径、构建、部署或宿主脚本。
+
+```bash
+./xenoid-service token create \
+  --name operator --all-instances --scope read --scope control
+./xenoid-service serve --bind 127.0.0.1 --port 8765
+```
+
+推荐保持 loopback，通过 SSH/VPN 或可信 TLS/OAuth 网关访问。非 loopback
+明文监听默认拒绝；临时可信网络测试必须显式传 `--allow-insecure-http` 并配置
+精确的 Host allowlist。反向代理的明文上游应保持在 loopback。macOS
+LaunchAgent、Linux ARM64 systemd、TLS、令牌 scope 与 MCP 客户端配置见
+[`docs/remote-service.md`](docs/remote-service.md)。
 
 ## 配置
 
@@ -431,4 +451,5 @@ MCP 不绕过 daemon token、backend 约束或运行时前置条件。向 agent 
 - [`docs/operations.md`](docs/operations.md)：运行、故障定位与发布操作；
 - [`docs/profile-and-hiding.md`](docs/profile-and-hiding.md)：设备画像与环境隐藏；
 - [`docs/build.md`](docs/build.md)：构建产物与依赖；
-- [`docs/mcp-tools.md`](docs/mcp-tools.md)：MCP 工具参数。
+- [`docs/mcp-tools.md`](docs/mcp-tools.md)：MCP 工具参数；
+- [`docs/remote-service.md`](docs/remote-service.md)：远端多实例部署与安全边界。

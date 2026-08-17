@@ -1,9 +1,18 @@
 # Xenoid MCP tool contract
 
-The `xenoid-mcp` stdio server exposes these tools for agent/host use (73 total).
-Every tool returns a JSON object; `ok` indicates success. The daemon-backed tools
-require the runtime up and the daemon reachable (daemon control channel is
-authenticated with the per-instance `X-Xenoid-Token`).
+The `xenoid-mcp` stdio server exposes the catalog below to a trusted local agent
+for one fixed `XENOID_INSTANCE`. The catalog is generated from code; this
+document intentionally does not hard-code a count. Every tool returns a JSON
+object; `ok` indicates success. Daemon-backed tools require the runtime up and
+the daemon reachable (the daemon control channel is authenticated with the
+per-instance `X-Xenoid-Token`).
+
+`xenoid-service` derives a smaller, scope-filtered network catalog from this
+local catalog. It adds a required `instance` parameter to every instance tool,
+supports `xenoid_instances_list`, disables implicit daemon self-healing, and
+excludes unrestricted host paths/code, builds, packaging, deployment, binderfs,
+and host protection changes. See [`remote-service.md`](remote-service.md) for
+the remote scope and transport contract.
 
 
 ## Runtime lifecycle
@@ -20,6 +29,15 @@ _No parameters._
 ### `xenoid_up_plan`
 Dry-run full Xenoid startup plan
 _No parameters._
+
+### `xenoid_up`
+Run the canonical full Xenoid production convergence path.
+  - `skipBuild` (boolean): use already built/packaged artifacts
+  - `reuseRuntime` (boolean): require and reuse an identity-matched running runtime
+
+Successful `xenoid_up` means the same complete runtime, daemon, profile,
+protection, and live-check contract as `./xenoid up`. Its remote result is stable
+and does not include subprocess stdout/stderr or host paths.
 
 ### `xenoid_start`
 Start Xenoid Android runtime
@@ -266,7 +284,6 @@ Parse Xenoid JS automation task into ordered calls
 Run/plan Xenoid JS automation task with host JS runner
   - `scriptPath` (string) **(required)**
   - `execute` (boolean)
-  - `endpoint` (string)
 
 ### `xenoid_automation_run`
 Run Xenoid JS automation task

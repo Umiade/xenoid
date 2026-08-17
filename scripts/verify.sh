@@ -2,6 +2,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# Doctor runs this suite inside the caller's production operation lock, while
+# the suite intentionally creates and operates on a separate fixture instance.
+# Never let the parent's immutable-instance markers contaminate that fixture.
+unset XENOID_OPERATION_LOCK_HELD XENOID_EXPECT_INSTANCE_ID XENOID_OPERATION_LOCK_TIMEOUT
 python3 -m compileall src
 python3 scripts/test-proxy.py >/tmp/xenoid-test-proxy.json
 python3 scripts/test-cellular-profile.py
@@ -9,6 +13,8 @@ python3 scripts/test-ril-source.py
 python3 scripts/test-google-services.py
 python3 scripts/test-proxy-control.py
 python3 scripts/test-proxy-compiler.py >/tmp/xenoid-test-proxy-compiler.json
+python3 scripts/test-remote-service.py >/tmp/xenoid-test-remote-service.json
+python3 scripts/test-mcp-contract.py >/tmp/xenoid-test-mcp-contract.json
 python3 scripts/audit-sensitive-data.py
 python3 scripts/smoke-profile-template.py >/tmp/xenoid-smoke-profile-template.json
 python3 scripts/smoke-storage-surfaces.py >/tmp/xenoid-smoke-storage-surfaces.json
@@ -38,7 +44,7 @@ python3 - <<'PY'
 import json
 lines=[json.loads(x) for x in open('/tmp/xenoid-mcp-verify.jsonl') if x.strip()]
 tools={t['name'] for t in lines[1]['result']['tools']}
-required={'xenoid_doctor','xenoid_start','xenoid_install_runtime_plan','xenoid_up_plan','xenoid_logs','xenoid_view','xenoid_verify_release','xenoid_package_release','xenoid_ebpf_build','xenoid_ebpf_load','xenoid_ebpf_status','xenoid_profile_deploy_helper','xenoid_profile_helper_status','xenoid_linux_binderfs','xenoid_runtime_build_image','xenoid_config_show','xenoid_frida_fetch','xenoid_frida_deploy_scripts','xenoid_frida_load_script','xenoid_input_tap','xenoid_hide_apply','xenoid_device_apply','xenoid_device_generate_frida','xenoid_device_generate_service_frida','xenoid_automation_plan','xenoid_automation_run_host','xenoid_automation_run','xenoid_netctl_deploy','xenoid_netctl_status','xenoid_netctl_set_mac','xenoid_location_list','xenoid_location_status','xenoid_location_set'}
+required={'xenoid_doctor','xenoid_start','xenoid_install_runtime_plan','xenoid_up_plan','xenoid_up','xenoid_logs','xenoid_view','xenoid_verify_release','xenoid_package_release','xenoid_ebpf_build','xenoid_ebpf_load','xenoid_ebpf_status','xenoid_profile_deploy_helper','xenoid_profile_helper_status','xenoid_linux_binderfs','xenoid_runtime_build_image','xenoid_config_show','xenoid_frida_fetch','xenoid_frida_deploy_scripts','xenoid_frida_load_script','xenoid_input_tap','xenoid_hide_apply','xenoid_device_apply','xenoid_device_generate_frida','xenoid_device_generate_service_frida','xenoid_automation_plan','xenoid_automation_run_host','xenoid_automation_run','xenoid_netctl_deploy','xenoid_netctl_status','xenoid_netctl_set_mac','xenoid_location_list','xenoid_location_status','xenoid_location_set'}
 required.add('xenoid_frida_install')
 required.update({'xenoid_google_services_status','xenoid_google_services_enable','xenoid_google_services_disable'})
 missing=sorted(required-tools)
