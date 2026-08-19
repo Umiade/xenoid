@@ -151,6 +151,114 @@ final class RootHelper {
     }
 
 
+    private static String readKeyboxStagePath(File request) {
+        try {
+            byte[] bytes = new byte[256];
+            int offset = 0;
+            try (FileInputStream input = new FileInputStream(request)) {
+                while (offset < bytes.length) {
+                    int count = input.read(bytes, offset, bytes.length - offset);
+                    if (count < 0) break;
+                    if (count == 0) return null;
+                    offset += count;
+                }
+                if (offset <= 0) return null;
+                int next = input.read();
+                if (next != -1) return null;
+            }
+            String text = new String(bytes, 0, offset, "UTF-8");
+            String[] lines = text.split("\n", -1);
+            if (lines.length != 4 || !lines[3].isEmpty()
+                    || !lines[0].startsWith("/data/local/tmp/.keybox-upload-")) {
+                return null;
+            }
+            String suffix = lines[0].substring("/data/local/tmp/.keybox-upload-".length());
+            if (!suffix.matches("[0-9a-f]{32}")) return null;
+            return lines[0];
+        } catch (Throwable failure) {
+            return null;
+        }
+    }
+
+    static boolean copyKeyboxStage(
+            File request, File destination, int appUid, String apkPath) {
+        boolean valid = isKeyboxRequest(request) && isKeyboxDestination(destination)
+                && request.getParentFile().equals(destination.getParentFile()) && appUid > 0;
+        if (!valid) return false;
+        if (readKeyboxStagePath(request) == null) return false;
+        return "ok".equals(runKeyboxClient(apkPath, "stage"));
+    }
+
+    static void cleanupKeyboxStage(File request, int appUid, String apkPath) {
+        if (!isKeyboxRequest(request) || !request.isFile() || appUid <= 0) return;
+        runKeyboxClient(apkPath, "stage-cleanup");
+    }
+
+    static String runKeyboxClient(String apkPath, String operation) {
+        if (apkPath == null
+                || (!"apply".equals(operation) && !"clear".equals(operation)
+                && !"stage".equals(operation) && !"stage-cleanup".equals(operation))) {
+            return "control_unavailable";
+        }
+        File apk = new File(apkPath);
+        try {
+            if (!apk.isFile() || !apk.getCanonicalPath().equals(apk.getAbsolutePath())) {
+                return "control_unavailable";
+            }
+        } catch (IOException ignored) {
+            return "control_unavailable";
+        }
+        String command = "set -eu;a=" + apk.getAbsolutePath() + ";"
+                + "[ -f $a ];[ ! -L $a ];[ $(readlink -f $a) = $a ];"
+                + "x=$(cat /proc/$(pidof zygote64)/environ | sed s/\\\\0/@@/g);"
+                + "b=${x#*BOOTCLASSPATH=};b=${b%%DEX2OATBOOTCLASSPATH=*};"
+                + "d=${x#*DEX2OATBOOTCLASSPATH=};d=${d%%SYSTEMSERVERCLASSPATH=*};"
+                + "[ ${#b} -gt 0 ];[ ${#d} -gt 0 ];"
+                + "ANDROID_ROOT=/system ANDROID_DATA=/data "
+                + "ANDROID_ART_ROOT=/apex/com.android.art "
+                + "ANDROID_I18N_ROOT=/apex/com.android.i18n "
+                + "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata "
+                + "BOOTCLASSPATH=$b DEX2OATBOOTCLASSPATH=$d "
+                + "CLASSPATH=$a /system/bin/xenoid-app-process / "
+                + "--nice-name=xenoid-keymint-once dev.xenoid.daemon.TeesimControlClient "
+                + operation + " 2>/dev/null";
+        Map<String, Object> result = execRootd(
+                command, "apply".equals(operation) ? 150000 : 60000);
+        String output = String.valueOf(result.get("stdout"));
+        if (output.contains("xenoid-keymint:ok")) return "ok";
+        if (output.contains("xenoid-keymint:native_rejected")) return "native_rejected";
+        if (output.contains("xenoid-keymint:key_migration_unavailable")) {
+            return "key_migration_unavailable";
+        }
+        if (output.contains("xenoid-keymint:invalid_stage")) return "invalid_stage";
+        return "control_unavailable";
+    }
+
+
+    private static boolean isKeyboxRequest(File request) {
+        if (request == null || !".stage-request".equals(request.getName())) return false;
+        File parent = request.getParentFile();
+        File noBackup = parent == null ? null : parent.getParentFile();
+        if (parent == null || noBackup == null || !"keybox".equals(parent.getName())
+                || !"no_backup".equals(noBackup.getName())) {
+            return false;
+        }
+        return "/data/user/0/dev.xenoid.daemon/no_backup/keybox/.stage-request"
+                .equals(request.getAbsolutePath());
+    }
+
+    private static boolean isKeyboxDestination(File destination) {
+        if (destination == null || !".candidate.xml".equals(destination.getName())) return false;
+        File parent = destination.getParentFile();
+        File noBackup = parent == null ? null : parent.getParentFile();
+        if (parent == null || noBackup == null || !"keybox".equals(parent.getName())
+                || !"no_backup".equals(noBackup.getName())) {
+            return false;
+        }
+        return "/data/user/0/dev.xenoid.daemon/no_backup/keybox/.candidate.xml"
+                .equals(destination.getAbsolutePath());
+    }
+
     static boolean copyCameraStage(String stagingPath, File destination, long size, String sha256, int appUid) {
         if (!isCameraStage(stagingPath) || destination == null || size <= 0
                 || sha256 == null || !sha256.matches("[0-9a-f]{64}") || appUid <= 0) return false;

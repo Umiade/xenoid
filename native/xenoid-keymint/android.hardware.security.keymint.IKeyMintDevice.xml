@@ -1,0 +1,12 @@
+<manifest version="2.0" type="device">
+    <!-- KeyMint HAL served by /system/bin/hw/android.hardware.security.keymint-service.
+         keystore2 resolves a declared AIDL KeyMint HAL in preference to its
+         in-process km_compat fallback. No IRemotelyProvisionedComponent or
+         ISharedSecret instances are declared: remote provisioning stays
+         unsupported, matching the stock runtime. -->
+    <hal format="aidl">
+        <name>android.hardware.security.keymint</name>
+        <version>1</version>
+        <fqname>IKeyMintDevice/default</fqname>
+    </hal>
+</manifest>

@@ -112,6 +112,17 @@ STATE = {
         "allowInsecureHttp": False,
         "checkId": 0,
     },
+    "keybox": {
+        "configured": False,
+        "ready": True,
+        "active": False,
+        "algorithms": {
+            "rsa": False,
+            "ecdsa": False,
+            "rsaChainCount": 0,
+            "ecdsaChainCount": 0,
+        },
+    },
 }
 
 
@@ -141,6 +152,100 @@ _PROXY_METHODS = {
     "/proxy/agent-bootstrap": "POST",
     "/proxy/agent": "POST",
 }
+
+KEYBOX_SOURCE_MAX_BYTES = 8 * 1024 * 1024
+KEYBOX_LOCK = threading.RLock()
+_KEYBOX_METHODS = {
+    "/keybox/status": "GET",
+    "/keybox/source": "POST",
+    "/keybox/clear": "POST",
+}
+_KEYBOX_STAGING_PATH = re.compile(
+    r"/data/local/tmp/\.keybox-upload-[0-9a-f]{32}"
+)
+_KEYBOX_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _keybox_error(error: str) -> dict[str, Any]:
+    return {"ok": False, "error": error}
+
+
+def _keybox_status() -> dict[str, Any]:
+    keybox = STATE["keybox"]
+    algorithms = keybox["algorithms"]
+    return {
+        "ok": True,
+        "configured": keybox["configured"],
+        "ready": keybox["ready"],
+        "active": keybox["active"],
+        "algorithms": {
+            "rsa": algorithms["rsa"],
+            "ecdsa": algorithms["ecdsa"],
+            "rsaChainCount": algorithms["rsaChainCount"],
+            "ecdsaChainCount": algorithms["ecdsaChainCount"],
+        },
+    }
+
+
+def _keybox_response(path: str, method: str, body: Any) -> dict[str, Any]:
+    if method != _KEYBOX_METHODS[path]:
+        return _keybox_error("method_not_allowed")
+    if not isinstance(body, dict):
+        return _keybox_error("invalid_request")
+
+    with KEYBOX_LOCK:
+        if path == "/keybox/status":
+            if body:
+                return _keybox_error("invalid_request")
+            return _keybox_status()
+
+        if path == "/keybox/source":
+            if set(body) != {"stagingPath", "size", "sha256"}:
+                return _keybox_error("invalid_request")
+            staging_path = body.get("stagingPath")
+            size = body.get("size")
+            digest = body.get("sha256")
+            if (
+                not isinstance(staging_path, str)
+                or _KEYBOX_STAGING_PATH.fullmatch(staging_path) is None
+            ):
+                return _keybox_error("invalid_stage")
+            if (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or not 0 < size <= KEYBOX_SOURCE_MAX_BYTES
+                or not isinstance(digest, str)
+                or _KEYBOX_SHA256.fullmatch(digest) is None
+            ):
+                return _keybox_error("invalid_request")
+            keybox = STATE["keybox"]
+            keybox["configured"] = True
+            keybox["ready"] = True
+            keybox["active"] = True
+            keybox["algorithms"] = {
+                "rsa": True,
+                "ecdsa": True,
+                "rsaChainCount": 3,
+                "ecdsaChainCount": 3,
+            }
+            return _keybox_status()
+
+        if path == "/keybox/clear":
+            if body:
+                return _keybox_error("invalid_request")
+            keybox = STATE["keybox"]
+            keybox["configured"] = False
+            keybox["ready"] = False
+            keybox["active"] = False
+            keybox["algorithms"] = {
+                "rsa": False,
+                "ecdsa": False,
+                "rsaChainCount": 0,
+                "ecdsaChainCount": 0,
+            }
+            return _keybox_status()
+
+    raise AssertionError(f"unhandled keybox route: {path}")
 
 
 def _proxy_error(error: str) -> dict[str, Any]:
@@ -341,7 +446,9 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
 
 
 
-def response(path: str, method: str, body: dict[str, Any]) -> dict[str, Any]:
+def response(path: str, method: str, body: Any) -> dict[str, Any]:
+    if path in _KEYBOX_METHODS:
+        return _keybox_response(path, method, body)
     if path in _PROXY_METHODS:
         return _proxy_response(path, method, body)
     if path == "/health":
@@ -499,11 +606,15 @@ class Handler(BaseHTTPRequestHandler):
         proxy_route = self.path in _PROXY_METHODS
         required_method = _PROXY_METHODS.get(self.path)
         unavailable_route = self.path in {"/proxy/agent-bootstrap", "/proxy/agent"}
+        keybox_route = self.path in _KEYBOX_METHODS
+        keybox_method = _KEYBOX_METHODS.get(self.path)
         result = None
         try:
             body = json.loads(raw) if raw else {}
         except Exception:
-            if proxy_route and self.command == required_method and not unavailable_route:
+            if keybox_route and self.command == keybox_method:
+                result = _keybox_error("invalid_request")
+            elif proxy_route and self.command == required_method and not unavailable_route:
                 result = _proxy_error("invalid_request_body")
             else:
                 body = {"raw": raw}
@@ -516,6 +627,14 @@ class Handler(BaseHTTPRequestHandler):
             and not raw
         ):
             result = _proxy_error("invalid_request_body")
+        if (
+            result is None
+            and keybox_route
+            and self.command == keybox_method
+            and self.command == "POST"
+            and not raw
+        ):
+            result = _keybox_error("invalid_request")
         if result is None:
             result = response(self.path, self.command, body)
         data = json.dumps(result, ensure_ascii=False).encode()

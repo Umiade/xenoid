@@ -74,6 +74,42 @@ Output:
 daemon/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+The mock daemon API smoke is runtime-free and uses generated dummy keybox bytes only. It verifies exact request/status schemas, safe errors and redaction, CLI parser/file boundaries, staging cleanup, and clear idempotence:
+
+```bash
+scripts/smoke-daemon-api.sh --mock
+```
+
+## Android 13 KeyMint HAL service
+
+Release users consume the validated Android ARM64 prebuilt:
+
+```text
+native/xenoid-keymint/xenoid-keymint
+```
+
+The implementation lives in-tree under `native/xenoid-keymint/`: the C++ HAL service and router in `src/` and the Rust glue crate in `rust/teesim-km` derive from [TEESimulator](https://github.com/JingMatrix/TEESimulator) (the glue crate is `GPL-3.0-or-later`, so redistributing source or prebuilt binaries requires corresponding license and source compliance); the in-process reference KeyMint TA is compiled from a pinned AOSP checkout with the patches in `rust/patches/` applied. AOSP and BoringSSL dependencies are not vendored: `scripts/fetch-keymint-deps.sh` clones exact commits into the gitignored `native/xenoid-keymint/.deps/` with partial clone + sparse checkout.
+
+Runtime-context generation requires the prebuilt, ships the VINTF fragment `native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml` (tracked), and generates `android.hardware.security.keymint-service.rc`, which starts the service as the `keystore` user in `class early_hal`; the rc filename sorts before `keystore2.rc` so the HAL registers in servicemanager first. The generated image installs the service at `/system/bin/hw/android.hardware.security.keymint-service` (mode `0755`), the rc under `/system/etc/init`, and the fragment under `/vendor/etc/vintf/manifest` (both mode `0644`). All VINTF fragments are normalized to mode `0644`: an unreadable fragment fails libvintf's whole-manifest parse in unprivileged readers such as `keystore2`.
+
+Runtime-free prebuilt verification:
+
+```bash
+scripts/build-keymint.sh
+```
+
+The command validates the existing binary (ELF64 PIE, ARM64, dependency allowlist, no host paths or product markers) without rebuilding.
+
+Source rebuilds are explicit and self-contained:
+
+```bash
+./xenoid build keymint
+```
+
+The first build fetches the pinned dependencies (network access to android.googlesource.com and boringssl.googlesource.com); later builds reuse them. Never encode a workstation checkout path in tracked files or release metadata. Release packaging includes the same validated binary under both `native/xenoid-keymint/` and `artifacts/`, and release verification requires them to match.
+
+The build and runtime context contain no keybox. Raw keybox XML/DER/private keys, source/staging paths, digests, transient control JSON, and private daemon state must never be tracked or copied into the image or release bundle.
+
 ## Native low-level input helper
 
 ```bash
@@ -131,6 +167,7 @@ Expected verification on Apple Silicon macOS:
 - native input helper: built for `aarch64-linux-android21`
 - camera provider: built for Android ARM64 with stable-AIDL VINTF registration
 - enhanced gralloc: built for Android ARM64 with legacy RGB/framebuffer ABI preserved
+- Android 13 KeyMint HAL service from external TEESimulator sources: validated ARM64 PIE executable with VINTF registration
 - doctor: passed
 
 ## Verify and bundle OTA

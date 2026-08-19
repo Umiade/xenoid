@@ -97,6 +97,21 @@ Never download the payload implicitly, pass import paths through MCP, copy priva
 
 Profile application regenerates unique identifiers unless `--keep-unique` is selected. `device regenerate` rotates every per-device uniqueness factor (stable IDs, container MAC, boot values, filesystem UUIDs, per-app SSAID, SIM identity for the same country, and on GMS instances the advertising ID state) on a live instance and re-converges it as a brand-new same-model device; user data and the location country/carrier are preserved. If it is interrupted, `start`/`up` fail closed with `device_regeneration_pending` until `device regenerate` is re-run to completion.
 
+## Android 13 KeyMint keybox
+
+Keybox operations are trusted-local CLI only:
+
+```bash
+chmod 600 /secure/local/keybox.xml
+./xenoid device keybox set /secure/local/keybox.xml
+./xenoid device keybox status
+./xenoid device keybox clear
+```
+
+The source must be a current-user-owned nonempty regular file, not a symlink, no larger than 8 MiB, with no group/world permission bits. Never copy keybox XML, DER, private keys, digests, or Android private/staging paths into tracked state, an image context, logs, command arguments, MCP, or remote-service calls. Status is metadata-only. `up` and daemon startup synchronously reapply configured state; `clear` deactivates the native profile before deleting the saved keybox, and no configured keybox is a healthy inactive state.
+
+This workflow is Android 13 ARM64 only and affects `com.google.android.gms` and `com.android.vending`; other callers keep the stock path. Generated attestation is software-executed even though it reports the configured KeyMint TEE security-level metadata. Do not describe it as hardware key custody, Play Integrity support, or Google device certification.
+
 ## Location identity
 
 ```bash

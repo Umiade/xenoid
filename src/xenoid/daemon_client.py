@@ -21,6 +21,95 @@ PROXY_MAX_REQUEST_BYTES = 6 * 1024 * 1024 + 4096
 PROXY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 PROXY_MAX_SOURCE_BYTES = 1024 * 1024
 PROXY_CHECK_TIMEOUT_SECONDS = 300.0
+KEYBOX_STATUS_TIMEOUT_SECONDS = 30.0
+KEYBOX_MUTATION_TIMEOUT_SECONDS = 180.0
+KEYBOX_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+_KEYBOX_STAGING_PATH = re.compile(
+    r"/data/local/tmp/\.keybox-upload-[0-9a-f]{32}"
+)
+_KEYBOX_SHA256 = re.compile(r"[0-9a-f]{64}")
+_KEYBOX_SAFE_ERRORS = frozenset({
+    "attestation_self_test_failed",
+    "clear_failed",
+    "daemon_response_invalid",
+    "daemon_unauthorized",
+    "daemon_unreachable",
+    "invalid_keybox",
+    "invalid_request",
+    "invalid_stage",
+    "key_migration_unavailable",
+    "keybox_request_failed",
+    "method_not_allowed",
+    "native_rejected",
+    "native_unavailable",
+    "response_too_large",
+    "state_persist_failed",
+    "unsupported_keybox",
+})
+
+def _keybox_failure(error: str) -> dict[str, Any]:
+    safe = error if error in _KEYBOX_SAFE_ERRORS else "keybox_request_failed"
+    return {"ok": False, "error": safe}
+
+
+def _keybox_algorithms(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != {
+        "rsa",
+        "ecdsa",
+        "rsaChainCount",
+        "ecdsaChainCount",
+    }:
+        return None
+    rsa = value.get("rsa")
+    ecdsa = value.get("ecdsa")
+    rsa_count = value.get("rsaChainCount")
+    ecdsa_count = value.get("ecdsaChainCount")
+    if (
+        not isinstance(rsa, bool)
+        or not isinstance(ecdsa, bool)
+        or not isinstance(rsa_count, int)
+        or isinstance(rsa_count, bool)
+        or not isinstance(ecdsa_count, int)
+        or isinstance(ecdsa_count, bool)
+        or not 0 <= rsa_count <= 64
+        or not 0 <= ecdsa_count <= 64
+    ):
+        return None
+    return {
+        "rsa": rsa,
+        "ecdsa": ecdsa,
+        "rsaChainCount": rsa_count,
+        "ecdsaChainCount": ecdsa_count,
+    }
+
+
+def _keybox_public_response(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not isinstance(value.get("ok"), bool):
+        return _keybox_failure("daemon_response_invalid")
+    if value["ok"] is not True:
+        error = value.get("error")
+        return _keybox_failure(error if isinstance(error, str) else "")
+
+    algorithms = _keybox_algorithms(value.get("algorithms"))
+    if (
+        not isinstance(value.get("configured"), bool)
+        or not isinstance(value.get("ready"), bool)
+        or not isinstance(value.get("active"), bool)
+        or algorithms is None
+    ):
+        return _keybox_failure("daemon_response_invalid")
+    result: dict[str, Any] = {
+        "ok": True,
+        "configured": value["configured"],
+        "ready": value["ready"],
+        "active": value["active"],
+        "algorithms": algorithms,
+    }
+    error = value.get("error")
+    if isinstance(error, str) and error in _KEYBOX_SAFE_ERRORS:
+        result["error"] = error
+    return result
+
 _PROXY_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROXY_CAPABILITY_KEYS = (
     "v4DnsProxy",
@@ -47,7 +136,7 @@ def _proxy_capabilities_match(value: Any, udp_allowed: Any) -> bool:
         and value["v6DnsProxy"]
         and value["v6TcpProxy"]
         and value["v4UdpProxy"] is udp_allowed
-        and value["v6UdpProxy"] is udp_allowed
+        and (udp_allowed or value["v6UdpProxy"] is False)
     )
 
 
@@ -496,6 +585,54 @@ class DaemonClient:
             "/location/verify",
             {"profileDigest": profile_digest, "runtimeEpoch": runtime_epoch},
             timeout=150,
+        )
+
+    def keybox_status(self) -> dict[str, Any]:
+        return _keybox_public_response(
+            self.request(
+                "GET",
+                "/keybox/status",
+                timeout=KEYBOX_STATUS_TIMEOUT_SECONDS,
+            )
+        )
+
+    def keybox_source(
+        self,
+        staging_path: str,
+        size: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(staging_path, str)
+            or _KEYBOX_STAGING_PATH.fullmatch(staging_path) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or not 0 < size <= KEYBOX_MAX_SOURCE_BYTES
+            or not isinstance(sha256, str)
+            or _KEYBOX_SHA256.fullmatch(sha256) is None
+        ):
+            return _keybox_failure("invalid_request")
+        return _keybox_public_response(
+            self.request(
+                "POST",
+                "/keybox/source",
+                {
+                    "stagingPath": staging_path,
+                    "size": size,
+                    "sha256": sha256,
+                },
+                timeout=KEYBOX_MUTATION_TIMEOUT_SECONDS,
+            )
+        )
+
+    def keybox_clear(self) -> dict[str, Any]:
+        return _keybox_public_response(
+            self.request(
+                "POST",
+                "/keybox/clear",
+                {},
+                timeout=KEYBOX_MUTATION_TIMEOUT_SECONDS,
+            )
         )
 
     def camera_status(self) -> dict[str, Any]:

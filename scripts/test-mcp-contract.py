@@ -99,6 +99,21 @@ def registered_tools_have_handlers() -> None:
     require(registered == handled, f"tool/handler mismatch: {sorted(registered ^ handled)}")
 
 
+def keybox_is_trusted_local_cli_only() -> None:
+    catalog = mcp_server.tools()
+    serialized = json.dumps(catalog, sort_keys=True).lower()
+    require("keybox" not in serialized, "keybox operation leaked into MCP catalog")
+    runtime = SimpleNamespace(
+        context=FakeContext(), config={}, manager=object(), daemon=object()
+    )
+    try:
+        mcp_server.call_tool(runtime, "xenoid_keybox_status", {})
+    except ValueError as exc:
+        require(str(exc) == "unknown tool: xenoid_keybox_status", "unstable MCP denial")
+    else:
+        raise AssertionError("unregistered keybox MCP operation was callable")
+
+
 def netctl_dispatches_to_runtime_manager() -> None:
     runtime = FakeRuntime()
     result = decoded(mcp_server.call_tool(
@@ -417,6 +432,7 @@ def versions_are_path_safe_before_side_effects() -> None:
 def main() -> int:
     cases = (
         registered_tools_have_handlers,
+        keybox_is_trusted_local_cli_only,
         netctl_dispatches_to_runtime_manager,
         up_tool_uses_complete_cli_path,
         generated_mcp_config_is_checkout_runnable,

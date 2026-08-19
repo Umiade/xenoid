@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Runtime-free behavioral smoke for app_process64 dependency injection."""
+"""Runtime-free behavioral smoke for runtime dependency and init-rc patching."""
 from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 

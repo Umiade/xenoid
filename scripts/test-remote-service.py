@@ -177,6 +177,14 @@ def catalog_and_routing_contract(
     require(reader is not None and operator is not None, "fixture authentication")
     reader_names = {tool["name"] for tool in app.remote_tools(reader)}
     operator_tools = {tool["name"]: tool for tool in app.remote_tools(operator)}
+    require(
+        all("keybox" not in name.lower() for name in reader_names | set(operator_tools)),
+        "trusted-local keybox operation leaked to remote catalog",
+    )
+    require(
+        all("keybox" not in name.lower() for name in REMOTE_TOOL_POLICIES),
+        "trusted-local keybox operation leaked to remote policy",
+    )
     require("xenoid_instances_list" in reader_names, "instance list missing")
     require("xenoid_status" in reader_names, "read tool missing")
     require("xenoid_proxy_check" not in reader_names, "stateful check leaked to read")

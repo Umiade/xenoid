@@ -305,6 +305,14 @@ The production profile is Google Pixel 6 Pro model `G8V0U`, build `TP1A.221005.0
 
 `device apply` synchronizes daemon profile state, SettingsProvider, property-area state, native HAL inputs, and reboot-persistent data. PackageManager advertises only camera and sensor capabilities implemented by the runtime; NFC, UWB, fingerprint/UDFPS, true NR, full/manual/RAW camera, HiFi sensor, and head-tracker claims remain absent. After changing profiles, cold-start the target application and recollect the complete profile; one `getprop` value is not sufficient evidence.
 
+Set the KeyMint attestation keybox (Android 13 ARM64):
+
+```bash
+./xenoid device keybox set /secure/local/keybox.xml
+./xenoid device keybox status
+./xenoid device keybox clear
+```
+
 ## Optional Google Play runtime
 
 Google Mobile Services is disabled by default. Xenoid supports one explicit Android 13 ARM64 release: `MindTheGapps-13.0.0-arm64-20231025_200931`. Obtain the official ZIP and its `release.x509.pem` sidecar from the [upstream GitHub release](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931), then configure a fresh instance:
@@ -454,3 +462,11 @@ Release bundles contain the CLI, MCP server, non-proprietary runtime assets, dae
 - [`docs/build.md`](docs/build.md): build artifacts and dependencies;
 - [`docs/mcp-tools.md`](docs/mcp-tools.md): MCP tool parameters;
 - [`docs/remote-service.md`](docs/remote-service.md): remote multi-instance deployment and security.
+
+## Acknowledgments
+
+Xenoid builds on the work of these projects:
+
+- [redroid](https://github.com/remote-android/redroid-doc): the remote Android container runtime Xenoid's Android 13 images are based on;
+- [MindTheGapps](https://gitlab.com/MindTheGapps/vendor_gapps): the optional Google Play services runtime;
+- [TEESimulator](https://github.com/JingMatrix/TEESimulator): the KeyMint simulation approach, router, and in-process reference KeyMint TA (`GPL-3.0-or-later`) that the Xenoid KeyMint HAL service derives from.

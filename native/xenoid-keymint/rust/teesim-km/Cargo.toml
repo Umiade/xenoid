@@ -1,0 +1,32 @@
+[package]
+name = "teesim-km"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+description = "In-process KeyMint TA (kmr-ta) and C ABI for the native interceptor."
+
+[lib]
+# A static library only: it is linked into the interceptor's shared object, which
+# resolves BoringSSL at runtime inside keystore2, so nothing here links libcrypto.
+crate-type = ["staticlib"]
+
+[dependencies]
+kmr-ta = { path = "../../.deps/keymint/ta" }
+kmr-common = { path = "../../.deps/keymint/common" }
+kmr-wire = { path = "../../.deps/keymint/wire" }
+kmr-crypto-boring = { path = "../../.deps/keymint/boringssl" }
+
+# openssl-sys generates the BoringSSL FFI from the platform headers at build time.
+openssl-sys = { version = "0.9.117", features = ["bindgen"] }
+
+log = "0.4"
+android_logger = "0.13"
+libc = "0.2"
+
+roxmltree = "0.20"
+base64 = "0.22"
+
+# X.509 assembly for patch mode: re-signing the real hardware attestation leaf under the keybox.
+# Pinned to the versions the vendored kmr-ta/kmr-common already use; x509-cert re-exports der/spki.
+x509-cert = "0.2"

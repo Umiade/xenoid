@@ -137,9 +137,8 @@ if [[ "$SKIP_BUILD" == 1 ]]; then
   APK="$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
   MISSING=()
   [[ -f "$APK" ]] || MISSING+=("daemon APK: $APK")
-  # Full ARM (aarch64, no-suffix/-arm64 convention) deliverable set: start's
-  # runtime-context needs netctl/prop-area/zygote/sensorshal; up's deploy steps
-  # need input/hide/overlay/ssaid/profile/rootd.
+  # Full Android ARM64 deliverable set. Runtime-context additionally requires
+  # the validated KeyMint preload pair; deploy steps need the remaining helpers.
   ARM_ARTS=(
     native/xenoid-input/xenoid-input
     native/xenoid-hide/xenoid-hide
@@ -158,6 +157,8 @@ if [[ "$SKIP_BUILD" == 1 ]]; then
     native/xenoid-camerahal/android.hardware.camera.provider-service-aidl
     native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml
     native/xenoid-camerahal/media_profiles_V1_0.xml
+    native/xenoid-keymint/xenoid-keymint
+    native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml
     native/xenoid-proxy-sandbox/xenoid-proxy-sandbox
   )
   for f in "${ARM_ARTS[@]}"; do
@@ -169,6 +170,9 @@ if [[ "$SKIP_BUILD" == 1 ]]; then
       esac
     fi
   done
+  if ! "$ROOT/scripts/build-keymint.sh" >/dev/null 2>&1; then
+    MISSING+=("native/xenoid-keymint service (invalid)")
+  fi
   SANDBOX="$ROOT/native/xenoid-proxy-sandbox/xenoid-proxy-sandbox"
   if [[ -f "$SANDBOX" ]] && ! python3 - "$SANDBOX" <<'PY'
 import pathlib, struct, sys

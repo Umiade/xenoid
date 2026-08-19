@@ -306,6 +306,14 @@ Frida 适合应用进程动态分析与 app-layer hook。文件系统、mount、
 
 `device apply` 会同步 daemon profile、SettingsProvider、property-area 状态、原生 HAL 输入与重启后持久化的数据。PackageManager 只声明运行时已实现的相机和传感器能力；NFC、UWB、指纹/UDFPS、真实 NR、full/manual/RAW 相机、HiFi sensor 与 head tracker 均保持未声明。换机后必须冷启动目标应用并重新采集完整画像，单个 `getprop` 值不能作为充分证据。
 
+设置 KeyMint 证明 keybox（Android 13 ARM64）：
+
+```bash
+./xenoid device keybox set /secure/local/keybox.xml
+./xenoid device keybox status
+./xenoid device keybox clear
+```
+
 ## 可选 Google Play 运行时
 
 Google 移动服务默认关闭。Xenoid 仅支持一个显式固定的 Android 13 ARM64 版本：`MindTheGapps-13.0.0-arm64-20231025_200931`。从[上游 GitHub release](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931)获取官方 ZIP 与配套的 `release.x509.pem`，再配置一个全新实例：
@@ -453,3 +461,11 @@ LaunchAgent、Linux ARM64 systemd、TLS、令牌 scope 与 MCP 客户端配置�
 - [`docs/build.md`](docs/build.md)：构建产物与依赖；
 - [`docs/mcp-tools.md`](docs/mcp-tools.md)：MCP 工具参数；
 - [`docs/remote-service.md`](docs/remote-service.md)：远端多实例部署与安全边界。
+
+## 致谢
+
+Xenoid 建立在以下项目的工作之上：
+
+- [redroid](https://github.com/remote-android/redroid-doc)：Xenoid Android 13 镜像所基于的远程 Android 容器运行时；
+- [MindTheGapps](https://gitlab.com/MindTheGapps/vendor_gapps)：可选的 Google Play 服务运行时；
+- [TEESimulator](https://github.com/JingMatrix/TEESimulator)：KeyMint 模拟思路、路由器与进程内参考 KeyMint TA（`GPL-3.0-or-later`），Xenoid 的 KeyMint HAL 服务由其衍生。

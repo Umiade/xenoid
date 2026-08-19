@@ -15,7 +15,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 from .backend import RuntimeManager
@@ -33,6 +33,8 @@ from .config import (
 )
 from .daemon_client import (
     CAMERA_MUTATION_TIMEOUT_SECONDS,
+    KEYBOX_MAX_SOURCE_BYTES,
+    KEYBOX_MUTATION_TIMEOUT_SECONDS,
     PROXY_MAX_SOURCE_BYTES,
     DaemonClient,
 )
@@ -84,9 +86,118 @@ from .util import (
 
 
 
+_KEYBOX_CHUNK_BYTES = 1024 * 1024
+_KEYBOX_PRIVATE_MODES = frozenset({0o400, 0o600})
+
+
+class _KeyboxFileError(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def _same_keybox_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+    )
+
+
+def _private_keybox_file(state: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(state.st_mode)
+        and state.st_uid == os.getuid()
+        and stat.S_IMODE(state.st_mode) in _KEYBOX_PRIVATE_MODES
+        and 0 < state.st_size <= KEYBOX_MAX_SOURCE_BYTES
+    )
+
+
+@contextmanager
+def _validated_keybox_source(
+    path: str,
+) -> Iterator[tuple[BinaryIO, int, str, os.stat_result]]:
+    try:
+        source = Path(path).expanduser()
+        before = os.lstat(source)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _KeyboxFileError("keybox_file_invalid") from exc
+    if not _private_keybox_file(before):
+        raise _KeyboxFileError("keybox_file_invalid")
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _KeyboxFileError("keybox_file_invalid")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except (OSError, ValueError) as exc:
+        raise _KeyboxFileError("keybox_file_invalid") from exc
+
+    try:
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+    except (OSError, ValueError) as exc:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise _KeyboxFileError("keybox_file_invalid") from exc
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            linked = os.lstat(source)
+        except OSError as exc:
+            raise _KeyboxFileError("keybox_file_changed") from exc
+        if (
+            not _private_keybox_file(opened)
+            or not _same_keybox_file(before, opened)
+            or not _same_keybox_file(opened, linked)
+        ):
+            raise _KeyboxFileError("keybox_file_changed")
+
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            try:
+                chunk = stream.read(_KEYBOX_CHUNK_BYTES)
+            except OSError as exc:
+                raise _KeyboxFileError("keybox_file_changed") from exc
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > KEYBOX_MAX_SOURCE_BYTES:
+                raise _KeyboxFileError("keybox_file_changed")
+            digest.update(chunk)
+
+        try:
+            after = os.fstat(descriptor)
+            linked_after = os.lstat(source)
+        except OSError as exc:
+            raise _KeyboxFileError("keybox_file_changed") from exc
+        if (
+            total != before.st_size
+            or not _private_keybox_file(after)
+            or not _same_keybox_file(opened, after)
+            or not _same_keybox_file(after, linked_after)
+        ):
+            raise _KeyboxFileError("keybox_file_changed")
+        try:
+            stream.seek(0)
+        except OSError as exc:
+            raise _KeyboxFileError("keybox_file_changed") from exc
+        yield stream, total, digest.hexdigest(), after
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
 
 def print_json(data: Any) -> None:
     print(json_dumps(data))
+
+
 def runtime(args: argparse.Namespace) -> RuntimeManager:
     return RuntimeManager(args.context, args.config, args.lease)
 
@@ -249,6 +360,20 @@ def cmd_build_daemon(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_build_keymint(args: argparse.Namespace) -> int:
+    script = args.project_root / "scripts" / "build-keymint.sh"
+    proc = subprocess.run(
+        [str(script), "--build"],
+        text=True,
+        capture_output=True,
+        cwd=args.project_root,
+        env=command_env(args),
+    )
+    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
 def cmd_build_input(args: argparse.Namespace) -> int:
     result = run_script(args, "build-native-input.sh")
     print_json(result)
@@ -338,6 +463,7 @@ def cmd_build_all(args: argparse.Namespace) -> int:
     root = args.project_root
     commands = [
         ("daemon", [root / "scripts" / "build-daemon.sh"]),
+        ("keymint", [root / "scripts" / "build-keymint.sh"]),
         ("input", [root / "scripts" / "build-native-input.sh"]),
         ("hide", [root / "scripts" / "build-native-hide.sh"]),
         ("profile", [root / "scripts" / "build-native-profile.sh"]),
@@ -1976,6 +2102,177 @@ def cmd_device_set(args: argparse.Namespace) -> int:
     return 0 if result.get("ok", False) else 1
 
 
+_KEYBOX_SAFE_PUBLIC_ERRORS = frozenset({
+    "attestation_self_test_failed",
+    "clear_failed",
+    "daemon_response_invalid",
+    "daemon_unauthorized",
+    "daemon_unreachable",
+    "invalid_keybox",
+    "invalid_request",
+    "invalid_stage",
+    "key_migration_unavailable",
+    "keybox_daemon_unavailable",
+    "keybox_file_changed",
+    "keybox_file_invalid",
+    "keybox_request_failed",
+    "keybox_set_failed",
+    "keybox_upload_failed",
+    "method_not_allowed",
+    "native_rejected",
+    "native_unavailable",
+    "response_too_large",
+    "state_persist_failed",
+    "unsupported_keybox",
+})
+
+
+def _public_keybox_result(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not isinstance(value.get("ok"), bool):
+        return {"ok": False, "error": "daemon_response_invalid"}
+    if value["ok"] is not True:
+        error = value.get("error")
+        return {
+            "ok": False,
+            "error": (
+                error
+                if isinstance(error, str) and error in _KEYBOX_SAFE_PUBLIC_ERRORS
+                else "keybox_request_failed"
+            ),
+        }
+
+    algorithms = value.get("algorithms")
+    valid_algorithms = (
+        isinstance(algorithms, dict)
+        and set(algorithms)
+        == {"rsa", "ecdsa", "rsaChainCount", "ecdsaChainCount"}
+        and isinstance(algorithms.get("rsa"), bool)
+        and isinstance(algorithms.get("ecdsa"), bool)
+        and isinstance(algorithms.get("rsaChainCount"), int)
+        and not isinstance(algorithms.get("rsaChainCount"), bool)
+        and isinstance(algorithms.get("ecdsaChainCount"), int)
+        and not isinstance(algorithms.get("ecdsaChainCount"), bool)
+        and 0 <= algorithms["rsaChainCount"] <= 64
+        and 0 <= algorithms["ecdsaChainCount"] <= 64
+    )
+    if (
+        not isinstance(value.get("configured"), bool)
+        or not isinstance(value.get("ready"), bool)
+        or not isinstance(value.get("active"), bool)
+        or not valid_algorithms
+    ):
+        return {"ok": False, "error": "daemon_response_invalid"}
+    result = {
+        "ok": True,
+        "configured": value["configured"],
+        "ready": value["ready"],
+        "active": value["active"],
+        "algorithms": {
+            "rsa": algorithms["rsa"],
+            "ecdsa": algorithms["ecdsa"],
+            "rsaChainCount": algorithms["rsaChainCount"],
+            "ecdsaChainCount": algorithms["ecdsaChainCount"],
+        },
+    }
+    error = value.get("error")
+    if isinstance(error, str) and error in _KEYBOX_SAFE_PUBLIC_ERRORS:
+        result["error"] = error
+    return result
+
+
+def _emit_keybox_result(value: Any) -> int:
+    result = _public_keybox_result(value)
+    print_json(result)
+    return 0 if result["ok"] is True else 1
+
+
+def _keybox_mutation_client(
+    args: argparse.Namespace,
+) -> tuple[Optional[RuntimeManager], Optional[DaemonClient]]:
+    try:
+        manager = runtime(args)
+        ensured = manager.ensure_daemon(
+            readiness_timeout=KEYBOX_MUTATION_TIMEOUT_SECONDS
+        )
+        if not isinstance(ensured, dict) or ensured.get("ok") is not True:
+            return None, None
+        return manager, daemon(args, manager)
+    except Exception:
+        return None, None
+
+
+def cmd_device_keybox_set(args: argparse.Namespace) -> int:
+    try:
+        with _validated_keybox_source(args.file) as validated:
+            stream, size, digest, validated_state = validated
+            manager, client = _keybox_mutation_client(args)
+            if manager is None or client is None:
+                return _emit_keybox_result(
+                    {"ok": False, "error": "keybox_daemon_unavailable"}
+                )
+
+            try:
+                current = os.fstat(stream.fileno())
+            except OSError as exc:
+                raise _KeyboxFileError("keybox_file_changed") from exc
+            if (
+                not _private_keybox_file(current)
+                or not _same_keybox_file(validated_state, current)
+            ):
+                raise _KeyboxFileError("keybox_file_changed")
+
+            staging_path: Optional[str] = None
+            try:
+                try:
+                    staged = manager.stage_keybox_source(stream, size)
+                except Exception:
+                    staged = {"ok": False}
+                if not isinstance(staged, dict) or staged.get("ok") is not True:
+                    return _emit_keybox_result(
+                        {"ok": False, "error": "keybox_upload_failed"}
+                    )
+                candidate = staged.get("stagingPath")
+                if not isinstance(candidate, str):
+                    return _emit_keybox_result(
+                        {"ok": False, "error": "keybox_upload_failed"}
+                    )
+                staging_path = candidate
+                try:
+                    result = client.keybox_source(staging_path, size, digest)
+                except Exception:
+                    result = {"ok": False, "error": "keybox_set_failed"}
+                return _emit_keybox_result(result)
+            finally:
+                if staging_path is not None:
+                    try:
+                        manager.cleanup_keybox_staging(staging_path)
+                    except Exception:
+                        pass
+    except _KeyboxFileError as exc:
+        return _emit_keybox_result({"ok": False, "error": exc.code})
+
+
+def cmd_device_keybox_status(args: argparse.Namespace) -> int:
+    try:
+        result = daemon(args).keybox_status()
+    except Exception:
+        result = {"ok": False, "error": "keybox_daemon_unavailable"}
+    return _emit_keybox_result(result)
+
+
+def cmd_device_keybox_clear(args: argparse.Namespace) -> int:
+    _, client = _keybox_mutation_client(args)
+    if client is None:
+        return _emit_keybox_result(
+            {"ok": False, "error": "keybox_daemon_unavailable"}
+        )
+    try:
+        result = client.keybox_clear()
+    except Exception:
+        result = {"ok": False, "error": "keybox_request_failed"}
+    return _emit_keybox_result(result)
+
+
 def cmd_device_regenerate(args: argparse.Namespace) -> int:
     """Rotate every per-device uniqueness factor and re-converge the runtime.
 
@@ -2473,6 +2770,8 @@ def build_parser() -> argparse.ArgumentParser:
     bsub = s.add_subparsers(required=True)
     bd = bsub.add_parser("daemon")
     bd.set_defaults(func=cmd_build_daemon)
+    bk = bsub.add_parser("keymint")
+    bk.set_defaults(func=cmd_build_keymint)
     bi = bsub.add_parser("input")
     bi.set_defaults(func=cmd_build_input)
     bh = bsub.add_parser("hide")
@@ -2838,7 +3137,7 @@ def build_parser() -> argparse.ArgumentParser:
     pdu = prof.add_parser("dump")
     pdu.set_defaults(func=cmd_profile_helper_dump)
 
-    s = sub.add_parser("device", help="fingerprint collect/apply/set")
+    s = sub.add_parser("device", help="fingerprint and trusted-local keybox operations")
     dev = s.add_subparsers(required=True)
     c = dev.add_parser("collect")
     c.add_argument("--out")
@@ -2869,6 +3168,18 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("field")
     st.add_argument("value")
     st.set_defaults(func=cmd_device_set)
+    keybox = dev.add_parser(
+        "keybox",
+        help="manage the trusted-local KeyMint keybox",
+    )
+    keybox_sub = keybox.add_subparsers(required=True)
+    keybox_set = keybox_sub.add_parser("set")
+    keybox_set.add_argument("file", metavar="FILE")
+    keybox_set.set_defaults(func=cmd_device_keybox_set)
+    keybox_status = keybox_sub.add_parser("status")
+    keybox_status.set_defaults(func=cmd_device_keybox_status)
+    keybox_clear = keybox_sub.add_parser("clear")
+    keybox_clear.set_defaults(func=cmd_device_keybox_clear)
     rg = dev.add_parser(
         "regenerate",
         help="rotate every per-device uniqueness factor (IDs, MAC, filesystem identity, per-app SSAID) and re-converge the runtime",
@@ -3003,6 +3314,7 @@ _READ_ONLY_INSTANCE_COMMANDS = frozenset({
     "cmd_location_status",
     "cmd_automation_plan",
     "cmd_hide_overlay_status",
+    "cmd_device_keybox_status",
     "cmd_mcp_config",
 })
 

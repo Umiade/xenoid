@@ -262,6 +262,25 @@ Android application network checks treat raw route-netlink `RTM_GETLINK` `EACCES
 
 Privileged operations pass through the daemon and loopback-only `xenoid-rootd`. Mutating requests require the per-instance token provisioned under `.xenoid/`; the Android rootfs exposes no persistent application-visible `su` path.
 
+## Android 13 KeyMint keybox
+
+Operate keyboxes only from the trusted local CLI:
+
+```bash
+chmod 600 /secure/local/keybox.xml
+./xenoid device keybox set /secure/local/keybox.xml
+./xenoid device keybox status
+./xenoid device keybox clear
+```
+
+The source must be a nonempty regular file owned by the current user, not a symlink, no larger than 8 MiB, and have no group or world permission bits. The set command opens with no-follow, hashes while streaming, and rejects any device, inode, size, or modification-time change. ADB staging uses a random shell-owned mode-`0600` `/data/local/tmp/.keybox-upload-<32 lowercase hex>` name and is cleaned in a `finally` path. Do not put keybox XML, DER, private keys, digests, or Android staging/private paths in shell variables, logs, tracked files, support bundles, image contexts, or command arguments.
+
+The CLI sends only staging metadata through the authenticated daemon and token-gated rootd boundary. The raw keybox is retained only in daemon app-private no-backup storage with mode `0600`; the transient encoded configuration exists only for the one-shot local control transaction. `status` is intentionally redacted and reports only configured/ready/active state, fixed safe errors, algorithm availability, and certificate-chain counts. There is no keybox MCP tool or remote-service operation.
+
+`set` replaces the one complete generation-mode profile after the native control endpoint acknowledges it. A successful `clear` first replaces the native profile set with zero profiles and only then deletes persistent raw state; if native deactivation fails, the saved state remains for recovery. `up` and daemon startup synchronously reapply configured state before reporting ready. No configured keybox is a healthy inactive state.
+
+This path supports only Android 13 ARM64 and scopes generated attestations to `com.google.android.gms` and `com.android.vending` (with installed UID fallback). The simulator executes key operations in software while reporting the configured KeyMint TEE metadata; it is not hardware-backed key custody and does not prove Play Integrity or Google device certification. Other packages continue through stock KeyMint behavior.
+
 ## Camera media control
 
 Use the Android Xenoid settings screen for Storage Access Framework imports, or use the same persistent state through the host CLI:

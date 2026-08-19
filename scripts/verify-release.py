@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, hashlib, inspect, json, pathlib, tarfile, tempfile, sys
+import argparse, hashlib, inspect, json, os, pathlib, subprocess, tarfile, tempfile, sys
 GENERIC_CAMERA_PATHS = [
   'native/xenoid-camerahal/android.hardware.camera.provider-service-aidl',
   'native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml',
@@ -27,6 +27,41 @@ RETIRED_RUNTIME_CAMERA_TOKENS = (
   '/system/bin/hw/xenoid-camerahal',
   'init.svc.xenoid-camerahal',
 )
+KEYMINT_NATIVE_PATHS = (
+  'native/xenoid-keymint/xenoid-keymint',
+)
+KEYMINT_ARTIFACT_PATHS = (
+  'artifacts/xenoid-keymint',
+)
+KEYMINT_RUNTIME_TOKENS = (
+  'COPY --chmod=755 payload/android.hardware.security.keymint-service /system/bin/hw/android.hardware.security.keymint-service',
+  'COPY --chmod=644 payload/android.hardware.security.keymint-service.rc /system/etc/init/android.hardware.security.keymint-service.rc',
+  'COPY payload/android.hardware.security.keymint.IKeyMintDevice.xml /vendor/etc/vintf/manifest/android.hardware.security.keymint.IKeyMintDevice.xml',
+)
+KEYMINT_SOURCE_PATHS = (
+  'scripts/build-keymint.sh',
+  'scripts/fetch-keymint-deps.sh',
+  'native/xenoid-keymint/CMakeLists.txt',
+  'native/xenoid-keymint/src/keymint_service.cpp',
+  'native/xenoid-keymint/src/keymint_router.cpp',
+  'native/xenoid-keymint/src/control.cpp',
+  'native/xenoid-keymint/src/control.h',
+  'native/xenoid-keymint/src/json.cpp',
+  'native/xenoid-keymint/src/json.hpp',
+  'native/xenoid-keymint/src/logging.hpp',
+  'native/xenoid-keymint/src/crypto_compat.c',
+  'native/xenoid-keymint/src/libcrypto.syms',
+  'native/xenoid-keymint/rust/Cargo.toml',
+  'native/xenoid-keymint/rust/build.sh',
+  'native/xenoid-keymint/rust/teesim-km/Cargo.toml',
+  'native/xenoid-keymint/rust/teesim-km/include/teesim_km.h',
+  'native/xenoid-keymint/rust/patches/kmr-crypto-boring.patch',
+  'native/xenoid-keymint/rust/patches/kmr-crypto-boring-ec-group.patch',
+  'native/xenoid-keymint/rust/patches/kmr-ta-authtoken.patch',
+  'native/xenoid-keymint/rust/patches/kmr-ta-seclevel.patch',
+  'native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml',
+)
+
 CAMERA_HARNESS_JAVA_PREFIX = 'tests/camera-runtime-probe/java/org/example/cameraruntimeprobe/'
 CAMERA_HARNESS_JAVA_PATHS = [
   CAMERA_HARNESS_JAVA_PREFIX + name
@@ -77,6 +112,9 @@ REQUIRED = [
   'native/xenoid-zygote/libxenoid_zygote.so',
   'native/xenoid-shim/libxenoid_shim-arm64.so',
   'native/xenoid-pivot/xenoid-pivot',
+  *KEYMINT_SOURCE_PATHS,
+  'scripts/smoke-app-process-needed.py',
+  *KEYMINT_NATIVE_PATHS, *KEYMINT_ARTIFACT_PATHS,
   'native/xenoid-sensorshal/xenoid-sensorshal',
   'native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml',
   'native/xenoid-proxy-sandbox/Makefile',
@@ -252,6 +290,57 @@ def main():
                  and sha(staged_sandbox) == sha(sandbox),
             'detail':str(artifact_sandbox),
         })
+        for native_rel, artifact_rel in zip(
+            KEYMINT_NATIVE_PATHS, KEYMINT_ARTIFACT_PATHS
+        ):
+            native = root/native_rel
+            artifact = root/artifact_rel
+            try:
+                native_data = native.read_bytes()
+                native_mode = native.stat().st_mode
+            except OSError:
+                native_data = b''
+                native_mode = 0
+            android_arm64_pie_executable = (
+                len(native_data) >= 64
+                and native_data[:6] == b'\x7fELF\x02\x01'
+                and int.from_bytes(native_data[16:18], 'little') == 3
+                and int.from_bytes(native_data[18:20], 'little') == 183
+                and bool(native_mode & 0o111)
+            )
+            matching_artifact = (
+                artifact.is_file()
+                and android_arm64_pie_executable
+                and sha(artifact) == sha(native)
+            )
+            if native_rel.endswith('xenoid-keymint'):
+                matching_artifact = (
+                    matching_artifact
+                    and b'android.hardware.security.keymint.IKeyMintDevice' in native_data
+                )
+            out['checks'].append({
+                'name':'keymint-artifact-match:'+pathlib.PurePosixPath(native_rel).name,
+                'ok':matching_artifact,
+                'detail':{'native':native_rel,'artifact':artifact_rel},
+            })
+        try:
+            keymint_validation = subprocess.run(
+                [str(root/'scripts/build-keymint.sh')],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            keymint_validation_ok = keymint_validation.returncode == 0
+            keymint_validation_detail = keymint_validation.stderr.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            keymint_validation_ok = False
+            keymint_validation_detail = 'keymint_validator_failed'
+        out['checks'].append({
+            'name':'keymint-prebuilt-validation',
+            'ok':keymint_validation_ok,
+            'detail':keymint_validation_detail,
+        })
         runtime_context_path = root/'scripts/make-runtime-context.sh'
         try:
             runtime_context = runtime_context_path.read_text()
@@ -267,6 +356,16 @@ def main():
         out['checks'].append({
             'name':'generic-camera-runtime-paths',
             'ok':generic_runtime_paths,
+            'detail':str(runtime_context_path),
+        })
+        out['checks'].append({
+            'name':'keymint-runtime-context',
+            'ok':all(token in runtime_context for token in KEYMINT_RUNTIME_TOKENS)
+                 and 'patch-keystore2-rc.py' not in runtime_context
+                 and 'libteesim_keymint' not in runtime_context
+                 and 'libxenoid_keymint_bootstrap' not in runtime_context
+                 and 'keybox.xml' not in runtime_context.lower()
+                 and '.keybox-upload-' not in runtime_context.lower(),
             'detail':str(runtime_context_path),
         })
         harness_java_sources = sorted(
@@ -320,6 +419,37 @@ def main():
             'name':'google-proprietary-payload-excluded',
             'ok':not proprietary_paths,
             'detail':proprietary_paths,
+        })
+        keybox_private_paths = sorted(
+            rel for rel in set(files) | archive_files
+            if '.keybox-upload-' in rel.lower()
+            or pathlib.PurePosixPath(rel).name.lower() in {
+                'keybox.xml', 'keybox.json', 'keybox.pem', 'keybox.der'
+            }
+        )
+        out['checks'].append({
+            'name':'keybox-private-payload-excluded',
+            'ok':not keybox_private_paths,
+            'detail':keybox_private_paths,
+        })
+        private_key_markers = sorted(
+            rel for rel in archive_files
+            if pathlib.PurePosixPath(rel).suffix.lower()
+               in {'.c', '.cc', '.cpp', '.h', '.java', '.md', '.py', '.sh', '.txt'}
+            and any(
+                marker in (root/rel).read_bytes()
+                for marker in (
+                    b'-----BEGIN ' + b'PRIVATE KEY-----',
+                    b'-----BEGIN RSA ' + b'PRIVATE KEY-----',
+                    b'-----BEGIN EC ' + b'PRIVATE KEY-----',
+                    b'<' + b'Keybox',
+                )
+            )
+        )
+        out['checks'].append({
+            'name':'keybox-private-content-excluded',
+            'ok':not private_key_markers,
+            'detail':private_key_markers,
         })
         retired_camera_paths = sorted(
             rel for rel in set(files) | archive_files

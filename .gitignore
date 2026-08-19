@@ -38,6 +38,9 @@ native/xenoid-netctl/xenoid-netctl
 native/xenoid-netctl/xenoid-netctl-x86_64
 native/xenoid-ril/xenoid-ril-profile-test
 native/xenoid-radio-config/android.hardware.radio.config-service.xenoid
+native/xenoid-keymint/xenoid-keymint
+native/xenoid-keymint/.deps/
+native/xenoid-keymint/rust/target/
 native/xenoid-rootd/xenoid-rootd-arm64
 native/xenoid-rootd/xenoid-rootd-x86_64
 native/xenoid-kmod/*.ko

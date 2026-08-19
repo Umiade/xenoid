@@ -33,6 +33,7 @@ MEDIA_PROFILES="$ROOT/native/xenoid-camerahal/media_profiles_V1_0.xml"
 RIL="$ROOT/native/xenoid-ril/libxenoid-ril.so"
 RADIO_CONFIG="$ROOT/native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"
 HARDWARE_FEATURES="$ROOT/runtime/redroid/xenoid-hardware-features.xml"
+TEESIM_KEYMINT="$ROOT/native/xenoid-keymint/xenoid-keymint"
 [[ -f "$HARDWARE_FEATURES" && ! -L "$HARDWARE_FEATURES" ]] || {
   echo "missing runtime/redroid/xenoid-hardware-features.xml" >&2
   exit 1
@@ -53,6 +54,9 @@ python3 "$ROOT/scripts/smoke-hardware-features.py" --contract "$HARDWARE_FEATURE
 [[ -f "$CAMERA_PROVIDER" ]] || "$ROOT/scripts/build-camera-hal.sh" arm64 >/dev/null
 [[ -f "$RIL" ]] || "$ROOT/scripts/build-ril.sh" arm64 >/dev/null
 [[ -f "$RADIO_CONFIG" ]] || "$ROOT/scripts/build-radio-config.sh" arm64 >/dev/null
+# Runtime-context generation consumes the validated prebuilt. Source rebuilds
+# are owned by `xenoid build keymint` / `build all`, never by image staging.
+"$ROOT/scripts/build-keymint.sh" >/dev/null
 rm -rf "$OUT"
 mkdir -p "$OUT/payload"
 if [[ -n "$GOOGLE_PAYLOAD" ]]; then
@@ -68,6 +72,8 @@ mkdir -p "$OUT/payload/XenoidDaemon"
 cp "$DAEMON" "$OUT/payload/XenoidDaemon/XenoidDaemon.apk"
 chmod 0755 "$OUT/payload/XenoidDaemon"
 chmod 0644 "$OUT/payload/XenoidDaemon/XenoidDaemon.apk"
+cp "$TEESIM_KEYMINT" "$OUT/payload/android.hardware.security.keymint-service"
+cp "$ROOT/native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml" "$OUT/payload/android.hardware.security.keymint.IKeyMintDevice.xml" || { echo "missing native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
 cp "$INPUT" "$OUT/payload/xenoid-input"
 cp "$HIDE" "$OUT/payload/xenoid-hide-helper"
 cp "$OVERLAY" "$OUT/payload/xenoid-overlay-helper"
@@ -121,6 +127,7 @@ if command -v docker >/dev/null 2>&1; then
     # the canonical hardware identity is correct before graphics initialization.
     _required_extract_ok=1
     "${DOCKER[@]}" cp "$_cid:/system/bin/app_process64" "$OUT/payload/app_process64" >/dev/null || _required_extract_ok=0
+    "${DOCKER[@]}" cp "$_cid:/system/bin/app_process64" "$OUT/payload/xenoid-app-process" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libui.so" "$OUT/payload/libui.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libselinux.so" "$OUT/payload/libselinux.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/hw/gralloc.redroid.so" "$OUT/payload/gralloc.base.redroid.so" >/dev/null || _required_extract_ok=0
@@ -132,7 +139,7 @@ if command -v docker >/dev/null 2>&1; then
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/libpuresoftkeymasterdevice.so" "$OUT/payload/libpuresoftkeymasterdevice.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" rm "$_cid" >/dev/null 2>&1 || true
     if [[ "$_required_extract_ok" != "1" ]]; then
-      echo "failed to extract required runtime library, framework jar, graphics HAL, or SoftKeymaster payload from $IMAGE" >&2
+      echo "failed to extract required Android 13 runtime payload from $IMAGE" >&2
       exit 1
     fi
     _props_args=("$ROOT/scripts/patch-runtime-props.py" "$_stock" "$OUT/payload/props")
@@ -331,6 +338,18 @@ service vendor.camera-provider-aidl /system/bin/hw/android.hardware.camera.provi
     group root
 RC
 
+# The filename sorts before keystore2.rc, so within class early_hal the KeyMint
+# HAL registers in servicemanager before keystore2 starts and resolves devices.
+# It runs as the keystore user: the daemon's control client authenticates the
+# @teesim peer by that uid.
+cat > "$OUT/payload/android.hardware.security.keymint-service.rc" <<'RC'
+service vendor.keymint-aidl /system/bin/hw/android.hardware.security.keymint-service
+    class early_hal
+    user keystore
+    group keystore
+    interface aidl android.hardware.security.keymint.IKeyMintDevice/default
+RC
+
 assert_no_artifact_markers() {
   local artifact="$1"
   shift
@@ -346,6 +365,8 @@ assert_no_artifact_markers() {
 # interface even when unsupported, so its standard descriptor is not a
 # product-specific marker.
 assert_no_artifact_markers "$OUT/payload/android.hardware.camera.provider-service-aidl" \
+  xenoid mock replay /Users/ /home/
+assert_no_artifact_markers "$OUT/payload/android.hardware.security.keymint-service" \
   xenoid mock replay /Users/ /home/
 assert_no_artifact_markers "$OUT/payload/gralloc.redroid.so" \
   mock replay inject /Users/ /home/
@@ -371,11 +392,23 @@ if not markers or set(markers) != {expected}:
 PY
 for artifact in \
   "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml" \
-  "$OUT/payload/android.hardware.camera.provider-service-aidl.rc"; do
+  "$OUT/payload/android.hardware.camera.provider-service-aidl.rc" \
+  "$OUT/payload/android.hardware.security.keymint.IKeyMintDevice.xml" \
+  "$OUT/payload/android.hardware.security.keymint-service.rc"; do
   assert_no_artifact_markers "$artifact" \
     xenoid mock replay inject /Users/ /home/
 done
 chmod 755 "$OUT/payload/xenoid-input" "$OUT/payload/xenoid-hide-helper" "$OUT/payload/xenoid-overlay-helper" "$OUT/payload/xenoid-profile-helper" "$OUT/payload/xenoid-netctl"
+chmod 0755 "$OUT/payload/android.hardware.security.keymint-service"
+# VINTF fragments must be world-readable: libvintf in unprivileged readers
+# (keystore2 runs as the keystore user) fails the whole device-manifest parse on
+# an unreadable fragment, and keystore2 then crashes dereferencing the result.
+chmod 0644 "$OUT/payload/android.hardware.security.keymint-service.rc" \
+  "$OUT/payload/android.hardware.security.keymint.IKeyMintDevice.xml" \
+  "$OUT/payload/android.hardware.radio.IRadio.xml" \
+  "$OUT/payload/android.hardware.radio.config.IRadioConfig.xml" \
+  "$OUT/payload/android.hardware.sensors.ISensors.xml" \
+  "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml"
 cat > "$OUT/Dockerfile" <<DOCKER
 FROM $IMAGE
 __GOOGLE_LABELS__
@@ -407,6 +440,12 @@ COPY payload/android.hardware.camera.provider.ICameraProvider.xml /vendor/etc/vi
 COPY payload/xenoid.rc /system/etc/init/xenoid.rc
 COPY payload/android.hardware.camera.provider-service-aidl.rc /system/etc/init/android.hardware.camera.provider-service-aidl.rc
 COPY payload/init.zygote64.rc /system/etc/init/hw/init.zygote64.rc
+# Deterministic Android 13 KeyMint HAL service. keystore2 resolves the declared
+# AIDL HAL over its in-process km_compat fallback; the stock HIDL Keymaster 4.1
+# service remains the owning backend for the explicit SOFTWARE security level.
+COPY --chmod=755 payload/android.hardware.security.keymint-service /system/bin/hw/android.hardware.security.keymint-service
+COPY --chmod=644 payload/android.hardware.security.keymint-service.rc /system/etc/init/android.hardware.security.keymint-service.rc
+COPY payload/android.hardware.security.keymint.IKeyMintDevice.xml /vendor/etc/vintf/manifest/android.hardware.security.keymint.IKeyMintDevice.xml
 COPY payload/libandroid_runtime.so /system/lib64/libandroid_runtime.so
 # Preserve descriptor 0 when legacy AHardwareBuffer clients use it as no-fence.
 COPY --chmod=644 payload/libui.so /system/lib64/libui.so
@@ -425,6 +464,7 @@ COPY --chmod=644 payload/services.jar /system/framework/services.jar
 # Legacy HIDL LTE identities derive bands from EARFCN and use profile bandwidth.
 COPY --chmod=644 payload/telephony-common.jar /system/framework/telephony-common.jar
 COPY --chmod=755 payload/app_process64 /system/bin/app_process64
+COPY --chmod=755 payload/xenoid-app-process /system/bin/xenoid-app-process
 COPY --chmod=644 payload/libpiex_shim.so /system/lib64/libpiex_shim.so
 COPY payload/props/system_build.prop /system/build.prop
 COPY payload/props/vendor_build.prop /vendor/build.prop

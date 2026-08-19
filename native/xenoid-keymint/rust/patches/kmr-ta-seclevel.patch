@@ -1,0 +1,124 @@
+diff --git a/ta/src/cert.rs b/ta/src/cert.rs
+index ce07450..39b4d20 100644
+--- a/ta/src/cert.rs
++++ b/ta/src/cert.rs
+@@ -300,9 +300,21 @@ enum SecurityLevel {
+ }
+ 
+ /// Build an ASN.1 DER-encoded attestation extension.
++/// The `keyMintVersion` that corresponds to an `attestationVersion`. They agree for KeyMint (>= 100)
++/// but differ for pre-KeyMint Keymaster releases: attestation 2 -> keymaster 3 (Keymaster 3.0),
++/// 3 -> 4 (Keymaster 4.0), 4 -> 41 (Keymaster 4.1). Any other value is passed through unchanged.
++fn keymint_version_for(attestation_version: i32) -> i32 {
++    match attestation_version {
++        2 => 3,
++        3 => 4,
++        4 => 41,
++        v => v,
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub(crate) fn attestation_extension<'a>(
+-    keymint_version: i32,
++    attestation_version: i32,
+     challenge: &'a [u8],
+     app_id: &'a [u8],
+     security_level: keymint::SecurityLevel,
+@@ -333,6 +345,14 @@ pub(crate) fn attestation_extension<'a>(
+         keymint::SecurityLevel::Software => (params, &[]),
+         _ => (&[], params),
+     };
++    // Tag::MODULE_HASH (724) was introduced in KeyMint v4 (attestationVersion 400); no earlier
++    // KeyMint or Keymaster attestation carries it. Gate the additional info by the version this key
++    // is emitted at so the tag tracks that version even when the TA has a module hash recorded. The
++    // check is here (per emission) rather than at the TA's recorded state because a single TA attests
++    // at different versions per security level, so a dual-level device that reports v4 at TEE and v3
++    // at StrongBox stays honest at each level.
++    let additional_attestation_info: &[KeyParam] =
++        if attestation_version >= 400 { additional_attestation_info } else { &[] };
+     let sw_enforced = AuthorizationList::new(
+         sw_chars,
+         sw_params,
+@@ -352,9 +372,9 @@ pub(crate) fn attestation_extension<'a>(
+     let sec_level = SecurityLevel::try_from(security_level as u32)
+         .map_err(|_| km_err!(InvalidArgument, "invalid security level {security_level:?}"))?;
+     let ext = AttestationExtension {
+-        attestation_version: keymint_version,
++        attestation_version,
+         attestation_security_level: sec_level,
+-        keymint_version,
++        keymint_version: keymint_version_for(attestation_version),
+         keymint_security_level: sec_level,
+         attestation_challenge: challenge,
+         unique_id,
+diff --git a/ta/src/keys.rs b/ta/src/keys.rs
+index 60f9895..f4d3310 100644
+--- a/ta/src/keys.rs
++++ b/ta/src/keys.rs
+@@ -174,7 +174,7 @@ impl crate::KeyMintTa {
+                 let unique_id = self.calculate_unique_id(app_id, params)?;
+                 let boot_info = self.boot_info_hashed_key()?;
+                 let attest_ext = cert::attestation_extension(
+-                    self.aidl_version as i32,
++                    self.attestation_version,
+                     challenge,
+                     app_id,
+                     self.hw_info.security_level,
+diff --git a/ta/src/lib.rs b/ta/src/lib.rs
+index f281543..5f17d72 100644
+--- a/ta/src/lib.rs
++++ b/ta/src/lib.rs
+@@ -128,6 +128,12 @@ pub struct KeyMintTa {
+     /// The version of the HAL AIDL interface specification that this TA acts as.
+     aidl_version: KeyMintHalVersion,
+ 
++    /// The raw `attestationVersion` to report in attestation records. Kept separate from
++    /// `aidl_version` (a KeyMint 100/200/300/400 enum used for HAL behaviour) because a pre-KeyMint
++    /// device reports Keymaster attestation versions (2, 3, 4) that the enum cannot represent, and the
++    /// matching `keyMintVersion` differs from it (e.g. Keymaster 4.0 is attestation 3, keymaster 4).
++    attestation_version: i32,
++
+     /// Versions of the HAL that this TA can be requested to act as.
+     allowed_aidl_versions: Box<[KeyMintHalVersion]>,
+ 
+@@ -353,6 +359,7 @@ impl KeyMintTa {
+             hw_info,
+             rpc_info,
+             aidl_version: KEYMINT_CURRENT_VERSION,
++            attestation_version: KEYMINT_CURRENT_VERSION as i32,
+             allowed_aidl_versions: allowed_aidl_versions.into(),
+             boot_info: None,
+             rot_data: None,
+@@ -384,6 +391,31 @@ impl KeyMintTa {
+         self.hw_info.security_level == SecurityLevel::Strongbox
+     }
+ 
++    /// Return the hardware security level reported in attestation records and key
++    /// characteristics.
++    pub fn security_level(&self) -> SecurityLevel {
++        self.hw_info.security_level
++    }
++
++    /// Override the hardware security level reported in attestation records and
++    /// key characteristics. Lets a single generateKey/importKey attest at the
++    /// security level of the HAL it was requested through.
++    pub fn set_security_level(&mut self, security_level: SecurityLevel) {
++        self.hw_info.security_level = security_level;
++    }
++
++    /// Return the raw `attestationVersion` reported in attestation records.
++    pub fn attestation_version(&self) -> i32 {
++        self.attestation_version
++    }
++
++    /// Override the `attestationVersion` reported in attestation records, so a generated key can claim
++    /// the version of the real HAL at the level it was requested through. Stored raw (2/3/4/100/…) so
++    /// pre-KeyMint (Keymaster) versions survive; the matching `keyMintVersion` is derived in cert.rs.
++    pub fn set_attestation_version(&mut self, version: i32) {
++        self.attestation_version = version;
++    }
++
+     /// Indicate whether the current device has secure storage available.
+     fn secure_storage_available(&self) -> kmr_common::tag::SecureStorage {
+         if self.dev.sdd_mgr.is_some() {

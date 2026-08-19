@@ -18,7 +18,7 @@ import time
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, BinaryIO, Mapping, Optional
 
 from .config import (
     InstanceContext,
@@ -26,7 +26,12 @@ from .config import (
     InstanceLease,
     XenoidConfig,
 )
-from .daemon_client import CAMERA_MUTATION_TIMEOUT_SECONDS, PROXY_MAX_SOURCE_BYTES, DaemonClient
+from .daemon_client import (
+    CAMERA_MUTATION_TIMEOUT_SECONDS,
+    KEYBOX_MAX_SOURCE_BYTES,
+    PROXY_MAX_SOURCE_BYTES,
+    DaemonClient,
+)
 from .device_identity import (
     DeviceIdentityStore,
     IdentityError,
@@ -89,6 +94,35 @@ def _camera_upload_timeout_seconds(size: int) -> int:
             _CAMERA_UPLOAD_SETUP_SECONDS + transfer_seconds,
         ),
     )
+
+
+_KEYBOX_STAGING_PATH = re.compile(
+    r"/data/local/tmp/\.keybox-upload-([0-9a-f]{32})"
+)
+_KEYBOX_STAGE_SCRIPT = """\
+set -eu
+IFS=' ' read -r token size
+[ "${#token}" -eq 32 ]
+case "$token" in *[!0-9a-f]*) exit 64;; esac
+case "$size" in *[!0-9]*) exit 64;; esac
+[ "$size" -gt 0 ]
+target="/data/local/tmp/.keybox-upload-${token}"
+umask 077
+trap 'rm -f "$target"' EXIT HUP INT TERM
+cat >"$target"
+chmod 0600 "$target"
+if [ "$(id -u)" = 0 ]; then chown 2000:2000 "$target"; fi
+[ "$(stat -c '%u:%g:%a' "$target")" = "2000:2000:600" ]
+[ "$(stat -c %s "$target")" = "$size" ]
+trap - EXIT HUP INT TERM
+"""
+_KEYBOX_CLEANUP_SCRIPT = """\
+set -eu
+IFS= read -r token
+[ "${#token}" -eq 32 ]
+case "$token" in *[!0-9a-f]*) exit 64;; esac
+rm -f "/data/local/tmp/.keybox-upload-${token}"
+"""
 
 
 @dataclass
@@ -460,6 +494,28 @@ class RuntimeManager:
             "test ! -e /system/lib64/libxenoid_core.so && "
             "grep -a -q 'libpiex_shim.so' /system/bin/app_process64 && "
             "! grep -q 'setenv LD_PRELOAD' /system/etc/init/hw/init.zygote64.rc && "
+            "test -x /system/bin/xenoid-app-process && "
+            "! grep -a -q 'libpiex_shim.so' /system/bin/xenoid-app-process && "
+            "test -x /system/bin/hw/android.hardware.security.keymint-service && "
+            "test -r /system/etc/init/android.hardware.security.keymint-service.rc && "
+            "grep -q '^service vendor.keymint-aidl ' "
+            "/system/etc/init/android.hardware.security.keymint-service.rc && "
+            "test -r /vendor/etc/vintf/manifest/android.hardware.security.keymint.IKeyMintDevice.xml && "
+            "grep -q 'IKeyMintDevice/default' "
+            "/vendor/etc/vintf/manifest/android.hardware.security.keymint.IKeyMintDevice.xml && "
+            "test -r /system/etc/init/keystore2.rc && "
+            "grep -q '^service keystore2 /system/bin/keystore2 /data/misc/keystore$' "
+            "/system/etc/init/keystore2.rc && "
+            "test \"$(grep -c '^service keystore2 ' /system/etc/init/keystore2.rc)\" = 1 && "
+            "! grep -q 'LD_PRELOAD' /system/etc/init/keystore2.rc && "
+            "test \"$(getprop init.svc.vendor.keymint-aidl)\" = running && "
+            "service list | grep -q 'android.hardware.security.keymint.IKeyMintDevice/default' && "
+            "test \"$(getprop init.svc.keystore2)\" = running && "
+            "keystore_pid=$(pidof keystore2 | cut -d' ' -f1) && "
+            "test -n \"$keystore_pid\" && "
+            "test \"$(readlink /proc/$keystore_pid/exe)\" = /system/bin/keystore2 && "
+            "test -x /vendor/bin/hw/android.hardware.keymaster@4.1-service && "
+            "test \"$(getprop init.svc.vendor.keymaster-4-1)\" = running && "
             "test \"$(getprop init.svc.xenoid-sensorshal)\" = running && "
             "test \"$(getprop init.svc.vendor.camera-provider-aidl)\" = running && "
             "test \"$(getprop ro.hardware)\" = raven && "
@@ -477,6 +533,8 @@ class RuntimeManager:
             "zygote-compatibility",
             "sensor-hal",
             "camera-provider",
+            "keymint-interceptor",
+            "stock-keymaster-4.1",
         ]
         return result
 
@@ -3829,6 +3887,132 @@ class RuntimeManager:
             f"tcp:{self.lease.android_daemon_port}",
         ])
 
+    def _run_keybox_adb_stream(
+        self,
+        script: str,
+        token: str,
+        *,
+        stream: Optional[BinaryIO] = None,
+        expected_size: int = 0,
+        timeout: float = 300,
+    ) -> bool:
+        """Run a fixed ADB receiver without placing private input in argv.
+
+        Uses `adb shell -T` (shell v2 raw mode): binary stdin is preserved and
+        the remote exit status propagates, unlike `exec-in` which always
+        reports zero. The staging script self-verifies size/ownership/mode
+        before disarming its cleanup trap, so a nonzero status here means the
+        content never landed intact.
+        """
+        adb_bin = which("adb")
+        if adb_bin is None:
+            return False
+        owned, _ = self._owned_container()
+        if not owned:
+            return False
+        command = [
+            adb_bin,
+            "-s",
+            self.adb_target,
+            "shell",
+            "-T",
+            "sh -c '" + script.replace("'", "'\"'\"'") + "'",
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, ValueError):
+            return False
+
+        try:
+            if process.stdin is None:
+                raise OSError("ADB input pipe unavailable")
+            if stream is not None:
+                header = f"{token} {expected_size}\n"
+            else:
+                header = f"{token}\n"
+            process.stdin.write(header.encode("ascii"))
+            if stream is not None:
+                stream.seek(0)
+                remaining = expected_size
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise OSError("keybox input changed")
+                    process.stdin.write(chunk)
+                    remaining -= len(chunk)
+                if stream.read(1):
+                    raise OSError("keybox input changed")
+            process.stdin.close()
+            return process.wait(timeout=bounded_timeout(timeout)) == 0
+        except (OSError, ValueError, subprocess.SubprocessError):
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=bounded_timeout(5))
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return False
+
+    def stage_keybox_source(
+        self,
+        stream: BinaryIO,
+        size: int,
+    ) -> dict[str, Any]:
+        """Stream a validated keybox to a private, shell-owned Android file."""
+        try:
+            file_state = os.fstat(stream.fileno())
+        except (AttributeError, OSError, ValueError):
+            return {"ok": False, "error": "keybox_upload_failed"}
+        permissions = stat.S_IMODE(file_state.st_mode)
+        if (
+            not stat.S_ISREG(file_state.st_mode)
+            or file_state.st_uid != os.getuid()
+            or permissions not in {0o400, 0o600}
+            or isinstance(size, bool)
+            or not 0 < size <= KEYBOX_MAX_SOURCE_BYTES
+            or file_state.st_size != size
+        ):
+            return {"ok": False, "error": "keybox_upload_failed"}
+
+        token = secrets.token_hex(16)
+        staging_path = f"/data/local/tmp/.keybox-upload-{token}"
+        staged = self._run_keybox_adb_stream(
+            _KEYBOX_STAGE_SCRIPT,
+            token,
+            stream=stream,
+            expected_size=size,
+        )
+        if not staged:
+            self.cleanup_keybox_staging(staging_path)
+            return {"ok": False, "error": "keybox_upload_failed"}
+        return {"ok": True, "stagingPath": staging_path}
+
+    def cleanup_keybox_staging(self, staging_path: str) -> dict[str, Any]:
+        """Best-effort removal restricted to the generated keybox namespace."""
+        match = _KEYBOX_STAGING_PATH.fullmatch(staging_path)
+        if match is None:
+            return {"ok": False, "error": "keybox_staging_invalid"}
+        cleaned = self._run_keybox_adb_stream(
+            _KEYBOX_CLEANUP_SCRIPT,
+            match.group(1),
+        )
+        return {
+            "ok": cleaned,
+            **({} if cleaned else {"error": "keybox_cleanup_failed"}),
+        }
+
     def stage_camera_source(self, local_path: str) -> dict[str, Any]:
         """Upload one immutable camera candidate for daemon-side validation."""
         try:
@@ -4117,6 +4301,9 @@ class RuntimeManager:
             'fi',
         ])
         if notification_grant.get("ok"):
+            # A running daemon keeps its already-loaded classes across
+            # `pm install -r`; force a restart so the updated APK takes effect.
+            self.adb(["shell", "am", "force-stop", "dev.xenoid.daemon"])
             return install
         failed = dict(install)
         failed["ok"] = False

@@ -26,6 +26,7 @@ public class XenoidDaemonService extends Service {
     private volatile ProxyManager proxyManager;
     private volatile ProxyAgentChannel proxyAgentChannel;
     private volatile LocationIdentityManager locationIdentityManager;
+    private volatile KeyboxManager keyboxManager;
     public IBinder onBind(Intent intent) { return null; }
     public int onStartCommand(Intent intent, int flags, int startId) { enterForeground(); startServer(); return START_STICKY; }
     public void onDestroy() {
@@ -69,6 +70,12 @@ public class XenoidDaemonService extends Service {
         try {
             String controlToken = getToken();
             RootHelper.setRootdToken(controlToken);
+            try {
+                keyboxManager = new KeyboxManager(this);
+            } catch (Throwable failure) {
+                android.util.Log.e(
+                        "xenoid-daemon", "keybox manager initialization failed", failure);
+            }
             try {
                 ProxyManager manager = new ProxyManager(this);
                 ProxyAgentChannel channel = new ProxyAgentChannel(manager);
@@ -300,6 +307,7 @@ public class XenoidDaemonService extends Service {
             if ("/location/status".equals(path) && "GET".equals(method)) return 0;
             return "POST".equals(method) ? 128 * 1024 : 0;
         }
+        if (path.startsWith("/keybox/")) return KeyboxManager.MAX_REQUEST_BODY_BYTES;
         if (path.startsWith("/camera/")) return 2048;
         return MAX_DEFAULT_BODY_BYTES;
     }
@@ -372,8 +380,10 @@ public class XenoidDaemonService extends Service {
                 if (!"GET".equals(method) || (body != null && !body.isEmpty())) {
                     return map("ok", false, "error", "invalid_request");
                 }
+                KeyboxManager keybox = keyboxManager;
                 if (cameraMediaManager == null || proxyManager == null
-                        || proxyAgentChannel == null || locationIdentityManager == null) {
+                        || proxyAgentChannel == null || locationIdentityManager == null
+                        || keybox == null || !keybox.healthReady()) {
                     return map("ok", false, "service", "xenoid-daemon",
                             "version", "0.1.0", "error", "service not ready");
                 }
@@ -382,6 +392,7 @@ public class XenoidDaemonService extends Service {
             if (path.startsWith("/proxy/")) return routeProxy(method, path, body);
             if (path.startsWith("/location/")) return routeLocation(method, path, body);
             if (path.startsWith("/camera/")) return routeCamera(method, path, body);
+            if (path.startsWith("/keybox/")) return routeKeybox(method, path, body);
             if (path.equals("/root/status")) return RootHelper.status();
             if (path.equals("/root/exec")) return RootHelper.exec(SimpleJson.stringValue(body, "command", "id"));
             if (path.equals("/profile/helper/status")) return RootHelper.profileStatus();
@@ -406,6 +417,84 @@ public class XenoidDaemonService extends Service {
             return map("ok", false, "error", "not found", "path", path);
         } catch(Exception e) { return map("ok", false, "error", e.toString()); }
     }
+
+    private Map<String, Object> routeKeybox(String method, String path, String body) {
+        boolean sourceHandled = false;
+        try {
+            if ("/keybox/status".equals(path)) {
+                requireKeyboxMethod(method, "GET");
+                requireEmptyKeyboxBody(body);
+                KeyboxManager manager = keyboxManager;
+                return manager == null
+                        ? keyboxError("native_unavailable") : manager.status();
+            }
+            if ("/keybox/source".equals(path)) {
+                requireKeyboxMethod(method, "POST");
+                JSONObject object = cameraObject(body, "stagingPath", "size", "sha256");
+                String stagingPath = cameraString(object, "stagingPath", 128);
+                long size = cameraLong(object, "size");
+                String sha256 = cameraString(object, "sha256", 64);
+                KeyboxManager manager = keyboxManager;
+                if (manager == null) return keyboxError("native_unavailable");
+                sourceHandled = true;
+                return manager.importStaged(stagingPath, size, sha256);
+            }
+            if ("/keybox/clear".equals(path)) {
+                requireKeyboxMethod(method, "POST");
+                cameraObject(body);
+                KeyboxManager manager = keyboxManager;
+                return manager == null
+                        ? keyboxError("native_unavailable") : manager.clear();
+            }
+            return keyboxError("invalid_request");
+        } catch (CameraRequestFailure ignored) {
+            return keyboxError("invalid_request");
+        } catch (KeyboxMethodFailure failure) {
+            return keyboxError(failure.code);
+        } catch (Throwable ignored) {
+            return keyboxError("native_unavailable");
+        } finally {
+            if ("/keybox/source".equals(path) && !sourceHandled) {
+                cleanupKeyboxStageFromBody(body);
+            }
+        }
+    }
+
+    private Map<String, Object> keyboxError(String error) {
+        KeyboxManager manager = keyboxManager;
+        Map<String, Object> response = manager == null
+                ? map("ok", false, "configured", false, "ready", false, "active", false,
+                        "algorithms", map("rsa", false, "ecdsa", false,
+                                "rsaChainCount", 0, "ecdsaChainCount", 0))
+                : manager.status();
+        response.put("ok", false);
+        response.put("error", error);
+        return response;
+    }
+
+    private static void requireKeyboxMethod(String actual, String expected)
+            throws KeyboxMethodFailure {
+        if (!expected.equals(actual)) throw new KeyboxMethodFailure("method_not_allowed");
+    }
+
+    private static void requireEmptyKeyboxBody(String body) throws CameraRequestFailure {
+        if (body != null && !body.trim().isEmpty()) {
+            throw new CameraRequestFailure("invalid_request");
+        }
+    }
+    private void cleanupKeyboxStageFromBody(String body) {
+        KeyboxManager manager = keyboxManager;
+        if (manager == null || body == null || body.length() == 0
+                || body.length() > KeyboxManager.MAX_REQUEST_BODY_BYTES) return;
+        try {
+            JSONTokener tokener = new JSONTokener(body);
+            Object parsed = tokener.nextValue();
+            if (!(parsed instanceof JSONObject) || tokener.nextClean() != 0) return;
+            Object value = ((JSONObject) parsed).opt("stagingPath");
+            if (value instanceof String) manager.cleanupStaged((String) value);
+        } catch (Throwable ignored) { }
+    }
+
 
     private Map<String, Object> routeLocation(String method, String path, String body) throws Exception {
         LocationIdentityManager manager = locationIdentityManager;
@@ -781,6 +870,11 @@ public class XenoidDaemonService extends Service {
         CameraRequestFailure(String safeMessage) {
             this.safeMessage = safeMessage;
         }
+    }
+
+    private static final class KeyboxMethodFailure extends Exception {
+        final String code;
+        KeyboxMethodFailure(String code) { this.code = code; }
     }
 
     static Map<String,Object> map(Object... kv) { Map<String,Object> m = new LinkedHashMap<>(); for(int i=0;i+1<kv.length;i+=2)m.put(String.valueOf(kv[i]),kv[i+1]); return m; }

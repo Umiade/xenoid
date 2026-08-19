@@ -108,6 +108,9 @@ xenoid device apply examples/fingerprints/pixel-raven-android13.json
 xenoid automation run examples/automation/tap-home.js
 xenoid camera status --check
 xenoid proxy status --check
+xenoid device keybox status
+xenoid device keybox set /secure/local/keybox.xml
+xenoid device keybox clear
 xenoid ota check
 xenoid mcp-config
 ```
@@ -132,6 +135,9 @@ xenoid mcp-config
 - `POST /camera/apply`
 - `POST /camera/self-test/start`
 - `GET /camera/self-test/status`
+- `GET /keybox/status`
+- `POST /keybox/source` with exactly `{stagingPath,size,sha256}`
+- `POST /keybox/clear` with an empty object
 - `GET /proxy/status`
 - `POST /proxy/source`
 - `POST /proxy/enabled`
@@ -142,6 +148,16 @@ xenoid mcp-config
 - `GET /location/status`
 - `POST /location/stage`
 - `POST /location/verify`
+
+## Android 13 KeyMint HAL service
+
+The image installs a standalone Android 13 ARM64 KeyMint HAL service, `/system/bin/hw/android.hardware.security.keymint-service`, started by init as the `keystore` user ahead of `keystore2` and declared in the vendor VINTF manifest as `android.hardware.security.keymint.IKeyMintDevice/default`. keystore2 resolves a declared AIDL KeyMint HAL in preference to its in-process km_compat fallback, so every TrustedEnvironment-level KeyMint request reaches the service over ordinary binder IPC. The service embeds TEESimulator's router and the in-process reference KeyMint TA. Because this runtime has no hardware KeyMint to forward non-target requests to, the daemon's profile targets `*` and the TA serves every caller; the stock HIDL Keymaster 4.1 service remains only for explicit SOFTWARE-level requests. The binary is an immutable, non-secret release artifact. There is no injection, no LD_PRELOAD, no ptrace, no Frida dependency, no Magisk/WebUI module, no legacy Android 10/11 keystore path, no new privileged helper, and no second daemon.
+
+The trusted-local CLI stages a validated, current-user-owned, non-symlink keybox file to a random `/data/local/tmp/.keybox-upload-<32 lowercase hex>` path owned by shell (UID 2000), mode `0600`, with an 8 MiB bound. Only that path, exact size, and SHA-256 digest cross the authenticated daemon API; keybox bytes never do. The daemon revalidates the staging object and atomically stores raw XML only in app-private no-backup storage with mode `0600`. Status contains exactly boolean `ok`, `configured`, `ready`, and `active`; optional fixed safe string `error`; and `algorithms` containing boolean `rsa`/`ecdsa` plus integer `rsaChainCount`/`ecdsaChainCount`. It never returns filenames, paths, digests, XML, DER, or private-key data. Keybox operations are deliberately absent from MCP and the remote-service catalog.
+
+The daemon creates a transient app-private configuration containing the encoded keybox only while a root `app_process` one-shot client sends a length-prefixed JSON frame to abstract socket `@teesim`. The native endpoint accepts only the root reverse-authenticated peer; the client requires native peer UID 1017. One acknowledged transaction replaces the complete profile set before readiness is committed. Startup synchronously reapplies saved configured state; an unconfigured inactive state is healthy. Clear first pushes zero profiles and deletes saved state only after that acknowledgement, so a deactivation failure preserves recoverable desired state.
+
+Profile `default` uses generation mode, attestation version 200, configured TEE security level 1, Verified/device-locked boot metadata, the current build identity and patch level, and no StrongBox. A daemon-private random verified-boot seed persists in no-backup storage so generated blobs remain decryptable after restart. Routing covers every caller (target `*`); the Play apps' installed UIDs stay listed so a set deletes their pre-service legacy attestation keys and they are recreated TA-backed. The configured TEE value is attestation metadata: TEESimulator executes in software, does not provide hardware key custody, and does not establish Play Integrity or Google device certification.
 
 ## Location identity
 
@@ -173,7 +189,7 @@ The engine installs a quarantine before configuration or lifecycle changes and o
 ./xenoid hide apply examples/hide/default-policy.json
 ```
 
-The daemon exposes the stable host/MCP policy facade. Runtime hiding is enforced by prop-area, bind overlays, kmod/eBPF, and the ordinary `app_process64` compatibility dependency; Magisk/Zygisk and linker preload state are not part of the production path.
+The daemon exposes the stable host/MCP policy facade. Runtime hiding is enforced by prop-area, bind overlays, kmod/eBPF, and the ordinary `app_process64` compatibility dependency; Magisk/Zygisk and app-wide linker preload state are not part of the production path.
 
 ## Backend modes
 
