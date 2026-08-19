@@ -27,12 +27,13 @@ def _proxy_capabilities_ready(value: Any, udp_allowed: bool) -> bool:
     return (
         isinstance(value, dict)
         and set(value) == _PROXY_CAPABILITY_KEYS
+        and all(isinstance(value.get(key), bool) for key in _PROXY_CAPABILITY_KEYS)
         and value.get("v4DnsProxy") is True
         and value.get("v6DnsProxy") is True
         and value.get("v4TcpProxy") is True
         and value.get("v6TcpProxy") is True
         and value.get("v4UdpProxy") is udp_allowed
-        and value.get("v6UdpProxy") is udp_allowed
+        and (udp_allowed or value.get("v6UdpProxy") is False)
     )
 
 

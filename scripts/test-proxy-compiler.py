@@ -14,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from xenoid import proxy_source
-from xenoid.daemon_client import wait_for_proxy_check
+from xenoid.daemon_client import _proxy_capabilities_match, wait_for_proxy_check
 from xenoid.proxy_controller import ProxyController
+from xenoid.doctor import _proxy_capabilities_ready
 from xenoid.proxy_protocol import (
     ProxyProtocolError,
     ReplayWindow,
@@ -325,6 +326,38 @@ def completed_proxy_status(check_id: int = 9) -> Dict[str, Any]:
             "capabilities": capabilities,
         },
     }
+
+@case("udpCapabilityPolicy")
+def udp_capability_policy() -> None:
+    capabilities = {
+        "v4DnsProxy": True,
+        "v4TcpProxy": True,
+        "v4UdpProxy": True,
+        "v6DnsProxy": True,
+        "v6TcpProxy": True,
+        "v6UdpProxy": False,
+    }
+    require(_proxy_capabilities_match(capabilities, True))
+    require(_proxy_capabilities_ready(capabilities, True))
+
+    capabilities["v6UdpProxy"] = True
+    require(_proxy_capabilities_match(capabilities, True))
+    require(_proxy_capabilities_ready(capabilities, True))
+
+    capabilities["v4UdpProxy"] = False
+    require(not _proxy_capabilities_match(capabilities, True))
+    require(not _proxy_capabilities_ready(capabilities, True))
+    require(not _proxy_capabilities_match(capabilities, False))
+    require(not _proxy_capabilities_ready(capabilities, False))
+
+    capabilities["v6UdpProxy"] = False
+    require(_proxy_capabilities_match(capabilities, False))
+    require(_proxy_capabilities_ready(capabilities, False))
+
+    capabilities["v4UdpProxy"] = True
+    capabilities["v6UdpProxy"] = "false"
+    require(not _proxy_capabilities_match(capabilities, True))
+    require(not _proxy_capabilities_ready(capabilities, True))
 
 
 class PendingCheckDaemon:
