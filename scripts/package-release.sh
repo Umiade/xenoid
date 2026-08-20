@@ -6,195 +6,466 @@ if [[ ${#VERSION} -gt 64 || ! "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; the
   echo "release_version_invalid" >&2
   exit 64
 fi
-RELEASE_ROOT="$ROOT/dist/release"
-REL="$RELEASE_ROOT/xenoid-$VERSION"
-ARCHIVE="$RELEASE_ROOT/xenoid-$VERSION.tar.gz"
-if ! python3 - "$RELEASE_ROOT" "$REL" "$ARCHIVE" <<'PY'
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1]).resolve()
-for raw in sys.argv[2:]:
-    target = Path(raw).resolve()
-    if target == root or root not in target.parents:
-        raise SystemExit(1)
-PY
-then
-  echo "release_version_invalid" >&2
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
+if ! [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]; then
+  echo "source_date_epoch_invalid" >&2
   exit 64
 fi
-rm -rf "$REL"
-mkdir -p "$REL" "$REL/bin" "$REL/artifacts" "$REL/config" "$REL/docs" "$REL/skills" "$REL/examples"
-cd "$ROOT"
-./xenoid build all >/tmp/xenoid-release-build.json
-OTA_BUNDLE="$("$ROOT/scripts/make-ota-bundle.sh" "$VERSION")"
-DOCTOR_PATH="$REL/doctor.json" python3 - <<'PY'
-import json, os, pathlib
-path = pathlib.Path(os.environ["DOCTOR_PATH"])
-path.write_text(json.dumps({
+export PYTHONDONTWRITEBYTECODE=1
+RELEASE_DEADLINE="$(python3 -c 'import time; print(time.monotonic()+7200)')"
+RELEASE_ROOT="$ROOT/dist/release"
+mkdir -p "$RELEASE_ROOT"
+STAGE="$(mktemp -d "$RELEASE_ROOT/.release-stage.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+REL="$STAGE/xenoid-$VERSION"
+ARTIFACT_STAGE="$STAGE/artifact-snapshot"
+CANDIDATE="$STAGE/xenoid-$VERSION.tar.gz"
+ARCHIVE="$RELEASE_ROOT/xenoid-$VERSION.tar.gz"
+mkdir -p "$REL" "$ARTIFACT_STAGE"
+
+capture_inventory() {
+  ROOT="$ROOT" OUTPUT="$1" PYTHONPATH="$ROOT/src" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from xenoid.process import run_bounded
+
+root = Path(os.environ["ROOT"])
+result = run_bounded(
+    [sys.executable, "scripts/audit-sensitive-data.py", "--inventory-digest"],
+    cwd=root,
+    deadline=time.monotonic() + 180.0,
+    project_root=root,
+)
+if not result.ok:
+    raise SystemExit("release_source_inventory_unavailable")
+evidence = json.loads(result.stdout_tail)
+if set(evidence) != {"count", "sha256"}:
+    raise SystemExit("release_source_inventory_invalid")
+Path(os.environ["OUTPUT"]).write_text(
+    json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+capture_inventory "$STAGE/source-before.json"
+# Direct release calls consume the same fresh, non-recursive gate owner as CI.
+PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m xenoid.gates release --fresh > "$STAGE/raw-gate-evidence.json"
+RAW_GATES="$STAGE/raw-gate-evidence.json" OUTPUT="$REL/gate-evidence.json" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+raw = json.loads(Path(os.environ["RAW_GATES"]).read_text(encoding="utf-8"))
+if (
+    raw.get("schema") != "dev.xenoid.gates/v1"
+    or raw.get("ok") is not True
+    or raw.get("profile") != "release"
+    or raw.get("fresh") is not True
+    or raw.get("failedGate") is not None
+    or not isinstance(raw.get("gates"), dict)
+):
+    raise SystemExit("release_gate_evidence_invalid")
+gates = {}
+for name, result in sorted(raw["gates"].items()):
+    if not isinstance(name, str) or not isinstance(result, dict):
+        raise SystemExit("release_gate_evidence_invalid")
+    gates[name] = {
+        "state": result.get("state"),
+        "cacheHit": result.get("cacheHit"),
+        "inputSha256": result.get("inputSha256"),
+    }
+evidence = {
+    "schema": "dev.xenoid.gates/v1",
+    "ok": True,
+    "profile": "release",
+    "fresh": True,
+    "failedGate": None,
+    "gates": gates,
+}
+Path(os.environ["OUTPUT"]).write_text(
+    json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+
+ROOT="$ROOT" ARTIFACT_STAGE="$ARTIFACT_STAGE" RELEASE_DEADLINE="$RELEASE_DEADLINE" PYTHONPATH="$ROOT/src" python3 - <<'PY'
+import os
+from pathlib import Path
+from xenoid.artifacts import ArtifactBuilder, CONSUMER_TARGETS
+
+root = Path(os.environ["ROOT"])
+destination = Path(os.environ["ARTIFACT_STAGE"])
+builder = ArtifactBuilder(root)
+result = builder.ensure(
+    CONSUMER_TARGETS["release"],
+    deadline=float(os.environ["RELEASE_DEADLINE"]),
+)
+if result.get("ok") is not True:
+    raise SystemExit("release_artifacts_failed")
+snapshot = builder.snapshot("release")
+builder.stage(snapshot, destination)
+PY
+
+
+XENOID_ARTIFACT_ROOT="$ARTIFACT_STAGE" XENOID_OTA_OUTPUT_ROOT="$STAGE/ota" \
+  SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+  "$ROOT/scripts/run-bounded-command.py" --deadline "$RELEASE_DEADLINE" \
+  "$ROOT/scripts/make-ota-bundle.sh" "$VERSION" >/dev/null
+OTA_BUNDLE="$STAGE/ota/xenoid-$VERSION.tar.gz"
+
+ROOT="$ROOT" REL="$REL" ARTIFACT_STAGE="$ARTIFACT_STAGE" \
+OTA_BUNDLE="$OTA_BUNDLE" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" python3 - <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import stat
+import sys
+import time
+
+sys.path.insert(0, str(Path(os.environ["ROOT"]) / "src"))
+from xenoid.process import run_bounded
+
+root = Path(os.environ["ROOT"])
+release = Path(os.environ["REL"])
+artifact_root = Path(os.environ["ARTIFACT_STAGE"])
+epoch = int(os.environ["SOURCE_DATE_EPOCH"], 10)
+
+allowed_files = {
+    ".gitignore",
+    "AGENTS.md",
+    "README.md",
+    "README_CN.md",
+    "pyproject.toml",
+    "setup.py",
+    "xenoid",
+    "xenoid-mcp",
+    "xenoid-service",
+}
+allowed_prefixes = (
+    ".githooks/",
+    ".github/",
+    "daemon/",
+    "data/",
+    "docs/",
+    "examples/",
+    "frida/",
+    "mcp/",
+    "modules/",
+    "native/",
+    "runtime/",
+    "scripts/",
+    "skills/",
+    "src/",
+    "tests/",
+)
+def copy_stable_source(source: Path, destination: Path) -> None:
+    try:
+        before = source.lstat()
+        descriptor = os.open(
+            source,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        raise SystemExit("release_source_type_invalid") from exc
+    try:
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or identity
+            != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+            )
+        ):
+            raise SystemExit("release_source_type_invalid")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        output = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_TRUNC
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(output, view)
+                    view = view[written:]
+        finally:
+            os.close(output)
+        after = os.fstat(descriptor)
+        current = source.lstat()
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or identity != (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        ):
+            raise SystemExit("release_source_changed")
+        destination.chmod(0o755 if before.st_mode & 0o111 else 0o644)
+    finally:
+        os.close(descriptor)
+
+
+captured = bytearray()
+inventory = run_bounded(
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    cwd=root,
+    deadline=time.monotonic() + 60.0,
+    project_root=root,
+    stdout_consumer=captured.extend,
+)
+if not inventory.ok:
+    raise SystemExit("release_source_inventory_unavailable")
+tracked = bytes(captured)
+missing_sources: list[Path] = []
+for raw in tracked.split(b"\0"):
+    if not raw:
+        continue
+    relative = raw.decode("utf-8")
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise SystemExit("release_source_inventory_invalid")
+    if relative not in allowed_files and not relative.startswith(allowed_prefixes):
+        raise SystemExit("release_source_not_allowlisted")
+    source = root / relative
+    destination = release / relative
+    try:
+        source.lstat()
+    except FileNotFoundError:
+        missing_sources.append(source)
+        continue
+    except OSError as exc:
+        raise SystemExit("release_source_type_invalid") from exc
+    copy_stable_source(source, destination)
+for source in missing_sources:
+    try:
+        source.lstat()
+    except FileNotFoundError:
+        continue
+    except OSError as exc:
+        raise SystemExit("release_source_changed") from exc
+    raise SystemExit("release_source_changed")
+
+# Materialize the validated immutable artifact snapshot over source-tree paths.
+for source in sorted(artifact_root.rglob("*"), key=lambda item: item.as_posix().encode()):
+    if not source.is_file() or source.is_symlink():
+        continue
+    relative = source.relative_to(artifact_root)
+    destination = release / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    destination.chmod(0o755 if source.stat().st_mode & 0o111 else 0o644)
+
+(release / "bin").mkdir(exist_ok=True)
+for name in ("xenoid", "xenoid-mcp", "xenoid-service"):
+    shutil.copyfile(root / name, release / "bin" / name)
+    (release / "bin" / name).chmod(0o755)
+
+aliases = {
+    "artifacts/xenoid-daemon.apk": "daemon/app/build/outputs/apk/debug/app-debug.apk",
+    "artifacts/xenoid-input": "native/xenoid-input/xenoid-input",
+    "artifacts/xenoid-hide-helper": "native/xenoid-hide/xenoid-hide",
+    "artifacts/xenoid-profile-helper": "native/xenoid-profile/xenoid-profile",
+    "artifacts/xenoid-netctl": "native/xenoid-netctl/xenoid-netctl",
+    "artifacts/xenoid-rootd-arm64": "native/xenoid-rootd/xenoid-rootd-arm64",
+    "artifacts/libxenoid_zygote.so": "native/xenoid-zygote/libxenoid_zygote.so",
+    "artifacts/libxenoid_shim-arm64.so": "native/xenoid-shim/libxenoid_shim-arm64.so",
+    "artifacts/xenoid-pivot": "native/xenoid-pivot/xenoid-pivot",
+    "artifacts/xenoid-sensorshal": "native/xenoid-sensorshal/xenoid-sensorshal",
+    "artifacts/android.hardware.sensors.ISensors.xml": "native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml",
+    "artifacts/android.hardware.camera.provider-service-aidl": "native/xenoid-camerahal/android.hardware.camera.provider-service-aidl",
+    "artifacts/android.hardware.camera.provider.ICameraProvider.xml": "native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml",
+    "artifacts/media_profiles_V1_0.xml": "native/xenoid-camerahal/media_profiles_V1_0.xml",
+    "artifacts/gralloc.redroid.so": "native/xenoid-gralloc/gralloc.redroid.so",
+    "artifacts/hwcomposer.raven.so": "native/xenoid-hwcomposer/hwcomposer.raven.so",
+    "artifacts/xenoid-overlay-helper": "native/xenoid-hide/xenoid-overlay",
+    "artifacts/xenoid-prop-area": "native/xenoid-hide/xenoid-prop-area",
+    "artifacts/xenoid-ssaid": "native/xenoid-hide/xenoid-ssaid",
+    "artifacts/xenoid-proxy-sandbox": "native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",
+    "artifacts/libxenoid-ril.so": "native/xenoid-ril/libxenoid-ril.so",
+    "artifacts/android.hardware.radio.config-service.xenoid": "native/xenoid-radio-config/android.hardware.radio.config-service.xenoid",
+    "artifacts/xenoid-keymint": "native/xenoid-keymint/xenoid-keymint",
+    "scripts/xenoid-proxy-sandbox": "native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",
+}
+for destination_name, source_name in aliases.items():
+    source = artifact_root / source_name
+    if not source.is_file() or source.is_symlink():
+        raise SystemExit("release_artifact_snapshot_invalid")
+    destination = release / destination_name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    destination.chmod(0o755 if source.stat().st_mode & 0o111 else 0o644)
+
+ota = Path(os.environ["OTA_BUNDLE"])
+if not ota.is_file() or ota.is_symlink():
+    raise SystemExit("release_ota_invalid")
+(release / "artifacts").mkdir(exist_ok=True)
+shutil.copyfile(ota, release / "artifacts" / ota.name)
+(release / "artifacts" / ota.name).chmod(0o644)
+
+(release / "config").mkdir(exist_ok=True)
+for name in ("config-macos-colima.json", "config-linux-arm.json"):
+    shutil.copyfile(root / "examples" / name, release / "config" / name)
+    (release / "config" / name).chmod(0o644)
+
+runbook = """# Xenoid Release Runbook
+
+Use `./bin/xenoid up --skip-build` for production convergence from validated
+release artifacts. Use `./bin/xenoid doctor --require-runtime` for a fresh,
+strictly observational runtime report. Keep credentials and private runtime
+state outside this extracted release directory.
+"""
+(release / "RUNBOOK.md").write_text(runbook, encoding="utf-8")
+(release / "RUNBOOK.md").chmod(0o644)
+
+gate_bytes = (release / "gate-evidence.json").read_bytes()
+doctor = {
     "schema": "dev.xenoid.doctor/v1",
     "ok": True,
     "complete": False,
     "full": False,
     "runtimeRequired": False,
     "runtimeAvailable": False,
-    "checks": [{"name": "releaseBuild", "ok": True, "skipped": False}],
+    "checks": [{"name": "offlineBuildEvidence", "ok": True}],
     "sections": {
-        "releaseBuild": {
+        "offlineBuildEvidence": {
             "ok": True,
-            "reason": "offline release packaging; no runtime was inspected",
+            "complete": False,
+            "gateEvidenceSha256": hashlib.sha256(gate_bytes).hexdigest(),
+            "reason": "offline-release-no-live-runtime-observation",
         }
     },
     "nextActions": [],
-}, indent=2) + "\n")
-PY
-REL="$REL" ROOT="$ROOT" python3 - <<'PY'
-import os, pathlib, shutil, subprocess, sys
-root = pathlib.Path(os.environ["ROOT"])
-release = pathlib.Path(os.environ["REL"])
-sys.path.insert(0, str(root / "src"))
-from xenoid.google_services import registered_metadata_files
-
-registered_google = registered_metadata_files()
-raw = subprocess.check_output(
-    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-    cwd=root,
+}
+(release / "doctor.json").write_text(
+    json.dumps(doctor, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
 )
-for item in raw.split(b"\0"):
-    if not item:
+(release / "doctor.json").chmod(0o644)
+
+# Normalize before manifesting; the archive writer independently enforces this.
+for path in sorted(release.rglob("*"), key=lambda item: item.as_posix().encode()):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise SystemExit("release_member_type_invalid")
+    path.chmod(0o755 if stat.S_ISDIR(info.st_mode) or info.st_mode & 0o111 else 0o644)
+    os.utime(path, (epoch, epoch), follow_symlinks=False)
+
+files = []
+for path in sorted(
+    (item for item in release.rglob("*") if item.is_file()),
+    key=lambda item: item.relative_to(release).as_posix().encode(),
+):
+    relative = path.relative_to(release).as_posix()
+    if relative == "manifest.json":
         continue
-    relative = pathlib.Path(item.decode())
-    normalized = relative.as_posix()
-    if relative.parts and relative.parts[0] == ".xenoid":
-        raise SystemExit(
-            f"refusing to package private runtime state: {normalized}"
-        )
-    if relative.suffix.lower() in {".zip", ".pem"}:
-        raise SystemExit(
-            f"refusing to package proprietary import payload: {normalized}"
-        )
-    if normalized.startswith("data/google-services/") and (
-        normalized not in registered_google
-    ):
-        raise SystemExit(
-            f"unregistered Google release metadata: {normalized}"
-        )
-    source = root / relative
-    if not source.is_file():
-        continue
-    destination = release / relative
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-for relative, expected_sha256 in registered_google.items():
-    packaged = release / relative
-    if not packaged.is_file():
-        raise SystemExit(f"registered Google release metadata missing: {relative}")
-    import hashlib
-    actual_sha256 = hashlib.sha256(packaged.read_bytes()).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise SystemExit(f"registered Google release metadata mismatch: {relative}")
+    info = path.stat()
+    files.append(
+        {
+            "path": relative,
+            "mode": stat.S_IMODE(info.st_mode),
+            "size": info.st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    )
+manifest = {
+    "schema": "dev.xenoid.release/v1",
+    "sourceDateEpoch": epoch,
+    "gateEvidenceSha256": hashlib.sha256(gate_bytes).hexdigest(),
+    "files": files,
+}
+(release / "manifest.json").write_text(
+    json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+(release / "manifest.json").chmod(0o644)
+os.utime(release / "manifest.json", (epoch, epoch))
+os.utime(release, (epoch, epoch))
 PY
-cp xenoid xenoid-mcp xenoid-service "$REL/bin/"
-mkdir -p "$REL/daemon/app/build/outputs/apk/debug"
-cp daemon/app/build/outputs/apk/debug/app-debug.apk "$REL/daemon/app/build/outputs/apk/debug/app-debug.apk"
-cp daemon/app/build/outputs/apk/debug/app-debug.apk "$REL/artifacts/xenoid-daemon.apk"
-cp native/xenoid-input/xenoid-input "$REL/artifacts/xenoid-input"
-cp native/xenoid-hide/xenoid-hide "$REL/artifacts/xenoid-hide-helper"
-cp native/xenoid-profile/xenoid-profile "$REL/artifacts/xenoid-profile-helper"
-cp native/xenoid-netctl/xenoid-netctl "$REL/artifacts/xenoid-netctl"
-cp native/xenoid-rootd/xenoid-rootd-arm64 "$REL/artifacts/xenoid-rootd-arm64"
-cp native/xenoid-zygote/libxenoid_zygote.so "$REL/artifacts/libxenoid_zygote.so"
-cp native/xenoid-shim/libxenoid_shim-arm64.so "$REL/artifacts/libxenoid_shim-arm64.so"
-cp native/xenoid-pivot/xenoid-pivot "$REL/artifacts/xenoid-pivot"
-cp native/xenoid-sensorshal/xenoid-sensorshal "$REL/artifacts/xenoid-sensorshal"
-cp native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml "$REL/artifacts/android.hardware.sensors.ISensors.xml"
-cp native/xenoid-camerahal/android.hardware.camera.provider-service-aidl "$REL/artifacts/android.hardware.camera.provider-service-aidl"
-cp native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml "$REL/artifacts/android.hardware.camera.provider.ICameraProvider.xml"
-cp native/xenoid-camerahal/media_profiles_V1_0.xml "$REL/artifacts/media_profiles_V1_0.xml"
-cp native/xenoid-gralloc/gralloc.redroid.so "$REL/artifacts/gralloc.redroid.so"
-cp native/xenoid-hide/xenoid-overlay "$REL/artifacts/xenoid-overlay-helper"
-cp native/xenoid-hide/xenoid-prop-area "$REL/artifacts/xenoid-prop-area"
-cp native/xenoid-hide/xenoid-ssaid "$REL/artifacts/xenoid-ssaid"
-cp native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/artifacts/xenoid-proxy-sandbox"
-cp native/xenoid-ril/libxenoid-ril.so "$REL/artifacts/libxenoid-ril.so"
-cp native/xenoid-radio-config/android.hardware.radio.config-service.xenoid "$REL/artifacts/android.hardware.radio.config-service.xenoid"
-install -m 0755 native/xenoid-keymint/xenoid-keymint "$REL/artifacts/xenoid-keymint"
-cp native/xenoid-input/xenoid-input "$REL/native/xenoid-input/xenoid-input"
-cp native/xenoid-hide/xenoid-hide "$REL/native/xenoid-hide/xenoid-hide"
-cp native/xenoid-hide/xenoid-overlay "$REL/native/xenoid-hide/xenoid-overlay"
-cp native/xenoid-hide/xenoid-prop-area "$REL/native/xenoid-hide/xenoid-prop-area"
-cp native/xenoid-hide/xenoid-ssaid "$REL/native/xenoid-hide/xenoid-ssaid"
-cp native/xenoid-profile/xenoid-profile "$REL/native/xenoid-profile/xenoid-profile"
-cp native/xenoid-netctl/xenoid-netctl "$REL/native/xenoid-netctl/xenoid-netctl"
-cp native/xenoid-rootd/xenoid-rootd-arm64 "$REL/native/xenoid-rootd/xenoid-rootd-arm64"
-cp native/xenoid-zygote/libxenoid_zygote.so "$REL/native/xenoid-zygote/libxenoid_zygote.so"
-cp native/xenoid-shim/libxenoid_shim-arm64.so "$REL/native/xenoid-shim/libxenoid_shim-arm64.so"
-cp native/xenoid-pivot/xenoid-pivot "$REL/native/xenoid-pivot/xenoid-pivot"
-cp native/xenoid-sensorshal/xenoid-sensorshal "$REL/native/xenoid-sensorshal/xenoid-sensorshal"
-cp native/xenoid-camerahal/android.hardware.camera.provider-service-aidl "$REL/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
-cp native/xenoid-camerahal/media_profiles_V1_0.xml "$REL/native/xenoid-camerahal/media_profiles_V1_0.xml"
-cp native/xenoid-gralloc/gralloc.redroid.so "$REL/native/xenoid-gralloc/gralloc.redroid.so"
-mkdir -p "$REL/native/xenoid-keymint"
-install -m 0755 native/xenoid-keymint/xenoid-keymint "$REL/native/xenoid-keymint/xenoid-keymint"
-install -m 0644 native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml "$REL/native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml"
-mkdir -p "$REL/native/xenoid-proxy-sandbox"
-cp -f native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/native/xenoid-proxy-sandbox/xenoid-proxy-sandbox"
-mkdir -p "$REL/native/xenoid-ril" "$REL/native/xenoid-radio-config"
-cp native/xenoid-ril/libxenoid-ril.so "$REL/native/xenoid-ril/libxenoid-ril.so"
-cp native/xenoid-radio-config/android.hardware.radio.config-service.xenoid "$REL/native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"
-cp -f native/xenoid-proxy-sandbox/xenoid-proxy-sandbox "$REL/scripts/xenoid-proxy-sandbox"
-cp "$OTA_BUNDLE" "$REL/artifacts/"
-cp examples/config-macos-colima.json examples/config-linux-arm.json "$REL/config/"
-cat > "$REL/RUNBOOK.md" <<'RUNBOOK'
-# Xenoid Release Runbook
-
-1. Install runtime dependencies on Apple Silicon macOS:
-
-```bash
-./bin/xenoid install-runtime
-```
-
-2. Start the complete runtime with prebuilt release artifacts:
-
-```bash
-./bin/xenoid up --skip-build
-```
-
-`up` performs the startup checks, converges the complete product state, and
-finishes with live-runtime validation. Run `./bin/xenoid doctor` separately
-only when additional diagnostic evidence is needed.
-
-3. Linux ARM direct Docker:
-
-```bash
-mkdir -p .xenoid
-cp config/config-linux-arm.json .xenoid/config.json
-sudo scripts/setup-linux-binderfs.sh
-./bin/xenoid up --skip-build
-```
-
-4. Start the authenticated multi-instance service:
-
-```bash
-./bin/xenoid-service token create \
-  --name operator --all-instances --scope read --scope control
-./bin/xenoid-service serve --bind 127.0.0.1 --port 8765
-```
-
-The token is shown once. Keep the default loopback binding behind SSH/VPN or a
-trusted TLS/OAuth gateway. See docs/remote-service.md before using a non-loopback
-listener.
-RUNBOOK
-REL="$REL" python3 - <<'PY' > "$REL/manifest.json"
-import hashlib, json, os, pathlib, time
-root=pathlib.Path(os.environ['REL'])
-files=[]
-for p in sorted(root.rglob('*')):
-    if p.is_file():
-        h=hashlib.sha256(p.read_bytes()).hexdigest()
-        files.append({'path': str(p.relative_to(root)), 'sha256': h, 'size': p.stat().st_size})
-print(json.dumps({'schema':'dev.xenoid.release/v1','createdAt':int(time.time()),'files':files}, indent=2))
+capture_inventory "$STAGE/source-after.json"
+BEFORE="$STAGE/source-before.json" AFTER="$STAGE/source-after.json" python3 - <<'PY'
+from pathlib import Path
+import os
+if Path(os.environ["BEFORE"]).read_bytes() != Path(os.environ["AFTER"]).read_bytes():
+    raise SystemExit("release_source_changed")
 PY
-rm -f "$ARCHIVE"
-COPYFILE_DISABLE=1 tar -C "$ROOT/dist/release" -czf "$ARCHIVE" "xenoid-$VERSION"
-printf '%s\n' "$ARCHIVE"
+
+
+SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+  "$ROOT/scripts/run-bounded-command.py" --deadline "$RELEASE_DEADLINE" \
+  "$ROOT/scripts/canonical-tar.py" "$REL" "$CANDIDATE"
+if ! "$ROOT/scripts/run-bounded-command.py" --deadline "$RELEASE_DEADLINE" \
+  "$ROOT/scripts/verify-release.py" "$CANDIDATE" > "$STAGE/verify-release.json"; then
+  VERIFY="$STAGE/verify-release.json" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+try:
+    value = json.loads(Path(os.environ["VERIFY"]).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    value = {}
+code = value.get("errorCode") or value.get("error")
+paths = value.get("privateContentPaths")
+result = {
+    "errorCode": (
+        code if isinstance(code, str) else "release_verification_failed"
+    ),
+}
+if isinstance(paths, list) and all(isinstance(path, str) for path in paths):
+    result["paths"] = paths[:64]
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+PY
+  exit 1
+fi
+CANDIDATE="$CANDIDATE" VERIFY="$STAGE/verify-release.json" python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+archive = Path(os.environ["CANDIDATE"])
+report = json.loads(Path(os.environ["VERIFY"]).read_text())
+digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+if report.get("ok") is not True or report.get("archiveSha256") != digest:
+    raise SystemExit("release_verification_failed")
+PY
+mv -f "$CANDIDATE" "$ARCHIVE"
+ARCHIVE="$ARCHIVE" python3 - <<'PY'
+import os
+from pathlib import Path
+path = Path(os.environ["ARCHIVE"])
+fd = os.open(path.parent, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+printf 'dist/release/xenoid-%s.tar.gz\n' "$VERSION"

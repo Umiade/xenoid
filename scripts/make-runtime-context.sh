@@ -1,63 +1,335 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+canonicalize_context() {
+  python3 - "$1" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+SCHEMA = "dev.xenoid.runtime-context/v1"
+EXECUTABLES = {
+    "payload/android.hardware.camera.provider-service-aidl",
+    "payload/android.hardware.radio.config-service.xenoid",
+    "payload/android.hardware.security.keymint-service",
+    "payload/app_process64",
+    "payload/xenoid-app-process",
+    "payload/xenoid-hide-helper",
+    "payload/xenoid-init",
+    "payload/xenoid-input",
+    "payload/xenoid-netctl",
+    "payload/xenoid-overlay-helper",
+    "payload/xenoid-profile-helper",
+    "payload/xenoid-prop-area",
+    "payload/xenoid-sensorshal",
+}
+GOOGLE_PREFIX = "payload/google-services/"
+
+
+class ContextError(Exception):
+    pass
+
+
+def digest_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonicalize(root: Path) -> None:
+    root_info = root.lstat()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ContextError("runtime_context_invalid")
+
+    files: list[tuple[bytes, str, Path, int]] = []
+    directories: list[tuple[bytes, str, Path]] = []
+    seen: set[str] = set()
+    for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(current)
+        for name in dirnames:
+            path = base / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ContextError("runtime_context_unsafe_entry")
+            relative = path.relative_to(root).as_posix()
+            if relative in seen:
+                raise ContextError("runtime_context_duplicate_entry")
+            seen.add(relative)
+            directories.append((relative.encode("utf-8"), relative, path))
+        for name in filenames:
+            path = base / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ContextError("runtime_context_unsafe_entry")
+            relative = path.relative_to(root).as_posix()
+            if relative == "context-manifest.json":
+                continue
+            if relative.startswith(".context-manifest."):
+                raise ContextError("runtime_context_temporary_entry")
+            if relative in seen:
+                raise ContextError("runtime_context_duplicate_entry")
+            seen.add(relative)
+            source_mode = stat.S_IMODE(info.st_mode)
+            files.append((relative.encode("utf-8"), relative, path, source_mode))
+
+
+    entries: list[dict[str, object]] = []
+    for _, relative, path, source_mode in files:
+        executable = relative in EXECUTABLES or (
+            relative.startswith(GOOGLE_PREFIX) and bool(source_mode & 0o111)
+        )
+        mode = 0o755 if executable else 0o644
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise ContextError("runtime_context_unsafe_entry")
+            os.fchmod(descriptor, mode)
+            os.utime(descriptor, ns=(0, 0))
+            digest = digest_descriptor(descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        entries.append(
+            {
+                "path": relative,
+                "type": "file",
+                "mode": f"0{mode:03o}",
+                "size": info.st_size,
+                "sha256": digest,
+            }
+        )
+    for _, relative, path in directories:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                raise ContextError("runtime_context_unsafe_entry")
+            os.fchmod(descriptor, 0o755)
+        finally:
+            os.close(descriptor)
+        entries.append(
+            {
+                "path": relative,
+                "type": "directory",
+                "mode": "0755",
+                "size": 0,
+                "sha256": None,
+            }
+        )
+    entries.sort(key=lambda entry: str(entry["path"]).encode("utf-8"))
+    manifest = {
+        "schema": SCHEMA,
+        "entries": entries,
+    }
+    payload = (
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+    descriptor, temporary = tempfile.mkstemp(prefix=".context-manifest.", dir=root)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+            os.utime(stream.fileno(), ns=(0, 0))
+            os.fsync(stream.fileno())
+        descriptor = -1
+        os.replace(temporary, root / "context-manifest.json")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+    for _, _, path in sorted(
+        directories,
+        key=lambda item: (item[1].count("/"), item[0]),
+        reverse=True,
+    ):
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.utime(descriptor, ns=(0, 0))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    root_descriptor = os.open(
+        root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fchmod(root_descriptor, 0o755)
+        os.utime(root_descriptor, ns=(0, 0))
+        os.fsync(root_descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
+try:
+    canonicalize(Path(sys.argv[1]))
+except ContextError as exc:
+    raise SystemExit(str(exc)) from None
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit("runtime_context_invalid") from None
+PY
+}
+
+if [[ "${1:-}" == "--canonicalize-only" ]]; then
+  if [[ "$#" != 2 ]]; then
+    echo "usage: make-runtime-context.sh --canonicalize-only <context-directory>" >&2
+    exit 2
+  fi
+  canonicalize_context "$2"
+  exit 0
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${1:-redroid/redroid:13.0.0_64only-latest}"
-DOCKER=(docker)
-if [[ -n "${XENOID_DOCKER_CONTEXT:-}" ]]; then
-  DOCKER+=(--context "$XENOID_DOCKER_CONTEXT")
-fi
-OUT="${2:-$ROOT/dist/runtime-context}"
+_DOCKER_LINES="$(
+  python3 - <<'PY'
+import json
+import os
+
+try:
+    value = json.loads(os.environ["XENOID_DOCKER_ARGV_JSON"])
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(item, str)
+            or not item
+            or any(character in item for character in ("\x00", "\r", "\n"))
+            for item in value
+        )
+    ):
+        raise ValueError
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(1) from None
+print("\n".join(value))
+PY
+)" || {
+  echo "runtime_context_docker_argv_invalid" >&2
+  exit 1
+}
+DOCKER=()
+while IFS= read -r argument; do
+  DOCKER+=("$argument")
+done <<< "$_DOCKER_LINES"
+unset _DOCKER_LINES
+REQUESTED_OUT="${2:-$ROOT/dist/runtime-context}"
 GOOGLE_PAYLOAD="${XENOID_GOOGLE_PAYLOAD:-}"
 GOOGLE_PROVIDER="${XENOID_GOOGLE_PROVIDER:-}"
 GOOGLE_RELEASE="${XENOID_GOOGLE_RELEASE:-}"
 GOOGLE_SPEC_SHA256="${XENOID_GOOGLE_SPEC_SHA256:-}"
 GOOGLE_DATA_COMPAT_SHA256="${XENOID_GOOGLE_DATA_COMPAT_SHA256:-}"
-if [[ -z "$OUT" || "$OUT" == "/" ]]; then
+ARTIFACT_ROOT="${XENOID_ARTIFACT_STAGE:-}"
+if [[ -z "$ARTIFACT_ROOT" || ! -d "$ARTIFACT_ROOT" || -L "$ARTIFACT_ROOT" ]]; then
+  echo "artifact_snapshot_invalid: XENOID_ARTIFACT_STAGE is required" >&2
+  exit 1
+fi
+if [[ -z "$REQUESTED_OUT" || "$REQUESTED_OUT" == "/" ]]; then
   echo "unsafe runtime context output path" >&2
   exit 2
 fi
-DAEMON="$ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
-INPUT="$ROOT/native/xenoid-input/xenoid-input"
-HIDE="$ROOT/native/xenoid-hide/xenoid-hide"
-OVERLAY="$ROOT/native/xenoid-hide/xenoid-overlay"
-PROFILE="$ROOT/native/xenoid-profile/xenoid-profile"
-NETCTL="$ROOT/native/xenoid-netctl/xenoid-netctl"
-PROP_AREA="$ROOT/native/xenoid-hide/xenoid-prop-area"
-ZYGOTE="$ROOT/native/xenoid-zygote/libxenoid_zygote.so"
-PIVOT="$ROOT/native/xenoid-pivot/xenoid-pivot"
-SENSORSHAL="$ROOT/native/xenoid-sensorshal/xenoid-sensorshal"
-CAMERA_PROVIDER="$ROOT/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
-GRALLOC="$ROOT/native/xenoid-gralloc/gralloc.redroid.so"
-HWCOMPOSER="$ROOT/native/xenoid-hwcomposer/hwcomposer.raven.so"
-MEDIA_PROFILES="$ROOT/native/xenoid-camerahal/media_profiles_V1_0.xml"
-RIL="$ROOT/native/xenoid-ril/libxenoid-ril.so"
-RADIO_CONFIG="$ROOT/native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"
+OUT_PARENT_REQUESTED="$(dirname "$REQUESTED_OUT")"
+OUT_BASENAME="$(basename "$REQUESTED_OUT")"
+if [[ "$OUT_BASENAME" == "." || "$OUT_BASENAME" == ".." || "$OUT_BASENAME" == "/" ]]; then
+  echo "unsafe runtime context output path" >&2
+  exit 2
+fi
+mkdir -p "$OUT_PARENT_REQUESTED"
+OUT_PARENT="$(cd "$OUT_PARENT_REQUESTED" && pwd -P)"
+PUBLISH_OUT="$OUT_PARENT/$OUT_BASENAME"
+if [[ -L "$PUBLISH_OUT" || ( -e "$PUBLISH_OUT" && ! -d "$PUBLISH_OUT" ) ]]; then
+  echo "unsafe runtime context output path" >&2
+  exit 2
+fi
+OUT=""
+_cid=""
+cleanup() {
+  local status=$?
+  if [[ -n "$_cid" ]]; then
+    "${DOCKER[@]}" rm "$_cid" >/dev/null 2>&1 || true
+    _cid=""
+  fi
+  if [[ -n "$OUT" && "$OUT" != "$PUBLISH_OUT" ]]; then
+    rm -rf -- "$OUT"
+  fi
+  return "$status"
+}
+trap cleanup EXIT
+DAEMON="$ARTIFACT_ROOT/daemon/app/build/outputs/apk/debug/app-debug.apk"
+INPUT="$ARTIFACT_ROOT/native/xenoid-input/xenoid-input"
+HIDE="$ARTIFACT_ROOT/native/xenoid-hide/xenoid-hide"
+OVERLAY="$ARTIFACT_ROOT/native/xenoid-hide/xenoid-overlay"
+PROFILE="$ARTIFACT_ROOT/native/xenoid-profile/xenoid-profile"
+NETCTL="$ARTIFACT_ROOT/native/xenoid-netctl/xenoid-netctl"
+PROP_AREA="$ARTIFACT_ROOT/native/xenoid-hide/xenoid-prop-area"
+ZYGOTE="$ARTIFACT_ROOT/native/xenoid-zygote/libxenoid_zygote.so"
+PIVOT="$ARTIFACT_ROOT/native/xenoid-pivot/xenoid-pivot"
+SENSORSHAL="$ARTIFACT_ROOT/native/xenoid-sensorshal/xenoid-sensorshal"
+CAMERA_PROVIDER="$ARTIFACT_ROOT/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
+GRALLOC="$ARTIFACT_ROOT/native/xenoid-gralloc/gralloc.redroid.so"
+HWCOMPOSER="$ARTIFACT_ROOT/native/xenoid-hwcomposer/hwcomposer.raven.so"
+MEDIA_PROFILES="$ARTIFACT_ROOT/native/xenoid-camerahal/media_profiles_V1_0.xml"
+RIL="$ARTIFACT_ROOT/native/xenoid-ril/libxenoid-ril.so"
+RADIO_CONFIG="$ARTIFACT_ROOT/native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"
 HARDWARE_FEATURES="$ROOT/runtime/redroid/xenoid-hardware-features.xml"
-TEESIM_KEYMINT="$ROOT/native/xenoid-keymint/xenoid-keymint"
+TEESIM_KEYMINT="$ARTIFACT_ROOT/native/xenoid-keymint/xenoid-keymint"
+KEYMINT_VINTF="$ARTIFACT_ROOT/native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml"
+SENSORS_VINTF="$ARTIFACT_ROOT/native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml"
+CAMERA_VINTF="$ARTIFACT_ROOT/native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml"
+RIL_VINTF="$ARTIFACT_ROOT/native/xenoid-ril/android.hardware.radio.IRadio.xml"
+RADIO_CONFIG_VINTF="$ARTIFACT_ROOT/native/xenoid-radio-config/android.hardware.radio.config.IRadioConfig.xml"
 [[ -f "$HARDWARE_FEATURES" && ! -L "$HARDWARE_FEATURES" ]] || {
   echo "missing runtime/redroid/xenoid-hardware-features.xml" >&2
   exit 1
 }
 python3 "$ROOT/scripts/smoke-hardware-features.py" --contract "$HARDWARE_FEATURES" >/dev/null
-[[ -f "$DAEMON" ]] || "$ROOT/scripts/build-daemon.sh" >/dev/null
-[[ -f "$INPUT" ]] || "$ROOT/scripts/build-native-input.sh" >/dev/null
-[[ -f "$HIDE" ]] || "$ROOT/scripts/build-native-hide.sh" >/dev/null
-[[ -f "$OVERLAY" ]] || "$ROOT/scripts/build-native-overlay.sh" >/dev/null
-[[ -f "$PROFILE" ]] || "$ROOT/scripts/build-native-profile.sh" >/dev/null
-[[ -f "$NETCTL" ]] || "$ROOT/scripts/build-native-netctl.sh" >/dev/null
-[[ -f "$PROP_AREA" ]] || "$ROOT/scripts/build-native-for-arch.sh" xenoid-prop-area "$ROOT/native/xenoid-hide/xenoid_prop_area.c" "$PROP_AREA" arm64 >/dev/null
-[[ -f "$PIVOT" ]] || "$ROOT/scripts/build-native-for-arch.sh" xenoid-pivot "$ROOT/native/xenoid-pivot/xenoid_pivot.c" "$PIVOT" arm64 static >/dev/null
-[[ -f "$ZYGOTE" ]] || "$ROOT/scripts/build-native-zygote.sh" arm64 >/dev/null
-[[ -f "$SENSORSHAL" ]] || "$ROOT/scripts/build-sensors-hal.sh" arm64 >/dev/null
-[[ -f "$GRALLOC" ]] || "$ROOT/scripts/build-gralloc.sh" arm64 >/dev/null
-[[ -f "$HWCOMPOSER" ]] || "$ROOT/scripts/build-hwcomposer.sh" arm64 >/dev/null
-[[ -f "$CAMERA_PROVIDER" ]] || "$ROOT/scripts/build-camera-hal.sh" arm64 >/dev/null
-[[ -f "$RIL" ]] || "$ROOT/scripts/build-ril.sh" arm64 >/dev/null
-[[ -f "$RADIO_CONFIG" ]] || "$ROOT/scripts/build-radio-config.sh" arm64 >/dev/null
-# Runtime-context generation consumes the validated prebuilt. Source rebuilds
-# are owned by `xenoid build keymint` / `build all`, never by image staging.
-"$ROOT/scripts/build-keymint.sh" >/dev/null
-rm -rf "$OUT"
+for artifact in \
+  "$DAEMON" "$INPUT" "$HIDE" "$OVERLAY" "$PROFILE" "$NETCTL" \
+  "$PROP_AREA" "$PIVOT" "$ZYGOTE" "$SENSORSHAL" "$GRALLOC" \
+  "$HWCOMPOSER" "$CAMERA_PROVIDER" "$MEDIA_PROFILES" "$RIL" \
+  "$RADIO_CONFIG" "$TEESIM_KEYMINT" "$KEYMINT_VINTF" \
+  "$SENSORS_VINTF" "$CAMERA_VINTF" "$RIL_VINTF" \
+  "$RADIO_CONFIG_VINTF"; do
+  if [[ ! -f "$artifact" || -L "$artifact" ]]; then
+    echo "artifact_snapshot_invalid: missing staged artifact" >&2
+    exit 1
+  fi
+done
+OUT="$(mktemp -d "$OUT_PARENT/.${OUT_BASENAME}.tmp.XXXXXXXX")"
+chmod 0755 "$OUT"
 mkdir -p "$OUT/payload"
 if [[ -n "$GOOGLE_PAYLOAD" ]]; then
   [[ -d "$GOOGLE_PAYLOAD" && ! -L "$GOOGLE_PAYLOAD" ]] || {
@@ -73,7 +345,7 @@ cp "$DAEMON" "$OUT/payload/XenoidDaemon/XenoidDaemon.apk"
 chmod 0755 "$OUT/payload/XenoidDaemon"
 chmod 0644 "$OUT/payload/XenoidDaemon/XenoidDaemon.apk"
 cp "$TEESIM_KEYMINT" "$OUT/payload/android.hardware.security.keymint-service"
-cp "$ROOT/native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml" "$OUT/payload/android.hardware.security.keymint.IKeyMintDevice.xml" || { echo "missing native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
+cp "$KEYMINT_VINTF" "$OUT/payload/android.hardware.security.keymint.IKeyMintDevice.xml"
 cp "$INPUT" "$OUT/payload/xenoid-input"
 cp "$HIDE" "$OUT/payload/xenoid-hide-helper"
 cp "$OVERLAY" "$OUT/payload/xenoid-overlay-helper"
@@ -82,16 +354,16 @@ cp "$NETCTL" "$OUT/payload/xenoid-netctl"
 cp "$PROP_AREA" "$OUT/payload/xenoid-prop-area"
 cp "$PIVOT" "$OUT/payload/xenoid-init"
 cp "$SENSORSHAL" "$OUT/payload/xenoid-sensorshal"
-cp "$ROOT/native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml" "$OUT/payload/android.hardware.sensors.ISensors.xml" || { echo "missing native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
+cp "$SENSORS_VINTF" "$OUT/payload/android.hardware.sensors.ISensors.xml"
 cp "$CAMERA_PROVIDER" "$OUT/payload/android.hardware.camera.provider-service-aidl"
 cp "$GRALLOC" "$OUT/payload/gralloc.redroid.so"
 cp "$HWCOMPOSER" "$OUT/payload/hwcomposer.raven.so"
-cp "$ROOT/native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml" "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml" || { echo "missing native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml (required by Dockerfile VINTF COPY)" >&2; exit 1; }
-cp "$MEDIA_PROFILES" "$OUT/payload/media_profiles_V1_0.xml" || { echo "missing native/xenoid-camerahal/media_profiles_V1_0.xml (required by Dockerfile camera profile COPY)" >&2; exit 1; }
+cp "$CAMERA_VINTF" "$OUT/payload/android.hardware.camera.provider.ICameraProvider.xml"
+cp "$MEDIA_PROFILES" "$OUT/payload/media_profiles_V1_0.xml"
 cp "$RIL" "$OUT/payload/libxenoid-ril.so"
-cp "$ROOT/native/xenoid-ril/android.hardware.radio.IRadio.xml" "$OUT/payload/android.hardware.radio.IRadio.xml"
+cp "$RIL_VINTF" "$OUT/payload/android.hardware.radio.IRadio.xml"
 cp "$RADIO_CONFIG" "$OUT/payload/android.hardware.radio.config-service.xenoid"
-cp "$ROOT/native/xenoid-radio-config/android.hardware.radio.config.IRadioConfig.xml" "$OUT/payload/android.hardware.radio.config.IRadioConfig.xml"
+cp "$RADIO_CONFIG_VINTF" "$OUT/payload/android.hardware.radio.config.IRadioConfig.xml"
 cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/apns-conf.xml" "$OUT/payload/apns-conf.xml"
 cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/xenoid-cellular-features.xml" "$OUT/payload/xenoid-cellular-features.xml"
 cp "$HARDWARE_FEATURES" "$OUT/payload/xenoid-hardware-features.xml" || {
@@ -106,7 +378,7 @@ cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/privapp
 cp "$ZYGOTE" "$OUT/payload/libpiex_shim.so"
 # app_process64 loads the compatibility layer as an ordinary leading
 # dependency. Unlike LD_PRELOAD this does not populate bionic's preload vector.
-if command -v docker >/dev/null 2>&1; then
+if command -v "${DOCKER[0]}" >/dev/null 2>&1; then
   _cid=$("${DOCKER[@]}" create "$IMAGE" 2>/dev/null || true)
   if [[ -n "$_cid" ]]; then "${DOCKER[@]}" cp "$_cid:/system/etc/init/hw/init.zygote64.rc" "$OUT/payload/init.zygote64.rc" >/dev/null 2>&1 || true
     # Extract the stock build.prop files so identity can be baked in at image
@@ -137,7 +409,9 @@ if command -v docker >/dev/null 2>&1; then
     "${DOCKER[@]}" cp "$_cid:/system/framework/services.jar" "$OUT/payload/services.jar" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/framework/telephony-common.jar" "$OUT/payload/telephony-common.base.jar" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/libpuresoftkeymasterdevice.so" "$OUT/payload/libpuresoftkeymasterdevice.so" >/dev/null || _required_extract_ok=0
-    "${DOCKER[@]}" rm "$_cid" >/dev/null 2>&1 || true
+    if "${DOCKER[@]}" rm "$_cid" >/dev/null 2>&1; then
+      _cid=""
+    fi
     if [[ "$_required_extract_ok" != "1" ]]; then
       echo "failed to extract required Android 13 runtime payload from $IMAGE" >&2
       exit 1
@@ -259,7 +533,6 @@ PY4
     echo "failed to create extraction container from $IMAGE" >&2
     exit 1
   fi
-  unset _cid
 else
   echo "docker is required to extract runtime payloads from $IMAGE" >&2
   exit 1
@@ -519,12 +792,81 @@ cat >> "$OUT/Dockerfile" <<'DOCKER'
 # table looks like a physical device (no container overlayfs/binds anywhere).
 ENTRYPOINT ["/xenoid-init","/data/xenoid-rootfs.img","/data/xenoid-data.img","/init","qemu=1","androidboot.hardware=raven","androidboot.hardware.sku=G8V0U","androidboot.mode=normal","androidboot.bootreason=reboot,normal","androidboot.verifiedbootstate=green","androidboot.flash.locked=1","androidboot.vbmeta.device_state=locked","androidboot.veritymode=enforcing","androidboot.use_redroid_c2=1"]
 DOCKER
-cat > "$OUT/build.sh" <<'BUILD'
-#!/usr/bin/env bash
-set -euo pipefail
-TAG="${1:-xenoid/redroid:local}"
-docker build -t "$TAG" .
-echo "$TAG"
-BUILD
-chmod +x "$OUT/build.sh"
+canonicalize_context "$OUT"
+python3 - "$OUT" "$PUBLISH_OUT" <<'PY'
+from __future__ import annotations
+
+import ctypes
+import errno
+import os
+import shutil
+import stat
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+
+
+def exchange(left: Path, right: Path) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    left_bytes = os.fsencode(left)
+    right_bytes = os.fsencode(right)
+    if sys.platform == "darwin":
+        rename = library.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(left_bytes, right_bytes, 0x00000002)
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as exc:
+            raise OSError(errno.ENOTSUP, "atomic directory exchange unavailable") from exc
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(-100, left_bytes, -100, right_bytes, 0x00000002)
+    else:
+        raise OSError(errno.ENOTSUP, "atomic directory exchange unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+try:
+    source_info = source.lstat()
+    parent_info = destination.parent.lstat()
+    if (
+        stat.S_ISLNK(source_info.st_mode)
+        or not stat.S_ISDIR(source_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+    ):
+        raise OSError(errno.EINVAL, "unsafe runtime context publication")
+    try:
+        destination_info = destination.lstat()
+    except FileNotFoundError:
+        os.rename(source, destination)
+    else:
+        if stat.S_ISLNK(destination_info.st_mode) or not stat.S_ISDIR(destination_info.st_mode):
+            raise OSError(errno.EINVAL, "unsafe runtime context destination")
+        exchange(source, destination)
+        shutil.rmtree(source)
+    parent_descriptor = os.open(
+        destination.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+except OSError:
+    raise SystemExit("runtime_context_publish_failed") from None
+PY
+OUT="$PUBLISH_OUT"
 printf '%s\n' "$OUT"

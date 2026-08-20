@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 import json
-import pathlib
-import subprocess
+from pathlib import Path
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from xenoid.artifacts import TARGETS
+
 PROFILE = json.loads(
     (ROOT / "examples/fingerprints/pixel-raven-android13.json").read_text()
 )
 STORAGE = PROFILE["storage"]
-BUILD = ROOT / "scripts/build-native-overlay.sh"
-
+overlay = TARGETS["overlay"]
 checks: dict[str, bool] = {
     "profile_capacity_equation": (
         STORAGE["capacityBytes"]
@@ -33,17 +35,14 @@ checks: dict[str, bool] = {
         and STORAGE["sparse"] is True
         and STORAGE["removable"] is False
     ),
+    "overlay_artifact_owner": (
+        overlay.command == ("scripts/build-native-overlay.sh", "arm64")
+        and tuple(output.path for output in overlay.outputs)
+        == ("native/xenoid-hide/xenoid-overlay",)
+        and "native/xenoid-hide/xenoid_overlay.c" in overlay.sources
+        and "native/xenoid-hide/xenoid_power_supply.c" in overlay.sources
+    ),
 }
-
-build_result = subprocess.run(
-    [str(BUILD), "arm64"], cwd=ROOT, text=True, capture_output=True
-)
-checks["overlay_android_build"] = build_result.returncode == 0
-
-result = {
-    "ok": all(checks.values()),
-    "checks": checks,
-    "buildStderr": build_result.stderr.strip(),
-}
-print(json.dumps(result, indent=2, sort_keys=True))
+result = {"ok": all(checks.values()), "checks": checks}
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 sys.exit(0 if result["ok"] else 1)

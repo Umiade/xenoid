@@ -65,11 +65,14 @@ pub struct TsDeviceIds {
 pub unsafe extern "C" fn teesim_km_init(keybox_ptr: *const u8, keybox_len: usize) -> *mut Ta {
     init_logging();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        if keybox_ptr.is_null() {
-            return None;
-        }
-        let bytes = slice::from_raw_parts(keybox_ptr, keybox_len);
-        let xml = std::str::from_utf8(bytes).ok()?;
+        let xml = if keybox_len == 0 {
+            ""
+        } else {
+            if keybox_ptr.is_null() {
+                return None;
+            }
+            std::str::from_utf8(slice::from_raw_parts(keybox_ptr, keybox_len)).ok()?
+        };
         match Ta::new(xml) {
             Ok(ta) => Some(Box::into_raw(Box::new(ta))),
             Err(e) => {
@@ -110,10 +113,14 @@ pub unsafe extern "C" fn teesim_km_init_ex(
 ) -> *mut Ta {
     init_logging();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        if keybox_ptr.is_null() {
-            return None;
-        }
-        let xml = std::str::from_utf8(slice::from_raw_parts(keybox_ptr, keybox_len)).ok()?;
+        let xml = if keybox_len == 0 {
+            ""
+        } else {
+            if keybox_ptr.is_null() {
+                return None;
+            }
+            std::str::from_utf8(slice::from_raw_parts(keybox_ptr, keybox_len)).ok()?
+        };
 
         let attestation_ids = if ids.is_null() {
             None

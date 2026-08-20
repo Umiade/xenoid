@@ -15,7 +15,7 @@ cd xenoid
 
 `install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs and initializes the `default` instance from `examples/config-macos-colima.json` when absent. It does not start Android.
 
-`up` builds the configured artifacts, starts Android, deploys the daemon and native helpers, applies the device profile and protection policy, activates system protection, and validates the live runtime. It returns nonzero if convergence or validation fails.
+`up` is the sole production convergence owner. It validates/reuses artifacts, ensures a content-addressed image only when needed, selects the minimum safe runtime action, reconciles independent components, and returns success only after fresh `LiveAcceptance` for the final runtime. Healthy repeated runs are no-ops apart from fresh observation; daemon/helper/proxy-only drift does not recreate the container.
 
 ## Instance lifecycle and data persistence
 
@@ -25,7 +25,7 @@ Each instance is a logical device with three persistent components:
 2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
 3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a grow-only sparse ext4 backing image (`xenoid-data.img`) that is bind-mounted as the container's `/data`.
 
-`stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
+`stop` installs/verifies proxy quarantine, syncs, and stops the owned container without removing it. The immutable container ID and data volume survive, so `stop -> up` starts the same container. Explicit recreate and regenerate may change the ID but preserve the data volume. External volume deletion/prune or loss of private host state fails closed rather than creating an empty disk.
 
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
 
@@ -37,7 +37,7 @@ Sparse capacity is not host-space preallocation. `doctor` reports conservative D
 
 Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Linux ARM). Each instance gets a unique container, volume, network, MAC, IPv4/IPv6, host ADB/daemon port, and proxy routing table from the operator registry.
 
-Source-based `up` operations for the same project wait on one build/convergence lock because they share generated native artifacts. Each instance still runs concurrently after convergence and uses its own auto-built runtime image tag. Rootfs preparation streams to the Docker engine host, so macOS does not need temporary space for a complete rootfs tar.
+Artifact builds use content-addressed records plus output-directory locks: disjoint targets/instances can proceed concurrently, while shared output directories serialize. Runtime images are shared by immutable content identity rather than per-instance mutable tags. Shared kmod/eBPF protection is deployed once per Docker engine host and reused by all matching instances.
 
 ```bash
 ./xenoid --instance phone-a init --config examples/config-macos-colima.json
@@ -47,7 +47,7 @@ Source-based `up` operations for the same project wait on one build/convergence 
 ./xenoid --instance phone-a stop
 ```
 
-Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity. `./xenoid device regenerate` goes further: it rotates the stable identifiers, the lease network epoch (container MAC), the boot-scoped values, the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country) on a live instance — and on GMS instances clears the Google services apps so the app-readable advertising ID regenerates — then recreates the container and re-converges through the standard `up` pipeline, making the instance present as a brand-new same-model device while preserving user data and the location country/carrier.
+Device identity is generated once per instance. `device regenerate` publishes all stable/network/SIM/data/rootfs targets once in a v2 journal, then recreates and converges through the shared executor; configured Google packages are cleared only after fresh pre-Google acceptance. Plain `up` resumes a validated v2 transaction. A v1-only journal blocks until the operator explicitly runs `device regenerate --restart-legacy-transaction`.
 
 ## Linux ARM
 
@@ -60,11 +60,13 @@ sudo ./scripts/setup-linux-binderfs.sh
 ./xenoid up
 ```
 
-Release bundles contain prebuilt artifacts and can start with:
+Release bundles can require prebuilt evidence:
 
 ```bash
 ./xenoid up --skip-build
 ```
+
+This validates every required artifact record and immutable object, including current source/tool inputs and output mode/size/architecture/digest. Missing or stale data fails; it never compiles or trusts an arbitrary public output.
 
 Linux ARM hosts must expose binderfs to the Android container and use the redroid Android 13 `64only` image.
 
@@ -78,15 +80,15 @@ Linux ARM hosts must expose binderfs to the Android container and use the redroi
 ./xenoid stop
 ```
 
-Preview startup without changing the runtime:
+`up` automatically chooses `no-op`, journal `resume`, `start` for a matching stopped container, `create`, or `recreate` for boot/create-spec/storage drift. Compatible daemon APK and helper drift is deployed in place; proxy, identity, location, Keybox, camera, Google, and protection have independent actions. `start` is the low-level container control and is not a production-ready contract.
 
-```bash
-./xenoid up --dry-run
-```
+Before an operation can expose Android egress, the executor persists the plan and proves proxy quarantine against the same data UUID. If a desired image is needed, it records `quarantined` before `image_ensured`, and only then quiesces/removes/creates runtime state. A failure or interruption preserves the journal, selected immutable image identity, and quarantine for retry.
 
-`start` is the lower-level container command. Use `up` for normal operation because it owns complete state convergence and final validation.
+`status` is strictly observational. Read `recommendedAction`, `driftReasons`, cache/image/protection digests, and `pendingJournalPhase`; it never starts Activity/rootd, builds, retags, reconciles, or changes exit status merely because a valid container is stopped. Use `up --dry-run` for the exact actionable initial or resume plan.
 
-## Diagnostics
+Before any hashing, stderr receives a `dev.xenoid.progress/v1` `inspecting` or `resuming` `started` event. Long phases publish sanitized `running` heartbeats at least every five seconds. Stdout remains one final `dev.xenoid.convergence/v1` JSON document with the plan, `resumed`, safe phase results, immutable before/after IDs, and `nextActions`; no credential, private path, raw command/response, or successful child tail is retained.
+
+## Diagnostics and validation
 
 ```bash
 ./xenoid doctor
@@ -95,12 +97,21 @@ Preview startup without changing the runtime:
 ./xenoid doctor --out /tmp/xenoid-doctor.json
 ```
 
-- `doctor` performs non-mutating host and available-runtime checks.
-- `--require-runtime` fails unless Android and the daemon are ready.
-- `--full` adds builds, packaging checks, runtime-context checks, and the complete live smoke path.
-- `ok` reports the requested check result; `complete` reports end-to-end runtime readiness.
+- `GateRunner` supplies digest-aware static gate records; local verify/doctor may reuse a matching successful runtime-free record.
+- `LiveAcceptance` freshly and read-only observes an already-running owned runtime. It never converges or calls doctor/gates.
+- `doctor` composes those two sources without starting/repairing daemon/rootd, calling `up`, building an artifact/image, packaging, or invoking another suite.
+- `--full` selects the broader doctor-safe record set and fresh live observation; it does not execute mutating CI/release gates.
+- Runtime absence may be `ok=true, complete=false`; `--require-runtime` fails it. A cache hit can never make `complete=true`.
 
-`up` already runs the required live checks. Use standalone `doctor` for diagnosis and evidence.
+For fresh static evidence, use `./scripts/verify.sh --fresh`. CI and release select the same acyclic GateRunner catalog; no audit-bypass variable or recursive verify/CI/doctor invocation exists.
+
+## Listener-first bootstrap and final acceptance
+
+When daemon transport is absent, `up` launches the Activity at most once and waits for public `GET /bootstrap/transport`. After the listener answers, it reads the strictly validated app-private credential into a bounded in-memory buffer, proves authenticated UID-0 rootd, posts one generation-scoped reconcile request, and polls `dev.xenoid.daemon-bootstrap/v1`.
+
+Bootstrap reports fixed `root`, `keybox`, `proxy`, `location`, and `camera` component states. A failed component cannot suppress transport or unrelated diagnostics; an enabled proxy may remain quarantined/deferred until the later host data-plane phase. Aggregate `GET /health` is checked only during final acceptance and never gates bootstrap recovery. Transport, root, worker, boot, and proxy waits have named bounded deadlines; interruption preserves journals/quarantine for resume.
+
+Bootstrap/status/results never expose daemon/root credentials, proxy-agent keys or source, raw SIM identity, Keybox XML/DER/digests, private paths, exception text, or raw daemon responses. Missing/malformed credentials, 401 root authentication, unsafe legacy state, and unowned listener conflicts return stable fail-closed codes.
 
 ## Configuration
 
@@ -140,14 +151,15 @@ Prerequisites:
 
 Import is project-scoped and repeatable. It accepts only the exact pinned filenames and bytes, copies from regular non-symlink sources, performs no network access, uses `0700` directories and `0600` files, and publishes the final private asset directory atomically. Failure output uses stable error codes and never returns source or stored paths.
 
-`enable` also sets `auto_build_runtime_image=true`. The first `up` builds a specification-addressed image, writes the same provider/release/specification/data-compatibility identity to image and container labels, creates rootfs from that exact image, and commits the instance binding only after PackageManager reports GMS Core, Google Services Framework, and Play Store ready. A later provider/release mismatch fails without touching `/data`; create a new instance instead. `disable` has the same fresh-instance restriction.
+`enable` selects the pinned Google identity. When an image is required, `up` publishes a content-addressed image whose immutable record binds base image ID, Google specification/data-compatibility inputs, artifact closure, and boot policy; it commits the instance binding only after PackageManager readiness. A later provider/release mismatch fails without touching `/data`; create a new instance instead. `disable` has the same fresh-instance restriction.
 
-For ordinary convergence, use `up`. `up --reuse-runtime --skip-build` is an explicit no-build path and succeeds only when the owned running container, immutable binding, managed labels/command, image ID, rootfs source image ID, PackageManager state, and platform ABI already match.
+Ordinary `up` automatically reuses a compatible running or stopped runtime. `--skip-build` only validates the prebuilt artifact/object records; there is no runtime-reuse override.
+
+Focused smoke commands are explicit validation operations. They do not call doctor from inside the runtime transaction, and production convergence/regeneration never calls them:
 
 ```bash
 ./scripts/smoke-google-services-runtime.sh --instance play
 ./scripts/smoke-google-services-convergence.sh --instance play
-./xenoid --instance play doctor --full --require-runtime
 ```
 
 The focused smoke installs an ordinary non-debuggable app that verifies the three packages, discovers the framework `com.google` account authenticator, binds GMS Core through its exported service, and resolves the Play Store launcher. It does not submit account credentials; account login remains a manual acceptance step. Play Integrity verdicts and Google device certification are explicitly `unsupported`/`notEvaluated` until separately proven. If Google reports the device as uncertified, follow Google's [uncertified-device registration](https://www.google.com/android/uncertified/) process; Xenoid does not automate it.
@@ -189,6 +201,8 @@ The service manages one fixed project and only instances already initialized in
 that project. It re-resolves state for every request and serializes mutations per
 instance. Use the remote `xenoid_up` tool for complete production convergence;
 lower-level status/control calls never mean the full `up` contract succeeded.
+
+Remote `xenoid_up` accepts only the optional boolean `skipBuild` (plus the service-added required `instance`). It calls the shared in-process convergence executor and returns sanitized phase summaries in one final result; it does not spawn/parse a nested CLI or expose stderr/stdout tails. `xenoid_status` remains observational.
 
 On macOS, install it as a user LaunchAgent so it retains access to the user's
 Colima VM and `~/.xenoid`. On Linux ARM64, set the systemd `User`, `HOME`, and
@@ -246,6 +260,14 @@ Node and lifecycle commands:
 
 `set`, `subscribe`, and `import` enable by default; add `--no-enable` to stage a source. `list`, `status`, MCP results, and daemon status never return source values, credentials, provider URLs, cache keys, paths, or configuration digests. `./xenoid up` converges any saved enabled source before declaring the runtime ready.
 
+Proxy desired-state v2 is encrypted by its own app-private AES-256-GCM key and crash-resume transaction store; it is independent of the KeyMint keybox. If proxy state is unreadable, status reports a safe error and host quarantine remains installed. Recover only by authenticated `proxy import FILE` or by the explicit evidence-preserving source-less operation:
+
+```bash
+./xenoid proxy clear --discard-unreadable-state
+```
+
+Ordinary `proxy clear` refuses unreadable state. It never silently generates an empty state or releases direct egress. A proxy failure cannot hide Keybox/location/camera/root diagnostics, and a Keybox failure cannot modify proxy generations or keys.
+
 The Docker engine host must provide root/sudo, systemd, Python 3, iproute2, and IPv4/IPv6 netfilter support. Xenoid installs missing supported distro packages and a digest-pinned Mihomo binary on first use. The proxy namespace and listener stay on that host, including with a remote Linux Docker context; Android retains its normal cellular data interface (`rmnet_data0`) and route.
 
 If activation returns `data_plane_unverified`, inspect `./xenoid proxy status --check`. The per-instance quarantine intentionally remains closed until the exact current generation proves every requested IPv4/IPv6 DNS, TCP, and UDP capability. A stopped daemon, engine dependency failure, mismatched container identity, stale check, or inaccessible upstream cannot fall back to direct traffic. Use `./xenoid proxy off` to make an explicit fail-open operator decision, or fix the source/upstream and run `./xenoid proxy on`.
@@ -260,7 +282,7 @@ Android application network checks treat raw route-netlink `RTM_GETLINK` `EACCES
 ./xenoid root exec id
 ```
 
-Privileged operations pass through the daemon and loopback-only `xenoid-rootd`. Mutating requests require the per-instance token provisioned under `.xenoid/`; the Android rootfs exposes no persistent application-visible `su` path.
+Privileged operations pass through the daemon and loopback-only `xenoid-rootd`. The only durable credential is a strictly validated app-private daemon file. The host reads it only through a metadata-validated bounded engine pipe into a container-ID-bound memory buffer, passes it to rootd on stdin, then zeroizes it; no host token file/cache, argv/environment value, generic result, or progress field exists. Missing/malformed credentials, failed root UID/authentication proof, and unowned listener conflicts fail closed.
 
 ## Android 13 KeyMint keybox
 
@@ -277,7 +299,7 @@ The source must be a nonempty regular file owned by the current user, not a syml
 
 The CLI sends only staging metadata through the authenticated daemon and token-gated rootd boundary. The raw keybox is retained only in daemon app-private no-backup storage with mode `0600`; the transient encoded configuration exists only for the one-shot local control transaction. `status` is intentionally redacted and reports only configured/ready/active state, fixed safe errors, algorithm availability, and certificate-chain counts. There is no keybox MCP tool or remote-service operation.
 
-`set` replaces the one complete generation-mode profile after the native control endpoint acknowledges it. A successful `clear` first replaces the native profile set with zero profiles and only then deletes persistent raw state; if native deactivation fails, the saved state remains for recovery. `up` and daemon startup synchronously reapply configured state before reporting ready. No configured keybox is a healthy inactive state.
+Listener startup and Keybox recovery are separate. The daemon binds transport before constructing/reconciling components; the bounded bootstrap worker later reconciles Keybox after authenticated root is available. An unconfigured inactive keybox is healthy. Configured failure is reported independently and can fail final `up`, but it cannot prevent proxy/root/location/camera diagnosis or mutate proxy encryption state.
 
 This path supports only Android 13 ARM64 and scopes generated attestations to `com.google.android.gms` and `com.android.vending` (with installed UID fallback). The simulator executes key operations in software while reporting the configured KeyMint TEE metadata; it is not hardware-backed key custody and does not prove Play Integrity or Google device certification. Other packages continue through stock KeyMint behavior.
 
@@ -328,7 +350,9 @@ python -m pip install frida-tools
 
 The production template is Android 13 Pixel 6 Pro `raven`, model `G8V0U`, build `TP1A.221005.002`/`9012097`, shipping API 31. Profile application converges SettingsProvider, partition/property-area identity, display/input, native sensor and camera HAL inputs, battery, memory/storage, and reboot-persistent data. Recollect the complete profile after a change.
 
-`device regenerate` performs the one-shot new-device rotation on a live instance: stable identifiers, the lease network epoch (container MAC), boot-scoped values, data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell, same country) all rotate; on GMS instances the Google services apps are cleared so the advertising ID regenerates. The container is recreated and the full `up` convergence and validation re-run. User data, installed apps, keystore state, and the location country/carrier are preserved. An interrupted regenerate is journaled: `start`/`up` fail closed with `device_regeneration_pending` until `device regenerate` is re-run to completion.
+`device regenerate` creates a private `dev.xenoid.device-regenerate/v2` transaction and generates every stable/network/SIM/data/rootfs target exactly once before mutation. It quarantines, removes the owned container, commits each fixed target idempotently, and invokes the convergence executor directly. Fresh pre-Google acceptance gates the allowlisted package clears; fresh final acceptance gates journal deletion. User data, installed apps, keystore state, proxy/Keybox semantics, and location country/carrier are preserved.
+
+An interrupted v2 transaction is resumable by either `device regenerate` or plain `up`; both reuse recorded targets and completed phases. A legacy v1 journal lacks the values required for exactly-once recovery, so ordinary `up` fails `device_regeneration_legacy_pending`. The only destructive escape is `./xenoid device regenerate --restart-legacy-transaction`, which records a digest of the v1 evidence and atomically publishes a complete v2 target before mutation; factors already changed by v1 may rotate once more.
 
 ## Applications, input, and automation
 
@@ -344,7 +368,7 @@ The production template is Android 13 Pixel 6 Pro `raven`, model `G8V0U`, build 
 
 The daemon requires the init-managed native input service. Its persistent profile-backed touchscreen writes Linux `input_event` records through `/dev/uinput`; Android InputReader consumes the published `/dev/input/event*` node. Tap and swipe never fall back to the framework `input` command, accessibility, or instrumentation.
 
-## Protection policy
+## Shared protection policy
 
 ```bash
 ./xenoid hide status
@@ -352,17 +376,23 @@ The daemon requires the init-managed native input service. Its persistent profil
 ./xenoid ebpf status
 ```
 
-Production protection combines image state, property-area normalization, mount overlays, the zygote compatibility layer, eBPF/kernel enforcement, and framework/HAL services. Kmod/eBPF own SELinux compatibility metadata, ordinary-app access denial, and isolated-app ptrace parity; per-instance overlays do not remount SELinux controls. `up` owns deployment and activation; individual build/load commands are for diagnosis and development.
+`SharedProtectionManager` owns one root-managed kmod/eBPF deployment per selected Docker engine host. Its digest binds the engine/kernel/config/BTF/headers, source/build scripts, tools/loader, attach mode, and probe contract. Status reports safe engine hash, expected/current digest, reuse/replacement state, and maintenance requirement—never endpoints, host paths, tokens, or instance-private data.
+
+A matching module/link/map inventory is reused across instances. eBPF replacement stages transactional pins before swapping; kmod replacement requires zero active owned runtimes and restores a digest-matched last-known-good module on failure. If a sibling runtime is active, `up` returns `shared_protection_reload_requires_maintenance` without disrupting it. Stop every owned runtime, then rerun `up`; public `stop` never unloads protection. Direct eBPF unload is maintenance-only and requires `./xenoid ebpf unload --maintenance` with zero active runtimes.
 
 ## Build and release
 
 ```bash
 ./xenoid build all
+./xenoid build all --force
+./scripts/verify.sh --fresh
 ./xenoid package-release --version 0.1.0
 ./xenoid verify-release dist/release/xenoid-0.1.0.tar.gz
 ```
 
-Release bundles include the CLI, MCP server, non-proprietary runtime assets, daemon APK, native helpers, configuration examples, public Google release metadata, skill files, doctor metadata, and SHA-256 manifests. Imported Google archives, certificates, and expanded payloads are excluded.
+Normal builds reuse content-addressed artifact records; `--force` rebuilds and rejects nondeterministic output for an unchanged input/tool identity. Release packaging runs the non-recursive release gate profile fresh, stages validated immutable objects, creates canonical OTA/package archives with fixed `SOURCE_DATE_EPOCH`, and requires `verify-release` on the candidate before publication. Packaged `doctor.json` is deliberately offline with `complete=false`; sanitized gate evidence is not a live-runtime claim.
+
+Public releases exclude imported Google bytes, credentials/tokens/cookies, private registry/endpoint details, proxy sources or keys, Keybox bytes, runtime state, captures/device identifiers, workstation paths, and assessment details.
 
 ## OTA
 
@@ -379,6 +409,9 @@ Release bundles include the CLI, MCP server, non-proprietary runtime assets, dae
 ./xenoid mcp-config
 ./xenoid-mcp
 ```
+Put the repository `xenoid-mcp` launcher on the MCP client's `PATH`.
+`mcp-config` deliberately emits no absolute workspace path.
+
 
 `xenoid-mcp` is a trusted-local, fixed-instance stdio adapter. The networked,
 scope-filtered multi-instance adapter is `xenoid-service` at `POST /mcp`. Both

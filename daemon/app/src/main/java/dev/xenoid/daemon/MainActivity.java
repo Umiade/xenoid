@@ -208,7 +208,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        startForegroundService(new Intent(this, XenoidDaemonService.class));
+        requestDaemonService();
 
         Intent intent = getIntent();
         if (intent != null && intent.getBooleanExtra(EXTRA_BOOTSTRAP, false)) {
@@ -235,6 +235,20 @@ public class MainActivity extends Activity {
         settingsMode = true;
         buildSettingsScreen();
         initializeMediaManager();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        requestDaemonService();
+        if (intent != null && intent.getBooleanExtra(EXTRA_BOOTSTRAP, false)) {
+            moveTaskToBack(true);
+            finish();
+        }
+    }
+
+    private void requestDaemonService() {
+        startForegroundService(new Intent(this, XenoidDaemonService.class));
     }
 
     @Override protected void onResume() {

@@ -2,6 +2,8 @@
 """Root-only, exact-manifest Xenoid transparent proxy engine helper."""
 from __future__ import annotations
 import concurrent.futures
+import ctypes
+import http.client
 import argparse, array, binascii, fcntl, grp, hashlib, ipaddress, json, os, platform, pwd, re
 import select, signal, socket, stat, struct, subprocess, sys, tempfile, time, uuid, zlib
 from pathlib import Path
@@ -254,6 +256,19 @@ def validate_owner(m,o):
   integer(value["generation"],0,(1<<63)-1)
   if value["name"] not in ("a","b"):raise Error("ownership_invalid")
   if field=="candidate" and (not owned_path(m,value["path"]) or not HEX64.fullmatch(string(value["sha256"]))):raise Error("ownership_invalid")
+def sentinel_owner_transition(m,o):
+ if m["containerId"]=="0"*64:return False
+ sentinel={key:value for key,value in m.items() if not key.startswith("_")};sentinel["containerId"]="0"*64
+ sentinel["runtimeEpoch"]=o.get("runtimeEpoch")
+ sentinel["generation"]=o.get("manifestGeneration")
+ sentinel["manifestDigest"]=o.get("manifestDigest")
+ return (
+  isinstance(sentinel["runtimeEpoch"],str)
+  and isinstance(sentinel["generation"],int)
+  and manifest_digest(sentinel)==o.get("manifestDigest")
+  and lease_digest(sentinel)==o.get("leaseDigest")
+ )
+
 def owner(m,create=True):
  mkdir(STATE,0o711);mkdir(m["_state"],0o700);p=owner_path(m)
  if not p.exists():
@@ -262,17 +277,29 @@ def owner(m,create=True):
  o=read_json(p,"ownership_invalid")
  exact(o,("schema","instanceId","resourceTag","runtimeEpoch","manifestDigest","leaseDigest","manifestGeneration","appliedGeneration","phase","activeCandidate","candidate","previous","binarySha256","pythonPath","resources"),"ownership_invalid")
  validate_owner(m,o)
- if o["schema"]!=OWNER_SCHEMA or any(o[k]!=m[k] for k in ("instanceId","resourceTag")) or o["leaseDigest"]!=lease_digest(m) or o["pythonPath"]!=str(Path(sys.executable).resolve()) or o["binarySha256"]!=m["engine"]["binarySha256"]:raise Error("ownership_mismatch")
+ if o["schema"]!=OWNER_SCHEMA or any(o[k]!=m[k] for k in ("instanceId","resourceTag")) or o["pythonPath"]!=str(Path(sys.executable).resolve()) or o["binarySha256"]!=m["engine"]["binarySha256"]:raise Error("ownership_mismatch")
+ sentinel_transition=sentinel_owner_transition(m,o)
+ if o["leaseDigest"]!=lease_digest(m) and not sentinel_transition:raise Error("ownership_mismatch")
  if o["runtimeEpoch"]!=m["runtimeEpoch"]:
   if not create:raise Error("ownership_mismatch")
-  return rotate_owner(m,o)
+  return rotate_owner(
+   m,o,allow_stopped=o.get("phase") in ("off","quarantine")
+  )
  if create and any(resource.get("scope")=="epoch-temporary" for resource in o["resources"]):recover_epoch_transaction(m,o)
  if m["generation"]<o["manifestGeneration"]:raise Error("generation_stale")
  if not create and (m["generation"]!=o["manifestGeneration"] or m["manifestDigest"]!=o["manifestDigest"]):raise Error("ownership_mismatch")
- if create:o["manifestGeneration"],o["manifestDigest"]=m["generation"],m["manifestDigest"];save_owner(m,o)
  return o
 def remember(m,o,r):
- if r not in o["resources"]:o["resources"].append(r);save_owner(m,o)
+ if r.get("kind")=="file":
+  o["resources"]=[
+   resource for resource in o["resources"]
+   if not (
+    resource.get("kind")=="file"
+    and resource.get("path")==r.get("path")
+   )
+  ]
+ if r not in o["resources"]:o["resources"].append(r)
+ save_owner(m,o)
 def command_resource(o,delete,scope):
  return next((resource for resource in o["resources"] if resource.get("kind")=="command" and resource.get("delete")==delete and resource.get("scope")==scope),None)
 def mutate(m,o,create,delete,code,scope="transient"):
@@ -316,9 +343,9 @@ def prerequisites():
  if "TPROXY" not in targets4 or "REDIRECT" not in targets4 or "socket" not in matches4:raise Error("tproxy_unsupported")
  if "TPROXY" not in targets6 or "REDIRECT" not in targets6 or "socket" not in matches6:raise Error("ipv6_unsupported")
 def install_deps():
- if tool_opt("apk"):run([tool("apk"),"add","--no-cache","python3","py3-cryptography","py3-yaml","iproute2","iptables","util-linux","libcap","ca-certificates","curl","conntrack-tools","shadow","build-base","procps"],code="dependency_install_failed")
- elif tool_opt("apt-get"):run([tool("apt-get"),"update"],code="dependency_install_failed");run([tool("apt-get"),"install","-y","--no-install-recommends","python3","python3-cryptography","python3-yaml","iproute2","iptables","util-linux","libcap2-bin","ca-certificates","curl","conntrack","gcc","libc6-dev","procps"],code="dependency_install_failed")
- elif tool_opt("dnf"):run([tool("dnf"),"install","-y","python3","python3-cryptography","python3-pyyaml","iproute","iptables","util-linux","libcap","ca-certificates","curl","conntrack-tools","shadow-utils","gcc","glibc-devel","procps-ng"],code="dependency_install_failed")
+ if tool_opt("apk"):run([tool("apk"),"add","--no-cache","python3","py3-cryptography","py3-yaml","iproute2","iptables","util-linux","libcap","ca-certificates","curl","conntrack-tools","shadow","procps"],code="dependency_install_failed")
+ elif tool_opt("apt-get"):run([tool("apt-get"),"update"],code="dependency_install_failed");run([tool("apt-get"),"install","-y","--no-install-recommends","python3","python3-cryptography","python3-yaml","iproute2","iptables","util-linux","libcap2-bin","ca-certificates","curl","conntrack","procps"],code="dependency_install_failed")
+ elif tool_opt("dnf"):run([tool("dnf"),"install","-y","python3","python3-cryptography","python3-pyyaml","iproute","iptables","util-linux","libcap","ca-certificates","curl","conntrack-tools","shadow-utils","procps-ng"],code="dependency_install_failed")
  else:raise Error("package_manager_unsupported")
 def install_prerequisites():
  modprobe=tool_opt("modprobe")
@@ -380,20 +407,14 @@ def static_aarch64_elf(data):
  return all(struct.unpack_from("<I",data,program_offset+entry_size*index)[0]!=3 for index in range(entry_count))
 def install_sandbox(m):
  root=Path(__file__).resolve().parent
- prebuilt=next((path for path in (root/"xenoid-proxy-sandbox",Path("/usr/libexec/xenoid-proxy-sandbox.staged")) if path.is_file()),None)
- if prebuilt is not None:
-  data=prebuilt.read_bytes()
-  if not static_aarch64_elf(data):raise Error("install_artifact_missing")
-  atomic(SANDBOX,data,0o555);return
- source=next((path for path in (root.parent/"native/xenoid-proxy-sandbox"/"xenoid_proxy_sandbox.c",Path("/usr/share/xenoid/proxy/xenoid_proxy_sandbox.c")) if path.is_file()),None)
- if source is None:raise Error("install_artifact_missing")
- compiler=tool_opt("cc") or tool_opt("gcc")
- if compiler is None:raise Error("dependency_install_failed")
- uid,gid=ensure_user(m["users"]["compiler"],m["_state"]);build=m["_state"]/"sandbox-build";owned_dir(build,uid,gid,0o700);output=build/"xenoid-proxy-sandbox"
- run([tool("setpriv"),"--reuid",str(uid),"--regid",str(gid),"--init-groups","--no-new-privs","--bounding-set=-all",compiler,"-O2","-std=c11","-Wall","-Wextra","-Werror","-D_FORTIFY_SOURCE=3","-fstack-protector-strong","-fPIE","-static-pie","-Wl,-z,relro,-z,now","-Wl,-z,noexecstack",str(source),"-o",str(output)],code="sandbox_build_failed")
- data=output.read_bytes()
- if not static_aarch64_elf(data):raise Error("sandbox_build_failed")
- atomic(SANDBOX,data,0o555);output.unlink();build.rmdir()
+ prebuilt=root/"xenoid-proxy-sandbox"
+ try:state=prebuilt.lstat()
+ except OSError as exc:raise Error("install_artifact_missing") from exc
+ if not stat.S_ISREG(state.st_mode) or state.st_nlink!=1:raise Error("install_artifact_missing")
+ try:data=prebuilt.read_bytes()
+ except OSError as exc:raise Error("install_artifact_missing") from exc
+ if not static_aarch64_elf(data):raise Error("install_artifact_missing")
+ atomic(SANDBOX,data,0o555)
 def control_paths():
  package=PYTHON_ROOT/"xenoid"
  return {ENGINE_HELPER:0o555,AGENT_SERVICE:0o644,SANDBOX:0o555,Path("/usr/libexec/xenoid-proxy-agent.py"):0o555,Path("/usr/libexec/xenoid-proxy-compile-worker.py"):0o555,Path("/usr/libexec/xenoid-proxy-fetch-worker.py"):0o555,package/"__init__.py":0o444,package/"proxy_source.py":0o444,package/"proxy_protocol.py":0o444,}
@@ -874,7 +895,21 @@ def runtime_dir(m):
  if (s.st_uid,s.st_gid,stat.S_IMODE(s.st_mode))!=(0,0,0o711):raise Error("unsafe_path")
  return path
 def process_files(m,o,p,c,g,state_name):
- account=pwd.getpwnam(m["users"]["proxy"]);runtime=runtime_dir(m);state=runtime/state_name;owned_dir(state,account.pw_uid,account.pw_gid,0o700);remember(m,o,{"kind":"tree","path":str(state),"uid":account.pw_uid,"gid":account.pw_gid});root_file(p);config=runtime/f"config-{c}-{g}.yaml";data=p.read_bytes();atomic(config,data,0o640,0,account.pw_gid);remember(m,o,{"kind":"file","path":str(config),"sha256":hashlib.sha256(data).hexdigest()});return config,state
+ account=pwd.getpwnam(m["users"]["proxy"])
+ runtime=runtime_dir(m);state=runtime/state_name
+ owned_dir(state,account.pw_uid,account.pw_gid,0o700)
+ remember(m,o,{"kind":"tree","path":str(state),"uid":account.pw_uid,"gid":account.pw_gid})
+ root_file(p);config=runtime/f"config-{c}-{g}.yaml";data=p.read_bytes()
+ if config.exists():
+  metadata=config.lstat()
+  if (
+   stat.S_ISLNK(metadata.st_mode)
+   or not stat.S_ISREG(metadata.st_mode)
+   or (metadata.st_uid,metadata.st_gid,stat.S_IMODE(metadata.st_mode),metadata.st_nlink)!=(0,account.pw_gid,0o640,1)
+  ):raise Error("ownership_mismatch")
+ atomic(config,data,0o640,0,account.pw_gid)
+ remember(m,o,{"kind":"file","path":str(config),"sha256":hashlib.sha256(data).hexdigest()})
+ return config,state
 def launch(m,o,p,c,g,n):
  validate_binary(m)
  uid,gid=ensure_user(m["users"]["proxy"],m["_state"]);config,state=process_files(m,o,p,c,g,f"mihomo-{c}-{g}")
@@ -917,7 +952,7 @@ def outbound_ready(m,controller_port,secret):
    except (json.JSONDecodeError,AttributeError):delay=None
    if isinstance(delay,int) and not isinstance(delay,bool) and delay>=0:return
   time.sleep(.25)
- raise Error("engine_health_failed")
+ raise Error("proxy_outbound_unavailable")
 def stop(m,n,child=None):
  p=proc_path(m,n)
  if not p.exists():return
@@ -1057,7 +1092,9 @@ def validate_ipc(m):
  if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_uid,metadata.st_gid,stat.S_IMODE(metadata.st_mode))!=(0,agent.pw_gid,0o660):raise Error("ipc_unavailable")
  return True
 def status(m,o,expected_generation=None):
- n=names(m);validate_control();validate_provider_cache(m);validate_ipc(m);phase_state=o["phase"];process=None;generation=None;candidate=None;config_path=None
+ n=names(m);validate_control();validate_provider_cache(m);phase_state=o["phase"]
+ if phase_state!="off":validate_ipc(m)
+ process=None;generation=None;candidate=None;config_path=None
  if phase_state=="applied":
   process=proc_path(m,"process");generation=o["appliedGeneration"];candidate=o["activeCandidate"];config_path=Path(m["paths"]["config"])
  elif phase_state=="applied-pending":
@@ -1182,7 +1219,16 @@ def cleanup(m,o):
   if resource["kind"]=="file":
    path=Path(resource["path"])
    if path.exists():
-    if sha(path)!=resource["sha256"]:raise Error("cleanup_incomplete")
+    actual=sha(path)
+    if actual!=resource["sha256"]:
+     recoverable=any(
+      candidate.get("kind")=="file"
+      and candidate.get("path")==resource["path"]
+      and candidate.get("sha256")==actual
+      for candidate in o["resources"][:-1]
+     )
+     if not recoverable:raise Error("cleanup_incomplete")
+     o["resources"].pop();save_owner(m,o);continue
     path.unlink()
   elif resource["kind"]=="tree":
    path=Path(resource["path"])
@@ -1212,13 +1258,13 @@ def recover_epoch_transaction(m,o):
  quarantine(m,o)
  for resource in reversed(temporary):
   remove_command_resource(resource);o["resources"].remove(resource);save_owner(m,o)
-def rotate_owner(m,o):
+def rotate_owner(m,o,allow_stopped=False):
  old=dict(m);old["runtimeEpoch"]=o["runtimeEpoch"];old["generation"]=o["manifestGeneration"];old["manifestDigest"]=o["manifestDigest"]
  record_path=server_record(old)
  if record_path.exists():
   record=read_json(record_path,"process_identity_mismatch")
   if record.get("pid")==os.getpid():raise Error("instance_busy")
- live(m);quarantine(old,o);comment=f"xenoid-proxy/{m['resourceTag']}/epoch-rotation/{m['runtimeEpoch']}"
+ live(m,False,allow_stopped);quarantine(old,o);comment=f"xenoid-proxy/{m['resourceTag']}/epoch-rotation/{m['runtimeEpoch']}"
  for executable in (tool("iptables"),tool("ip6tables")):
   args=["-i",m["bridgeName"],"-m","mac","--mac-source",m["android"]["mac"],"-m","comment","--comment",comment,"-j","DROP"]
   rule(m,o,executable,"filter","DOCKER-USER",args,True,scope="epoch-temporary")
@@ -1277,6 +1323,115 @@ def sealed(fd):
  os.lseek(fd,0,0);data=os.read(fd,MAX_CONFIG+1)
  if len(data)!=s.st_size:raise Error("ipc_fd_invalid")
  return data
+def sealed_payload(name,payload):
+ if not hasattr(os,"memfd_create") or not payload or len(payload)>MAX_CONFIG:raise Error("ipc_unavailable")
+ descriptor=os.memfd_create(name,os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+ try:
+  offset=0
+  while offset<len(payload):
+   written=os.write(descriptor,payload[offset:])
+   if written<=0:raise OSError
+   offset+=written
+  os.lseek(descriptor,0,os.SEEK_SET)
+  seals=sum(getattr(fcntl,name,value) for name,value in (("F_SEAL_SEAL",1),("F_SEAL_SHRINK",2),("F_SEAL_GROW",4),("F_SEAL_WRITE",8)))
+  fcntl.fcntl(descriptor,getattr(fcntl,"F_ADD_SEALS",1033),seals)
+  return descriptor
+ except OSError as exc:
+  os.close(descriptor);raise Error("ipc_unavailable") from exc
+def write_pipe(descriptor,payload):
+ offset=0
+ while offset<len(payload):
+  written=os.write(descriptor,payload[offset:])
+  if written<=0:raise OSError
+  offset+=written
+def daemon_child(descriptor,namespace,manifest,payload,agent_token,timeout):
+ account=None;connection=None;frame=b"U"
+ try:
+  if not hasattr(os,"setns"):raise OSError
+  parent=os.getppid();libc=ctypes.CDLL(None,use_errno=True)
+  if parent<=1 or libc.prctl(1,signal.SIGKILL,0,0,0)!=0 or os.getppid()!=parent:
+   raise OSError
+  account=pwd.getpwnam(manifest["users"]["agent"])
+  os.setns(namespace,getattr(os,"CLONE_NEWNET",0x40000000));os.close(namespace);namespace=-1
+  if descriptor!=3:
+   os.dup2(descriptor,3);os.close(descriptor);descriptor=3
+  for entry in os.listdir("/proc/self/fd"):
+   try:inherited=int(entry)
+   except ValueError:continue
+   if inherited>3:
+    try:os.close(inherited)
+    except OSError:pass
+  os.setgroups([]);os.setgid(account.pw_gid);os.setuid(account.pw_uid)
+  connection=http.client.HTTPConnection("127.0.0.1",manifest["daemon"]["port"],timeout=timeout)
+  connection.request("POST","/proxy/agent",body=payload,headers={
+   "Content-Type":"application/json",
+   "Content-Length":str(len(payload)),
+   "Connection":"close",
+   "X-Xenoid-Agent-Token":agent_token,
+  })
+  response=connection.getresponse();body=response.read(MAX_CONFIG+1)
+  frame=b"O"+body if response.status==200 and 0<len(body)<=MAX_CONFIG else b"A"
+ except Exception:
+  frame=b"U"
+ finally:
+  if namespace>=0:
+   try:os.close(namespace)
+   except OSError:pass
+  if connection is not None:
+   try:connection.close()
+   except Exception:pass
+ try:write_pipe(descriptor,frame)
+ except OSError:pass
+ os._exit(0)
+def stop_relay(pid):
+ try:os.kill(pid,signal.SIGKILL)
+ except ProcessLookupError:pass
+ try:os.waitpid(pid,0)
+ except ChildProcessError:pass
+def daemon_request(manifest,payload,agent_token,timeout_ms):
+ if not isinstance(agent_token,str) or len(agent_token)!=44 or any(character.isspace() for character in agent_token):raise Error("ipc_request_invalid")
+ try:decoded=bytearray(binascii.a2b_base64(agent_token,strict_mode=True))
+ except (binascii.Error,ValueError) as exc:raise Error("ipc_request_invalid") from exc
+ valid_token=len(decoded)==32
+ for index in range(len(decoded)):decoded[index]=0
+ if not valid_token:raise Error("ipc_request_invalid")
+ if isinstance(timeout_ms,bool) or not isinstance(timeout_ms,int) or not 1000<=timeout_ms<=70000:raise Error("ipc_request_invalid")
+ if not payload or len(payload)>MAX_CONFIG or b"\0" in payload:raise Error("ipc_request_invalid")
+ first=runtime_inspect(manifest);state=first.get("State") if isinstance(first,dict) else None;pid=state.get("Pid") if isinstance(state,dict) else None
+ if isinstance(pid,bool) or not isinstance(pid,int) or pid<=1 or state.get("Running") is not True:raise Error("runtime_identity_mismatch")
+ try:namespace=os.open(f"/proc/{pid}/ns/net",os.O_RDONLY|os.O_CLOEXEC)
+ except OSError as exc:raise Error("runtime_identity_mismatch") from exc
+ second=runtime_inspect(manifest);second_state=second.get("State") if isinstance(second,dict) else None
+ if not isinstance(second_state,dict) or second_state.get("Pid")!=pid or second_state.get("Running") is not True:
+  os.close(namespace);raise Error("runtime_identity_mismatch")
+ read_descriptor,write_descriptor=os.pipe2(os.O_CLOEXEC)
+ try:child=os.fork()
+ except OSError as exc:
+  os.close(read_descriptor);os.close(write_descriptor);os.close(namespace)
+  raise Error("ipc_unavailable") from exc
+ if child==0:
+  os.close(read_descriptor)
+  daemon_child(write_descriptor,namespace,manifest,payload,agent_token,timeout_ms/1000.0)
+ os.close(write_descriptor);os.close(namespace)
+ output=bytearray();poller=select.poll();poller.register(read_descriptor,select.POLLIN|select.POLLHUP|select.POLLERR);deadline=time.monotonic()+timeout_ms/1000.0+5.0;reaped=False
+ try:
+  while True:
+   remaining=deadline-time.monotonic()
+   if remaining<=0:raise Error("agent_channel_unreachable")
+   events=poller.poll(max(1,int(remaining*1000)))
+   if not events:raise Error("agent_channel_unreachable")
+   chunk=os.read(read_descriptor,65536)
+   if not chunk:break
+   output.extend(chunk)
+   if len(output)>MAX_CONFIG+1:raise Error("agent_channel_auth_failed")
+  _,status=os.waitpid(child,0);reaped=True
+  if status!=0 or not output:raise Error("agent_channel_unreachable")
+ finally:
+  os.close(read_descriptor)
+  if not reaped:stop_relay(child)
+ if output[0]==ord("A"):raise Error("agent_channel_auth_failed")
+ if output[0]!=ord("O") or len(output)==1:raise Error("agent_channel_unreachable")
+ return bytes(output[1:])
 def worker(m,kind):
  path=Path(f"/usr/libexec/xenoid-proxy-{'compile' if kind=='Compiler' else 'fetch'}-worker.py");root_file(path,0o555);user=m["users"]["compiler" if kind=="Compiler" else "fetcher"];uid,gid=ensure_user(user,m["_state"]);read_input,write_input=os.pipe2(os.O_CLOEXEC);read_output,write_output=os.pipe2(os.O_CLOEXEC);devnull=os.open("/dev/null",os.O_WRONLY)
  command=[tool("setpriv"),"--pdeathsig","KILL","--reuid",str(uid),"--regid",str(gid),"--init-groups","--no-new-privs","--bounding-set=-all",str(path)]
@@ -1332,14 +1487,21 @@ def serve(m,listener):
    if json.dumps(request,ensure_ascii=True,sort_keys=True,separators=(",",":")).encode()!=packet:raise Error("ipc_request_invalid")
    exact(request,("schema","method","instanceId","resourceTag","runtimeEpoch","manifestDigest","generation","body"),"ipc_request_invalid")
    if request["schema"]!=IPC_SCHEMA or any(request[key]!=m[key] for key in ("instanceId","resourceTag","runtimeEpoch","manifestDigest")):raise Error("ipc_identity_mismatch")
-   _REQUEST_DEADLINE=time.monotonic()+25;lock_fd=request_lock()
-   manifest=load_manifest(str(m["_path"]));live(manifest);ownership=owner(manifest);method=request["method"];generation=integer(request["generation"],manifest["generation"],(1<<63)-1)
+   method=request["method"];_REQUEST_DEADLINE=time.monotonic()+25
+   if method!="daemonRequest":lock_fd=request_lock()
+   manifest=load_manifest(str(m["_path"]))
+   if any(request[key]!=manifest[key] for key in ("instanceId","resourceTag","runtimeEpoch","manifestDigest")):raise Error("ipc_identity_mismatch")
+   live(manifest);ownership=owner(manifest) if method!="daemonRequest" else None;generation=integer(request["generation"],manifest["generation"],(1<<63)-1)
    if method=="writeConfig" and request["body"]=={} and len(fds)==1:write_config(manifest,ownership,sealed(fds[0]),generation);body={}
    elif method=="apply" and isinstance(request["body"],dict) and set(request["body"])=={"target","commit"} and isinstance(request["body"]["commit"],bool):apply(manifest,ownership,request["body"]["target"],request["body"]["commit"],generation);body=status(manifest,ownership,generation)
    elif method=="status" and request["body"]=={} and not fds:body=status(manifest,ownership,generation)
    elif method=="prepare" and request["body"]=={} and not fds:prepare_runtime(manifest,ownership);body={}
    elif method=="off" and request["body"]=={} and not fds:off(manifest,ownership,generation);body=status(manifest,ownership,generation)
    elif method=="quarantine" and request["body"]=={} and not fds:quarantine(manifest,ownership);body={}
+   elif method=="daemonRequest" and isinstance(request["body"],dict) and set(request["body"])=={"agentToken","timeoutMs"} and len(fds)==1:
+    timeout_ms=request["body"]["timeoutMs"]
+    response=daemon_request(manifest,sealed(fds[0]),request["body"]["agentToken"],timeout_ms)
+    response_fds=[sealed_payload("xenoid-daemon-response",response)];body={"size":len(response)}
    elif method in ("spawnCompiler","spawnFetcher") and request["body"]=={} and not fds:
     if len(workers)>=4:raise Error("worker_limit")
     process,write_input,read_output=worker(manifest,method[5:]);worker_id=os.urandom(16).hex();workers[worker_id]=process;response_fds=[write_input,read_output];body={"workerId":worker_id}
@@ -1365,20 +1527,6 @@ def serve(m,listener):
     try:os.close(descriptor)
     except OSError:pass
    connection.close()
-def service_launch(m,o):
- if o["phase"] not in ("prepared","configured","quarantine","off","applied","applied-pending"):raise Error("engine_not_prepared")
- validate_control();validate_accounts(m);quarantine(m,o);listener=open_ipc_listener(m);pid=os.fork()
- if pid==0:
-  try:serve(m,listener)
-  finally:os._exit(1)
- listener.close()
- try:
-  record=server_id(pid);atomic(server_record(m),json.dumps(record,sort_keys=True,separators=(",",":")).encode()+b"\n",0o600)
-  os.execv("/usr/libexec/xenoid-proxy-agent.py",["/usr/libexec/xenoid-proxy-agent.py","--manifest",str(m["_path"])])
- except BaseException:
-  try:os.kill(pid,signal.SIGKILL)
-  except ProcessLookupError:pass
-  raise
 def discard_key(m):
  path=Path(m["paths"]["key"])
  try:metadata=path.lstat()
@@ -1386,6 +1534,26 @@ def discard_key(m):
  root_file(path,0o400)
  if metadata.st_nlink!=1:raise Error("agent_key_invalid")
  path.unlink()
+ directory=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|getattr(os,"O_NOFOLLOW",0))
+ try:os.fsync(directory)
+ finally:os.close(directory)
+def service_launch(m,o):
+ pid=-1
+ try:
+  if o["phase"] not in ("prepared","configured","quarantine","off","applied","applied-pending"):raise Error("engine_not_prepared")
+  validate_control();validate_accounts(m);quarantine(m,o);listener=open_ipc_listener(m);pid=os.fork()
+  if pid==0:
+   try:serve(m,listener)
+   finally:os._exit(1)
+  listener.close();record=server_id(pid);atomic(server_record(m),json.dumps(record,sort_keys=True,separators=(",",":")).encode()+b"\n",0o600)
+  os.execv("/usr/libexec/xenoid-proxy-agent.py",["/usr/libexec/xenoid-proxy-agent.py","--manifest",str(m["_path"])])
+ except BaseException:
+  try:discard_key(m)
+  except BaseException:pass
+  if pid>0:
+   try:os.kill(pid,signal.SIGKILL)
+   except ProcessLookupError:pass
+  raise
 def parser():
  p=Parser(allow_abbrev=False);s=p.add_subparsers(dest="action",required=True)
  for x in ("check-control","prepare-host","install-control","install-asset","discard-key","prepare","write-config","apply","off","status","quarantine","cleanup","service"):q=s.add_parser(x,allow_abbrev=False);q.add_argument("--manifest",required=True)

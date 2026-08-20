@@ -515,10 +515,7 @@ import json, pathlib, sys
 outer = json.load(open(sys.argv[1], encoding='utf-8'))
 if outer.get('ok') is not True:
     raise SystemExit(1)
-nested = json.loads(outer.get('stdout', ''))
-if nested.get('ok') is not True:
-    raise SystemExit(1)
-parts = nested.get('stdout', '').split()
+parts = str(outer.get('stdout', '')).split()
 if len(parts) != 4 or any(not part.isdigit() for part in parts):
     raise SystemExit(1)
 values = [int(part) for part in parts]

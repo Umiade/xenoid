@@ -4,8 +4,8 @@ LLVM_STRIP ?= llvm-strip
 BPFTOOL ?= bpftool
 ARCH := $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/' -e 's/armv.*/arm/')
 INCLUDES := -I. -I/usr/include -I/usr/include/$(shell uname -m)-linux-gnu
-BPF_CFLAGS := -target bpf -O2 -g -D__TARGET_ARCH_$(ARCH) $(INCLUDES) -Wall
-USER_CFLAGS := -O2 -g -Wall $(INCLUDES)
+BPF_CFLAGS := -target bpf -O2 -g -ffile-prefix-map=$(CURDIR)=. -fdebug-prefix-map=$(CURDIR)=. -D__TARGET_ARCH_$(ARCH) $(INCLUDES) -Wall
+USER_CFLAGS := -O2 -g -ffile-prefix-map=$(CURDIR)=. -fdebug-prefix-map=$(CURDIR)=. -Wall $(INCLUDES)
 USER_LDFLAGS := -lbpf -lelf -lz
 
 .PHONY: all clean vmlinux skeleton

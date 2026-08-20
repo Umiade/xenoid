@@ -263,8 +263,8 @@ final class DeviceProfileManager {
                 throw new IllegalStateException("input_driver_reload_failed");
             }
             Map<String,Object> overlay = RootHelper.exec(
-                    "test -x /data/local/tmp/xenoid-overlay-helper"
-                    + " && /data/local/tmp/xenoid-overlay-helper apply"
+                    "test -x /system/bin/xenoid-overlay-helper"
+                    + " && /system/bin/xenoid-overlay-helper apply"
                     + " >/data/local/tmp/xenoid-overlay.log 2>&1");
             actions.add(overlay);
             if (!Boolean.TRUE.equals(overlay.get("ok"))) {
@@ -623,10 +623,10 @@ final class DeviceProfileManager {
         } else if ("boot_id".equals(field)) {
             actions.add(RootHelper.exec("setprop persist.xenoid.boot_id " + RootHelper.shellQuote(value)));
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/boot_id"));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+            actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if ("random_uuid".equals(field)) {
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/random_uuid"));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+            actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if ("imei".equals(field) || "persist.xenoid.radio.imei".equals(field)) {
             actions.add(RootHelper.exec("setprop persist.xenoid.radio.imei " + RootHelper.shellQuote(value)));
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/imei"));
@@ -641,14 +641,14 @@ final class DeviceProfileManager {
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(serial + "\n") + " > /data/local/tmp/xenoid-profile/serial"));
             actions.add(RootHelper.exec("resetprop ro.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || setprop ro.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || true"));
             actions.add(RootHelper.exec("resetprop ro.boot.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || setprop ro.boot.serialno " + RootHelper.shellQuote(serial) + " 2>/dev/null || true"));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+            actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if (field.startsWith("ro.") || field.startsWith("persist.")) {
             actions.add(RootHelper.exec("resetprop " + RootHelper.shellQuote(field) + " " + RootHelper.shellQuote(value) + " 2>/dev/null || setprop " + RootHelper.shellQuote(field) + " " + RootHelper.shellQuote(value) + " || true"));
         } else if (field.startsWith("usb.")) {
             String key = field.substring("usb.".length()).replace('-', '_');
             String outName = "usb_" + key;
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/" + outName));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+            actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if (field.startsWith("network.") || "mac".equals(field)
                 || "mac_address".equals(field) || "wifi_mac".equals(field)
                 || "ip".equals(field) || "ip_address".equals(field)
@@ -679,8 +679,8 @@ final class DeviceProfileManager {
             }
             if (refreshBattery) {
                 actions.add(RootHelper.exec(
-                        "test -x /data/local/tmp/xenoid-overlay-helper"
-                        + " && /data/local/tmp/xenoid-overlay-helper apply"
+                        "test -x /system/bin/xenoid-overlay-helper"
+                        + " && /system/bin/xenoid-overlay-helper apply"
                         + " >/data/local/tmp/xenoid-overlay.log 2>&1"));
                 actions.add(RootHelper.exec(BATTERY_HEALTH_REFRESH));
             }
@@ -692,7 +692,7 @@ final class DeviceProfileManager {
             if (zone.length() == 0) zone = "0";
             String outName = "type".equals(key) ? "thermal_zone" + zone + "_type" : "thermal_zone" + zone + "_temp";
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/" + outName));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+            actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if (field.startsWith("display.")) {
             String key = field.substring("display.".length()).replace('-', '_');
             String outName = "densityDpi".equals(key) || "density_dpi".equals(key)
@@ -702,14 +702,14 @@ final class DeviceProfileManager {
                     + RootHelper.shellQuote(value + "\n") + " > "
                     + RootHelper.shellQuote("/data/local/tmp/xenoid-profile/" + outName)));
             actions.add(RootHelper.exec(
-                    "test -x /data/local/tmp/xenoid-overlay-helper && "
-                    + "/data/local/tmp/xenoid-overlay-helper apply "
+                    "test -x /system/bin/xenoid-overlay-helper && "
+                    + "/system/bin/xenoid-overlay-helper apply "
                     + ">/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if (field.startsWith("input.") || field.startsWith("touch.")) {
             String key = field.substring(field.indexOf('.') + 1).replace('-', '_');
             String outName = ("name".equals(key) || "device_name".equals(key)) ? "input_name" : "input_" + key;
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/" + outName));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
+            actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if ("locale".equals(field) || "timezone".equals(field)) {
             out.put("ok", false);
             out.put("applied", false);

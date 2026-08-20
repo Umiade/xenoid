@@ -13,19 +13,14 @@ Modern AIDL/V1_5 conversion is untouched.
 from __future__ import annotations
 
 import hashlib
-import shutil
-import subprocess
 import sys
 import tempfile
-import urllib.request
 import zipfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from xenoid_archive import canonicalize_zip, publish_file_atomic, run_apktool
+
 EXPECTED_JAR_SHA256 = "3751dc61bde64590638904407f03a95c9ebe7078ea964a0133d47137ac794a8e"
-APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
-APKTOOL_SHA256 = "c0350abbab5314248dfe2ee0c907def4edd14f6faef1f5d372d3d4abd28f0431"
-APKTOOL_MAX_BYTES = 32 * 1024 * 1024
 
 OLD_V10 = """    new-array v9, v3, [I
 
@@ -144,28 +139,6 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def apktool() -> Path:
-    cache = ROOT / ".xenoid" / "cache" / "tooling" / "apktool_2.10.0.jar"
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    if cache.is_file() and sha256(cache) == APKTOOL_SHA256:
-        return cache
-    temporary = cache.with_suffix(".download")
-    temporary.unlink(missing_ok=True)
-    with urllib.request.urlopen(APKTOOL_URL, timeout=120) as response, temporary.open("xb") as output:
-        length = 0
-        while True:
-            chunk = response.read(64 * 1024)
-            if not chunk:
-                break
-            length += len(chunk)
-            if length > APKTOOL_MAX_BYTES:
-                raise RuntimeError("apktool_download_too_large")
-            output.write(chunk)
-    if sha256(temporary) != APKTOOL_SHA256:
-        temporary.unlink(missing_ok=True)
-        raise RuntimeError("apktool_sha256_mismatch")
-    temporary.replace(cache)
-    return cache
 
 
 def main() -> int:
@@ -180,15 +153,13 @@ def main() -> int:
         dex_names = [name for name in archive.namelist() if name.endswith(".dex")]
     if dex_names != ["classes.dex"]:
         raise RuntimeError("telephony_common_dex_layout_mismatch")
-    tool = apktool()
+    destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="xenoid-telephony-") as directory:
         work = Path(directory)
         decoded = work / "decoded"
-        staged = work / "telephony-common.jar"
-        subprocess.run(
-            ["java", "-jar", str(tool), "d", "-f", "-o", str(decoded), str(source)],
-            check=True,
-        )
+        staged = work / "telephony-common.apktool.jar"
+        canonical = work / "telephony-common.canonical.jar"
+        run_apktool(["d", "-f", "-o", str(decoded), str(source)])
         matches = list(decoded.glob("smali*/com/android/internal/telephony/RILUtils.smali"))
         if len(matches) != 1:
             raise RuntimeError("rilutils_smali_layout_mismatch")
@@ -214,19 +185,21 @@ def main() -> int:
         profile_smali.write_text(profile_text.replace(
             OLD_EMPTY_LEGACY_PROFILE_GUARD, EMPTY_LEGACY_PROFILE_CALL, 1
         ))
-        subprocess.run(
-            ["java", "-jar", str(tool), "b", "-f", "-o", str(staged), str(decoded)],
-            check=True,
-        )
-        with zipfile.ZipFile(staged) as archive:
+        run_apktool(["b", "-f", "-o", str(staged), str(decoded)])
+        canonicalize_zip(staged, canonical)
+        with zipfile.ZipFile(canonical) as archive:
+            dex_names = [name for name in archive.namelist() if name.endswith(".dex")]
+            if dex_names != ["classes.dex"]:
+                raise RuntimeError("patched_telephony_dex_layout_mismatch")
             dex = archive.read("classes.dex")
-        if (dex.count(b"getOperatingBandForEarfcn") != 1
-                or b"AccessNetworkUtils" not in dex
-                or b"persist.xenoid.radio.lte_band" not in dex
-                or b"persist.xenoid.radio.lte_bandwidth_khz" not in dex):
+        if (
+            dex.count(b"getOperatingBandForEarfcn") != 1
+            or b"AccessNetworkUtils" not in dex
+            or b"persist.xenoid.radio.lte_band" not in dex
+            or b"persist.xenoid.radio.lte_bandwidth_khz" not in dex
+        ):
             raise RuntimeError("patched_telephony_verification_failed")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(staged, destination)
+        publish_file_atomic(canonical, destination)
     print(destination)
     return 0
 

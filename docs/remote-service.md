@@ -19,9 +19,9 @@ remote users and model clients connect to.
   External config changes are therefore visible without restarting the service.
 - Mutations are serialized per instance in-process and across service processes.
   Different instances may run concurrently.
-- `xenoid_up` invokes the canonical `./xenoid --instance NAME up` convergence
-  path. It is the only remote operation that means the complete production
-  runtime is ready.
+- `xenoid_up` calls the shared in-process convergence executor. It is the only remote operation whose success means the complete production runtime passed fresh acceptance.
+- Its only optional tool property is `skipBuild`; the service-added `instance` remains required. Runtime reuse is automatic.
+- `xenoid_status` and other reads are strictly observational and never start/repair bootstrap, build, retag, reconcile, or claim the full `up` contract.
 - V1 operates initialized instances. Create or clone them with the local CLI;
   remote create, rename, delete, and lease release are intentionally absent.
 
@@ -29,6 +29,10 @@ The service must run as the same OS user, with the same `HOME`, project root,
 Docker/Colima access, and private `~/.xenoid` state as the normal Xenoid CLI.
 On macOS, use a user LaunchAgent rather than a root LaunchDaemon so the service
 sees the operator's Colima VM and instance state.
+
+Remote `xenoid_stop` quarantines, syncs, and stops the owned container but retains its immutable container ID and data volume. A following `xenoid_up` selects `start` for that same compatible container. Create/recreate decisions remain owned by the convergence planner.
+
+The daemon is listener-first: transport binds before component reconciliation, and runtime tools join the same authenticated root/component bootstrap used by CLI and stdio MCP. The service never stores a daemon/root credential; the runtime adapter may hold the app-private credential only in a container-ID-bound memory buffer. Missing/malformed credentials, failed root proof, proxy unreadability, and unowned listeners remain fail-closed.
 
 ## Create access
 
@@ -149,13 +153,11 @@ secret manager rather than committing it to a config file:
 }
 ```
 
-The transport is stateless HTTP. Clients call `server/discover`, then
-`tools/list`, then `xenoid_instances_list`; every instance tool includes a
-required `instance` property with the MCP `Instance` parameter-header binding.
-The service validates the 2026-07-28 request metadata and the
-`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and `Mcp-Param-Instance`
-headers against the JSON body. It returns one `application/json` response per
-POST; server-sent event streaming and GET sessions are not needed.
+The transport is stateless HTTP. Clients call `server/discover`, then `tools/list`, then `xenoid_instances_list`; every instance tool includes a required `instance` property with the MCP `Instance` parameter-header binding. The service validates the 2026-07-28 request metadata and the `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and `Mcp-Param-Instance` headers against the JSON body. It returns one `application/json` response per POST; server-sent event streaming and GET sessions are not needed.
+
+`xenoid_up` accepts `{instance,skipBuild?}`. `skipBuild=true` validates required content-addressed artifact records and immutable objects and fails on stale/missing evidence instead of compiling. The final value is `dev.xenoid.convergence/v1` with plan/resume, safe phase summaries, immutable before/after identifiers, and `nextActions`. CLI-only pre-hash JSONL progress/heartbeats are represented by those sanitized final phase summaries rather than raw remote streams.
+
+A remote `xenoid_up` also resumes a validated v2 regeneration journal through the same shared API and recorded fixed targets. A v1-only journal returns the legacy-recovery action; the explicit evidence-preserving restart remains local CLI only.
 
 Those dynamic `Mcp-*` headers are emitted by a 2026-07-28-compatible MCP HTTP
 transport, not by the static client configuration above. A client that only
@@ -171,11 +173,9 @@ Endpoints:
 | `GET /v1/instances` | Bearer token with `read` | Authorized redacted inventory |
 | `GET /healthz` | None, Host/Origin checks still apply | Process liveness only |
 
-The remote MCP catalog is deliberately smaller than local `xenoid-mcp`.
-Unrestricted host paths, host JavaScript, builds, packaging, deployment,
-binderfs, kernel/eBPF changes, and credential-bearing proxy imports are never
-network tools. Read tokens also never implicitly start or repair the daemon;
-use `xenoid_up` explicitly before runtime-dependent calls.
+The remote MCP catalog is deliberately smaller than local `xenoid-mcp`. Unrestricted host paths/code, builds, packaging, deployment, binderfs, kernel/eBPF changes, Keybox operations, credential-bearing proxy imports, and regeneration's destructive legacy escape are never network tools. Read tokens never implicitly start or repair daemon/rootd; call `xenoid_up` explicitly when convergence is required.
+
+`xenoid_proxy_clear` accepts optional `discardUnreadableState`. Omitted/false performs ordinary clear and refuses unreadable state. True is an explicit evidence-preserving source-less recovery that retains quarantine until absence of proxy routing/agent state is proved; authenticated import remains trusted-local CLI only.
 
 ## macOS LaunchAgent
 
@@ -253,20 +253,12 @@ preserve a configured Host value and apply the OAuth/token rules above.
   connection. Connection and request admission also use bounded global,
   per-address (IPv6 `/64`), and active-connection limits. All operator-facing
   limits are configurable.
-- Remote external commands inherit one absolute budget: 60 seconds for reads,
-  900 seconds for ordinary mutations, and 7200 seconds for full `up`. Existing
-  shorter backend/daemon timeouts still win.
-- A second mutation for the same instance fails fast with `instance_busy`/HTTP
-  503 instead of occupying a global worker while queued. Long `up` calls may
-  continue while other instances are controlled normally.
-- Tokens, daemon tokens, host paths, stdout/stderr, commands, URLs containing
-  credentials, and private roots are removed from remote results.
+- Remote work inherits one absolute budget: 60 seconds for reads, 900 seconds for ordinary mutations, and 7200 seconds for full `up`; shorter artifact/image/bootstrap/boot/proxy deadlines still win. Cancellation must terminate the owned local/remote process group, not merely drop the socket.
+- A second mutation for the same instance fails fast with `instance_busy`/HTTP 503. Long `up` calls on different instances may proceed; shared artifact output, content-image publication, and engine-host protection locks serialize only their actual shared resource.
+- Tokens, cookies, daemon/root credentials, proxy sources/keys, Keybox/SIM bytes, host/private paths, endpoint userinfo/query, stdout/stderr, raw commands/responses, captures, and assessment details are removed from network results.
 - Token changes are visible immediately; restart is unnecessary.
-- All resolved local CLI mutations, mutating fixed-instance stdio MCP calls,
-  and remote service mutations share the same per-instance operation lock.
-  CLI-backed `up`, Google-provider, and location mutations acquire and retain
-  that lock in the child, so a service process exit cannot unlock an operation
-  that is still running.
+- CLI, fixed-instance stdio MCP, and remote mutations share the same per-instance operation lock. Remote `xenoid_up` executes directly while holding it; there is no child CLI or recursive suite whose lifetime can escape the service lock.
+- Content/image/artifact/protection digests and stable safe error codes may remain visible because they carry no secret input bytes. Successful phases retain no raw child tail; failure diagnostics share a deterministic bounded sanitized budget.
 - Stop the service before moving the project or changing the operator user/HOME.
 
 Run the runtime-free service contracts after changes:

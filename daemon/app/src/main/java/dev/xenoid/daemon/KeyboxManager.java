@@ -68,6 +68,7 @@ final class KeyboxManager {
     private final Context context;
     private final File stateDirectory;
     private final File stateFile;
+    private final File wrappingSeedFile;
     private final File candidateFile;
     private final File controlFile;
     private final File stageRequestFile;
@@ -85,13 +86,14 @@ final class KeyboxManager {
         this.context = context.getApplicationContext();
         stateDirectory = new File(this.context.getNoBackupFilesDir(), "keybox");
         stateFile = new File(stateDirectory, "state.bin");
+        wrappingSeedFile = new File(stateDirectory, "wrapping-seed.bin");
         candidateFile = new File(stateDirectory, ".candidate.xml");
         controlFile = new File(stateDirectory, "control.json");
         stageRequestFile = new File(stateDirectory, ".stage-request");
         apkPath = this.context.getApplicationInfo().sourceDir;
         appUid = Process.myUid();
         ensureStateDirectory();
-        restoreAtStartup();
+        initializePrivateState();
     }
 
     synchronized boolean healthReady() {
@@ -136,7 +138,8 @@ final class KeyboxManager {
             candidate = readCandidate(size, sha256);
             candidateInfo = parseKeybox(candidate);
             previous = readStateIfValid();
-            seed = previous == null ? randomBytes(SEED_BYTES) : previous.seed.clone();
+            seed = loadOrCreateWrappingSeed(
+                    previous == null ? null : previous.seed);
 
             String convergence = converge(candidate, seed, candidateInfo);
             if (!"ok".equals(convergence)) {
@@ -179,7 +182,8 @@ final class KeyboxManager {
         try {
             ensureStateDirectory();
             previous = readStateIfValid();
-            temporarySeed = previous == null ? randomBytes(SEED_BYTES) : previous.seed.clone();
+            temporarySeed = loadOrCreateWrappingSeed(
+                    previous == null ? null : previous.seed);
             String cleared = convergeEmpty(temporarySeed);
             if (!"ok".equals(cleared)) {
                 restoreAfterFailedMutation(previous);
@@ -212,8 +216,17 @@ final class KeyboxManager {
                     byte[] recoverySeed = temporarySeed;
                     boolean destroyRecoverySeed = false;
                     if (recoverySeed == null) {
-                        recoverySeed = randomBytes(SEED_BYTES);
-                        destroyRecoverySeed = true;
+                        try {
+                            recoverySeed = loadOrCreateWrappingSeed(null);
+                            destroyRecoverySeed = true;
+                        } catch (Throwable seedFailure) {
+                            configured = existsNoFollow(stateFile);
+                            ready = false;
+                            active = false;
+                            safeError = "state_persist_failed";
+                            replaceMetadata(KeyboxInfo.empty());
+                            return responseFailure("clear_failed");
+                        }
                     }
                     try {
                         convergeEmpty(recoverySeed);
@@ -238,54 +251,114 @@ final class KeyboxManager {
         }
     }
 
-    private void restoreAtStartup() {
-        RootHelper.cleanupKeyboxStage(stageRequestFile, appUid, apkPath);
+    private void initializePrivateState() {
         deletePrivateFile(stageRequestFile);
         deletePrivateFile(candidateFile);
         deletePrivateFile(controlFile);
         deletePrivateFile(new File(stateDirectory, ".stage-request.tmp"));
         deletePrivateFile(new File(stateDirectory, ".control.tmp"));
         deletePrivateFile(new File(stateDirectory, ".state.tmp"));
-        if (!existsNoFollow(stateFile)) {
-            configured = false;
-            ready = true;
-            active = false;
-            safeError = null;
-            replaceMetadata(KeyboxInfo.empty());
-            return;
-        }
-        configured = true;
+        deletePrivateFile(new File(stateDirectory, ".wrapping-seed.tmp"));
+        configured = existsNoFollow(stateFile);
+        ready = false;
+        active = false;
+        safeError = null;
+        replaceMetadata(KeyboxInfo.empty());
+        if (!configured) return;
+
         Snapshot snapshot = null;
+        byte[] wrappingSeed = null;
         try {
             snapshot = readState();
-            String convergence = converge(snapshot.xml, snapshot.seed, snapshot.info);
+            wrappingSeed = loadOrCreateWrappingSeed(snapshot.seed);
+            replaceMetadata(snapshot.info.copy());
+        } catch (Throwable ignored) {
+            safeError = "invalid_keybox";
+        } finally {
+            if (snapshot != null) snapshot.destroy();
+            if (wrappingSeed != null) Arrays.fill(wrappingSeed, (byte) 0);
+        }
+    }
+
+    synchronized BootstrapCoordinator.ComponentStatus reconcileBootstrap(
+            long deadline, BootstrapCoordinator.CancellationSignal cancellation) {
+        Map<String, Object> fields = bootstrapFields();
+        if (ready) {
+            return BootstrapCoordinator.ComponentStatus.ready(
+                    configured ? "ready" : "unconfigured", fields);
+        }
+        if (cancellation.isCancelled()) {
+            return BootstrapCoordinator.ComponentStatus.cancelled();
+        }
+        if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+            return BootstrapCoordinator.ComponentStatus.timedOut();
+        }
+        if ("invalid_keybox".equals(safeError)) {
+            return BootstrapCoordinator.ComponentStatus.failed("invalid_keybox", fields);
+        }
+
+        RootHelper.cleanupKeyboxStage(stageRequestFile, appUid, apkPath);
+        deletePrivateFile(stageRequestFile);
+        deletePrivateFile(candidateFile);
+        deletePrivateFile(controlFile);
+        Snapshot snapshot = null;
+        byte[] emptySeed = null;
+        try {
+            final String convergence;
+            if (configured) {
+                snapshot = readState();
+                convergence = converge(snapshot.xml, snapshot.seed, snapshot.info);
+                replaceMetadata(snapshot.info.copy());
+            } else {
+                emptySeed = loadOrCreateWrappingSeed(null);
+                convergence = convergeEmpty(emptySeed);
+            }
+            if (cancellation.isCancelled()) {
+                return BootstrapCoordinator.ComponentStatus.cancelled();
+            }
+            if (android.os.SystemClock.elapsedRealtime() > deadline) {
+                return BootstrapCoordinator.ComponentStatus.timedOut();
+            }
             if (!"ok".equals(convergence)) {
-                convergeEmpty(snapshot.seed);
                 ready = false;
                 active = false;
                 safeError = convergence;
-                replaceMetadata(snapshot.info.copy());
-                return;
+                return BootstrapCoordinator.ComponentStatus.failed(
+                        convergence, bootstrapFields());
             }
             ready = true;
-            active = true;
+            active = configured;
             safeError = null;
-            replaceMetadata(snapshot.info.copy());
-        } catch (Throwable ignored) {
-            byte[] seed = randomBytes(SEED_BYTES);
-            try {
-                convergeEmpty(seed);
-            } finally {
-                Arrays.fill(seed, (byte) 0);
-            }
+            return BootstrapCoordinator.ComponentStatus.ready(
+                    configured ? "ready" : "unconfigured", bootstrapFields());
+        } catch (KeyboxFailure failure) {
             ready = false;
             active = false;
-            safeError = "invalid_keybox";
-            replaceMetadata(KeyboxInfo.empty());
+            safeError = failure.code;
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    failure.code, bootstrapFields());
+        } catch (Throwable ignored) {
+            ready = false;
+            active = false;
+            safeError = configured ? "invalid_keybox" : "native_unavailable";
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    safeError, bootstrapFields());
         } finally {
             deletePrivateFile(controlFile);
             if (snapshot != null) snapshot.destroy();
+            if (emptySeed != null) Arrays.fill(emptySeed, (byte) 0);
         }
+    }
+
+    private Map<String, Object> bootstrapFields() {
+        return XenoidDaemonService.map(
+                "configured", configured,
+                "active", active,
+                "algorithms", XenoidDaemonService.map(
+                        "rsa", metadata.rsa,
+                        "ecdsa", metadata.ecdsa,
+                        "rsaChainCount", metadata.rsaChainCount,
+                        "ecdsaChainCount", metadata.ecdsaChainCount));
     }
 
     private String converge(byte[] xml, byte[] seed, KeyboxInfo info) {
@@ -326,16 +399,21 @@ final class KeyboxManager {
 
     private void restoreAfterFailedMutation(Snapshot previous) {
         if (previous == null) {
-            byte[] seed = randomBytes(SEED_BYTES);
+            byte[] seed = null;
             try {
+                seed = loadOrCreateWrappingSeed(null);
                 String result = convergeEmpty(seed);
                 configured = existsNoFollow(stateFile);
                 ready = !configured && "ok".equals(result);
                 active = false;
                 safeError = ready ? null : "native_unavailable";
                 if (!configured) replaceMetadata(KeyboxInfo.empty());
+            } catch (Throwable ignored) {
+                ready = false;
+                active = false;
+                safeError = "native_unavailable";
             } finally {
-                Arrays.fill(seed, (byte) 0);
+                if (seed != null) Arrays.fill(seed, (byte) 0);
             }
             return;
         }
@@ -419,6 +497,91 @@ final class KeyboxManager {
         Os.chmod(stateDirectory.getAbsolutePath(), 0700);
         stat = Os.lstat(stateDirectory.getAbsolutePath());
         if ((stat.st_mode & 0777) != 0700) throw new IOException();
+    }
+
+    private byte[] loadOrCreateWrappingSeed(byte[] preferred) throws Exception {
+        ensureStateDirectory();
+        if (existsNoFollow(wrappingSeedFile)) {
+            byte[] seed = readWrappingSeed();
+            if (preferred != null && !MessageDigest.isEqual(seed, preferred)) {
+                Arrays.fill(seed, (byte) 0);
+                throw new KeyboxFailure("invalid_keybox");
+            }
+            return seed;
+        }
+        byte[] seed = preferred == null ? randomBytes(SEED_BYTES) : preferred.clone();
+        File temporary = new File(stateDirectory, ".wrapping-seed.tmp");
+        deletePrivateFile(temporary);
+        if (existsNoFollow(temporary)) {
+            Arrays.fill(seed, (byte) 0);
+            throw new KeyboxFailure("invalid_keybox");
+        }
+        try {
+            FileDescriptor descriptor = Os.open(
+                    temporary.getAbsolutePath(),
+                    OsConstants.O_WRONLY | OsConstants.O_CREAT | OsConstants.O_EXCL
+                            | OsConstants.O_NOFOLLOW,
+                    0600);
+            try (FileOutputStream output = new FileOutputStream(descriptor)) {
+                output.write(seed);
+                output.flush();
+                output.getFD().sync();
+                validateWrappingSeedStat(Os.fstat(output.getFD()));
+            }
+            if (existsNoFollow(wrappingSeedFile)) {
+                throw new KeyboxFailure("invalid_keybox");
+            }
+            Os.rename(temporary.getAbsolutePath(), wrappingSeedFile.getAbsolutePath());
+            syncDirectory();
+            byte[] observed = readWrappingSeed();
+            boolean matches = MessageDigest.isEqual(seed, observed);
+            Arrays.fill(observed, (byte) 0);
+            if (!matches) throw new KeyboxFailure("invalid_keybox");
+            return seed;
+        } catch (Throwable failure) {
+            deletePrivateFile(temporary);
+            Arrays.fill(seed, (byte) 0);
+            throw failure;
+        }
+    }
+
+    private byte[] readWrappingSeed() throws Exception {
+        StructStat before = Os.lstat(wrappingSeedFile.getAbsolutePath());
+        validateWrappingSeedStat(before);
+        byte[] seed = new byte[SEED_BYTES];
+        try {
+            FileDescriptor descriptor = Os.open(
+                    wrappingSeedFile.getAbsolutePath(),
+                    OsConstants.O_RDONLY | OsConstants.O_NOFOLLOW,
+                    0);
+            try (FileInputStream input = new FileInputStream(descriptor)) {
+                StructStat opened = Os.fstat(input.getFD());
+                validateWrappingSeedStat(opened);
+                if (!sameFile(before, opened)) throw new KeyboxFailure("invalid_keybox");
+                int offset = 0;
+                while (offset < seed.length) {
+                    int count = input.read(seed, offset, seed.length - offset);
+                    if (count <= 0) throw new KeyboxFailure("invalid_keybox");
+                    offset += count;
+                }
+                if (input.read() != -1) throw new KeyboxFailure("invalid_keybox");
+            }
+            StructStat after = Os.lstat(wrappingSeedFile.getAbsolutePath());
+            validateWrappingSeedStat(after);
+            if (!sameFile(before, after)) throw new KeyboxFailure("invalid_keybox");
+            return seed;
+        } catch (Throwable failure) {
+            Arrays.fill(seed, (byte) 0);
+            throw failure;
+        }
+    }
+
+    private void validateWrappingSeedStat(StructStat stat) throws KeyboxFailure {
+        if (!OsConstants.S_ISREG(stat.st_mode) || stat.st_uid != appUid
+                || (stat.st_mode & 0777) != 0600 || stat.st_nlink != 1
+                || stat.st_size != SEED_BYTES) {
+            throw new KeyboxFailure("invalid_keybox");
+        }
     }
 
     private byte[] readCandidate(long expectedSize, String expectedSha256) throws Exception {
@@ -538,12 +701,16 @@ final class KeyboxManager {
         if (existsNoFollow(temporary) || existsNoFollow(controlFile)) throw new IOException();
         long epoch = nextEpoch();
         JSONObject boot = bootInfo(seed);
-        JSONObject remainder = empty ? null : profileRemainder();
+        JSONObject remainder = profileRemainder();
         try (FileOutputStream output = new FileOutputStream(temporary)) {
             Os.chmod(temporary.getAbsolutePath(), 0600);
+            String rest = remainder.toString();
+            if (rest.length() < 2 || rest.charAt(0) != '{') throw new IOException();
             if (empty) {
                 writeAscii(output, "{\"type\":\"config\",\"epoch\":" + epoch
-                        + ",\"bootInfo\":" + boot.toString() + ",\"profiles\":[]}");
+                        + ",\"bootInfo\":" + boot.toString()
+                        + ",\"profiles\":[{\"id\":\"platform\",\"keyboxB64\":\"\","
+                        + rest.substring(1) + "]}");
             } else {
                 if (xml == null || xml.length <= 0) throw new IOException();
                 writeAscii(output, "{\"type\":\"config\",\"epoch\":" + epoch
@@ -552,8 +719,6 @@ final class KeyboxManager {
                 OutputStream base64 = Base64.getEncoder().wrap(new NonClosingOutputStream(output));
                 base64.write(xml);
                 base64.close();
-                String rest = remainder.toString();
-                if (rest.length() < 2 || rest.charAt(0) != '{') throw new IOException();
                 writeAscii(output, "\"," + rest.substring(1) + "]}");
             }
             output.flush();
@@ -941,7 +1106,8 @@ final class KeyboxManager {
     private static boolean sameFile(StructStat first, StructStat second) {
         return first.st_dev == second.st_dev && first.st_ino == second.st_ino
                 && first.st_size == second.st_size && first.st_mtime == second.st_mtime
-                && first.st_uid == second.st_uid && first.st_mode == second.st_mode;
+                && first.st_uid == second.st_uid && first.st_mode == second.st_mode
+                && first.st_nlink == second.st_nlink;
     }
 
     private static byte[] hex(String text) throws KeyboxFailure {

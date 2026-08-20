@@ -109,6 +109,7 @@ public final class ProbeActivity extends Activity {
         return out;
     }
 
+
     private JSONObject bindGmsCore() throws Exception {
         CountDownLatch connected = new CountDownLatch(1);
         AtomicReference<String> componentName = new AtomicReference<>("");

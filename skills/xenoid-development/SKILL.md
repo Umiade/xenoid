@@ -10,14 +10,39 @@ Maintain a coherent Android runtime whose public CLI is predictable, whose privi
 
 Treat Xenoid as one converged system rather than a collection of independent spoofing functions:
 
-1. **Host orchestration**: `src/xenoid/`, `scripts/xenoid-up.sh`, Colima or Docker, binderfs, networking, and persistent images.
-2. **Android control plane**: the daemon, rootd, token-gated privileged operations, application management, input, and automation.
-3. **Filesystem and identity**: rootfs/data images, pivot and mount namespaces, overlays, property files, property-area state, SettingsProvider, and generated identifiers.
-4. **Kernel-visible state**: kmod and eBPF behavior for procfs, sysfs, paths, UTS data, and raw syscall consumers.
+1. **Host convergence**: `src/xenoid/{convergence,artifacts,runtime_image,protection,process}.py`, Docker/Colima, binderfs, networking, persistent images, and resumable journals.
+2. **Android control plane**: listener-first daemon bootstrap, token-gated loopback rootd, component managers, application/input/automation control, and no application-visible `su`.
+3. **Filesystem and identity**: rootfs/data images, pivot/mount namespaces, overlays, property state, SettingsProvider, fixed-target regeneration, and storage provenance.
+4. **Engine-host shared protection**: one digest-bound kmod/eBPF deployment for every owned runtime on the selected engine.
 5. **Process-visible state**: zygote preload, libc interposition, framework behavior, package/service responses, and runtime mappings.
-6. **Hardware-facing state**: sensors, camera, battery, key attestation, and other HAL or service contracts.
+6. **Hardware-facing state**: sensors, camera, battery, key attestation, radio/location identity, and other HAL/service contracts.
+7. **Evidence**: non-converging `LiveAcceptance`, digest-aware `GateRunner`, observational doctor, CI profiles, and deterministic release verification.
 
 A fix is complete only when all readers of the same fact agree. Changing one API while leaving a contradictory file, property, service, or syscall result is a defect.
+
+## Production ownership contracts
+
+- `up` is the sole mutating production convergence owner. It plans before mutation and automatically chooses no-op, resume, start, create, restart, recreate, or component-only work. Never add a shell wrapper, nested CLI call, command-specific bootstrap chain, or runtime-reuse override.
+- A private convergence journal is created only before mutation. Egress-sensitive order is `planned -> quarantined -> image_ensured` before runtime replacement. Retry must re-inspect recorded immutable IDs/UUIDs/generations and resume idempotently; a third state fails closed.
+- `stop` quarantines, syncs, and stops the owned container without removing it. Replacement belongs only to explicit recreate, regeneration, or a planner-selected immutable mismatch.
+- `status` is strictly observational and reports one `recommendedAction`; `up --dry-run` is the actionable plan. `--skip-build` validates artifact records/objects and never compiles stale or missing work.
+- Emit `dev.xenoid.progress/v1` `inspecting|resuming started` before hashing, then sanitized five-second heartbeats for long work. CLI stdout is one final `dev.xenoid.convergence/v1` JSON document. MCP/remote call the executor directly and return safe phase summaries, not parsed child output.
+
+## Build and image identity
+
+- `ArtifactBuilder` is the only source-artifact owner. Records bind declared source/command/environment/tool identities to immutable SHA-256 objects and exact output path/mode/size/architecture/digest. Consumers stage validated `runtimeContext`, `liveDeploy`, or `release` snapshots; they never read mutable outputs behind the manifest or perform fallback builds.
+- Normal builds reuse valid records. Forced builds must reproduce the same bytes for the same input identity or preserve the prior record and fail. Output-directory locks serialize only targets that genuinely share outputs.
+- Runtime images are addressed by complete input digest over immutable base ID, validated artifact closure, canonical recipes/context, toolchain/builder identities, and Google inputs. A separate boot digest substitutes the daemon seed integration contract, allowing only verified update-compatible daemon-only live deployment.
+- The configured tag is a repository namespace. Publish to the derived content tag under an engine-host lock; never implicitly pull a mutable base, overwrite a conflicting content tag, retag a running instance, or let low-level `start --recreate` compile.
+
+## Bootstrap and fail-closed components
+
+- The daemon validates its app-private credential, binds transport, and accepts requests before any manager recovery. Host recovery is one bounded transport -> authenticated rootd -> generation-scoped component reconciliation sequence. Aggregate health is final acceptance, never bootstrap.
+- The host may keep the credential only in a container-ID-bound secret memory buffer. Never persist a host token cache/file or expose credentials in argv, environment, generic process results/tails, progress, logs, MCP, or remote JSON.
+- Root, Keybox, proxy, location, and camera report independent safe states. Failure in one cannot prevent constructing or diagnosing the others.
+- Proxy desired-state v2 has its own app-private AES-256-GCM key and crash-resume journal, independent of KeyMint. Unreadable bytes are evidence, not “off”: retain quarantine and require authenticated import or explicit `clear --discard-unreadable-state`.
+- Regeneration v2 fixes all stable/network/SIM/data/rootfs targets before mutation and uses direct convergence plus fresh pre-/post-Google observation. Plain `up` resumes valid v2. V1-only state blocks until explicit `device regenerate --restart-legacy-transaction` records evidence and publishes v2 targets.
+- Shared kmod/eBPF protection is one engine-host deployment. Matching digests/inventory reuse it. Active siblings block unsafe replacement; public stop never unloads, and maintenance unload requires explicit acknowledgement plus zero active runtimes.
 
 ## Required discovery
 
@@ -44,16 +69,16 @@ Before editing:
 - Keep Google binaries, release certificates, expanded payloads, and captures in ignored `.xenoid/` state. Public files may contain only pinned hashes, signer identities, package/version/ABI inventory, reproducibility metadata, and operator guidance.
 - Do not add an automatic downloader, broad GApps version matcher, late APK installer, Magisk module, or MCP host-path import. The one registered release must remain an explicit local import.
 - Treat provider, release, specification fingerprint, data-compatibility fingerprint, image ID, rootfs source ID, container labels/command, and per-instance binding as one immutable identity. A transition after any Android data exists must fail without erasing or migrating data.
-- Verify importer boundary changes with `python3 scripts/test-google-services.py`. Verify image/runtime changes with `scripts/smoke-google-services-runtime.sh`, two-pass `scripts/smoke-google-services-convergence.sh`, and `./xenoid doctor --full --require-runtime` on an enabled fresh instance.
+- Verify importer boundaries with the focused runtime-free contract, then use explicit fresh gates and the applicable live smoke on an enabled fresh instance. `LiveAcceptance`/doctor may observe the final runtime, but production convergence and regeneration never invoke doctor, `--full`, a smoke suite, CI, or build as a nested acceptance path.
 - Package presence and a Play Store launcher prove only runtime bootstrap. Google account login is operator-driven; Play Integrity and device certification remain unsupported/not evaluated unless an independent capability probe proves them.
 
 ## Android 13 KeyMint changes
 
-- Support only Android 13 ARM64 stock `keystore2`. The one production integration is an init `LD_PRELOAD` of `/system/lib64/libxenoid_keymint_bootstrap.so`; the bootstrap has a direct `DT_NEEDED` on `/system/lib64/libteesim_keymint.so` and its constructor calls `entry(NULL)`. Do not add a direct HAL replacement, ptrace injector, Frida dependency, Magisk/WebUI/service module, legacy Android 10/11 keystore path, new privileged helper, or second daemon.
+- Support only Android 13 ARM64 stock `keystore2`. The production integration is the init-managed standalone AIDL KeyMint service with its VINTF declaration; do not add a second HAL path, ptrace injector, Frida dependency, Magisk/WebUI module, legacy Android 10/11 keystore route, application-visible helper, or second daemon.
 - Treat TEESimulator as an external/prebuilt boundary. Source rebuilds receive its checkout only through `TEESIMULATOR_SOURCE`; never write a workstation path into tracked files. The `teesim-km` Rust crate is GPL-3.0-or-later, so every distributed prebuilt must retain the corresponding license and source-compliance obligations. Do not copy that crate's source into Xenoid.
-- Keep raw keybox XML/DER/private keys exclusively in daemon app-private no-backup mode-`0600` storage. Host imports must enforce current-user ownership, regular non-symlink identity, no group/world permission bits, nonempty size at most 8 MiB, no-follow open, and stable device/inode/size/mtime while hashing. Only exact staging path/size/SHA-256 metadata may cross the authenticated daemon route; always clean the random shell-owned mode-`0600` staging file.
-- Keep the control transaction one-shot and local: transient encoded config, root `app_process`, abstract `@teesim`, big-endian `u32` frame length, UTF-8 JSON at most 8 MiB, native root reverse-auth, and client verification of peer UID 1017. An acknowledgement must replace exactly one complete profile before set is ready; clear must acknowledge zero profiles before deleting state. Startup synchronously reapplies desired configured state.
-- Keep keybox operations out of MCP and remote-service catalogs. Status may expose only configured/ready/active booleans, fixed safe error codes, algorithm booleans, and chain counts—never bytes, XML, DER, private-key data, filenames, paths, or digests.
+- Keep raw keybox XML/DER/private keys exclusively in daemon app-private no-backup mode-`0600` storage. Host imports enforce strict ownership/type/mode/size/stability and clean bounded staging. Public status exposes only safe configured/ready/active, error-code, algorithm, and count fields—never bytes, filenames, paths, digests, XML/DER, or private-key material.
+- Listener startup is independent of Keybox. The bounded bootstrap worker reconciles configured state after authenticated root becomes available; unconfigured inactive is healthy. Keybox set/clear and proxy source/select/on/off/clear are independent transactions and never rotate, repair, or delete each other's key/state.
+- Keep keybox operations out of MCP and remote-service catalogs. Never let Keybox failure hide root/proxy/location/camera diagnostics.
 - Generation profile `default` is limited to `com.google.android.gms` and `com.android.vending` by package and installed UID fallback. It uses Android 13 attestation version 200, configured TEE security level 1, current build/patch identity, Verified/device-locked boot metadata, a stable private verified-boot seed, and no StrongBox. Execution remains software-only: never claim hardware private-key custody, Play Integrity support, or Google device certification.
 - Contract tests use generated dummy files/material only. Cover parser registration, local file permissions/symlinks/stability, exact daemon route schemas and redaction, init-rc patch idempotence/rejection, both shared-library manifests, and absence from MCP/remote catalogs. Never place a real keybox or private certificate in fixtures.
 
@@ -77,26 +102,31 @@ entry point -> data source -> predicate -> process -> repair layer -> static evi
 
 Do not claim coverage from strings alone. Every covered predicate needs a control-flow basis and either a runtime observation or a deterministic replica contract.
 
-## Verification ladder
+## Evidence ownership and validation DAG
 
 Choose evidence that exercises the real contract:
 
-- **Pure source change**: syntax or compile check plus the narrow source smoke.
-- **CLI or daemon behavior**: invoke the real command and inspect structured output and failure semantics.
-- **Image-bound component**: rebuild the component, rebuild or refresh the runtime context, start through `./xenoid up`, and verify the deployed artifact.
-- **UI or application behavior**: cold-start the original application, wait for terminal state, collect machine-readable UI or backing-store evidence, and inspect fatal/ANR logs.
-- **Kernel-visible behavior**: test libc and raw syscall paths from an unprivileged app context; include isolated processes when access rules differ. For Android 13 route netlink, the expected matrix is ordinary app socket creation succeeds but `RTM_GETLINK` send returns `EACCES`; ordinary `RTM_GETADDR`/`RTM_GETROUTE`, TCP/UDP, Bionic `getifaddrs`, and Java interface enumeration succeed; isolated process non-Unix socket creation returns `EACCES` while AF_UNIX/Binder/inherited descriptors remain usable; UID-below-10000 control paths such as `xenoid-netctl` keep rtnetlink access. Never use a broad app-UID socket denial to satisfy this matrix.
-- **Production acceptance**: no probes or inspection servers, a fresh runtime restart, repeated cold starts, and `./xenoid doctor --require-runtime`.
+- **Pure source change**: the narrow source/contract gate through `GateRunner`.
+- **CLI or daemon behavior**: invoke the real command and inspect its one structured final result, progress ordering, deadlines, redaction, and failure semantics.
+- **Image-bound component**: ensure its artifact record, ensure the content-addressed image only when boot inputs require it, converge through `up`, and verify the deployed digest.
+- **UI or application behavior**: cold-start the original application, wait for terminal state, and collect bounded machine-readable evidence.
+- **Kernel-visible behavior**: test libc and raw-syscall paths from ordinary and isolated unprivileged Android contexts; exercise the selected Docker engine host rather than local-host assumptions.
+- **Production acceptance**: `LiveAcceptance.observe` freshly inspects an already-running owned runtime. It never mutates, ensures bootstrap, invokes gates/doctor/verify/CI, or builds.
 
-Repository checks:
+Validation owners:
+
+- `scripts/verify.sh` is a thin `GateRunner` profile. Matching successful runtime-free records may be reused; `--fresh` ignores them. Sensitive-data inventory always recomputes.
+- `scripts/ci.sh` selects the same acyclic catalog (`static`, explicit runtime, or full); gates never recursively invoke verify, CI, doctor, or themselves, and there is no audit bypass.
+- `doctor` combines selected GateRunner records with fresh LiveAcceptance. Even `doctor --full` remains observational and excludes mutating convergence/build/release gates. Runtime absence can be `ok=true, complete=false` unless required.
+- Release runs fresh gates, validated artifact snapshots, canonical OTA/package staging under `SOURCE_DATE_EPOCH`, and mandatory candidate verification. Offline packaged doctor evidence always has `complete=false`.
+
+Typical explicit commands:
 
 ```bash
+./scripts/verify.sh --fresh
 ./scripts/ci.sh
-python3 scripts/audit-sensitive-data.py
 ./xenoid doctor --require-runtime
 ```
-
-Use `./xenoid doctor --full --require-runtime` when a change affects build orchestration, runtime images, protection activation, or several layers at once.
 
 ## Instrumentation hygiene
 
@@ -108,26 +138,27 @@ Use `./xenoid doctor --full --require-runtime` when a change affects build orche
 
 ## Kernel safety
 
-- Test kernel changes in an isolated runtime before making startup depend on them.
-- Build and load failures must be hard startup failures when the layer is required.
-- A hang, unbounded retry, or unstable kernel path invalidates the design even if a narrow detector result improves.
-- Exercise repeated reads, concurrent readers, app and isolated UIDs, cold starts, and sustained runtime load.
-- Keep an explicit fallback design for risky kernel experiments, but do not ship both paths.
+- Test kernel changes in an isolated runtime before making convergence depend on them.
+- Build and validate replacement artifacts before touching the verified engine-host deployment.
+- A hang, unbounded retry, unknown/restored-but-unverified digest, or disruption of sibling runtimes invalidates the design.
+- Exercise repeated reads, concurrent readers, ordinary and isolated Android UIDs, cold starts, and sustained runtime load through the selected engine transport.
+- eBPF replacement uses staged transaction pins; kmod replacement requires zero active owned runtimes and a digest-matched last-known-good rollback. Never ship a fallback protection path or unload shared protection on ordinary stop.
 
 ## Privacy boundary
 
-Tracked GitHub content may include architecture, supported workflows, public APIs, generic engineering methods, and reproducible validation commands.
+Tracked GitHub content may include architecture, supported workflows, public schemas, generic engineering methods, fixed content/tool digests, and reproducibility metadata.
 
-Keep the following ignored and local:
+Keep private and ignored:
 
-- third-party binaries and decompilation outputs;
-- device dumps, logs, screenshots, maps, memory captures, and identifiers;
-- assessment-target names, versions, predicates, offsets, and result matrices;
-- workstation paths, credentials, tokens, private endpoints, and account metadata;
-- per-instance location identity state (master seed, full SIM/MSISDN values); only masked location views belong in outputs;
+- credentials, tokens, cookies, private registry or endpoint details, and workstation paths/identities;
+- proxy sources, URLs, keys, cache/quarantine bytes, and evidence objects;
+- Keybox XML/DER/private keys, daemon/root credentials, staging/private paths, and raw control messages;
+- imported Google binaries/certificates/expanded payloads and other third-party samples;
+- device dumps, logs, screenshots, maps, memory captures, raw SIM/device identifiers, and runtime state;
+- assessment targets, captures, investigation records, predicates, offsets, and result matrices;
 - internal articles, cached references, and session-specific continuation notes.
 
-Use `.skills/` for local agent handoff, `.doc/` for local references, `.tmp/` for disposable evidence, and `.xenoid/` for runtime state. These directories must remain ignored.
+Public progress/results/docs must use stable safe codes, content digests, counts, booleans, and bounded sanitized diagnostics. Successful phases retain no child tails. Never publish absolute private paths, raw commands/responses, URI userinfo/query, source credentials, or a live-acceptance claim from offline packaging.
 
 Before committing, inspect the complete prospective tree rather than only the diff:
 

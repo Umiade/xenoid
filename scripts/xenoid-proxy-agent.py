@@ -7,7 +7,6 @@ import base64
 import ctypes
 import fcntl
 import hashlib
-import http.client
 import ipaddress
 import json
 import os
@@ -24,7 +23,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 try:
     from xenoid.proxy_protocol import ProxyProtocolError, derive_key, open_response, seal_request
@@ -379,7 +378,7 @@ class EngineIPC:
         self._path = RUNTIME_ROOT / manifest["resourceTag"] / "engine.sock"
         self.generation = manifest["generation"]
 
-    def _connect(self) -> socket.socket:
+    def _connect(self, timeout: float) -> socket.socket:
         try:
             info = self._path.stat(follow_symlinks=False)
         except OSError as exc:
@@ -392,7 +391,7 @@ class EngineIPC:
         ):
             raise AgentFailure("engine_unavailable")
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
-        connection.settimeout(ROOT_TIMEOUT)
+        connection.settimeout(timeout)
         try:
             connection.connect(str(self._path))
             credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
@@ -411,10 +410,11 @@ class EngineIPC:
         *,
         descriptor: int | None = None,
         receive_descriptors: int = 0,
+        timeout: float = ROOT_TIMEOUT,
     ) -> tuple[dict[str, Any], list[int]]:
         if method not in {
             "status", "writeConfig", "prepare", "apply", "off", "quarantine",
-            "spawnCompiler", "spawnFetcher", "stopWorker",
+            "spawnCompiler", "spawnFetcher", "stopWorker", "daemonRequest",
         }:
             raise AgentFailure("agent_internal_error")
         request = {
@@ -431,7 +431,7 @@ class EngineIPC:
         if descriptor is not None:
             packed = array.array("i", [descriptor])
             ancillary.append((socket.SOL_SOCKET, socket.SCM_RIGHTS, packed.tobytes()))
-        connection = self._connect()
+        connection = self._connect(timeout)
         received: list[int] = []
         try:
             connection.sendmsg([_canonical(request)], ancillary)
@@ -502,6 +502,97 @@ class EngineIPC:
             raise AgentFailure("engine_unavailable") from exc
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _sealed_memfd(name: str, payload: bytes) -> int:
+        if not hasattr(os, "memfd_create") or not payload or len(payload) > MAX_CHANNEL_BYTES:
+            raise AgentFailure("engine_unavailable")
+        descriptor = os.memfd_create(
+            name,
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError
+                offset += written
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            seals = (
+                fcntl.F_SEAL_SEAL
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_WRITE
+            )
+            fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
+            return descriptor
+        except OSError as exc:
+            os.close(descriptor)
+            raise AgentFailure("engine_unavailable") from exc
+
+    def daemon_request(
+        self,
+        payload: bytes,
+        agent_token: bytearray,
+        timeout: float,
+    ) -> bytes:
+        descriptor = self._sealed_memfd("xenoid-daemon-request", payload)
+        received: list[int] = []
+        response_fd = -1
+        try:
+            body, received = self.call(
+                "daemonRequest",
+                {
+                    "agentToken": agent_token.decode("ascii"),
+                    "timeoutMs": max(1000, min(70_000, int(timeout * 1000))),
+                },
+                descriptor=descriptor,
+                receive_descriptors=1,
+                timeout=timeout + 10.0,
+            )
+            if set(body) != {"size"}:
+                raise AgentFailure("engine_unavailable")
+            size = body["size"]
+            if (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or not 0 < size <= MAX_CHANNEL_BYTES
+                or len(received) != 1
+            ):
+                raise AgentFailure("engine_unavailable")
+            response_fd = received.pop()
+            info = os.fstat(response_fd)
+            required_seals = (
+                fcntl.F_SEAL_SEAL
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_WRITE
+            )
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_size != size
+                or fcntl.fcntl(response_fd, fcntl.F_GET_SEALS) & required_seals
+                != required_seals
+            ):
+                raise AgentFailure("engine_unavailable")
+            output = bytearray()
+            while len(output) < size:
+                chunk = os.read(response_fd, size - len(output))
+                if not chunk:
+                    break
+                output.extend(chunk)
+            if len(output) != size:
+                raise AgentFailure("engine_unavailable")
+            return bytes(output)
+        except (OSError, UnicodeError) as exc:
+            raise AgentFailure("engine_unavailable") from exc
+        finally:
+            os.close(descriptor)
+            if response_fd >= 0:
+                os.close(response_fd)
+            for item in received:
+                os.close(item)
 
     def spawn(self, role: str) -> tuple[str, int, int]:
         method = {"compiler": "spawnCompiler", "fetcher": "spawnFetcher"}.get(role)
@@ -592,9 +683,89 @@ def _live_status(manifest: dict[str, Any], manifest_path: Path) -> dict[str, Any
     return value
 
 
+def _consume_channel_secret(path: Path, maximum: int) -> bytearray:
+    directory_fd = -1
+    descriptor = -1
+    data = bytearray()
+    failure: Optional[BaseException] = None
+    try:
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != 0
+            or directory.st_gid != 0
+            or stat.S_IMODE(directory.st_mode) != 0o700
+        ):
+            raise AgentFailure("agent_key_invalid")
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o400
+                or info.st_nlink != 1
+                or info.st_size <= 0
+                or info.st_size > maximum
+            ):
+                raise AgentFailure("agent_key_invalid")
+            while len(data) < info.st_size:
+                chunk = os.read(descriptor, info.st_size - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if len(data) != info.st_size:
+                raise AgentFailure("agent_key_invalid")
+        except BaseException as exc:
+            failure = exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+                descriptor = -1
+            try:
+                os.unlink(path.name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                failure = AgentFailure("agent_key_invalid")
+                failure.__cause__ = exc
+            try:
+                os.fsync(directory_fd)
+            except OSError as exc:
+                failure = AgentFailure("agent_key_invalid")
+                failure.__cause__ = exc
+    except AgentFailure as exc:
+        failure = exc
+    except OSError as exc:
+        failure = AgentFailure("agent_key_invalid")
+        failure.__cause__ = exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+    if failure is not None:
+        for index in range(len(data)):
+            data[index] = 0
+        raise failure
+    return data
+
+
 def _read_channel_secret(manifest: dict[str, Any]) -> tuple[bytearray, bytearray]:
     path = Path(manifest["paths"]["key"])
-    data = bytearray(_read_exact_file(path, 0o400, 512))
+    data = _consume_channel_secret(path, 512)
     master = bytearray()
     token = bytearray()
     raw_token = bytearray()
@@ -748,27 +919,17 @@ class DaemonChannel:
         except ProxyProtocolError as exc:
             raise ChannelAuthenticationFailure("agent_channel_auth_failed") from exc
         encoded = _canonical(envelope)
-        # The Android probe endpoint runs ordinary-app capability probes with a
-        # 45s budget through the fresh data path; keep channel headroom above it.
         timeout = 70.0 if operation == "probe" else 20.0
-        connection = http.client.HTTPConnection(self._manifest["daemon"]["ip"], self._manifest["daemon"]["port"], timeout=timeout)
         try:
-            connection.request("POST", "/proxy/agent", body=encoded, headers={
-                "Content-Type": "application/json",
-                "Content-Length": str(len(encoded)),
-                "Connection": "close",
-                "X-Xenoid-Agent-Token": self._agent_token.decode("ascii"),
-            })
-            response = connection.getresponse()
-            payload = response.read(MAX_CHANNEL_BYTES + 1)
-            if response.status != 200 or len(payload) > MAX_CHANNEL_BYTES:
-                raise ChannelAuthenticationFailure("agent_channel_auth_failed")
-        except ChannelAuthenticationFailure:
+            payload = _engine().daemon_request(
+                encoded,
+                self._agent_token,
+                timeout,
+            )
+        except AgentFailure as exc:
+            if exc.code == "agent_channel_auth_failed":
+                raise ChannelAuthenticationFailure("agent_channel_auth_failed") from exc
             raise
-        except (OSError, http.client.HTTPException) as exc:
-            raise AgentFailure("agent_channel_unreachable") from exc
-        finally:
-            connection.close()
         try:
             outer = _loads(payload, "agent_channel_auth_failed")
         except AgentFailure as exc:
@@ -813,7 +974,7 @@ class DaemonChannel:
 def _desired(channel: DaemonChannel, manifest: dict[str, Any], floor: int) -> dict[str, Any]:
     value = channel.call("desired", {})
     _require_keys(value, {"schemaVersion", "instanceId", "generation", "enabled", "checkId", "source"})
-    if value["schemaVersion"] != 1 or value["instanceId"] != manifest["instanceId"]:
+    if value["schemaVersion"] != 2 or value["instanceId"] != manifest["instanceId"]:
         raise ChannelAuthenticationFailure("runtime_epoch_mismatch")
     generation = value["generation"]
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < floor or generation >= 2**63:
@@ -1282,12 +1443,22 @@ def _report_staging(channel: DaemonChannel, desired: dict[str, Any]) -> None:
     })
 
 
-def _report_failure(channel: DaemonChannel, desired: dict[str, Any], code: str, quarantined: bool) -> None:
+def _report_failure(
+    channel: DaemonChannel,
+    desired: dict[str, Any],
+    code: str,
+    quarantined: bool,
+    *,
+    nodes: Sequence[str] = (),
+    selected_node: str = "",
+) -> None:
     channel.call("report", {
         "generation": desired["generation"], "checkId": desired["checkId"],
         "structuralApplied": False, "dataPlaneVerified": False,
-        "phase": "quarantined" if quarantined else "error", "selectedNode": "",
-        "nodeCount": 0, "nodes": [], "capabilities": {}, "counters": {}, "errorCode": code,
+        "phase": "quarantined" if quarantined else "error",
+        "selectedNode": selected_node,
+        "nodeCount": len(nodes), "nodes": list(nodes),
+        "capabilities": {}, "counters": {}, "errorCode": code,
     })
 
 
@@ -1352,8 +1523,9 @@ def _probe_data_plane(
         capabilities["v4DnsProxy"]
         and capabilities["v4TcpProxy"]
         and capabilities["v6DnsProxy"]
+        and capabilities["v6TcpProxy"]
         and capabilities["v4UdpProxy"] == udp_allowed
-        and (udp_allowed or not capabilities["v6UdpProxy"])
+        and capabilities["v6UdpProxy"] == udp_allowed
     )
     if not policy_matches:
         raise AgentFailure("data_plane_unverified")
@@ -1406,6 +1578,9 @@ def _run(
     initial: dict[str, Any],
 ) -> int:
     channel = DaemonChannel(manifest, master, agent_token)
+    for secret in (master, agent_token):
+        for index in range(len(secret)):
+            secret[index] = 0
     metadata: dict[str, tuple[str, str]] = {}
     floor = max(manifest["generation"], initial["generation"])
     last_seen = floor
@@ -1419,6 +1594,7 @@ def _run(
     retry_generation = -1
     retry_count = 0
     retry_at = 0.0
+    retry_error = ""
     try:
         while not _STOP:
             desired = _desired(channel, manifest, floor)
@@ -1434,6 +1610,13 @@ def _run(
                 and (generation != retry_generation or now >= retry_at)
             )
             changed = generation != last_seen or candidate_due
+            if retry_generation == generation and now < retry_at:
+                _write_health(
+                    manifest,
+                    "error" if verified_old else "quarantined",
+                    generation,
+                    retry_error,
+                )
             refresh_due = desired["enabled"] and now - last_refresh >= REFRESH_SECONDS
             check_due = desired["checkId"] > last_check
             last_seen = generation
@@ -1456,7 +1639,7 @@ def _run(
                 active_generation, active_digest, active_nodes, active_selected = generation, "", [], ""
                 verified_old = False
                 last_check = desired["checkId"]
-                retry_generation, retry_count, retry_at = -1, 0, 0.0
+                retry_generation, retry_count, retry_at, retry_error = -1, 0, 0.0, ""
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -1473,6 +1656,8 @@ def _run(
                 _write_health(manifest, "applying", generation)
                 candidate_staged = False
                 had_verified_old = verified_old
+                report_nodes: list[str] = []
+                report_selected = ""
                 try:
                     if _live_status(manifest, manifest_path)["phase"] == "off":
                         _run_root("prepare", manifest_path)
@@ -1493,6 +1678,8 @@ def _run(
                     selected = desired["source"]["selectedNode"]
                     if selected and selected not in nodes:
                         raise AgentFailure("selection_missing")
+                    report_nodes = list(nodes)
+                    report_selected = selected
                     config_digest = hashlib.sha256(_canonical(compiled["config"])).hexdigest()
                     if generation != active_generation or config_digest != active_digest:
                         candidate = {
@@ -1524,13 +1711,16 @@ def _run(
                     verified_old = True
                     last_refresh = time.monotonic()
                     last_check = desired["checkId"]
-                    retry_generation, retry_count, retry_at = -1, 0, 0.0
+                    retry_generation, retry_count, retry_at, retry_error = -1, 0, 0.0, ""
                     _write_health(manifest, "ready", generation)
                 except ChannelAuthenticationFailure:
                     raise
                 except AgentFailure as exc:
                     restored_active = False
-                    report_failure = retry_generation != generation
+                    report_failure = (
+                        retry_generation != generation
+                        or desired["checkId"] > last_check
+                    )
                     if had_verified_old:
                         try:
                             if candidate_staged:
@@ -1588,7 +1778,11 @@ def _run(
                             desired,
                             exc.code,
                             True,
+                            nodes=report_nodes,
+                            selected_node=report_selected,
                         )
+                    if report_failure:
+                        last_check = desired["checkId"]
                     _write_health(
                         manifest,
                         "error" if verified_old else "quarantined",
@@ -1598,8 +1792,9 @@ def _run(
                     last_refresh = time.monotonic()
                     if retry_generation != generation:
                         retry_generation, retry_count = generation, 0
+                    retry_error = exc.code
                     retry_count = min(retry_count + 1, 4)
-                    retry_at = time.monotonic() + (5.0, 15.0, 60.0, 300.0)[retry_count - 1]
+                    retry_at = time.monotonic() + (5.0, 15.0, 60.0, 60.0)[retry_count - 1]
             elif check_due and verified_old and active_generation == generation:
                 try:
                     before = _live_status(manifest, manifest_path)

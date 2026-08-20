@@ -355,7 +355,7 @@ fi
 
 # Apply native overlays/hide helpers if they are deployed; these commands are idempotent.
 # These need uid=0 (bind mounts + /dev/__properties__ patches), so route through the root channel.
-as_root 'test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay-smoke.log 2>&1 || true; test -x /data/local/tmp/xenoid-hide-helper && /data/local/tmp/xenoid-hide-helper apply >/data/local/tmp/xenoid-hide-apply-smoke.log 2>&1 || true; PROP=$( { test -x /system/bin/xenoid-prop-area && echo /system/bin/xenoid-prop-area; } || { test -x /data/local/tmp/xenoid-prop-area && echo /data/local/tmp/xenoid-prop-area; } ) && "$PROP" --identity >/data/local/tmp/xenoid-prop-area-smoke.log 2>&1 || true' >/dev/null 2>&1 || true
+as_root 'test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay-smoke.log 2>&1 || true; test -x /data/local/tmp/xenoid-hide-helper && /data/local/tmp/xenoid-hide-helper apply >/data/local/tmp/xenoid-hide-apply-smoke.log 2>&1 || true; PROP=$( { test -x /system/bin/xenoid-prop-area && echo /system/bin/xenoid-prop-area; } || { test -x /data/local/tmp/xenoid-prop-area && echo /data/local/tmp/xenoid-prop-area; } ) && "$PROP" --identity >/data/local/tmp/xenoid-prop-area-smoke.log 2>&1 || true' >/dev/null 2>&1 || true
 
 # Native hide status: su/zygisk file surfaces must be clean after apply (zygisk!=SELinux attr/prev).
 if as_root 'test -x /data/local/tmp/xenoid-hide-helper && /data/local/tmp/xenoid-hide-helper status' >/tmp/xenoid-smoke-hide-files.out 2>&1; then
@@ -405,7 +405,7 @@ if "$ADB_BIN" -s "$ADB_TARGET" shell 'bad="frida|xenoid|magisk|zygisk|lsposed|ri
 if ./scripts/smoke-prop-files.sh >/tmp/xenoid-smoke-prop-files.out 2>&1; then add prop_files true "$(cat /tmp/xenoid-smoke-prop-files.out)"; else add prop_files false "$(cat /tmp/xenoid-smoke-prop-files.out)"; fi
 
 # Summarize missing or duplicate overlay targets.
-if as_root 'test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper status-json' >/tmp/xenoid-smoke-overlay-status.out 2>&1; then
+if as_root 'test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper status-json' >/tmp/xenoid-smoke-overlay-status.out 2>&1; then
   overlay_summary=$(python3 - <<'PY2'
 import json
 try:

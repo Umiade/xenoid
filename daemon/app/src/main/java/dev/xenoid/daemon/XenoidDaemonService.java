@@ -3,6 +3,9 @@ package dev.xenoid.daemon;
 import android.app.*;
 import android.content.*;
 import android.os.*;
+import android.system.Os;
+import android.system.OsConstants;
+import android.system.StructStat;
 import org.json.*;
 import java.io.*;
 import java.net.*;
@@ -10,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -21,23 +25,41 @@ public class XenoidDaemonService extends Service {
     private static final int HEADER_READ_TIMEOUT_MS = 5000;
     private static final int SOURCE_READ_TIMEOUT_MS = 15000;
     private volatile ExecutorService pool;
+    private volatile Thread acceptThread;
+    private volatile Thread initializerThread;
     private volatile ServerSocket server;
     private volatile CameraMediaManager cameraMediaManager;
     private volatile ProxyManager proxyManager;
     private volatile ProxyAgentChannel proxyAgentChannel;
     private volatile LocationIdentityManager locationIdentityManager;
     private volatile KeyboxManager keyboxManager;
+    private volatile BootstrapCoordinator bootstrapCoordinator;
+    private final Set<Client> clients =
+            Collections.newSetFromMap(new ConcurrentHashMap<Client, Boolean>());
     public IBinder onBind(Intent intent) { return null; }
     public int onStartCommand(Intent intent, int flags, int startId) { enterForeground(); startServer(); return START_STICKY; }
     public void onDestroy() {
         ServerSocket listener = server;
         try { if (listener != null) listener.close(); } catch(Exception ignored) {}
+        BootstrapCoordinator coordinator = bootstrapCoordinator;
+        if (coordinator != null) coordinator.close();
         ProxyAgentChannel channel = proxyAgentChannel;
         if (channel != null) channel.close();
         ProxyManager manager = proxyManager;
         if (manager != null) manager.close();
+        for (Client client : clients) client.close();
         ExecutorService workers = pool;
-        if (workers != null) workers.shutdownNow();
+        if (workers != null) {
+            for (Runnable abandoned : workers.shutdownNow()) {
+                if (abandoned instanceof Client) ((Client) abandoned).close();
+            }
+        }
+        for (Client client : clients) client.close();
+        Thread acceptor = acceptThread;
+        if (acceptor != null) acceptor.interrupt();
+        Thread initializer = initializerThread;
+        if (initializer != null) initializer.interrupt();
+        super.onDestroy();
     }
     private void enterForeground() {
         String channelId = "xenoid-control";
@@ -60,64 +82,97 @@ public class XenoidDaemonService extends Service {
     }
     private synchronized void startServer() {
         if (pool != null) return;
-        ExecutorService workers = Executors.newFixedThreadPool(16);
+        ExecutorService workers = new ThreadPoolExecutor(
+                16, 16, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<Runnable>(32),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "xenoid-http");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                new ThreadPoolExecutor.AbortPolicy());
         pool = workers;
-        workers.submit(() -> initializeServer(workers));
+        Thread initializer = new Thread(
+                () -> initializeServer(workers), "xenoid-http-initialize");
+        initializer.setDaemon(true);
+        initializerThread = initializer;
+        initializer.start();
     }
 
     private void initializeServer(ExecutorService workers) {
         ServerSocket listener = null;
+        BootstrapCoordinator coordinator = null;
         try {
-            String controlToken = getToken();
+            String controlToken = loadOrCreateTokenStrict();
+            token = controlToken;
             RootHelper.setRootdToken(controlToken);
+            coordinator = new BootstrapCoordinator(this);
+            bootstrapCoordinator = coordinator;
+
+            listener = new ServerSocket(18765, 50, InetAddress.getByName("127.0.0.1"));
+            if (workers.isShutdown() || Thread.currentThread().isInterrupted()) {
+                listener.close();
+                return;
+            }
+            server = listener;
+            final ServerSocket activeListener = listener;
+            Thread acceptor = new Thread(
+                    () -> acceptClients(activeListener, workers), "xenoid-http-accept");
+            acceptor.setDaemon(true);
+            acceptThread = acceptor;
+            acceptor.start();
+
+            String keyboxError = null;
             try {
                 keyboxManager = new KeyboxManager(this);
-            } catch (Throwable failure) {
-                android.util.Log.e(
-                        "xenoid-daemon", "keybox manager initialization failed", failure);
-            }
-            try {
-                ProxyManager manager = new ProxyManager(this);
-                ProxyAgentChannel channel = new ProxyAgentChannel(manager);
-                proxyManager = manager;
-                proxyAgentChannel = channel;
             } catch (Throwable ignored) {
-                android.util.Log.e("xenoid-daemon", "proxy control initialization failed");
+                keyboxError = "keybox_unavailable";
+                android.util.Log.e("xenoid-daemon", "keybox manager initialization failed");
             }
+
+            String proxyError = null;
+            ProxyManager candidateProxy = null;
             try {
-                LocationIdentityManager location = new LocationIdentityManager(this);
-                locationIdentityManager = location;
+                candidateProxy = new ProxyManager(this);
+                proxyManager = candidateProxy;
+                proxyError = candidateProxy.initializationErrorCode();
+            } catch (Throwable ignored) {
+                proxyError = "proxy_state_invalid";
+                android.util.Log.e("xenoid-daemon", "proxy state facade initialization failed");
+            }
+            if (candidateProxy != null) {
                 try {
-                    location.restoreDataPlane();
+                    proxyAgentChannel = new ProxyAgentChannel(candidateProxy);
                 } catch (Throwable ignored) {
-                    android.util.Log.e("xenoid-daemon", "location data-plane restoration failed");
+                    if (proxyError == null) proxyError = "proxy_unavailable";
+                    android.util.Log.e("xenoid-daemon", "proxy agent channel initialization failed");
                 }
+            }
+
+            String locationError = null;
+            try {
+                locationIdentityManager = new LocationIdentityManager(this);
             } catch (Throwable ignored) {
+                locationError = "location_unavailable";
                 android.util.Log.e("xenoid-daemon", "location identity initialization failed");
             }
+
+            String cameraError = null;
             try {
                 cameraMediaManager = CameraMediaManager.get(this);
             } catch (Throwable ignored) {
+                cameraError = "camera_unavailable";
                 android.util.Log.e("xenoid-daemon", "camera manager initialization failed");
             }
-            listener = new ServerSocket(18765, 50, InetAddress.getByName("0.0.0.0"));
-            server = listener;
-            LocationIdentityManager location = locationIdentityManager;
-            if (location != null) {
-                workers.submit(() -> {
-                    try {
-                        Thread.sleep(2000);
-                        location.restoreDataPlane();
-                    } catch (Throwable ignored) {
-                        android.util.Log.e("xenoid-daemon", "delayed location data-plane restoration failed");
-                    }
-                });
-            }
-            final ServerSocket activeListener = listener;
-            workers.submit(() -> acceptClients(activeListener, workers));
-        } catch(Exception e) {
-            try { if (listener != null) listener.close(); } catch (Exception ignored) { }
-            android.util.Log.e("xenoid-daemon", "bind failed", e);
+            coordinator.installComponents(
+                    keyboxManager, keyboxError,
+                    proxyAgentChannel == null ? null : proxyManager, proxyError,
+                    locationIdentityManager, locationError,
+                    cameraMediaManager, cameraError);
+        } catch(Exception ignored) {
+            try { if (listener != null) listener.close(); } catch (Exception closeIgnored) { }
+            if (coordinator != null) coordinator.close();
+            android.util.Log.e("xenoid-daemon", "control listener initialization failed");
         }
     }
 
@@ -128,45 +183,129 @@ public class XenoidDaemonService extends Service {
                 Socket client = listener.accept();
                 try {
                     client.setSoTimeout(HEADER_READ_TIMEOUT_MS);
-                    workers.submit(new Client(client));
-                } catch (RejectedExecutionException e) {
-                    try { client.close(); } catch (Exception ignored) { }
-                    break;
+                    Client request = new Client(client);
+                    clients.add(request);
+                    try {
+                        workers.execute(request);
+                    } catch (RejectedExecutionException rejected) {
+                        clients.remove(request);
+                        request.close();
+                    }
                 } catch (SocketException ignored) {
                     try { client.close(); } catch (Exception closeIgnored) { }
                 }
             }
-        } catch (Exception e) {
+        } catch (Exception ignored) {
             if (!listener.isClosed()) {
-                android.util.Log.e("xenoid-daemon", "accept failed", e);
+                android.util.Log.e("xenoid-daemon", "control listener accept failed");
             }
         }
     }
-    // Shared-secret token for the daemon control channel. Generated once into the
-    // app's private dir (only the daemon and root can read it; other apps cannot).
-    // The host CLI reads it via the root channel and sends it as X-Xenoid-Token.
+    // The only durable control credential is this app-private, strictly validated file.
     private String token;
-    private synchronized String getToken() {
-        if (token == null) {
-            try {
-                File f = new File(getFilesDir(), "daemon.token");
-                if (f.exists()) {
-                    token = new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8").trim();
-                } else {
-                    token = UUID.randomUUID().toString().replace("-", "");
-                    java.nio.file.Files.write(f.toPath(), token.getBytes("UTF-8"));
-                    f.setReadable(false, false); f.setReadable(true, true);
-                }
-            } catch (Exception e) { token = UUID.randomUUID().toString().replace("-", ""); }
+
+    private synchronized String loadOrCreateTokenStrict() throws Exception {
+        File file = new File(getFilesDir(), "daemon.token");
+        try {
+            return readStrictToken(file);
+        } catch (android.system.ErrnoException missing) {
+            if (missing.errno != OsConstants.ENOENT) throw missing;
+        } catch (InvalidToken invalid) {
+            Os.remove(file.getAbsolutePath());
+            syncDirectory(file.getParentFile());
         }
-        return token;
+
+        byte[] random = new byte[16];
+        byte[] encoded = new byte[32];
+        new SecureRandom().nextBytes(random);
+        final byte[] digits = "0123456789abcdef".getBytes(StandardCharsets.US_ASCII);
+        for (int index = 0; index < random.length; index++) {
+            int value = random[index] & 0xff;
+            encoded[index * 2] = digits[value >>> 4];
+            encoded[index * 2 + 1] = digits[value & 0x0f];
+        }
+        File temporary = new File(file.getParentFile(),
+                ".daemon.token." + UUID.randomUUID() + ".tmp");
+        FileDescriptor descriptor = null;
+        try {
+            descriptor = Os.open(temporary.getAbsolutePath(), OsConstants.O_WRONLY
+                    | OsConstants.O_CREAT | OsConstants.O_EXCL | OsConstants.O_NOFOLLOW, 0600);
+            Os.fchmod(descriptor, 0600);
+            try (FileOutputStream output = new FileOutputStream(descriptor)) {
+                descriptor = null;
+                output.write(encoded);
+                output.flush();
+                output.getFD().sync();
+            }
+            Os.rename(temporary.getAbsolutePath(), file.getAbsolutePath());
+            syncDirectory(file.getParentFile());
+            return readStrictToken(file);
+        } finally {
+            Arrays.fill(random, (byte) 0);
+            Arrays.fill(encoded, (byte) 0);
+            if (descriptor != null) try { Os.close(descriptor); } catch (Throwable ignored) { }
+            try { Os.remove(temporary.getAbsolutePath()); } catch (Throwable ignored) { }
+        }
     }
+
+    private static String readStrictToken(File file) throws Exception {
+        StructStat initial = Os.lstat(file.getAbsolutePath());
+        if (!validTokenStat(initial)) throw new InvalidToken();
+        FileDescriptor descriptor = Os.open(file.getAbsolutePath(),
+                OsConstants.O_RDONLY | OsConstants.O_NOFOLLOW, 0);
+        byte[] bytes = new byte[32];
+        try (FileInputStream input = new FileInputStream(descriptor)) {
+            descriptor = null;
+            StructStat opened = Os.fstat(input.getFD());
+            if (!validTokenStat(opened)
+                    || opened.st_dev != initial.st_dev || opened.st_ino != initial.st_ino) {
+                throw new InvalidToken();
+            }
+            int offset = 0;
+            while (offset < bytes.length) {
+                int count = input.read(bytes, offset, bytes.length - offset);
+                if (count <= 0) throw new InvalidToken();
+                offset += count;
+            }
+            if (input.read() != -1) throw new InvalidToken();
+            for (byte value : bytes) {
+                if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f'))) {
+                    throw new InvalidToken();
+                }
+            }
+            return new String(bytes, StandardCharsets.US_ASCII);
+        } finally {
+            Arrays.fill(bytes, (byte) 0);
+            if (descriptor != null) try { Os.close(descriptor); } catch (Throwable ignored) { }
+        }
+    }
+
+    private static boolean validTokenStat(StructStat stat) {
+        return (stat.st_mode & OsConstants.S_IFMT) == OsConstants.S_IFREG
+                && (stat.st_mode & 07777) == 0600
+                && stat.st_uid == android.os.Process.myUid()
+                && stat.st_nlink == 1 && stat.st_size == 32;
+    }
+
+    private static void syncDirectory(File directory) throws Exception {
+        FileDescriptor descriptor = Os.open(directory.getAbsolutePath(),
+                OsConstants.O_RDONLY | OsConstants.O_NOFOLLOW, 0);
+        try {
+            StructStat metadata = Os.fstat(descriptor);
+            if ((metadata.st_mode & OsConstants.S_IFMT) != OsConstants.S_IFDIR
+                    || metadata.st_uid != android.os.Process.myUid()) throw new Exception();
+            Os.fsync(descriptor);
+        } finally {
+            Os.close(descriptor);
+        }
+    }
+
     private boolean authorized(String tokenHeader, String path) {
-        // /health is public; /proxy/agent has its separate process-scoped credential.
-        if ("/health".equals(path)) return true;
-        if (tokenHeader == null) return false;
+        if ("/health".equals(path) || "/bootstrap/transport".equals(path)) return true;
+        String expectedToken = token;
+        if (tokenHeader == null || expectedToken == null) return false;
         byte[] supplied = tokenHeader.getBytes(StandardCharsets.UTF_8);
-        byte[] expected = getToken().getBytes(StandardCharsets.UTF_8);
+        byte[] expected = expectedToken.getBytes(StandardCharsets.US_ASCII);
         try {
             return MessageDigest.isEqual(supplied, expected);
         } finally {
@@ -174,15 +313,21 @@ public class XenoidDaemonService extends Service {
             Arrays.fill(expected, (byte) 0);
         }
     }
+
+    private static final class InvalidToken extends Exception { }
     final class Client implements Runnable {
         final Socket socket;
         Client(Socket socket) { this.socket = socket; }
+        void close() {
+            try { socket.close(); } catch (Exception ignored) { }
+        }
         public void run() {
             try {
                 handle(socket);
             } catch (Exception ignored) {
             } finally {
-                try { socket.close(); } catch (Exception ignored) { }
+                clients.remove(this);
+                close();
             }
         }
     }
@@ -249,7 +394,7 @@ public class XenoidDaemonService extends Service {
             if (!isAuthorized) {
                 writeResponse(output, 401, map(
                         "ok", false,
-                        "error", agentRequest ? "agent_rejected" : "unauthorized"));
+                        "errorCode", agentRequest ? "agent_rejected" : "unauthorized"));
                 return;
             }
             int maximumBody = bodyLimit(method, path);
@@ -271,13 +416,24 @@ public class XenoidDaemonService extends Service {
                 }
                 offset += read;
             }
-            String body;
+            String body = null;
             try {
                 body = decodeUtf8(bodyBytes);
             } finally {
                 Arrays.fill(bodyBytes, (byte) 0);
             }
-            writeResponse(output, 200, route(method, path, body));
+            HttpResponse response;
+            try {
+                response = dispatch(method, path, body);
+            } finally {
+                body = null;
+            }
+            try {
+                writeResponse(output, response.status, response.body);
+            } finally {
+                if ("/proxy/export".equals(path)
+                        || "/proxy/agent-bootstrap".equals(path)) response.body.clear();
+            }
         } catch (HttpFailure | SocketTimeoutException ignored) {
             writeResponse(output, 400, map("ok", false, "error", "invalid_request"));
         }
@@ -291,7 +447,11 @@ public class XenoidDaemonService extends Service {
     }
 
     private static int bodyLimit(String method, String path) {
-        if ("/health".equals(path)) return "GET".equals(method) ? 0 : 0;
+        if ("/health".equals(path) || "/bootstrap/transport".equals(path)
+                || "/bootstrap/status".equals(path)) return 0;
+        if ("/bootstrap/reconcile".equals(path)) return "POST".equals(method) ? 512 : 0;
+        if ("/bootstrap/cancel".equals(path)) return "POST".equals(method) ? 256 : 0;
+        if (path.startsWith("/bootstrap/")) return 0;
         if ("/proxy/source".equals(path)) {
             return "POST".equals(method) ? ProxyManager.MAX_REQUEST_BODY_BYTES : 0;
         }
@@ -362,7 +522,9 @@ public class XenoidDaemonService extends Service {
         byte[] bytes = new JSONObject(response).toString().getBytes(StandardCharsets.UTF_8);
         try {
             String label = status == 200 ? "200 OK"
-                    : status == 401 ? "401 Unauthorized" : "400 Bad Request";
+                    : status == 202 ? "202 Accepted"
+                    : status == 401 ? "401 Unauthorized"
+                    : status == 409 ? "409 Conflict" : "400 Bad Request";
             output.write(("HTTP/1.1 " + label
                     + "\r\nContent-Type: application/json\r\nContent-Length: " + bytes.length
                     + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
@@ -374,6 +536,55 @@ public class XenoidDaemonService extends Service {
     }
 
     private static final class HttpFailure extends Exception { }
+
+    private HttpResponse dispatch(String method, String path, String body) {
+        if ("/bootstrap/transport".equals(path)) {
+            if (!"GET".equals(method) || (body != null && !body.isEmpty())) {
+                return bootstrapError(400, "invalid_request");
+            }
+            return new HttpResponse(200, map(
+                    "ok", true,
+                    "schema", "dev.xenoid.daemon-transport/v1",
+                    "service", "xenoid-daemon",
+                    "transportReady", true));
+        }
+        if (path.startsWith("/bootstrap/")) {
+            BootstrapCoordinator coordinator = bootstrapCoordinator;
+            if (coordinator == null) return bootstrapError(409, "bootstrap_unavailable");
+            BootstrapCoordinator.Response result;
+            if ("/bootstrap/reconcile".equals(path)) {
+                if (!"POST".equals(method)) return bootstrapError(400, "invalid_request");
+                result = coordinator.reconcile(body);
+            } else if ("/bootstrap/status".equals(path)) {
+                if (!"GET".equals(method)) return bootstrapError(400, "invalid_request");
+                result = coordinator.status(body);
+            } else if ("/bootstrap/cancel".equals(path)) {
+                if (!"POST".equals(method)) return bootstrapError(400, "invalid_request");
+                result = coordinator.cancel(body);
+            } else {
+                return bootstrapError(400, "invalid_request");
+            }
+            return new HttpResponse(result.status, result.body);
+        }
+        return new HttpResponse(200, route(method, path, body));
+    }
+
+    private static HttpResponse bootstrapError(int status, String code) {
+        return new HttpResponse(status, map(
+                "ok", false,
+                "schema", BootstrapCoordinator.SCHEMA,
+                "errorCode", code));
+    }
+
+    private static final class HttpResponse {
+        final int status;
+        final Map<String, Object> body;
+
+        HttpResponse(int status, Map<String, Object> body) {
+            this.status = status;
+            this.body = body;
+        }
+    }
     private Map<String,Object> route(String method, String path, String body) {
         try {
             if (path.equals("/health")) {
@@ -381,11 +592,18 @@ public class XenoidDaemonService extends Service {
                     return map("ok", false, "error", "invalid_request");
                 }
                 KeyboxManager keybox = keyboxManager;
-                if (cameraMediaManager == null || proxyManager == null
+                ProxyManager proxy = proxyManager;
+                BootstrapCoordinator coordinator = bootstrapCoordinator;
+                if (cameraMediaManager == null || proxy == null
                         || proxyAgentChannel == null || locationIdentityManager == null
-                        || keybox == null || !keybox.healthReady()) {
+                        || keybox == null || coordinator == null
+                        || !coordinator.aggregateBootstrapReady()
+                        || !keybox.healthReady() || !proxy.healthReady()
+                        || !locationIdentityManager.healthReady()
+                        || !cameraMediaManager.healthReady()
+                        || !rootHealthReady()) {
                     return map("ok", false, "service", "xenoid-daemon",
-                            "version", "0.1.0", "error", "service not ready");
+                            "version", "0.1.0", "error", "service_not_ready");
                 }
                 return map("ok", true, "service", "xenoid-daemon", "version", "0.1.0");
             }
@@ -414,8 +632,10 @@ public class XenoidDaemonService extends Service {
             if (path.equals("/hide/apply")) return HideManager.apply(body);
             if (path.equals("/ota/check")) return OtaManager.check();
             if (path.equals("/ota/apply")) return OtaManager.apply(SimpleJson.stringValue(body, "channel", "stable"));
-            return map("ok", false, "error", "not found", "path", path);
-        } catch(Exception e) { return map("ok", false, "error", e.toString()); }
+            return map("ok", false, "error", "not_found");
+        } catch(Exception ignored) {
+            return map("ok", false, "error", "internal_error");
+        }
     }
 
     private Map<String, Object> routeKeybox(String method, String path, String body) {
@@ -428,6 +648,7 @@ public class XenoidDaemonService extends Service {
                 return manager == null
                         ? keyboxError("native_unavailable") : manager.status();
             }
+            if (!rootComponentReady()) return keyboxError("rootd_unavailable");
             if ("/keybox/source".equals(path)) {
                 requireKeyboxMethod(method, "POST");
                 JSONObject object = cameraObject(body, "stagingPath", "size", "sha256");
@@ -443,6 +664,7 @@ public class XenoidDaemonService extends Service {
                 requireKeyboxMethod(method, "POST");
                 cameraObject(body);
                 KeyboxManager manager = keyboxManager;
+                if (!rootComponentReady()) return keyboxError("rootd_unavailable");
                 return manager == null
                         ? keyboxError("native_unavailable") : manager.clear();
             }
@@ -498,11 +720,14 @@ public class XenoidDaemonService extends Service {
 
     private Map<String, Object> routeLocation(String method, String path, String body) throws Exception {
         LocationIdentityManager manager = locationIdentityManager;
-        if (manager == null) throw new IllegalStateException("location_unavailable");
+        if (manager == null) return map("ok", false, "error", "location_unavailable");
         if ("/location/status".equals(path)) {
             requireProxyMethod(method, "GET");
             ProxyManager.requireEmptyBody(body);
             return manager.status();
+        }
+        if (!rootComponentReady()) {
+            return map("ok", false, "error", "rootd_unavailable");
         }
         if ("/location/stage".equals(path)) {
             requireProxyMethod(method, "POST");
@@ -526,7 +751,11 @@ public class XenoidDaemonService extends Service {
                 requireProxyMethod(method, "POST");
                 Map<String, Object> request =
                         ProxyManager.parseObject(body, ProxyManager.MAX_REQUEST_BODY_BYTES);
-                return requireProxyManager().setSource(request);
+                try {
+                    return requireProxyManager().setSource(request);
+                } finally {
+                    request.clear();
+                }
             }
             if ("/proxy/enabled".equals(path)) {
                 requireProxyMethod(method, "POST");
@@ -577,15 +806,14 @@ public class XenoidDaemonService extends Service {
             return map("ok", false, "error", failure.code);
         } catch (ProxyAgentChannel.AgentRejected ignored) {
             return map("ok", false, "error", "agent_rejected");
-        } catch (Throwable failure) {
-            android.util.Log.e("xenoid-daemon", "proxy route failed", failure);
+        } catch (Throwable ignored) {
             return map("ok", false, "error", "proxy_request_failed");
         }
     }
 
     private ProxyManager requireProxyManager() throws ProxyManager.ProxyException {
         ProxyManager manager = proxyManager;
-        if (manager == null || proxyAgentChannel == null) {
+        if (manager == null) {
             throw new ProxyManager.ProxyException("proxy_unavailable");
         }
         return manager;
@@ -597,9 +825,34 @@ public class XenoidDaemonService extends Service {
             throw new ProxyManager.ProxyException("method_not_allowed");
         }
     }
+
+    private boolean rootComponentReady() {
+        BootstrapCoordinator coordinator = bootstrapCoordinator;
+        return coordinator != null && coordinator.componentReady("root");
+    }
+
+    private boolean rootHealthReady() {
+        RootHelper.ConnectionHandle handle = RootHelper.newConnectionHandle();
+        try {
+            Map<String, Object> status = RootHelper.status(10000, handle);
+            return Boolean.TRUE.equals(status.get("ok"))
+                    && Boolean.TRUE.equals(status.get("root"));
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            handle.close();
+        }
+    }
     private Map<String,Object> routeCamera(String method, String path, String body) {
         try {
             CameraMediaManager manager = cameraMediaManager;
+            if (manager != null && !"/camera/status".equals(path)
+                    && !rootComponentReady()) {
+                Map<String, Object> response = manager.status();
+                response.put("ok", false);
+                response.put("error", "rootd_unavailable");
+                return response;
+            }
             if (manager == null) {
                 if ("/camera/status".equals(path)) {
                     requireCameraMethod(method, "GET");
@@ -757,6 +1010,11 @@ public class XenoidDaemonService extends Service {
         } catch (Throwable ignored) {
             throw new CameraRequestFailure("invalid request schema");
         }
+    }
+
+    static boolean isStrictSimpleObject(String body) {
+        return body != null && body.length() <= 1024
+                && new StrictCameraObjectParser(body).parse();
     }
 
     private static final class StrictCameraObjectParser {

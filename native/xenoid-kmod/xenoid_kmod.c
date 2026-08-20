@@ -324,6 +324,37 @@ static char statfs_symbol[128] = "vfs_statfs";
 module_param_string(statfs_symbol, statfs_symbol, sizeof(statfs_symbol), 0444);
 MODULE_PARM_DESC(statfs_symbol, "Resolved vfs_statfs implementation symbol");
 
+static char deployment_digest[65];
+module_param_string(deployment_digest, deployment_digest,
+		    sizeof(deployment_digest), 0444);
+MODULE_PARM_DESC(deployment_digest,
+		 "Digest binding this loaded module to the shared protection record");
+
+static char artifact_digest[65];
+module_param_string(artifact_digest, artifact_digest,
+		    sizeof(artifact_digest), 0444);
+MODULE_PARM_DESC(artifact_digest,
+		 "SHA-256 of the immutable module artifact loaded by the manager");
+
+static bool lowercase_sha256_valid(const char *value)
+{
+	unsigned int i;
+
+	if (strlen(value) != 64)
+		return false;
+	for (i = 0; i < 64; i++)
+		if (!((value[i] >= '0' && value[i] <= '9') ||
+		      (value[i] >= 'a' && value[i] <= 'f')))
+			return false;
+	return true;
+}
+
+static bool deployment_digest_valid(void)
+{
+	return lowercase_sha256_valid(deployment_digest) &&
+	       lowercase_sha256_valid(artifact_digest);
+}
+
 static struct kretprobe statfs_kp = {
 	.handler = statfs_post,
 	.entry_handler = statfs_pre,
@@ -380,7 +411,7 @@ static bool path_hidden(const char *path)
         return true;
     /* Isolated application domains must retain the stock procfs access view. */
     if (current_is_isolated_android_app() && !strcmp(path, "/proc/version"))
-        return true;
+        return false;
     return path_has_dotdot_component(path) || str_has_any(path, path_markers);
 }
 
@@ -1958,6 +1989,11 @@ static int __init xenoid_kmod_init(void)
 {
     unsigned int i;
     int ret;
+
+    if (!deployment_digest_valid()) {
+        pr_err("xenoid_kmod: missing or invalid shared protection digest\n");
+        return -EINVAL;
+    }
 
     for (i = 0; i < ARRAY_SIZE(seclabel_rprobes); i++) {
         ret = register_kretprobe(seclabel_rprobes[i]);

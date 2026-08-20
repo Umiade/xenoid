@@ -72,6 +72,10 @@ public final class ProxyAgentChannel {
         if (!isValidInstanceId(requestedInstance) || !isValidRuntimeEpoch(requestedEpoch)) {
             throw new ProxyManager.ProxyException("invalid_request_schema");
         }
+        // Prove the exact persisted/bootstrap identity before generating any
+        // process-scoped channel secret.
+        manager.bindRuntime(requestedInstance, requestedEpoch);
+
 
         byte[] master = new byte[MASTER_KEY_BYTES];
         byte[] rawAgentToken = new byte[MASTER_KEY_BYTES];
@@ -99,14 +103,6 @@ public final class ProxyAgentChannel {
             wipe(rawAgentToken);
         }
 
-        try {
-            manager.bindRuntime(requestedInstance, requestedEpoch);
-        } catch (ProxyManager.ProxyException failure) {
-            wipe(nextC2s);
-            wipe(nextS2c);
-            wipe(nextAgentToken);
-            throw failure;
-        }
         wipe(c2sKey);
         wipe(s2cKey);
         wipe(agentToken);
@@ -208,7 +204,17 @@ public final class ProxyAgentChannel {
             wipe(plaintext);
         }
 
+        try {
+            return handleInner(
+                    requestInstance, requestEpoch, session, sequence, requestId, inner);
+        } finally {
+            dropMutable(inner);
+        }
+    }
 
+    private Map<String, Object> handleInner(
+            String requestInstance, String requestEpoch, String session, long sequence,
+            String requestId, Map<String, Object> inner) throws AgentRejected {
         String operation;
         long timestamp;
         Map<String, Object> body;
@@ -226,7 +232,8 @@ public final class ProxyAgentChannel {
             throw new AgentRejected();
         }
 
-        Map<String, Object> result;
+        Map<String, Object> result = null;
+        Map<String, Object> response = null;
         try {
             if ("desired".equals(operation)) {
                 ProxyManager.requireKeys(body);
@@ -239,17 +246,19 @@ public final class ProxyAgentChannel {
             } else {
                 return sealError(requestInstance, requestEpoch, session, sequence, requestId);
             }
+            response = map("body", result, "ok", true);
+            return sealResponse(
+                    requestInstance, requestEpoch, session, sequence, requestId, 200, response);
         } catch (ProxyManager.ProxyException failure) {
             if ("agent_rejected".equals(failure.code)
                     || "instance_identity_mismatch".equals(failure.code)) {
                 throw new AgentRejected();
             }
             return sealError(requestInstance, requestEpoch, session, sequence, requestId);
+        } finally {
+            if (response != null) response.clear();
+            dropMutable(result);
         }
-
-        return sealResponse(
-                requestInstance, requestEpoch, session, sequence, requestId, 200,
-                map("body", result, "ok", true));
     }
 
     public synchronized boolean authorizedAgentToken(String supplied) {
@@ -487,6 +496,21 @@ public final class ProxyAgentChannel {
             result.put(String.valueOf(values[index]), values[index + 1]);
         }
         return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void dropMutable(Object value) {
+        if (value instanceof Map) {
+            Map<String, Object> object = (Map<String, Object>) value;
+            for (Object item : new ArrayList<>(object.values())) dropMutable(item);
+            object.clear();
+        } else if (value instanceof List) {
+            List<Object> items = (List<Object>) value;
+            for (Object item : new ArrayList<>(items)) dropMutable(item);
+            items.clear();
+        } else if (value instanceof byte[]) {
+            wipe((byte[]) value);
+        }
     }
 
     private static void wipe(byte[] value) {

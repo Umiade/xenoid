@@ -1,29 +1,12 @@
 package dev.xenoid.daemon;
 
 import android.content.Context;
-import android.os.Process;
 import android.os.SystemClock;
-import android.security.keystore.KeyGenParameterSpec;
-import android.security.keystore.KeyProperties;
-import android.system.Os;
-import android.system.OsConstants;
-
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.File;
-import java.io.FileDescriptor;
-import java.io.FileOutputStream;
-import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
-import java.nio.file.StandardCopyOption;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
@@ -33,7 +16,6 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URI;
-import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -51,23 +33,18 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import javax.crypto.Cipher;
-import javax.crypto.KeyGenerator;
-import javax.crypto.SecretKey;
-import javax.crypto.spec.GCMParameterSpec;
 
 /**
- * Serialized owner of proxy desired state, runtime observations, and the narrow fail-close guard.
- * Only bounded daemon probes perform networking; proxy/VPN data-plane setup never occurs here.
+ * Serialized owner of proxy runtime policy and observations. ProxyStateStore is
+ * the sole owner of desired-state persistence and verified migration/recovery.
  */
 public final class ProxyManager {
-    static final int SCHEMA_VERSION = 1;
+    static final int SCHEMA_VERSION = 2;
     static final int MAX_SOURCE_BYTES = 1024 * 1024;
     static final int MAX_SELECTED_NODE = 128;
     static final int MAX_REQUEST_BODY_BYTES = 6 * MAX_SOURCE_BYTES + 4096;
     static final int MAX_AGENT_PLAINTEXT_BYTES = MAX_REQUEST_BODY_BYTES;
 
-    private static final int MAX_STATE_BYTES = 1536 * 1024;
     private static final int MAX_COUNTERS = 64;
     private static final long PROBE_TIMEOUT_MS = 45000L;
     private static final int PROBE_IO_TIMEOUT_MS = 15000;
@@ -89,11 +66,6 @@ public final class ProxyManager {
             0x26, 0x06, 0x47, 0x00, 0x00, 0x48, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
     private static final SecureRandom PROBE_RANDOM = new SecureRandom();
-    private static final String KEYSTORE = "AndroidKeyStore";
-    private static final String KEY_ALIAS = "dev.xenoid.daemon.proxy.desired.v1";
-    private static final String STATE_NAME = "desired-v1.json";
-    private static final byte[] STATE_AAD_PREFIX =
-            "XENOID-PROXY-STATE-V1\n".getBytes(StandardCharsets.UTF_8);
     private static final Pattern SAFE_TOKEN =
             Pattern.compile("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}");
     private static final Pattern COUNTER_NAME =
@@ -110,9 +82,7 @@ public final class ProxyManager {
                     "v4DnsProxy", "v4TcpProxy", "v4UdpProxy",
                     "v6DnsProxy", "v6TcpProxy", "v6UdpProxy")));
 
-    private final File directory;
-    private final File stateFile;
-    private final SecretKey stateKey;
+    private final ProxyStateStore stateStore;
     private final ExecutorService probeExecutor =
             Executors.newFixedThreadPool(6, runnable -> {
                 Thread thread = new Thread(runnable, "proxy-android-probe");
@@ -120,54 +90,76 @@ public final class ProxyManager {
                 return thread;
             });
     private State state;
+    private String stateErrorCode;
+    private String recoveryInstanceId;
     private boolean quarantineInstalled;
 
-    // Process scoped only. These fields are never written by commitState.
+    // Process scoped only. ProxyStateStore never persists these observations.
     private long checkId;
     private String runtimeEpoch = "";
     private Map<String, Object> lastEngineReport;
     private Map<String, Object> lastProbe;
 
     public ProxyManager(Context context) throws InitializationException {
-        directory = new File(context.getApplicationContext().getFilesDir(), "proxy-state");
-        stateFile = new File(directory, STATE_NAME);
         try {
-            ensurePrivateDirectory(directory);
-            stateKey = loadOrCreateStateKey();
-            if (stateFile.exists()) {
-                state = loadState();
-            } else {
-                state = State.empty();
-                commitState(state);
-            }
-            quarantineInstalled = state.enabled;
-            applyPrivateDnsPolicy(state.enabled);
+            stateStore = ProxyStateStore.open(context.getApplicationContext());
         } catch (Throwable ignored) {
             throw new InitializationException();
+        }
+        try {
+            installLoadedState(stateStore.load());
+        } catch (ProxyStateStore.StateException failure) {
+            markUnreadable(failure.code);
+        } catch (Throwable ignored) {
+            markUnreadable("proxy_state_invalid");
         }
     }
 
     /** The transparent engine hijacks UDP/TCP 53; opportunistic DNS-over-TLS
      * (853) bypasses that channel and can stall behind exits that cannot carry
      * it, so the resolver must stay on plain DNS while the proxy is enabled. */
-    private static void applyPrivateDnsPolicy(boolean enabled) {
+    private static boolean applyPrivateDnsPolicy(boolean enabled) {
         try {
-            RootHelper.execRootd(enabled
+            Map<String, Object> result = RootHelper.execRootd(enabled
                     ? "settings put global private_dns_mode off"
                     : "settings delete global private_dns_mode");
+            return Boolean.TRUE.equals(result.get("ok"));
         } catch (Throwable ignored) {
-            android.util.Log.e("xenoid-daemon", "private DNS policy application failed");
+            return false;
         }
     }
 
     public synchronized Map<String, Object> status() {
-        Desired source = state.desired;
+        State current = state;
+        if (current == null) {
+            return map(
+                    "ok", false,
+                    "schemaVersion", SCHEMA_VERSION,
+                    "stateReadable", false,
+                    "stateError", safeStateError(),
+                    "instanceId", recoveryInstanceId,
+                    "generation", null,
+                    "enabled", null,
+                    "configured", null,
+                    "sourceKind", null,
+                    "selectedNode", null,
+                    "udpAllowed", null,
+                    "allowInsecureHttp", null,
+                    "quarantined", true,
+                    "checkId", checkId,
+                    "runtimeEpoch", runtimeEpoch,
+                    "report", null,
+                    "probe", null);
+        }
+        Desired source = current.desired;
         return map(
                 "ok", true,
                 "schemaVersion", SCHEMA_VERSION,
-                "instanceId", state.instanceId == null ? "" : state.instanceId,
-                "generation", state.generation,
-                "enabled", state.enabled,
+                "stateReadable", true,
+                "stateError", null,
+                "instanceId", current.instanceId == null ? "" : current.instanceId,
+                "generation", current.generation,
+                "enabled", current.enabled,
                 "configured", source != null,
                 "sourceKind", source == null ? null : source.kind,
                 "selectedNode", source == null ? "" : source.selectedNode,
@@ -178,6 +170,71 @@ public final class ProxyManager {
                 "runtimeEpoch", runtimeEpoch,
                 "report", deepCopyMap(lastEngineReport),
                 "probe", deepCopyMap(lastProbe));
+    }
+
+    synchronized String initializationErrorCode() {
+        return state == null ? safeStateError() : null;
+    }
+
+    synchronized String bootstrapInstanceId() {
+        return state == null ? null : state.instanceId;
+    }
+
+    synchronized BootstrapCoordinator.ComponentStatus reconcileBootstrap(
+            String instanceId, String epoch, long deadline,
+            BootstrapCoordinator.CancellationSignal cancellation) {
+        if (cancellation.isCancelled()) {
+            return BootstrapCoordinator.ComponentStatus.cancelled();
+        }
+        if (SystemClock.elapsedRealtime() >= deadline) {
+            return BootstrapCoordinator.ComponentStatus.timedOut();
+        }
+        try {
+            bindRuntime(instanceId, epoch);
+            State current = requireReadableState();
+            if (!applyPrivateDnsPolicy(current.enabled)) {
+                return BootstrapCoordinator.ComponentStatus.failed(
+                        "proxy_policy_unavailable", bootstrapFields());
+            }
+            if (cancellation.isCancelled()) {
+                return BootstrapCoordinator.ComponentStatus.cancelled();
+            }
+            if (SystemClock.elapsedRealtime() > deadline) {
+                return BootstrapCoordinator.ComponentStatus.timedOut();
+            }
+            String componentState = quarantineInstalled
+                    ? (current.enabled && current.desired == null ? "deferred" : "quarantined")
+                    : "ready";
+            return BootstrapCoordinator.ComponentStatus.ready(
+                    componentState, bootstrapFields());
+        } catch (ProxyException failure) {
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    failure.code, bootstrapFields());
+        } catch (Throwable ignored) {
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    "proxy_unavailable", bootstrapFields());
+        }
+    }
+
+    private Map<String, Object> bootstrapFields() {
+        State current = state;
+        return map(
+                "configured", current == null ? null : current.desired != null,
+                "enabled", current == null ? null : current.enabled,
+                "generation", current == null ? null : current.generation,
+                "quarantined", current == null || quarantineInstalled);
+    }
+
+    synchronized boolean healthReady() {
+        State current = state;
+        if (current == null || quarantineInstalled) return false;
+        if (!current.enabled) return true;
+        return current.desired != null
+                && lastEngineReport != null
+                && Boolean.TRUE.equals(lastEngineReport.get("structuralApplied"))
+                && Boolean.TRUE.equals(lastEngineReport.get("dataPlaneVerified"))
+                && "active".equals(lastEngineReport.get("phase"))
+                && androidProbeReadyLocked();
     }
 
     public synchronized Map<String, Object> setSource(Map<String, Object> request)
@@ -203,10 +260,17 @@ public final class ProxyManager {
         }
         Desired desired = new Desired(
                 kind, value, selectedNode, udpAllowed, allowInsecureHttp);
-        if (state.enabled == enable && desired.sameAs(state.desired)) return mutationResult();
+        State current = state;
+        if (current != null && current.enabled == enable && desired.sameAs(current.desired)) {
+            return mutationResult();
+        }
+        ensureQuarantineLocked();
         if (enable) requireCheckCapacityLocked();
-        if (state.enabled || enable) ensureQuarantineLocked();
-        commit(new State(state.instanceId, nextGeneration(), enable, desired));
+        if (current == null) {
+            commitRecoveredImport(enable, desired);
+        } else {
+            commitUpdate(enable, desired);
+        }
         if (enable) allocateCheckLocked();
         return mutationResult();
     }
@@ -214,12 +278,13 @@ public final class ProxyManager {
     public synchronized Map<String, Object> setEnabled(Map<String, Object> request)
             throws ProxyException {
         requireKeys(request, "enabled");
+        State current = requireReadableState();
         boolean enabled = requireBoolean(request, "enabled");
-        if (enabled && state.desired == null) throw new ProxyException("source_invalid");
-        if (enabled == state.enabled) return mutationResult();
-        if (enabled) requireCheckCapacityLocked();
+        if (enabled && current.desired == null) throw new ProxyException("source_invalid");
+        if (enabled == current.enabled) return mutationResult();
         ensureQuarantineLocked();
-        commit(new State(state.instanceId, nextGeneration(), enabled, state.desired));
+        if (enabled) requireCheckCapacityLocked();
+        commitUpdate(enabled, current.desired);
         if (enabled) allocateCheckLocked();
         return mutationResult();
     }
@@ -227,68 +292,90 @@ public final class ProxyManager {
     public synchronized Map<String, Object> select(Map<String, Object> request)
             throws ProxyException {
         requireKeys(request, "name");
+        State currentState = requireReadableState();
         String name = requireString(request, "name", MAX_SELECTED_NODE, false);
-        if (containsNul(name) || state.desired == null) throw new ProxyException("source_invalid");
-        Desired current = state.desired;
+        if (containsNul(name) || currentState.desired == null) {
+            throw new ProxyException("source_invalid");
+        }
+        Desired current = currentState.desired;
         Desired desired = new Desired(
                 current.kind, current.value, name, current.udpAllowed,
                 current.allowInsecureHttp);
         if (name.equals(current.selectedNode)) return mutationResult();
-        if (state.enabled) {
-            requireCheckCapacityLocked();
-            ensureQuarantineLocked();
-        }
-        commit(new State(state.instanceId, nextGeneration(), state.enabled, desired));
-        if (state.enabled) allocateCheckLocked();
+        ensureQuarantineLocked();
+        if (currentState.enabled) requireCheckCapacityLocked();
+        commitUpdate(currentState.enabled, desired);
+        if (currentState.enabled) allocateCheckLocked();
         return mutationResult();
     }
 
     public synchronized Map<String, Object> clear(Map<String, Object> request)
             throws ProxyException {
-        requireKeys(request);
-        if (!state.enabled && state.desired == null) return mutationResult();
-        if (state.enabled) ensureQuarantineLocked();
-        commit(new State(state.instanceId, nextGeneration(), false, null));
+        requireKeys(request, "discardUnreadableState");
+        boolean discardUnreadableState = requireBoolean(request, "discardUnreadableState");
+        State current = state;
+        if (current == null && !discardUnreadableState) {
+            throw new ProxyException(safeStateError());
+        }
+        if (current != null && !discardUnreadableState
+                && !current.enabled && current.desired == null) {
+            return mutationResult();
+        }
+        ensureQuarantineLocked();
+        commitClear(discardUnreadableState);
         return mutationResult();
     }
 
     public synchronized Map<String, Object> check(Map<String, Object> request)
             throws ProxyException {
         requireKeys(request);
-        if (!state.enabled || state.desired == null) {
+        State current = requireReadableState();
+        if (!current.enabled || current.desired == null) {
             throw new ProxyException("proxy_disabled");
         }
         requireCheckCapacityLocked();
         allocateCheckLocked();
-        return map("ok", true, "generation", state.generation, "checkId", checkId);
+        return map("ok", true, "generation", current.generation, "checkId", checkId);
     }
 
-    /** Full admin export. The service enforces daemon authentication before calling this. */
-    public synchronized Map<String, Object> exportDesired() {
-        Map<String, Object> exported = desiredPayload();
+    /** Full admin export. The service authenticates this route before decryption. */
+    public synchronized Map<String, Object> exportDesired() throws ProxyException {
+        State verified = verifyDecryptableState();
+        Map<String, Object> exported = desiredPayload(verified);
         exported.put("ok", true);
         return exported;
     }
 
-    /** Pins an immutable volume identity and a process-scoped runtime epoch. */
+    /** Pins the exact bootstrap instance identity and a process-scoped runtime epoch. */
     public synchronized void bindRuntime(String instanceId, String epoch) throws ProxyException {
-        if (state.instanceId == null) {
-            commit(new State(instanceId, state.generation, state.enabled, state.desired));
-        } else if (!state.instanceId.equals(instanceId)) {
+        if (!ProxyAgentChannel.isValidInstanceId(instanceId)
+                || !ProxyAgentChannel.isValidRuntimeEpoch(epoch)) {
+            throw new ProxyException("invalid_request_schema");
+        }
+        if (recoveryInstanceId != null && !recoveryInstanceId.equals(instanceId)) {
             throw new ProxyException("instance_identity_mismatch");
         }
+        recoveryInstanceId = instanceId;
         runtimeEpoch = epoch;
+        State current = state;
+        if (current == null) throw new ProxyException(safeStateError());
+        if (current.instanceId == null) {
+            installCommitted(callBindInstance(instanceId));
+            current = state;
+        } else if (!current.instanceId.equals(instanceId)) {
+            throw new ProxyException("instance_identity_mismatch");
+        }
         lastEngineReport = null;
         lastProbe = null;
-        if (state.enabled) {
+        if (current.enabled) {
             ensureQuarantineLocked();
             if (checkId == 0) {
                 requireCheckCapacityLocked();
                 allocateCheckLocked();
             }
         }
-    }
 
+    }
     synchronized Map<String, Object> desiredForAgent(String instanceId, String epoch)
             throws ProxyException {
         requireCurrentRuntime(instanceId, epoch);
@@ -370,8 +457,13 @@ public final class ProxyManager {
         }
     }
 
-    public void close() {
+    public synchronized void close() {
         probeExecutor.shutdownNow();
+        state = null;
+        lastEngineReport = null;
+        lastProbe = null;
+        runtimeEpoch = "";
+        recoveryInstanceId = null;
     }
 
     private ProbeResult executeAndroidProbe(long requestedCheck, boolean udpAllowed) {
@@ -619,7 +711,11 @@ public final class ProxyManager {
     }
 
     private Map<String, Object> desiredPayload() {
-        Desired desired = state.desired;
+        return desiredPayload(state);
+    }
+
+    private Map<String, Object> desiredPayload(State current) {
+        Desired desired = current.desired;
         Map<String, Object> source = desired == null ? null : map(
                 "kind", desired.kind,
                 "value", desired.value,
@@ -628,9 +724,9 @@ public final class ProxyManager {
                 "allowInsecureHttp", desired.allowInsecureHttp);
         return map(
                 "schemaVersion", SCHEMA_VERSION,
-                "instanceId", state.instanceId == null ? "" : state.instanceId,
-                "generation", state.generation,
-                "enabled", state.enabled,
+                "instanceId", current.instanceId == null ? "" : current.instanceId,
+                "generation", current.generation,
+                "enabled", current.enabled,
                 "checkId", checkId,
                 "source", source);
     }
@@ -646,7 +742,9 @@ public final class ProxyManager {
     }
 
     private void requireCurrentRuntime(String instanceId, String epoch) throws ProxyException {
-        if (state.instanceId == null || !state.instanceId.equals(instanceId)
+        State current = state;
+        if (current == null || current.instanceId == null
+                || !current.instanceId.equals(instanceId)
                 || runtimeEpoch.isEmpty() || !runtimeEpoch.equals(epoch)) {
             throw new ProxyException("agent_rejected");
         }
@@ -672,18 +770,20 @@ public final class ProxyManager {
     }
 
     private boolean capabilityMatrixMatchesPolicy(Object value) {
-        if (!(value instanceof Map) || state.desired == null) return false;
+        State current = state;
+        if (!(value instanceof Map) || current == null || current.desired == null) return false;
         Map<?, ?> capabilities = (Map<?, ?>) value;
         if (!capabilities.keySet().equals(CAPABILITY_FIELDS)) return false;
         for (Object item : capabilities.values()) {
             if (!(item instanceof Boolean)) return false;
         }
-        boolean udpAllowed = state.desired.udpAllowed;
+        boolean udpAllowed = current.desired.udpAllowed;
         return Boolean.TRUE.equals(capabilities.get("v4DnsProxy"))
                 && Boolean.TRUE.equals(capabilities.get("v4TcpProxy"))
                 && Boolean.TRUE.equals(capabilities.get("v6DnsProxy"))
+                && Boolean.TRUE.equals(capabilities.get("v6TcpProxy"))
                 && Boolean.valueOf(udpAllowed).equals(capabilities.get("v4UdpProxy"))
-                && (udpAllowed || Boolean.FALSE.equals(capabilities.get("v6UdpProxy")));
+                && Boolean.valueOf(udpAllowed).equals(capabilities.get("v6UdpProxy"));
     }
     private void requireCheckCapacityLocked() throws ProxyException {
         if (checkId == Long.MAX_VALUE) throw new ProxyException("proxy_unavailable");
@@ -693,24 +793,152 @@ public final class ProxyManager {
         checkId++;
         lastProbe = null;
     }
-
-    private long nextGeneration() throws ProxyException {
-        if (state.generation == Long.MAX_VALUE) throw new ProxyException("proxy_unavailable");
-        return state.generation + 1;
+    private State requireReadableState() throws ProxyException {
+        State current = state;
+        if (current == null) throw new ProxyException(safeStateError());
+        return current;
+    }
+    private State verifyDecryptableState() throws ProxyException {
+        State current = requireReadableState();
+        try {
+            State verified = runtimeState(stateStore.load());
+            boolean sourceMatches = current.desired == null
+                    ? verified.desired == null : current.desired.sameAs(verified.desired);
+            boolean identityMatches = current.instanceId == null
+                    ? verified.instanceId == null : current.instanceId.equals(verified.instanceId);
+            if (!identityMatches || current.generation != verified.generation
+                    || current.enabled != verified.enabled || !sourceMatches) {
+                markUnreadable("proxy_state_invalid");
+                throw new ProxyException("proxy_state_invalid");
+            }
+            return verified;
+        } catch (ProxyStateStore.StateException failure) {
+            throw storeFailure(failure);
+        } catch (ProxyException failure) {
+            throw failure;
+        } catch (Throwable ignored) {
+            markUnreadable("proxy_state_invalid");
+            throw new ProxyException("proxy_state_invalid");
+        }
     }
 
-    private void commit(State next) throws ProxyException {
+
+    private String requireBoundInstanceId() throws ProxyException {
+        State current = state;
+        String identity = current == null ? recoveryInstanceId : current.instanceId;
+        if (identity == null || identity.isEmpty()) {
+            throw new ProxyException("instance_identity_mismatch");
+        }
+        return identity;
+    }
+
+    private ProxyStateStore.LoadedState callBindInstance(String instanceId)
+            throws ProxyException {
         try {
-            commitState(next);
-            state = next;
-            // An old generation can never establish readiness for the new desired state.
-            lastEngineReport = null;
-            lastProbe = null;
+            return stateStore.bindInstance(instanceId);
+        } catch (ProxyStateStore.StateException failure) {
+            throw storeFailure(failure);
         } catch (Throwable ignored) {
             throw new ProxyException("state_commit_failed");
         }
-        applyPrivateDnsPolicy(next.enabled);
     }
+
+    private void commitUpdate(boolean enabled, Desired desired) throws ProxyException {
+        State current = requireReadableState();
+        if (current.instanceId == null) throw new ProxyException("instance_identity_mismatch");
+        try {
+            installCommitted(stateStore.update(
+                    current.instanceId, enabled, toStoreSource(desired)));
+        } catch (ProxyStateStore.StateException failure) {
+            throw storeFailure(failure);
+        } catch (Throwable ignored) {
+            throw new ProxyException("state_commit_failed");
+        }
+    }
+
+    private void commitRecoveredImport(boolean enabled, Desired desired) throws ProxyException {
+        try {
+            installCommitted(stateStore.recoverImport(
+                    requireBoundInstanceId(), enabled, toStoreSource(desired)));
+        } catch (ProxyStateStore.StateException failure) {
+            throw storeFailure(failure);
+        } catch (ProxyException failure) {
+            throw failure;
+        } catch (Throwable ignored) {
+            throw new ProxyException("state_commit_failed");
+        }
+    }
+
+    private void commitClear(boolean discardUnreadableState) throws ProxyException {
+        try {
+            installCommitted(stateStore.clear(
+                    requireBoundInstanceId(), discardUnreadableState));
+        } catch (ProxyStateStore.StateException failure) {
+            throw storeFailure(failure);
+        } catch (ProxyException failure) {
+            throw failure;
+        } catch (Throwable ignored) {
+            throw new ProxyException("state_commit_failed");
+        }
+    }
+
+    private ProxyException storeFailure(ProxyStateStore.StateException failure) {
+        String code = safeStateCode(failure.code);
+        if (!"state_commit_failed".equals(code)) markUnreadable(code);
+        return new ProxyException(code);
+    }
+
+    private void installCommitted(ProxyStateStore.LoadedState loaded) {
+        boolean retainQuarantine = quarantineInstalled;
+        installLoadedState(loaded);
+        quarantineInstalled = retainQuarantine;
+        lastEngineReport = null;
+        lastProbe = null;
+        applyPrivateDnsPolicy(state.enabled);
+    }
+
+    private void installLoadedState(ProxyStateStore.LoadedState loaded) {
+        state = runtimeState(loaded);
+        stateErrorCode = null;
+        if (loaded.instanceId != null) recoveryInstanceId = loaded.instanceId;
+        quarantineInstalled = loaded.enabled;
+    }
+
+    private static State runtimeState(ProxyStateStore.LoadedState loaded) {
+        ProxyStateStore.Source source = loaded.source;
+        Desired desired = source == null ? null : new Desired(
+                source.kind, source.value, source.selectedNode,
+                source.udpAllowed, source.allowInsecureHttp);
+        return new State(loaded.instanceId, loaded.generation, loaded.enabled, desired);
+    }
+    private void markUnreadable(String code) {
+        state = null;
+        stateErrorCode = safeStateCode(code);
+        quarantineInstalled = true;
+        checkId = 0;
+        lastEngineReport = null;
+        lastProbe = null;
+    }
+
+    private String safeStateError() {
+        return safeStateCode(stateErrorCode);
+    }
+
+    private static String safeStateCode(String code) {
+        if ("proxy_state_key_unusable".equals(code)
+                || "proxy_state_key_mismatch".equals(code)
+                || "state_commit_failed".equals(code)) {
+            return code;
+        }
+        return "proxy_state_invalid";
+    }
+
+    private static ProxyStateStore.Source toStoreSource(Desired desired) {
+        return desired == null ? null : new ProxyStateStore.Source(
+                desired.kind, desired.value, desired.selectedNode,
+                desired.udpAllowed, desired.allowInsecureHttp);
+    }
+
 
     private Map<String, Object> validateReport(Map<String, Object> report) throws ProxyException {
         requireAllowedKeys(report, REPORT_FIELDS);
@@ -822,231 +1050,6 @@ public final class ProxyManager {
     }
 
 
-    private State loadState() throws Exception {
-        if (!Files.isRegularFile(stateFile.toPath(), LinkOption.NOFOLLOW_LINKS)
-                || Files.isSymbolicLink(stateFile.toPath())
-                || stateFile.length() <= 0 || stateFile.length() > MAX_STATE_BYTES
-                || Os.lstat(stateFile.getAbsolutePath()).st_uid != Process.myUid()) {
-            throw new Exception();
-        }
-        byte[] bytes = Files.readAllBytes(stateFile.toPath());
-        Map<String, Object> object;
-        try {
-            object = parseObject(decodeUtf8(bytes), MAX_STATE_BYTES);
-        } finally {
-            Arrays.fill(bytes, (byte) 0);
-        }
-        requireKeys(object, "schemaVersion", "instanceId", "generation", "enabled",
-                "sourceIv", "sourceCiphertext");
-        requireLong(object, "schemaVersion", SCHEMA_VERSION, SCHEMA_VERSION);
-        long generation = requireLong(object, "generation", 0, Long.MAX_VALUE);
-        boolean enabled = requireBoolean(object, "enabled");
-        String instanceId = null;
-        Object identity = object.get("instanceId");
-        if (identity != null) {
-            if (!(identity instanceof String)
-                    || !ProxyAgentChannel.isValidInstanceId((String) identity)) throw new Exception();
-            instanceId = (String) identity;
-        }
-        Object encodedIv = object.get("sourceIv");
-        Object encodedCiphertext = object.get("sourceCiphertext");
-        Desired desired = null;
-        if (encodedIv == null || encodedCiphertext == null) {
-            if (encodedIv != null || encodedCiphertext != null || enabled) throw new Exception();
-        } else {
-            if (!(encodedIv instanceof String) || !(encodedCiphertext instanceof String)) {
-                throw new Exception();
-            }
-            byte[] iv = java.util.Base64.getDecoder().decode((String) encodedIv);
-            byte[] ciphertext = java.util.Base64.getDecoder().decode((String) encodedCiphertext);
-            try {
-                if (iv.length != 12 || ciphertext.length < 16
-                        || ciphertext.length > MAX_SOURCE_BYTES + 1024) throw new Exception();
-                Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-                cipher.init(Cipher.DECRYPT_MODE, stateKey, new GCMParameterSpec(128, iv));
-                byte[] aad = stateAad(instanceId, generation);
-                byte[] plaintext;
-                try {
-                    cipher.updateAAD(aad);
-                    plaintext = cipher.doFinal(ciphertext);
-                } finally {
-                    Arrays.fill(aad, (byte) 0);
-                }
-                try {
-                    desired = decodeDesired(plaintext);
-                } finally {
-                    Arrays.fill(plaintext, (byte) 0);
-                }
-            } finally {
-                Arrays.fill(iv, (byte) 0);
-                Arrays.fill(ciphertext, (byte) 0);
-            }
-        }
-        return new State(instanceId, generation, enabled, desired);
-    }
-
-    private void commitState(State value) throws Exception {
-        String ivText = null;
-        String ciphertextText = null;
-        if (value.desired != null) {
-            byte[] plaintext = encodeDesired(value.desired);
-            byte[] iv = null;
-            byte[] ciphertext = null;
-            byte[] aad = null;
-            try {
-                Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-                cipher.init(Cipher.ENCRYPT_MODE, stateKey);
-                aad = stateAad(value.instanceId, value.generation);
-                cipher.updateAAD(aad);
-                iv = cipher.getIV();
-                if (iv == null || iv.length != 12) throw new Exception();
-                ciphertext = cipher.doFinal(plaintext);
-                ivText = java.util.Base64.getEncoder().encodeToString(iv);
-                ciphertextText = java.util.Base64.getEncoder().encodeToString(ciphertext);
-            } finally {
-                Arrays.fill(plaintext, (byte) 0);
-                if (aad != null) Arrays.fill(aad, (byte) 0);
-                if (iv != null) Arrays.fill(iv, (byte) 0);
-                if (ciphertext != null) Arrays.fill(ciphertext, (byte) 0);
-            }
-        }
-        org.json.JSONObject object = new org.json.JSONObject();
-        object.put("schemaVersion", SCHEMA_VERSION);
-        object.put("instanceId", value.instanceId == null ? org.json.JSONObject.NULL : value.instanceId);
-        object.put("generation", value.generation);
-        object.put("enabled", value.enabled);
-        object.put("sourceIv", ivText == null ? org.json.JSONObject.NULL : ivText);
-        object.put("sourceCiphertext",
-                ciphertextText == null ? org.json.JSONObject.NULL : ciphertextText);
-        byte[] bytes = object.toString().getBytes(StandardCharsets.UTF_8);
-        if (bytes.length > MAX_STATE_BYTES) throw new Exception();
-        File prepared = new File(directory, ".desired-" + randomHex(16) + ".tmp");
-        FileOutputStream output = null;
-        try {
-            output = new FileOutputStream(prepared);
-            Os.chmod(prepared.getAbsolutePath(), 0600);
-            output.write(bytes);
-            output.flush();
-            output.getFD().sync();
-        } catch (Exception failure) {
-            deleteQuietly(prepared);
-            throw failure;
-        } catch (Error failure) {
-            deleteQuietly(prepared);
-            throw failure;
-        } finally {
-            Arrays.fill(bytes, (byte) 0);
-            if (output != null) try { output.close(); } catch (Throwable ignored) { }
-        }
-        try {
-            Files.move(prepared.toPath(), stateFile.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            syncDirectory(directory);
-        } catch (AtomicMoveNotSupportedException failure) {
-            throw failure;
-        } finally {
-            deleteQuietly(prepared);
-        }
-    }
-
-    private static byte[] encodeDesired(Desired desired) throws Exception {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        DataOutputStream output = new DataOutputStream(bytes);
-        output.writeInt(SCHEMA_VERSION);
-        writeString(output, desired.kind, 16);
-        writeString(output, desired.value, MAX_SOURCE_BYTES);
-        writeString(output, desired.selectedNode, MAX_SELECTED_NODE * 4);
-        output.writeBoolean(desired.udpAllowed);
-        output.writeBoolean(desired.allowInsecureHttp);
-        output.flush();
-        return bytes.toByteArray();
-    }
-
-    private static Desired decodeDesired(byte[] plaintext) throws Exception {
-        DataInputStream input = new DataInputStream(new ByteArrayInputStream(plaintext));
-        if (input.readInt() != SCHEMA_VERSION) throw new Exception();
-        String kind = readString(input, 16);
-        if (!"endpoint".equals(kind) && !"uri_list".equals(kind)
-                && !"clash".equals(kind) && !"subscription".equals(kind)) {
-            throw new Exception();
-        }
-        String value = readString(input, MAX_SOURCE_BYTES);
-        String selectedNode = readString(input, MAX_SELECTED_NODE * 4);
-        boolean udpAllowed = input.readBoolean();
-        boolean allowInsecureHttp = input.readBoolean();
-        if (input.available() != 0 || value.isEmpty()
-                || selectedNode.length() > MAX_SELECTED_NODE
-                || containsNul(value) || containsNul(selectedNode)
-                || ("subscription".equals(kind)
-                && !isValidSubscriptionUrl(value, allowInsecureHttp))) throw new Exception();
-        return new Desired(kind, value, selectedNode, udpAllowed, allowInsecureHttp);
-    }
-
-    private static void writeString(DataOutputStream output, String value, int maximum)
-            throws Exception {
-        byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
-        try {
-            if (encoded.length > maximum) throw new Exception();
-            output.writeInt(encoded.length);
-            output.write(encoded);
-        } finally {
-            Arrays.fill(encoded, (byte) 0);
-        }
-    }
-
-    private static String readString(DataInputStream input, int maximum) throws Exception {
-        int length = input.readInt();
-        if (length < 0 || length > maximum || length > input.available()) throw new Exception();
-        byte[] encoded = new byte[length];
-        input.readFully(encoded);
-        try {
-            return decodeUtf8(encoded);
-        } finally {
-            Arrays.fill(encoded, (byte) 0);
-        }
-    }
-
-    private static byte[] stateAad(String instanceId, long generation) {
-        byte[] suffix = ((instanceId == null ? "" : instanceId) + "\n" + generation)
-                .getBytes(StandardCharsets.UTF_8);
-        byte[] result = Arrays.copyOf(STATE_AAD_PREFIX, STATE_AAD_PREFIX.length + suffix.length);
-        System.arraycopy(suffix, 0, result, STATE_AAD_PREFIX.length, suffix.length);
-        Arrays.fill(suffix, (byte) 0);
-        return result;
-    }
-
-    private static SecretKey loadOrCreateStateKey() throws Exception {
-        KeyStore store = KeyStore.getInstance(KEYSTORE);
-        store.load(null);
-        java.security.Key existing = store.getKey(KEY_ALIAS, null);
-        if (existing != null) {
-            if (!(existing instanceof SecretKey)) throw new Exception();
-            return (SecretKey) existing;
-        }
-        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE);
-        generator.init(new KeyGenParameterSpec.Builder(
-                KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
-                .setKeySize(256)
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setRandomizedEncryptionRequired(true)
-                .build());
-        return generator.generateKey();
-    }
-
-    private static void ensurePrivateDirectory(File directory) throws Exception {
-        boolean created = false;
-        if (!directory.exists()) {
-            if (!directory.mkdirs()) throw new Exception();
-            created = true;
-        }
-        if (!directory.isDirectory() || Files.isSymbolicLink(directory.toPath())
-                || Os.lstat(directory.getAbsolutePath()).st_uid != Process.myUid()) {
-            throw new Exception();
-        }
-        Os.chmod(directory.getAbsolutePath(), 0700);
-        if (created) syncDirectory(directory.getParentFile());
-    }
 
     private static boolean containsControl(String value) {
         for (int offset = 0; offset < value.length();) {
@@ -1057,35 +1060,6 @@ public final class ProxyManager {
         return false;
     }
 
-    private static void syncDirectory(File directory) throws Exception {
-        if (directory == null) throw new Exception();
-        FileDescriptor descriptor = Os.open(directory.getAbsolutePath(), OsConstants.O_RDONLY, 0);
-        try {
-            Os.fsync(descriptor);
-        } finally {
-            Os.close(descriptor);
-        }
-    }
-
-    private static String randomHex(int bytes) {
-        byte[] value = new byte[bytes];
-        new java.security.SecureRandom().nextBytes(value);
-        char[] alphabet = "0123456789abcdef".toCharArray();
-        char[] output = new char[bytes * 2];
-        for (int index = 0; index < bytes; index++) {
-            int item = value[index] & 0xff;
-            output[index * 2] = alphabet[item >>> 4];
-            output[index * 2 + 1] = alphabet[item & 15];
-        }
-        Arrays.fill(value, (byte) 0);
-        return new String(output);
-    }
-
-    private static void deleteQuietly(File file) {
-        try {
-            if (file != null && file.isFile() && !Files.isSymbolicLink(file.toPath())) file.delete();
-        } catch (Throwable ignored) { }
-    }
 
     static Map<String, Object> parseObject(String body, int maximumUtf8Bytes)
             throws ProxyException {
@@ -1173,12 +1147,6 @@ public final class ProxyManager {
         }
     }
 
-    private static String decodeUtf8(byte[] value) throws CharacterCodingException {
-        return StandardCharsets.UTF_8.newDecoder()
-                .onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT)
-                .decode(ByteBuffer.wrap(value)).toString();
-    }
 
     private static boolean containsNul(String value) {
         return value.indexOf('\u0000') >= 0;
@@ -1262,10 +1230,6 @@ public final class ProxyManager {
             this.enabled = enabled;
             this.desired = desired;
         }
-
-        static State empty() {
-            return new State(null, 0, false, null);
-        }
     }
 
     private static final class Desired {
@@ -1342,8 +1306,8 @@ public final class ProxyManager {
         }
 
         boolean matchesPolicy(boolean udpAllowed) {
-            return v4DnsProxy && v4TcpProxy && v6DnsProxy
-                    && v4UdpProxy == udpAllowed && (udpAllowed || !v6UdpProxy);
+            return v4DnsProxy && v4TcpProxy && v6DnsProxy && v6TcpProxy
+                    && v4UdpProxy == udpAllowed && v6UdpProxy == udpAllowed;
         }
     }
 

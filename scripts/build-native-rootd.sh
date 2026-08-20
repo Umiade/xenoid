@@ -10,7 +10,9 @@ build_one() {
   for ndk in "$SDK"/ndk/*; do for pre in darwin-arm64 darwin-x86_64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
   [[ -n "$BIN" ]] || { echo "$TOOL not found" >&2; exit 1; }
   local OUT="$ROOT/native/xenoid-rootd/xenoid-rootd-$arch"
-  "$BIN" -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 -o "$OUT" "$ROOT/native/xenoid-rootd/xenoid_rootd.c"
+  "$BIN" -O2 -Wall -Wextra -pthread -fPIE -pie -fstack-protector-strong \
+    -D_FORTIFY_SOURCE=2 -Wl,-z,relro,-z,now \
+    -o "$OUT" "$ROOT/native/xenoid-rootd/xenoid_rootd.c"
   echo "$OUT"
 }
 if [[ "$ARCH" == all ]]; then

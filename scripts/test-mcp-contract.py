@@ -11,6 +11,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 
@@ -49,6 +50,11 @@ class FakeContext:
 class FakeManager:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.operation_lock_held = False
+
+    def migrate_legacy_token_state(self) -> dict:
+        self.calls.append(("legacy-token-migration",))
+        return {"ok": True, "removed": 0}
 
     def deploy_netctl_helper(self, path: str, remote_path: str) -> dict:
         self.calls.append(("deploy", path, remote_path))
@@ -62,6 +68,27 @@ class FakeManager:
         self.calls.append(("set-mac", mac, ifname))
         return {"ok": True, "operation": "set-mac"}
 
+    def runtime_image_input_record(self, base_image: str | None = None) -> dict:
+        self.calls.append(("image-input", base_image))
+        return {
+            "schema": "dev.xenoid.runtime-image-input/v1",
+            "inputSha256": "1" * 64,
+            "bootInputSha256": "2" * 64,
+            "derivedTag": "xenoid/redroid:xenoid-" + "1" * 32,
+        }
+
+    def ensure_runtime_image(self, base_image: str | None = None) -> dict:
+        self.calls.append(("image-ensure", base_image))
+        return {
+            "ok": True,
+            "schema": "dev.xenoid.runtime-image/v1",
+            "inputSha256": "1" * 64,
+            "bootInputSha256": "2" * 64,
+            "derivedTag": "xenoid/redroid:xenoid-" + "1" * 32,
+            "imageId": "sha256:" + "3" * 64,
+            "reused": True,
+        }
+
 
 class FakeRuntime:
     def __init__(self) -> None:
@@ -70,6 +97,7 @@ class FakeRuntime:
         self.lease = object()
         self.manager = FakeManager()
         self.daemon = object()
+        self.operation_lock_held = True
 
     @property
     def subprocess_env(self) -> dict[str, str]:
@@ -113,6 +141,60 @@ def keybox_is_trusted_local_cli_only() -> None:
     else:
         raise AssertionError("unregistered keybox MCP operation was callable")
 
+def proxy_unreadable_discard_is_explicit() -> None:
+    catalog = {entry["name"]: entry for entry in mcp_server.tools()}
+    clear_schema = catalog["xenoid_proxy_clear"]["inputSchema"]
+    require(
+        clear_schema.get("properties")
+        == {"discardUnreadableState": {"type": "boolean"}},
+        "proxy clear recovery boolean missing from MCP schema",
+    )
+    require(
+        "required" not in clear_schema,
+        "ordinary proxy clear must remain an explicit false default",
+    )
+
+    calls: list[bool] = []
+
+    class Manager:
+        @staticmethod
+        def reconcile_bootstrap() -> dict:
+            return {"ok": True, "transportReady": True, "controlReady": True}
+
+    class Controller:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def clear(self, *, discard_unreadable_state: bool = False) -> dict:
+            calls.append(discard_unreadable_state)
+            return {"ok": True}
+
+    runtime = mcp_server.MCPRuntime(
+        FakeContext(),
+        object(),
+        object(),
+        Manager(),
+        object(),
+    )
+    with mock.patch.object(mcp_server, "ProxyController", Controller):
+        require(
+            decoded(mcp_server.call_tool(runtime, "xenoid_proxy_clear", {}))["ok"]
+            is True,
+            "ordinary MCP proxy clear failed",
+        )
+        require(
+            decoded(
+                mcp_server.call_tool(
+                    runtime,
+                    "xenoid_proxy_clear",
+                    {"discardUnreadableState": True},
+                )
+            )["ok"]
+            is True,
+            "explicit MCP proxy recovery failed",
+        )
+    require(calls == [False, True], "MCP proxy clear recovery flag was not exact")
+
 
 def netctl_dispatches_to_runtime_manager() -> None:
     runtime = FakeRuntime()
@@ -137,66 +219,148 @@ def netctl_dispatches_to_runtime_manager() -> None:
     ], "netctl arguments were not propagated")
 
 
-def up_tool_uses_complete_cli_path() -> None:
+def up_tools_use_in_process_convergence() -> None:
     runtime = FakeRuntime()
-    completed = subprocess.CompletedProcess([], 0, stdout="private output", stderr="")
-    with mock.patch.object(mcp_server, "_run_up_cli_process", return_value=completed) as run_mock:
-        result = decoded(mcp_server.call_tool(
-            runtime,
-            "xenoid_up",
-            {"skipBuild": True, "reuseRuntime": True},
-        ))
-    command = run_mock.call_args.args[0]
-    require(command == [
-        str(ROOT / "xenoid"),
-        "--instance",
-        "phone-a",
-        "up",
-        "--skip-build",
-        "--reuse-runtime",
-    ], "xenoid_up did not invoke the complete CLI up path")
-    require(run_mock.call_args.kwargs["cwd"] == ROOT, "xenoid_up cwd mismatch")
-    require(result["ok"] is True and result["returncode"] == 0, "xenoid_up success result")
-    require("private output" not in json.dumps(result), "xenoid_up leaked subprocess output")
+    calls: list[tuple[str, Any]] = []
+    result_payload = {
+        "schema": "dev.xenoid.convergence/v1",
+        "ok": True,
+        "resumed": False,
+        "dryRun": False,
+        "plan": {"schema": "dev.xenoid.convergence-plan/v1", "planDigest": "1" * 64},
+        "initialPlanDigest": "1" * 64,
+        "resolvedPlanDigest": None,
+        "followUpPlanDigest": None,
+        "phases": [],
+        "before": {},
+        "after": {},
+        "nextActions": [],
+    }
 
-    failed = subprocess.CompletedProcess(
-        [],
-        17,
-        stdout="/private/operator/path",
-        stderr="sensitive exception text",
+    class FakeExecutor:
+        def __init__(self, manager: object, **_kwargs: object) -> None:
+            calls.append(("executor", manager))
+
+        def run(self, **kwargs: object) -> dict[str, Any]:
+            calls.append(("run", dict(kwargs)))
+            return dict(result_payload)
+
+    class FakePlan:
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "schema": "dev.xenoid.convergence-plan/v1",
+                "resolution": "complete",
+                "planDigest": "2" * 64,
+            }
+
+    class FakePlanner:
+        def __init__(self, manager: object, **_kwargs: object) -> None:
+            calls.append(("planner", manager))
+
+        def inspect(self, **kwargs: object) -> FakePlan:
+            calls.append(("inspect", dict(kwargs)))
+            return FakePlan()
+
+    with mock.patch.object(mcp_server, "ConvergenceExecutor", FakeExecutor), \
+         mock.patch.object(mcp_server, "ConvergencePlanner", FakePlanner):
+        result = decoded(
+            mcp_server.call_tool(runtime, "xenoid_up", {"skipBuild": True})
+        )
+        dry_plan = decoded(
+            mcp_server.call_tool(runtime, "xenoid_up_plan", {})
+        )
+
+    require(result == result_payload, "xenoid_up changed the executor result")
+    require(
+        calls[0] == ("executor", runtime.manager)
+        and calls[1][0] == "run"
+        and calls[1][1].get("skip_build") is True,
+        "xenoid_up did not call the shared executor directly",
     )
-    with mock.patch.object(mcp_server, "_run_up_cli_process", return_value=failed):
-        result = decoded(mcp_server.call_tool(runtime, "xenoid_up", {}))
-    rendered = json.dumps(result)
-    require(result.get("code") == "xenoid_up_failed", "xenoid_up failure code")
-    require("private/operator" not in rendered and "sensitive" not in rendered, "xenoid_up leaked failure output")
+    require(
+        calls[2] == ("planner", runtime.manager)
+        and calls[3] == ("inspect", {"skip_build": False}),
+        "xenoid_up_plan did not inspect through the shared planner",
+    )
+    require(
+        dry_plan.get("schema") == "dev.xenoid.convergence-plan/v1"
+        and dry_plan.get("planDigest") == "2" * 64,
+        "xenoid_up_plan result is not the canonical plan",
+    )
 
-    with mock.patch.object(
-        mcp_server,
-        "_run_up_cli_process",
-        side_effect=OSError("/private/operator/executable"),
-    ):
-        result = decoded(mcp_server.call_tool(runtime, "xenoid_up", {}))
-    require(result.get("code") == "xenoid_up_unavailable", "xenoid_up OSError code")
-    require("private/operator" not in json.dumps(result), "xenoid_up leaked exception text")
+    regeneration_payload = {
+        "schema": "dev.xenoid.convergence/v1",
+        "ok": True,
+        "regeneration": {
+            "schema": "dev.xenoid.device-regenerate/v2",
+            "transactionId": "3" * 32,
+            "phase": "committed",
+        },
+    }
+    with mock.patch.object(mcp_server, "RegenerationJournal") as journal_type, \
+         mock.patch.object(
+             mcp_server,
+             "_execute_device_regeneration",
+             return_value=regeneration_payload,
+         ) as resume, \
+         mock.patch.object(
+             mcp_server,
+             "ConvergenceExecutor",
+             side_effect=AssertionError("regeneration bypassed shared resume"),
+         ):
+        journal_type.return_value.load.return_value = {
+            "schema": "dev.xenoid.device-regenerate/v2",
+            "transactionId": "3" * 32,
+        }
+        regenerated = decoded(
+            mcp_server.call_tool(runtime, "xenoid_up", {"skipBuild": True})
+        )
+    require(
+        regenerated == regeneration_payload,
+        "xenoid_up changed regeneration resume result",
+    )
+    resume_args = resume.call_args.args[0]
+    require(
+        resume_args.context is runtime.context
+        and resume_args.skip_build is True
+        and resume_args._operation_lock_held is True,
+        "xenoid_up did not pass the locked runtime into regeneration resume",
+    )
 
-    with mock.patch.object(
-        mcp_server,
-        "_run_up_cli_process",
-        side_effect=RuntimeError("sensitive internal failure"),
-    ):
-        result = decoded(mcp_server.call_tool(runtime, "xenoid_up", {}))
-    require(result.get("code") == "xenoid_up_unavailable", "xenoid_up exception code")
-    require("sensitive" not in json.dumps(result), "xenoid_up leaked unexpected exception text")
+    failed_payload = {
+        **result_payload,
+        "ok": False,
+        "error": "convergence_state_conflict",
+        "nextActions": ["resume"],
+    }
 
-    with mock.patch.object(mcp_server, "_run_up_cli_process") as run_mock:
-        result = decoded(mcp_server.call_tool(
-            runtime,
-            "xenoid_up",
-            {"skipBuild": "false"},
-        ))
-    require(result.get("code") == "invalid_request_schema", "xenoid_up type validation")
-    run_mock.assert_not_called()
+    class FailingExecutor(FakeExecutor):
+        def run(self, **kwargs: object) -> dict[str, Any]:
+            calls.append(("failed-run", dict(kwargs)))
+            return dict(failed_payload)
+
+    with mock.patch.object(mcp_server, "ConvergenceExecutor", FailingExecutor):
+        failed = decoded(mcp_server.call_tool(runtime, "xenoid_up", {}))
+    require(failed == failed_payload, "xenoid_up hid the convergence failure")
+    require("private/operator" not in json.dumps(failed), "xenoid_up leaked private output")
+
+    with mock.patch.object(mcp_server, "ConvergenceExecutor", FakeExecutor):
+        before = len(calls)
+        invalid_type = decoded(
+            mcp_server.call_tool(runtime, "xenoid_up", {"skipBuild": "false"})
+        )
+        removed_alias = decoded(
+            mcp_server.call_tool(runtime, "xenoid_up", {"reuseRuntime": True})
+        )
+    require(
+        invalid_type.get("code") == "invalid_request_schema",
+        "xenoid_up skipBuild type validation",
+    )
+    require(
+        removed_alias.get("code") == "invalid_request_schema",
+        "removed reuseRuntime accepted",
+    )
+    require(len(calls) == before, "invalid xenoid_up request reached the executor")
 
 
 def generated_mcp_config_is_checkout_runnable() -> None:
@@ -205,43 +369,54 @@ def generated_mcp_config_is_checkout_runnable() -> None:
         rc = cli.cmd_mcp_config(SimpleNamespace(context=FakeContext()))
     require(rc == 0, "mcp-config return code")
     server = json.loads(output.getvalue())["mcpServers"]["xenoid"]
-    require(server["command"] == str(ROOT / "xenoid-mcp"), "wrapper not selected")
+    require(server["command"] == "xenoid-mcp", "path-independent wrapper not selected")
     require(server["args"] == [], "wrapper received module arguments")
-    require(server["env"] == {
-        "XENOID_PROJECT": str(ROOT),
-        "XENOID_INSTANCE": "phone-a",
-    }, "mcp-config instance binding")
+    require(
+        server["env"] == {"XENOID_INSTANCE": "phone-a"},
+        "mcp-config instance binding",
+    )
+    require(str(ROOT) not in json.dumps(server), "mcp-config leaked checkout path")
 
 
-def up_timeout_terminates_and_waits_for_process_group() -> None:
-    class FakeProcess:
-        pid = 4321
-        returncode = None
-
-        def __init__(self) -> None:
-            self.communicate_calls = 0
-
-        def communicate(self, timeout: object = None) -> tuple[str, str]:
-            self.communicate_calls += 1
-            if self.communicate_calls == 1:
-                raise subprocess.TimeoutExpired(["xenoid"], 1)
-            self.returncode = -15
-            return "", ""
-
-    process = FakeProcess()
-    with mock.patch.object(mcp_server.subprocess, "Popen", return_value=process) as popen_mock, \
-         mock.patch.object(mcp_server.os, "killpg") as kill_mock:
-        try:
-            mcp_server._run_up_cli_process(
-                ["xenoid", "up"], cwd=ROOT, env={}
-            )
-        except subprocess.TimeoutExpired:
-            pass
-        else:
-            raise AssertionError("up timeout was swallowed")
-    require(popen_mock.call_args.kwargs["start_new_session"] is True, "no process group")
-    kill_mock.assert_called_once_with(4321, mcp_server.signal.SIGTERM)
-    require(process.communicate_calls == 2, "process group was not waited")
+def up_source_has_no_nested_process() -> None:
+    mcp_source = (ROOT / "src/xenoid/mcp_server.py").read_text(encoding="utf-8")
+    require("_run_up_cli_process" not in mcp_source, "MCP retained the up child runner")
+    require("_up_cli_result" not in mcp_source, "MCP retained the up CLI adapter")
+    require("xenoid-up.sh" not in mcp_source, "MCP retained the shell up planner")
+    require(
+        "CHILD_LOCK_TOOL_NAMES" not in mcp_source,
+        "MCP retained child-owned mutation lock exceptions",
+    )
+    require(
+        "_location_cli_result" not in mcp_source
+        and "_google_services_cli_result" not in mcp_source,
+        "MCP retained nested feature CLI adapters",
+    )
+    require(
+        'project_root / "xenoid"' not in mcp_source,
+        "MCP retained a nested xenoid command path",
+    )
+    cli_source = (ROOT / "src/xenoid/cli.py").read_text(encoding="utf-8")
+    tree = ast.parse(cli_source)
+    handler = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "cmd_up"
+    )
+    rendered = ast.get_source_segment(cli_source, handler) or ""
+    require(
+        "ConvergenceExecutor" in rendered and ".run(" in rendered,
+        "CLI up bypasses the shared executor",
+    )
+    require(
+        "subprocess" not in rendered and "xenoid-up.sh" not in rendered,
+        "CLI up retained nested process orchestration",
+    )
+    require(
+        "--reuse-runtime" not in cli_source and "reuse_runtime" not in rendered,
+        "CLI retained the removed reuse runtime alias",
+    )
 
 
 def stdio_mutations_use_shared_instance_lock() -> None:
@@ -281,6 +456,76 @@ def stdio_mutations_use_shared_instance_lock() -> None:
     require(locked == [FakeContext.state_root], "stdio mutation lock missing")
     locked_runtime = call_mock.call_args.args[0]
     require(locked_runtime.operation_lock_held is True, "nested lock marker missing")
+    require(
+        ("legacy-token-migration",) in runtime.manager.calls,
+        "stdio mutator did not migrate legacy token state under the lock",
+    )
+    with mock.patch.object(
+        mcp_server,
+        "_refresh_stdio_runtime",
+        side_effect=[runtime, runtime],
+    ), mock.patch.object(
+        mcp_server,
+        "instance_operation_lock",
+        side_effect=fake_lock,
+    ), mock.patch.object(
+        mcp_server,
+        "RegenerationJournal",
+    ) as journal_type, mock.patch.object(
+        mcp_server,
+        "call_tool",
+        return_value={"ok": True},
+    ) as blocked_call:
+        journal_type.return_value.load.return_value = {
+            "phase": "storage_pending",
+            "transactionId": "4" * 32,
+        }
+        blocked = decoded(
+            mcp_server._call_stdio_tool(
+                runtime,
+                "xenoid_proxy_off",
+                {},
+            )
+        )
+    require(
+        blocked.get("error") == "device_regeneration_pending",
+        "stdio mutator bypassed regeneration guard",
+    )
+    blocked_call.assert_not_called()
+
+    for direct_name, direct_arguments in (
+        ("xenoid_up", {"skipBuild": True}),
+        ("xenoid_google_services_enable", {}),
+        ("xenoid_google_services_disable", {}),
+        ("xenoid_location_set", {"countryCode": "US"}),
+    ):
+        locked.clear()
+        with mock.patch.object(
+            mcp_server,
+            "_refresh_stdio_runtime",
+            side_effect=[runtime, runtime],
+        ), mock.patch.object(
+            mcp_server,
+            "instance_operation_lock",
+            side_effect=fake_lock,
+        ), mock.patch.object(
+            mcp_server,
+            "call_tool",
+            return_value={"ok": True},
+        ) as direct_call:
+            mcp_server._call_stdio_tool(
+                runtime,
+                direct_name,
+                direct_arguments,
+            )
+        require(
+            locked == [FakeContext.state_root],
+            f"stdio {direct_name} operation lock missing",
+        )
+        require(
+            direct_call.call_args.args[0].operation_lock_held is True,
+            f"stdio {direct_name} did not retain the shared operation lock",
+        )
 
     with mock.patch.object(
         mcp_server,
@@ -297,21 +542,7 @@ def stdio_mutations_use_shared_instance_lock() -> None:
         mcp_server._call_stdio_tool(runtime, "xenoid_status", {})
     lock_mock.assert_not_called()
 
-    for child_name in mcp_server.CHILD_LOCK_TOOL_NAMES:
-        with mock.patch.object(
-            mcp_server,
-            "_refresh_stdio_runtime",
-            return_value=runtime,
-        ), mock.patch.object(
-            mcp_server,
-            "instance_operation_lock",
-        ) as lock_mock, mock.patch.object(
-            mcp_server,
-            "call_tool",
-            return_value={"ok": True},
-        ):
-            mcp_server._call_stdio_tool(runtime, child_name, {})
-        lock_mock.assert_not_called()
+
 
     rebound_context = SimpleNamespace(
         project_root=ROOT,
@@ -343,13 +574,9 @@ def stdio_mutations_use_shared_instance_lock() -> None:
 
 def remote_command_deadline_bounds_unset_subprocesses() -> None:
     started = time.monotonic()
-    try:
-        with command_timeout(0.05):
-            run([sys.executable, "-c", "import time; time.sleep(5)"])
-    except subprocess.TimeoutExpired:
-        pass
-    else:
-        raise AssertionError("request command deadline was not enforced")
+    with command_timeout(0.05):
+        bounded = run([sys.executable, "-c", "import time; time.sleep(5)"])
+    require(bounded.returncode != 0, "request command deadline was not enforced")
     require(time.monotonic() - started < 1.0, "command deadline did not fail fast")
 
     manager = object.__new__(RuntimeManager)
@@ -397,7 +624,7 @@ def versions_are_path_safe_before_side_effects() -> None:
         else:
             raise AssertionError(f"invalid version accepted: {value!r}")
 
-    with mock.patch.object(cli.subprocess, "run") as run_mock:
+    with mock.patch.object(cli, "run_bounded") as run_mock:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             rc = cli.cmd_package_release(SimpleNamespace(version="a/../../outside"))
@@ -409,7 +636,7 @@ def versions_are_path_safe_before_side_effects() -> None:
     require(ota.get("code") == "release_version_invalid", "OTA Python validation")
 
     runtime = FakeRuntime()
-    with mock.patch.object(mcp_server.subprocess, "run") as run_mock:
+    with mock.patch.object(mcp_server, "run_bounded") as run_mock:
         result = decoded(mcp_server.call_tool(
             runtime,
             "xenoid_package_release",
@@ -429,17 +656,122 @@ def versions_are_path_safe_before_side_effects() -> None:
         require(proc.stderr.strip() == "release_version_invalid", f"{relative} unstable error")
 
 
+def runtime_image_tool_uses_content_addressed_builder() -> None:
+    source = (ROOT / "src" / "xenoid" / "mcp_server.py").read_text(encoding="utf-8")
+    marker = '    if name == "xenoid_runtime_build_image":'
+    require(source.count(marker) == 1, "runtime image MCP handler missing")
+    branch = source.split(marker, 1)[1].split("\n    if name == ", 1)[0]
+    require("ensure_runtime_image" in branch, "runtime image MCP bypasses shared builder")
+    require("runtime_image_input_record" in branch, "runtime image dry-run lacks pure input record")
+    require("subprocess.run" not in branch, "runtime image MCP invokes a raw build child")
+    require("make_runtime_context" not in branch, "runtime image MCP creates an unowned context")
+    require('"build"' not in branch, "runtime image MCP exposes the legacy Docker builder")
+
+    cli_source = (ROOT / "src" / "xenoid" / "cli.py").read_text(encoding="utf-8")
+    tree = ast.parse(cli_source)
+    handler = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "cmd_runtime_build_image"
+    )
+    rendered = ast.get_source_segment(cli_source, handler) or ""
+    require("ensure_runtime_image" in rendered, "runtime image CLI bypasses shared builder")
+    require("runtime_image_input_record" in rendered, "runtime image CLI dry-run lacks pure record")
+    require("subprocess.run" not in rendered, "runtime image CLI invokes a raw build child")
+    require("make_runtime_context" not in rendered, "runtime image CLI creates an unowned context")
+
+    runtime = FakeRuntime()
+    dry_run = decoded(
+        mcp_server.call_tool(
+            runtime,
+            "xenoid_runtime_build_image",
+            {"image": "example/base:observed", "dryRun": True},
+        )
+    )
+    ensured = decoded(
+        mcp_server.call_tool(
+            runtime,
+            "xenoid_runtime_build_image",
+            {"image": "example/base:observed", "dryRun": False},
+        )
+    )
+    require(dry_run["dryRun"] is True, "runtime image MCP dry-run schema")
+    require(dry_run["schema"] == "dev.xenoid.runtime-image-input/v1", "runtime input schema")
+    require(ensured["schema"] == "dev.xenoid.runtime-image/v1", "runtime ensure schema")
+    require(runtime.manager.calls == [
+        ("image-input", "example/base:observed"),
+        ("image-ensure", "example/base:observed"),
+    ], "runtime image MCP did not dispatch to shared builder APIs")
+
+
+def legacy_proxy_recovery_requires_bound_quarantine() -> None:
+    runtime = FakeRuntime()
+    digest = "ab" * 32
+    bound_state = {
+        "operationId": digest[:32],
+        "regenerationTransactionId": "cd" * 16,
+        "completed": ["planned", "quarantined"],
+    }
+    with mock.patch.object(
+        mcp_server,
+        "RegenerationJournal",
+    ) as journal_type, mock.patch.object(
+        mcp_server,
+        "ConvergenceExecutor",
+    ) as executor_type:
+        journal_type.return_value.legacy_source_digest.return_value = digest
+        executor_type.return_value.journal.load.return_value = bound_state
+        require(
+            mcp_server._legacy_proxy_recovery_allowed(
+                runtime,
+                "xenoid_proxy_set",
+                {},
+            ),
+            "bound proxy import recovery was rejected",
+        )
+        require(
+            mcp_server._legacy_proxy_recovery_allowed(
+                runtime,
+                "xenoid_proxy_clear",
+                {"discardUnreadableState": True},
+            ),
+            "bound explicit proxy discard recovery was rejected",
+        )
+        require(
+            not mcp_server._legacy_proxy_recovery_allowed(
+                runtime,
+                "xenoid_proxy_clear",
+                {"discardUnreadableState": False},
+            ),
+            "ordinary clear bypassed regeneration guard",
+        )
+        forged = dict(bound_state, operationId="ef" * 16)
+        executor_type.return_value.journal.load.return_value = forged
+        require(
+            not mcp_server._legacy_proxy_recovery_allowed(
+                runtime,
+                "xenoid_proxy_set",
+                {},
+            ),
+            "forged compatibility journal authorized proxy recovery",
+        )
+
+
 def main() -> int:
     cases = (
         registered_tools_have_handlers,
         keybox_is_trusted_local_cli_only,
+        proxy_unreadable_discard_is_explicit,
         netctl_dispatches_to_runtime_manager,
-        up_tool_uses_complete_cli_path,
+        up_tools_use_in_process_convergence,
         generated_mcp_config_is_checkout_runnable,
-        up_timeout_terminates_and_waits_for_process_group,
+        up_source_has_no_nested_process,
         stdio_mutations_use_shared_instance_lock,
+        legacy_proxy_recovery_requires_bound_quarantine,
         remote_command_deadline_bounds_unset_subprocesses,
         versions_are_path_safe_before_side_effects,
+        runtime_image_tool_uses_content_addressed_builder,
     )
     completed = []
     for case in cases:

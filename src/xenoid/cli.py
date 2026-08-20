@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import dataclasses
 import binascii
 import hashlib
 import getpass
@@ -10,7 +11,6 @@ import os
 import re
 import secrets
 import stat
-import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -19,6 +19,9 @@ from typing import Any, BinaryIO, Callable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 from .backend import RuntimeManager
+from .convergence import ConvergenceExecutor
+from .live_observe import LiveAcceptance
+from .artifacts import ALL_TARGETS, TARGETS, ArtifactBuilder, ArtifactError
 from .cellular import CellularError, encode_profile_v1
 from .config import (
     InstanceError,
@@ -32,19 +35,21 @@ from .config import (
     select_instance_name,
 )
 from .daemon_client import (
-    CAMERA_MUTATION_TIMEOUT_SECONDS,
     KEYBOX_MAX_SOURCE_BYTES,
-    KEYBOX_MUTATION_TIMEOUT_SECONDS,
     PROXY_MAX_SOURCE_BYTES,
     DaemonClient,
 )
 from .doctor import build_doctor_report
 from .device_identity import (
+    GOOGLE_CLEAR_PACKAGES,
+    REGENERATION_PHASES,
     DeviceIdentityStore,
+    IdentityError,
     RegenerationJournal,
     converge_instance_identity,
     identity_field_key,
     public_identity_state,
+    stable_identity_digest,
     validate_identity_value,
 )
 from .google_services import (
@@ -56,6 +61,7 @@ from .google_services import (
     quick_validate_assets,
     registry_public,
 )
+from .process import run_bounded
 from .location import (
     DEFAULT_COUNTRY,
     LocationError,
@@ -63,6 +69,7 @@ from .location import (
     STAGE_SCHEMA,
     convergence_action,
     location_runtime_epoch,
+    missing_regeneration_target,
     masked_android_status,
     normalize_country,
     public_summary,
@@ -70,14 +77,19 @@ from .location import (
 )
 from .operation_lock import (
     EXPECTED_INSTANCE_ID_ENV,
-    OPERATION_LOCK_ENV,
     OPERATION_LOCK_TIMEOUT_ENV,
     instance_operation_lock,
     operation_lock_is_held,
 )
 from .proxy_controller import ProxyController
-from .storage import StorageError, StorageStateStore
+from .storage import (
+    StorageError,
+    StorageStateStore,
+    storage_rotation_target,
+)
 from .util import (
+    bounded_timeout,
+    command_timeout,
     json_dumps,
     read_json_file,
     validate_release_version,
@@ -199,7 +211,9 @@ def print_json(data: Any) -> None:
 
 
 def runtime(args: argparse.Namespace) -> RuntimeManager:
-    return RuntimeManager(args.context, args.config, args.lease)
+    manager = RuntimeManager(args.context, args.config, args.lease)
+    manager.operation_lock_held = bool(getattr(args, "_operation_lock_held", False))
+    return manager
 
 
 def daemon(
@@ -220,18 +234,15 @@ def command_env(args: argparse.Namespace) -> dict[str, str]:
         "XENOID_PROJECT": str(args.project_root),
         "XENOID_INSTANCE": args.instance_name,
     }
+    environment.pop("XENOID_OPERATION_LOCK_HELD", None)
     if getattr(args, "_operation_lock_held", False):
-        environment[OPERATION_LOCK_ENV] = args.context.instance_id
         environment[EXPECTED_INSTANCE_ID_ENV] = args.context.instance_id
     return environment
 
 
 @contextmanager
 def cli_operation_lock(args: argparse.Namespace) -> Iterator[None]:
-    if (
-        getattr(args, "_operation_lock_held", False)
-        or operation_lock_is_held(args.context.instance_id)
-    ):
+    if operation_lock_is_held(args.context.instance_id):
         yield
         return
     timeout: Optional[float] = None
@@ -255,27 +266,35 @@ def cli_operation_lock(args: argparse.Namespace) -> Iterator[None]:
 
 def run_script(args: argparse.Namespace, name: str) -> dict[str, Any]:
     script = args.project_root / "scripts" / name
-    proc = subprocess.run(
+    proc = run_bounded(
         [str(script)],
-        text=True,
-        capture_output=True,
         cwd=args.project_root,
         env=command_env(args),
+        deadline=time.monotonic() + 900.0,
+        project_root=args.project_root,
     )
-    return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
+    return {
+        "ok": proc.ok,
+        "state": proc.state,
+        "errorCode": proc.error_code,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout_tail,
+        "stderr": proc.stderr_tail,
+        "script": name,
+    }
 
 
 def cmd_install_runtime(args: argparse.Namespace) -> int:
     script = args.project_root / "scripts" / "install-macos-runtime.sh"
     cmd = [str(script)] + (["--dry-run"] if args.dry_run else [])
-    proc = subprocess.run(
+    proc = run_bounded(
         cmd,
-        text=True,
-        capture_output=True,
         cwd=args.project_root,
         env=command_env(args),
+        deadline=time.monotonic() + 3600.0,
+        project_root=args.project_root,
     )
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
+    result = {"ok": proc.ok, "state": proc.state, "errorCode": proc.error_code, "returncode": proc.returncode, "stdout": proc.stdout_tail, "stderr": proc.stderr_tail, "script": script.name}
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -295,30 +314,79 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 
+_UP_TIMEOUT_SECONDS = 7200.0
 
-def cmd_up(args: argparse.Namespace) -> int:
-    script = args.context.project_root / "scripts" / "xenoid-up.sh"
-    cmd = [str(script), "--instance", args.context.instance_name]
-    if args.dry_run:
-        cmd.append("--dry-run")
-    if args.skip_build:
-        cmd.append("--skip-build")
-    if args.reuse_runtime:
-        cmd.append("--reuse-runtime")
-    with cli_operation_lock(args):
-        environment = command_env(args)
-        environment[OPERATION_LOCK_ENV] = args.context.instance_id
-        environment[EXPECTED_INSTANCE_ID_ENV] = args.context.instance_id
-        proc = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            cwd=str(args.context.project_root),
-            env=environment,
+
+def _write_up_progress(event: Mapping[str, Any]) -> None:
+    sys.stderr.write(
+        json.dumps(
+            dict(event),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
+        + "\n"
+    )
+    sys.stderr.flush()
+
+
+def _execute_convergence(
+    args: argparse.Namespace,
+    *,
+    manager: Optional[RuntimeManager] = None,
+    regeneration_capability: Any = None,
+) -> dict[str, Any]:
+    executor = ConvergenceExecutor(manager or runtime(args))
+    with command_timeout(_UP_TIMEOUT_SECONDS):
+        return executor.run(
+            progress=_write_up_progress,
+            skip_build=bool(getattr(args, "skip_build", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            regeneration_capability=regeneration_capability,
+        )
+def cmd_up(args: argparse.Namespace) -> int:
+    journal = RegenerationJournal(args.context)
+    regeneration = journal.load()
+    if regeneration is not None and not bool(args.dry_run):
+        try:
+            result = _execute_device_regeneration(args)
+        except (IdentityError, InstanceError, LocationError, StorageError) as exc:
+            result = {
+                "schema": "dev.xenoid.device-regenerate/v2",
+                "ok": False,
+                "error": getattr(
+                    exc,
+                    "code",
+                    "device_regeneration_state_invalid",
+                ),
+            }
+    else:
+        manager = runtime(args)
+        capability = (
+            {"transactionId": regeneration["transactionId"]}
+            if regeneration is not None
+            else None
+        )
+
+        def converge() -> dict[str, Any]:
+            executor = ConvergenceExecutor(manager)
+            with command_timeout(_UP_TIMEOUT_SECONDS):
+                return executor.run(
+                    progress=_write_up_progress,
+                    skip_build=bool(args.skip_build),
+                    dry_run=bool(args.dry_run),
+                    regeneration_capability=capability,
+                )
+
+        if args.dry_run:
+            result = converge()
+        else:
+            with cli_operation_lock(args):
+                result = converge()
     print_json(result)
     return 0 if result.get("ok") else 1
+
+
 
 
 
@@ -328,14 +396,14 @@ def cmd_up(args: argparse.Namespace) -> int:
 def cmd_linux_binderfs(args: argparse.Namespace) -> int:
     script = args.context.project_root / "scripts" / "setup-linux-binderfs.sh"
     cmd = [str(script)] + (["--dry-run"] if args.dry_run else [])
-    proc = subprocess.run(
+    proc = run_bounded(
         cmd,
-        text=True,
-        capture_output=True,
         cwd=args.context.project_root,
         env=command_env(args),
+        deadline=time.monotonic() + 900.0,
+        project_root=args.context.project_root,
     )
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+    result = {"ok": proc.ok, "state": proc.state, "errorCode": proc.error_code, "returncode": proc.returncode, "stdout": proc.stdout_tail, "stderr": proc.stderr_tail}
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -354,86 +422,76 @@ def cmd_make_rootfs(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
-def cmd_build_daemon(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-daemon.sh")
+def _run_artifact_build(
+    args: argparse.Namespace,
+    targets: tuple[str, ...],
+    *,
+    force: bool = False,
+) -> int:
+    result = ArtifactBuilder(
+        args.project_root,
+        environment=command_env(args),
+    ).ensure(targets, force=force)
     print_json(result)
-    return 0 if result.get("ok") else 1
 
-
-def cmd_build_keymint(args: argparse.Namespace) -> int:
-    script = args.project_root / "scripts" / "build-keymint.sh"
-    proc = subprocess.run(
-        [str(script), "--build"],
-        text=True,
-        capture_output=True,
-        cwd=args.project_root,
-        env=command_env(args),
+    target_results = result.get("targets")
+    if not isinstance(target_results, dict):
+        return 1
+    expected_targets = set(targets)
+    if set(target_results) != expected_targets:
+        return 1
+    successful = all(
+        isinstance(target_results[target], dict)
+        and target_results[target].get("status") in {"built", "reused"}
+        for target in targets
     )
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
-    print_json(result)
-    return 0 if result.get("ok") else 1
+    return 0 if (
+        result.get("schema") == "dev.xenoid.artifacts/v1"
+        and result.get("ok") is True
+        and result.get("status") == "passed"
+        and successful
+    ) else 1
 
 
-def cmd_build_input(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-native-input.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
-
-
-def cmd_build_hide(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-native-hide.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
-
-
-def cmd_build_profile(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-native-profile.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
-
-
-def cmd_build_netctl(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-native-netctl.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
-
-
-def cmd_build_gralloc(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-gralloc.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
-
-def cmd_build_hwcomposer(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-hwcomposer.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
-
-
-def cmd_build_ril(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-ril.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
-
-
-def cmd_build_radio_config(args: argparse.Namespace) -> int:
-    result = run_script(args, "build-radio-config.sh")
-    print_json(result)
-    return 0 if result.get("ok") else 1
+def cmd_build_target(args: argparse.Namespace) -> int:
+    target = args.artifact_target
+    if target not in TARGETS:
+        result = {
+            "schema": "dev.xenoid.artifacts/v1",
+            "ok": False,
+            "status": "failed",
+            "manifestSha256": None,
+            "targets": {
+                str(target): {
+                    "status": "failed",
+                    "durationMs": 0,
+                    "code": "artifact_target_unknown",
+                },
+            },
+        }
+        print_json(result)
+        return 1
+    return _run_artifact_build(
+        args,
+        (target,),
+        force=bool(getattr(args, "artifact_force", False)),
+    )
 
 
 def cmd_verify_release(args: argparse.Namespace) -> int:
     script = args.project_root / "scripts" / "verify-release.py"
-    proc = subprocess.run(
+    proc = run_bounded(
         [str(script), args.archive],
-        text=True,
-        capture_output=True,
         cwd=args.project_root,
         env=command_env(args),
+        deadline=time.monotonic() + 600.0,
+        project_root=args.project_root,
     )
-    print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, file=sys.stderr, end="")
-    return 0 if proc.returncode == 0 else proc.returncode
+    if proc.stdout_tail:
+        print(proc.stdout_tail)
+    if proc.stderr_tail:
+        print(proc.stderr_tail, file=sys.stderr)
+    return 0 if proc.ok else (proc.returncode or 1)
 
 
 def cmd_package_release(args: argparse.Namespace) -> int:
@@ -447,63 +505,33 @@ def cmd_package_release(args: argparse.Namespace) -> int:
         })
         return 2
     script = args.project_root / "scripts" / "package-release.sh"
-    proc = subprocess.run(
+    proc = run_bounded(
         [str(script), version],
-        text=True,
-        capture_output=True,
         cwd=args.project_root,
         env={**command_env(args), "REL": ""},
+        deadline=time.monotonic() + 7200.0,
+        project_root=args.project_root,
     )
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip(), "archive": proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else None}
+    stdout = proc.stdout_tail.strip()
+    result = {
+        "ok": proc.ok,
+        "returncode": proc.returncode,
+        "state": proc.state,
+        "errorCode": proc.error_code,
+        "stdout": stdout,
+        "stderr": proc.stderr_tail.strip(),
+        "archive": stdout.splitlines()[-1] if stdout else None,
+    }
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_build_all(args: argparse.Namespace) -> int:
-    root = args.project_root
-    commands = [
-        ("daemon", [root / "scripts" / "build-daemon.sh"]),
-        ("keymint", [root / "scripts" / "build-keymint.sh"]),
-        ("input", [root / "scripts" / "build-native-input.sh"]),
-        ("hide", [root / "scripts" / "build-native-hide.sh"]),
-        ("profile", [root / "scripts" / "build-native-profile.sh"]),
-        ("rootd", [root / "scripts" / "build-native-rootd.sh"]),
-        ("netctl", [root / "scripts" / "build-native-netctl.sh"]),
-        ("overlay", [root / "scripts" / "build-native-overlay.sh", "arm64"]),
-        ("zygote", [root / "scripts" / "build-native-zygote.sh", "arm64"]),
-        ("sensorsHal", [root / "scripts" / "build-sensors-hal.sh", "arm64"]),
-        ("gralloc", [root / "scripts" / "build-gralloc.sh", "arm64"]),
-        ("hwcomposer", [root / "scripts" / "build-hwcomposer.sh", "arm64"]),
-        ("cameraProvider", [root / "scripts" / "build-camera-hal.sh", "arm64"]),
-        ("ril", [root / "scripts" / "build-ril.sh", "arm64"]),
-        ("radioConfig", [root / "scripts" / "build-radio-config.sh", "arm64"]),
-        ("shimArm64", [root / "scripts" / "build-native-shim.sh", "arm64", "prop"]),
-        ("pivot", [root / "scripts" / "build-native-for-arch.sh", "xenoid-pivot", root / "native" / "xenoid-pivot" / "xenoid_pivot.c", root / "native" / "xenoid-pivot" / "xenoid-pivot", "arm64", "static"]),
-        ("propArea", [root / "scripts" / "build-native-for-arch.sh", "xenoid-prop-area", root / "native" / "xenoid-hide" / "xenoid_prop_area.c", root / "native" / "xenoid-hide" / "xenoid-prop-area", "arm64"]),
-        ("ssaid", [root / "scripts" / "build-native-for-arch.sh", "xenoid-ssaid", root / "native" / "xenoid-hide" / "xenoid_ssaid.c", root / "native" / "xenoid-hide" / "xenoid-ssaid", "arm64"]),
-        (
-            "proxySandbox",
-            [root / "scripts" / "build-proxy-sandbox.sh"],
-        ),
-    ]
-    steps: dict[str, Any] = {}
-    for name, command in commands:
-        proc = subprocess.run(
-            [str(part) for part in command],
-            text=True,
-            capture_output=True,
-            cwd=root,
-            env=command_env(args),
-        )
-        steps[name] = {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip(),
-        }
-    result = {"ok": all(step["ok"] for step in steps.values()), "steps": steps}
-    print_json(result)
-    return 0 if result["ok"] else 1
+    return _run_artifact_build(
+        args,
+        ALL_TARGETS,
+        force=bool(getattr(args, "force", False)),
+    )
 
 
 
@@ -579,7 +607,7 @@ def cmd_google_services_status(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
-def cmd_google_services_enable(args: argparse.Namespace) -> int:
+def _google_services_enable_result(args: argparse.Namespace) -> dict[str, Any]:
     if (
         args.config.google_services_provider == PROVIDER_MINDTHEGAPPS
         and args.config.google_services_release == args.release
@@ -589,14 +617,12 @@ def cmd_google_services_enable(args: argparse.Namespace) -> int:
         result["runtimeReady"] = bool(result.get("ready"))
         result["runtimeError"] = result.get("error")
         result["ok"] = bool(result.get("configured") and result.get("hostReady"))
-        print_json(result)
-        return 0 if result["ok"] else 1
+        return result
     spec = load_release_spec(args.context.project_root, args.release)
     quick_validate_assets(args.context.project_root, spec)
     mutable = runtime(args).google_services_configuration_mutable()
     if mutable.get("ok") is not True:
-        print_json(mutable)
-        return 1
+        return mutable
     cfg = merge_config(
         args.context,
         {
@@ -607,11 +633,11 @@ def cmd_google_services_enable(args: argparse.Namespace) -> int:
     )
     save_config(args.context, cfg)
     args.config = cfg
-    result = RuntimeManager(
-        args.context,
-        cfg,
-        args.lease,
-    ).google_services_status()
+    manager = RuntimeManager(args.context, cfg, args.lease)
+    manager.operation_lock_held = bool(
+        getattr(args, "_operation_lock_held", False)
+    )
+    result = manager.google_services_status()
     result["changed"] = True
     result["runtimeReady"] = bool(result.get("ready"))
     result["runtimeError"] = result.get("error")
@@ -620,23 +646,26 @@ def cmd_google_services_enable(args: argparse.Namespace) -> int:
     result["nextActions"] = [
         f"./xenoid --instance {args.context.instance_name} up"
     ]
+    return result
+
+
+def cmd_google_services_enable(args: argparse.Namespace) -> int:
+    result = _google_services_enable_result(args)
     print_json(result)
-    return 0
+    return 0 if result.get("ok") else 1
 
 
-def cmd_google_services_disable(args: argparse.Namespace) -> int:
+def _google_services_disable_result(args: argparse.Namespace) -> dict[str, Any]:
     if (
         args.config.google_services_provider == PROVIDER_NONE
         and args.config.google_services_release == PROVIDER_NONE
     ):
         result = runtime(args).google_services_status()
         result["unchanged"] = True
-        print_json(result)
-        return 0 if result.get("ok") else 1
+        return result
     mutable = runtime(args).google_services_configuration_mutable()
     if mutable.get("ok") is not True:
-        print_json(mutable)
-        return 1
+        return mutable
     cfg = merge_config(
         args.context,
         {
@@ -646,14 +675,19 @@ def cmd_google_services_disable(args: argparse.Namespace) -> int:
     )
     save_config(args.context, cfg)
     args.config = cfg
-    result = RuntimeManager(
-        args.context,
-        cfg,
-        args.lease,
-    ).google_services_status()
+    manager = RuntimeManager(args.context, cfg, args.lease)
+    manager.operation_lock_held = bool(
+        getattr(args, "_operation_lock_held", False)
+    )
+    result = manager.google_services_status()
     result["changed"] = True
+    return result
+
+
+def cmd_google_services_disable(args: argparse.Namespace) -> int:
+    result = _google_services_disable_result(args)
     print_json(result)
-    return 0
+    return 0 if result.get("ok") else 1
 
 
 def cmd_google_services_registry(args: argparse.Namespace) -> int:
@@ -665,16 +699,18 @@ def cmd_google_services_registry(args: argparse.Namespace) -> int:
 def cmd_runtime_build_image(args: argparse.Namespace) -> int:
     mgr = runtime(args)
     if args.dry_run:
-        # A dry-run is a plan: it must not contact the Docker engine, so it
-        # also works with an unconfigured or unreachable docker context.
-        planned_context = str(mgr.context.state_root / "runtime-context" / "<pending>")
-        print_json({"ok": True, "dryRun": True, "context": planned_context, "command": [*mgr.docker_base_cmd(), "build", "-t", args.tag, planned_context]})
-        return 0
-    ctx = mgr.make_runtime_context(args.image)
-    if not ctx.get("ok"):
-        print_json(ctx); return 1
-    proc = subprocess.run([*(runtime(args).docker_base_cmd()), "build", "-t", args.tag, ctx.get("context")], text=True, capture_output=True)
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "tag": args.tag, "context": ctx.get("context")}
+        try:
+            record = mgr.runtime_image_input_record(args.image)
+            result = {"ok": True, "dryRun": True, **record}
+        except (InstanceError, OSError, RuntimeError, ValueError) as exc:
+            result = {
+                "ok": False,
+                "dryRun": True,
+                "error": getattr(exc, "code", "runtime_image_input_invalid"),
+                "message": str(exc),
+            }
+    else:
+        result = mgr.ensure_runtime_image(args.image)
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -684,7 +720,7 @@ def cmd_runtime_build_image(args: argparse.Namespace) -> int:
 def cmd_start(args: argparse.Namespace) -> int:
     mgr = runtime(args)
     with cli_operation_lock(args):
-        result = mgr.start(dry_run=args.dry_run, wait=not args.no_wait, install_daemon_apk=args.install_daemon, start_colima=args.start_colima, adb_root=not args.no_adb_root, skip_preflight=args.skip_preflight, recreate=args.recreate, defer_proxy=args.defer_proxy)
+        result = mgr.start(dry_run=args.dry_run, wait=not args.no_wait, install_daemon_apk=args.install_daemon, start_colima=args.start_colima, adb_root=not args.no_adb_root, skip_preflight=args.skip_preflight, recreate=args.recreate, defer_proxy=False)
     print_json(result)
     return 0 if result.get("ok") or args.dry_run else 1
 
@@ -708,10 +744,61 @@ def cmd_view(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _status_recommended_action(result: Mapping[str, Any]) -> str:
+    current = result.get("recommendedAction")
+    allowed = {
+        "no-op",
+        "resume",
+        "start",
+        "create",
+        "recreate",
+        "image-required",
+        "daemon-only",
+        "daemon-incompatible",
+        "helper-only",
+        "proxy-recovery",
+        "protection-maintenance",
+        "legacy-regeneration-recovery",
+        "resource-conflict",
+    }
+    if isinstance(current, str) and current in allowed:
+        return current
+    if result.get("pendingJournalPhase") or result.get("pendingJournal"):
+        return "resume"
+    error = result.get("error")
+    if error in {"resource_conflict", "ownership_mismatch", "runtime_identity_mismatch"}:
+        return "resource-conflict"
+    if error == "device_regeneration_legacy_pending":
+        return "legacy-regeneration-recovery"
+    if error == "daemon_seed_contract_incompatible":
+        return "daemon-incompatible"
+    if error == "shared_protection_reload_requires_maintenance":
+        return "protection-maintenance"
+    if isinstance(error, str) and error.startswith("proxy_"):
+        return "proxy-recovery"
+    runtime_image = result.get("runtimeImage")
+    if isinstance(runtime_image, Mapping) and runtime_image.get("ok") is not True:
+        return "image-required"
+    if result.get("running") is True:
+        return (
+            "no-op"
+            if result.get("containerContractMatches", True) is True
+            else "recreate"
+        )
+    if "containerContractMatches" in result:
+        return (
+            "start"
+            if result.get("containerContractMatches") is True
+            else "recreate"
+        )
+    return "create"
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     result = runtime(args).status()
+    result["recommendedAction"] = _status_recommended_action(result)
     print_json(result)
-    return 0 if result.get("ok") and result.get("running") else 1
+    return 0 if result.get("ok") else 1
 
 
 def cmd_adb(args: argparse.Namespace) -> int:
@@ -720,29 +807,51 @@ def cmd_adb(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
-def daemon_ensured(args: argparse.Namespace) -> DaemonClient:
-    manager = runtime(args)
-    manager.ensure_daemon()
-    return daemon(args, manager)
+def _bootstrap_error(result: Any, fallback: str = "daemon_unreachable") -> str:
+    if isinstance(result, dict):
+        code = result.get("code")
+        if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            return code
+        components = result.get("components")
+        root = components.get("root") if isinstance(components, dict) else None
+        root_error = root.get("errorCode") if isinstance(root, dict) else None
+        if (
+            isinstance(root_error, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", root_error)
+        ):
+            return root_error
+    return fallback
 
+
+def bootstrap_client(args: argparse.Namespace) -> DaemonClient:
+    manager = runtime(args)
+    reconciled = manager.reconcile_bootstrap()
+    if (
+        not isinstance(reconciled, dict)
+        or reconciled.get("transportReady") is not True
+        or reconciled.get("controlReady") is not True
+    ):
+        code = _bootstrap_error(reconciled)
+        raise InstanceError(code, code)
+    return daemon(args, manager)
 
 
 def cmd_daemon_ensure(args: argparse.Namespace) -> int:
     mgr = runtime(args)
-    daemon_result = mgr.ensure_daemon(
-        readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
-    )
+    bootstrap = mgr.reconcile_bootstrap()
     proxy = (
         mgr.reconcile_proxy_desired()
-        if daemon_result.get("ok") else {"ok": False, "skipped": True}
+        if bootstrap.get("controlReady") is True
+        else {"ok": False, "skipped": True}
     )
     result = {
-        "ok": bool(daemon_result.get("ok") and proxy.get("ok")),
-        "daemon": daemon_result,
+        "ok": bool(bootstrap.get("ok") and proxy.get("ok")),
+        "bootstrap": bootstrap,
         "proxyConverged": proxy,
     }
     print_json(result)
     return 0 if result.get("ok") else 1
+
 
 def cmd_daemon_health(args: argparse.Namespace) -> int:
     result = daemon(args).health()
@@ -753,36 +862,22 @@ def cmd_daemon_health(args: argparse.Namespace) -> int:
 def cmd_daemon_install(args: argparse.Namespace) -> int:
     mgr = runtime(args)
     install = mgr.install_daemon(args.apk)
-    start = (
-        mgr.start_daemon_service()
-        if install.get("ok") else {"ok": False, "skipped": True}
-    )
-    forward = (
-        mgr.forward_daemon_port()
-        if start.get("ok") else {"ok": False, "skipped": True}
-    )
-    rootd = (
-        mgr.ensure_rootd_root()
-        if forward.get("ok") else {"ok": False, "skipped": True}
-    )
-    ready = (
-        mgr.ensure_daemon(readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS)
-        if rootd.get("ok") else {"ok": False, "skipped": True}
+    bootstrap = (
+        mgr.reconcile_bootstrap()
+        if install.get("ok")
+        else {"ok": False, "skipped": True}
     )
     proxy = (
         mgr.reconcile_proxy_desired()
-        if ready.get("ok") else {"ok": False, "skipped": True}
+        if bootstrap.get("controlReady") is True
+        else {"ok": False, "skipped": True}
     )
+    if proxy.get("ok") is not True:
+        mgr._discard_pending_proxy_restore()
     result = {
-        "ok": all(
-            bool(step.get("ok"))
-            for step in (install, start, forward, rootd, ready, proxy)
-        ),
+        "ok": all(bool(step.get("ok")) for step in (install, bootstrap, proxy)),
         "install": install,
-        "start": start,
-        "forward": forward,
-        "rootd": rootd,
-        "ready": ready,
+        "bootstrap": bootstrap,
         "proxyConverged": proxy,
     }
     print_json(result)
@@ -791,32 +886,15 @@ def cmd_daemon_install(args: argparse.Namespace) -> int:
 
 def cmd_daemon_start(args: argparse.Namespace) -> int:
     mgr = runtime(args)
-    start = mgr.start_daemon_service()
-    forward = (
-        mgr.forward_daemon_port()
-        if start.get("ok") else {"ok": False, "skipped": True}
-    )
-    rootd = (
-        mgr.ensure_rootd_root()
-        if forward.get("ok") else {"ok": False, "skipped": True}
-    )
-    ready = (
-        mgr.ensure_daemon(readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS)
-        if rootd.get("ok") else {"ok": False, "skipped": True}
-    )
+    bootstrap = mgr.reconcile_bootstrap()
     proxy = (
         mgr.reconcile_proxy_desired()
-        if ready.get("ok") else {"ok": False, "skipped": True}
+        if bootstrap.get("controlReady") is True
+        else {"ok": False, "skipped": True}
     )
     result = {
-        "ok": all(
-            bool(step.get("ok"))
-            for step in (start, forward, rootd, ready, proxy)
-        ),
-        "start": start,
-        "forward": forward,
-        "rootd": rootd,
-        "ready": ready,
+        "ok": bool(bootstrap.get("ok") and proxy.get("ok")),
+        "bootstrap": bootstrap,
         "proxyConverged": proxy,
     }
     print_json(result)
@@ -946,7 +1024,7 @@ def _call_proxy_daemon(
     operation: Callable[[DaemonClient], dict[str, Any]],
 ) -> dict[str, Any]:
     try:
-        client = daemon_ensured(args)
+        client = bootstrap_client(args)
         result = operation(client)
     except InstanceError as exc:
         return _proxy_failure(exc.code)
@@ -959,14 +1037,18 @@ def _call_proxy_controller(
     args: argparse.Namespace,
     operation: Callable[[ProxyController], dict[str, Any]],
     *,
-    ensure_daemon: bool = True,
+    require_bootstrap: bool = True,
 ) -> dict[str, Any]:
     try:
         manager = runtime(args)
-        if ensure_daemon:
-            ensured = manager.ensure_daemon()
-            if not isinstance(ensured, dict) or ensured.get("ok") is not True:
-                return _proxy_failure("daemon_unreachable")
+        if require_bootstrap:
+            reconciled = manager.reconcile_bootstrap()
+            if (
+                not isinstance(reconciled, dict)
+                or reconciled.get("transportReady") is not True
+                or reconciled.get("controlReady") is not True
+            ):
+                return _proxy_failure(_bootstrap_error(reconciled))
         controller = ProxyController(
             args.context,
             args.config,
@@ -1297,7 +1379,12 @@ def cmd_proxy_enabled(args: argparse.Namespace) -> int:
 
 def cmd_proxy_clear(args: argparse.Namespace) -> int:
     return _emit_proxy_result(
-        _call_proxy_controller(args, lambda controller: controller.clear())
+        _call_proxy_controller(
+            args,
+            lambda controller: controller.clear(
+                discard_unreadable_state=args.discard_unreadable_state
+            ),
+        )
     )
 
 
@@ -1382,7 +1469,7 @@ def cmd_proxy_prepare(args: argparse.Namespace) -> int:
         _call_proxy_controller(
             args,
             lambda controller: controller.prepare(args.asset),
-            ensure_daemon=False,
+            require_bootstrap=False,
         )
     )
 
@@ -1430,17 +1517,21 @@ def _emit_camera_result(result: dict[str, Any]) -> int:
 
 def _camera_ready(
     args: argparse.Namespace,
-) -> tuple[Optional[RuntimeManager], Optional[DaemonClient]]:
+) -> tuple[Optional[RuntimeManager], Optional[DaemonClient], Optional[str]]:
     try:
         manager = runtime(args)
-        ensured = manager.ensure_daemon(
-            readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
-        )
-        if not ensured.get("ok"):
-            return None, None
-        return manager, daemon(args, manager)
+        reconciled = manager.reconcile_bootstrap()
+        if (
+            not isinstance(reconciled, dict)
+            or reconciled.get("transportReady") is not True
+            or reconciled.get("controlReady") is not True
+        ):
+            return None, None, _bootstrap_error(reconciled, "camera_unavailable")
+        return manager, daemon(args, manager), None
+    except InstanceError as exc:
+        return None, None, exc.code
     except Exception:
-        return None, None
+        return None, None, "camera_unavailable"
 
 def _camera_request(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     try:
@@ -1453,9 +1544,11 @@ def _camera_request(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
 
 
 def cmd_camera_status(args: argparse.Namespace) -> int:
-    manager, client = _camera_ready(args)
+    manager, client, bootstrap_error = _camera_ready(args)
     if manager is None or client is None:
-        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+        return _emit_camera_result(
+            {"ok": False, "error": bootstrap_error or "camera_unavailable"}
+        )
     if not args.check:
         return _emit_camera_result(_camera_request(client.camera_status))
 
@@ -1530,9 +1623,11 @@ def cmd_camera_set(args: argparse.Namespace) -> int:
             "error": "camera source must be a nonempty regular file",
         })
 
-    manager, client = _camera_ready(args)
+    manager, client, bootstrap_error = _camera_ready(args)
     if manager is None or client is None:
-        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+        return _emit_camera_result(
+            {"ok": False, "error": bootstrap_error or "camera_unavailable"}
+        )
 
     staging_path: Optional[str] = None
     result: dict[str, Any]
@@ -1560,23 +1655,29 @@ def cmd_camera_set(args: argparse.Namespace) -> int:
 
 
 def cmd_camera_mode(args: argparse.Namespace) -> int:
-    _, client = _camera_ready(args)
+    _, client, bootstrap_error = _camera_ready(args)
     if client is None:
-        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+        return _emit_camera_result(
+            {"ok": False, "error": bootstrap_error or "camera_unavailable"}
+        )
     return _emit_camera_result(_camera_request(lambda: client.camera_settings(args.mode)))
 
 
 def cmd_camera_clear(args: argparse.Namespace) -> int:
-    _, client = _camera_ready(args)
+    _, client, bootstrap_error = _camera_ready(args)
     if client is None:
-        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+        return _emit_camera_result(
+            {"ok": False, "error": bootstrap_error or "camera_unavailable"}
+        )
     return _emit_camera_result(_camera_request(lambda: client.camera_clear(args.kind)))
 
 
 def cmd_camera_apply(args: argparse.Namespace) -> int:
-    _, client = _camera_ready(args)
+    _, client, bootstrap_error = _camera_ready(args)
     if client is None:
-        return _emit_camera_result({"ok": False, "error": "camera daemon unavailable"})
+        return _emit_camera_result(
+            {"ok": False, "error": bootstrap_error or "camera_unavailable"}
+        )
     return _emit_camera_result(_camera_request(client.camera_apply))
 
 
@@ -1584,8 +1685,8 @@ def _location_failure(code: str) -> dict[str, Any]:
     return {"ok": False, "code": code, "error": code}
 
 
-# Daemon failures that mean the rootd/publish control plane is down; the
-# converge loop may repair it once or twice before giving up.
+# Bounded control-plane failures may trigger one retry through the same
+# listener/root/bootstrap coordinator path.
 _LOCATION_REPAIRABLE_CODES = frozenset({
     "daemon_unreachable",
     "location_profile_publish_failed",
@@ -1672,11 +1773,15 @@ def _location_converge(
 
     def repair_if_possible() -> bool:
         nonlocal repairs
-        if repairs >= 2:
+        if repairs >= 1:
             return False
         repairs += 1
-        repaired = manager.repair_control_plane()
-        return bool(isinstance(repaired, dict) and repaired.get("ok") is True)
+        reconciled = manager.reconcile_bootstrap()
+        return bool(
+            isinstance(reconciled, dict)
+            and reconciled.get("transportReady") is True
+            and reconciled.get("controlReady") is True
+        )
 
     for _ in range(12):
         state = store.load()
@@ -1686,14 +1791,12 @@ def _location_converge(
         client: Optional[DaemonClient] = None
         android: Optional[dict[str, Any]] = None
         if epoch:
-            ensured = manager.ensure_daemon(readiness_timeout=90.0)
-            if not (isinstance(ensured, dict) and ensured.get("ok") is True):
-                # A fresh container can lose the adb lease or the exec'd rootd
-                # right after start reports success; repair instead of failing
-                # the whole transaction on the transient.
-                repair_if_possible()
-                ensured = manager.ensure_daemon(readiness_timeout=60.0)
-            if isinstance(ensured, dict) and ensured.get("ok") is True:
+            reconciled = manager.reconcile_bootstrap()
+            if (
+                isinstance(reconciled, dict)
+                and reconciled.get("transportReady") is True
+                and reconciled.get("controlReady") is True
+            ):
                 client = daemon(args, manager)
                 android = _location_android_status(client)
         action = convergence_action(state, android, epoch)
@@ -1805,13 +1908,19 @@ def _location_converge(
         except Exception:
             proxy_rebind = _location_failure("proxy_reconcile_failed")
     state = store.load()
+    proxy_ok = proxy_rebind.get("ok") is True
     result: dict[str, Any] = {
-        "ok": True,
+        "ok": proxy_ok,
         "recreated": recreated,
         "identity": public_summary(state),
         "android": masked_android_status(verified_payload),
         "proxyRebind": proxy_rebind,
     }
+    if not proxy_ok:
+        result["error"] = _location_error_code(
+            proxy_rebind,
+            "proxy_reconcile_failed",
+        )
     if not legacy_cleaned:
         result["legacyCleanup"] = False
     return result
@@ -1848,7 +1957,19 @@ def cmd_location_status(args: argparse.Namespace) -> int:
         android: dict[str, Any] = {"ok": False, "error": "runtime_not_running"}
         if epoch:
             try:
-                android = masked_android_status(daemon(args, manager).location_status())
+                reconciled = manager.reconcile_bootstrap()
+                if (
+                    reconciled.get("transportReady") is not True
+                    or reconciled.get("controlReady") is not True
+                ):
+                    android = {
+                        "ok": False,
+                        "error": _bootstrap_error(reconciled),
+                    }
+                else:
+                    android = masked_android_status(
+                        daemon(args, manager).location_status()
+                    )
             except Exception:
                 android = {"ok": False, "error": "daemon_unreachable"}
         checked = True
@@ -1878,7 +1999,18 @@ def cmd_location_set(args: argparse.Namespace) -> int:
         target = normalize_country(args.country)
         store.ensure(args.context.instance_id, target)
         store.set_desired(target)
-        result = _location_converge(args, manager, store, rebind_proxy=True)
+        if manager.location_runtime_container_id() is None:
+            state = store.load()
+            result = {
+                "ok": True,
+                "pending": True,
+                "host": public_summary(state),
+                "nextActions": [
+                    f"./xenoid --instance {args.context.instance_name} up",
+                ],
+            }
+        else:
+            result = _location_converge(args, manager, store, rebind_proxy=True)
     except (CellularError, LocationError, InstanceError) as exc:
         result = _location_failure(exc.code)
     except Exception:
@@ -1888,7 +2020,7 @@ def cmd_location_set(args: argparse.Namespace) -> int:
 
 
 def cmd_location_apply(args: argparse.Namespace) -> int:
-    """Internal production path used by xenoid-up: converge the persisted location."""
+    """Explicitly converge the persisted Location state."""
     try:
         manager = runtime(args)
         store = LocationStateStore(args.context.state_root)
@@ -1913,7 +2045,7 @@ def cmd_cellular_status(args: argparse.Namespace) -> int:
             host = public_summary(store.load())
         except LocationError:
             host = {"state": "invalid"}
-        client = daemon_ensured(args)
+        client = bootstrap_client(args)
         location = masked_android_status(client.location_status())
         props: dict[str, str] = {}
         for name in (
@@ -1937,13 +2069,13 @@ def cmd_cellular_status(args: argparse.Namespace) -> int:
 
 
 def cmd_root_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).root_status()
+    result = bootstrap_client(args).root_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_root_exec(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).root_exec(" ".join(args.command))
+    result = bootstrap_client(args).root_exec(" ".join(args.command))
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -1984,19 +2116,19 @@ def cmd_frida_deploy(args: argparse.Namespace) -> int:
 
 
 def cmd_frida_start(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).frida_start(port=args.port)
+    result = bootstrap_client(args).frida_start(port=args.port)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_frida_stop(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).frida_stop()
+    result = bootstrap_client(args).frida_stop()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_frida_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).frida_status()
+    result = bootstrap_client(args).frida_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2009,25 +2141,25 @@ def cmd_profile_deploy_helper(args: argparse.Namespace) -> int:
 
 
 def cmd_profile_helper_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).profile_helper_status()
+    result = bootstrap_client(args).profile_helper_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_profile_helper_env(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).profile_helper_env()
+    result = bootstrap_client(args).profile_helper_env()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_profile_helper_dump(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).profile_helper_dump()
+    result = bootstrap_client(args).profile_helper_dump()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_device_collect(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).collect_fingerprint()
+    result = bootstrap_client(args).collect_fingerprint()
     if args.out and result.get("ok", True):
         write_json_file(args.out, result)
     print_json(result)
@@ -2037,12 +2169,17 @@ def cmd_device_collect(args: argparse.Namespace) -> int:
 def cmd_device_apply(args: argparse.Namespace) -> int:
     profile = read_json_file(args.profile)
     manager = runtime(args)
-    ensured = manager.ensure_daemon()
-    if not isinstance(ensured, dict) or ensured.get("ok") is not True:
+    bootstrap = manager.reconcile_bootstrap()
+    if (
+        not isinstance(bootstrap, dict)
+        or bootstrap.get("transportReady") is not True
+        or bootstrap.get("controlReady") is not True
+    ):
+        code = _bootstrap_error(bootstrap)
         result: dict[str, Any] = {
             "ok": False,
-            "error": "daemon_unreachable",
-            "daemon": ensured,
+            "error": code,
+            "bootstrap": bootstrap,
         }
     else:
         if args.keep_unique and not args.instance_identity:
@@ -2090,7 +2227,7 @@ def cmd_device_set(args: argparse.Namespace) -> int:
     key = identity_field_key(args.field)
     if key is not None:
         validate_identity_value(key, value)
-    result = daemon_ensured(args).set_fingerprint_field(args.field, value)
+    result = bootstrap_client(args).set_fingerprint_field(args.field, value)
     if key is not None and result.get("ok") is True:
         state = DeviceIdentityStore(args.context).update_field(args.field, value)
         result = {
@@ -2108,6 +2245,13 @@ _KEYBOX_SAFE_PUBLIC_ERRORS = frozenset({
     "daemon_response_invalid",
     "daemon_unauthorized",
     "daemon_unreachable",
+    "daemon_token_unavailable",
+    "daemon_transport_timeout",
+    "daemon_transport_unavailable",
+    "bootstrap_timeout",
+    "rootd_unauthorized",
+    "rootd_unavailable",
+    "rootd_resource_conflict",
     "invalid_keybox",
     "invalid_request",
     "invalid_stage",
@@ -2188,27 +2332,37 @@ def _emit_keybox_result(value: Any) -> int:
 
 def _keybox_mutation_client(
     args: argparse.Namespace,
-) -> tuple[Optional[RuntimeManager], Optional[DaemonClient]]:
+) -> tuple[Optional[RuntimeManager], Optional[DaemonClient], Optional[str]]:
     try:
         manager = runtime(args)
-        ensured = manager.ensure_daemon(
-            readiness_timeout=KEYBOX_MUTATION_TIMEOUT_SECONDS
-        )
-        if not isinstance(ensured, dict) or ensured.get("ok") is not True:
-            return None, None
-        return manager, daemon(args, manager)
+        reconciled = manager.reconcile_bootstrap()
+        if (
+            not isinstance(reconciled, dict)
+            or reconciled.get("transportReady") is not True
+            or reconciled.get("controlReady") is not True
+        ):
+            return None, None, _bootstrap_error(
+                reconciled,
+                "keybox_daemon_unavailable",
+            )
+        return manager, daemon(args, manager), None
+    except InstanceError as exc:
+        return None, None, exc.code
     except Exception:
-        return None, None
+        return None, None, "keybox_daemon_unavailable"
 
 
 def cmd_device_keybox_set(args: argparse.Namespace) -> int:
     try:
         with _validated_keybox_source(args.file) as validated:
             stream, size, digest, validated_state = validated
-            manager, client = _keybox_mutation_client(args)
+            manager, client, bootstrap_error = _keybox_mutation_client(args)
             if manager is None or client is None:
                 return _emit_keybox_result(
-                    {"ok": False, "error": "keybox_daemon_unavailable"}
+                    {
+                        "ok": False,
+                        "error": bootstrap_error or "keybox_daemon_unavailable",
+                    }
                 )
 
             try:
@@ -2253,18 +2407,28 @@ def cmd_device_keybox_set(args: argparse.Namespace) -> int:
 
 
 def cmd_device_keybox_status(args: argparse.Namespace) -> int:
-    try:
-        result = daemon(args).keybox_status()
-    except Exception:
-        result = {"ok": False, "error": "keybox_daemon_unavailable"}
+    _, client, bootstrap_error = _keybox_mutation_client(args)
+    if client is None:
+        result = {
+            "ok": False,
+            "error": bootstrap_error or "keybox_daemon_unavailable",
+        }
+    else:
+        try:
+            result = client.keybox_status()
+        except Exception:
+            result = {"ok": False, "error": "keybox_daemon_unavailable"}
     return _emit_keybox_result(result)
 
 
 def cmd_device_keybox_clear(args: argparse.Namespace) -> int:
-    _, client = _keybox_mutation_client(args)
+    _, client, bootstrap_error = _keybox_mutation_client(args)
     if client is None:
         return _emit_keybox_result(
-            {"ok": False, "error": "keybox_daemon_unavailable"}
+            {
+                "ok": False,
+                "error": bootstrap_error or "keybox_daemon_unavailable",
+            }
         )
     try:
         result = client.keybox_clear()
@@ -2273,200 +2437,949 @@ def cmd_device_keybox_clear(args: argparse.Namespace) -> int:
     return _emit_keybox_result(result)
 
 
-def cmd_device_regenerate(args: argparse.Namespace) -> int:
-    """Rotate every per-device uniqueness factor and re-converge the runtime.
+def _regeneration_phase_at_least(
+    state: Mapping[str, Any],
+    phase: str,
+) -> bool:
+    return REGENERATION_PHASES.index(str(state["phase"])) >= REGENERATION_PHASES.index(phase)
 
-    Crash-safe ordering: persist the rotated stable identity and network
-    epoch first, stop the owned container, rotate filesystem identity
-    offline, then let the standard up pipeline rebuild the container from
-    the rotated state and validate the production runtime.
-    """
+
+def _regeneration_result(
+    state: Mapping[str, Any],
+    *,
+    ok: bool,
+    error: Optional[str] = None,
+    **details: Any,
+) -> dict[str, Any]:
+    return {
+        "schema": "dev.xenoid.device-regenerate/v2",
+        "ok": ok,
+        "transactionId": state.get("transactionId"),
+        "phase": state.get("phase"),
+        **({} if error is None else {"error": error}),
+        **details,
+    }
+
+
+def _verify_regeneration_target_state(
+    manager: RuntimeManager,
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    current = manager.regeneration_snapshot()
+    before = state["before"]
+    target = state["target"]
+    expected = {
+        "stableDigest": target["stableDigest"],
+        "networkEpoch": target["networkEpoch"],
+        "simEpoch": target["simEpoch"],
+        "dataFilesystemUuid": target["dataFilesystemUuid"],
+        "rootfsFilesystemUuid": target["rootfsFilesystemUuid"],
+        "locationDigest": target["locationProfileDigest"],
+        **(
+            {}
+            if state.get("legacyEvidenceSha256") is not None
+            else {
+                "proxyEnabled": before["proxyEnabled"],
+                "proxyGeneration": target["proxyGeneration"],
+            }
+        ),
+        "googleBindingDigest": target["googleBindingDigest"],
+    }
+    if any(current.get(key) != value for key, value in expected.items()):
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "a regenerated feature matches neither its recorded before nor fixed target",
+        )
+    return current
+
+
+def _regeneration_acceptance(
+    manager: RuntimeManager,
+    state: Mapping[str, Any],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    context = manager.acceptance_context()
+    expected = dict(context.get("expected") or {})
+    target = state["target"]
+    expected.update(
+        {
+            "dataUuid": target["dataFilesystemUuid"],
+            "rootfsUuid": target["rootfsFilesystemUuid"],
+            **(
+                {}
+                if state.get("legacyEvidenceSha256") is not None
+                else {"proxyGeneration": target["proxyGeneration"]}
+            ),
+        }
+    )
+    return LiveAcceptance().observe(
+        context,
+        expected,
+        mode,
+        time.monotonic() + 300.0,
+        _write_up_progress,
+    )
+
+
+def _wipe_regeneration_google_packages(
+    manager: RuntimeManager,
+    journal: RegenerationJournal,
+    capability: Mapping[str, str],
+) -> dict[str, Any]:
+    while True:
+        state = journal.load()
+        if state is None:
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        cleared = list(state["googleClearedPackages"])
+        if len(cleared) == len(GOOGLE_CLEAR_PACKAGES):
+            return {"ok": True, "cleared": cleared}
+        package = GOOGLE_CLEAR_PACKAGES[len(cleared)]
+        if state["googleActivePackage"] is None:
+            state = journal.advance(
+                "google_wiping",
+                googleActivePackage=package,
+                googleMarkerRoots=[],
+                googlePackageArmed=False,
+            )
+        if state["googleActivePackage"] != package:
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        if state["googlePackageArmed"] is not True:
+            armed = manager.prepare_google_package_clear(
+                package,
+                str(state["transactionId"]),
+                capability,
+            )
+            if armed.get("ok") is not True:
+                return armed
+            state = journal.advance(
+                "google_wiping",
+                googleMarkerRoots=list(armed.get("roots") or []),
+                googlePackageArmed=True,
+            )
+        else:
+            stopped = manager.adb(
+                ["shell", "am", "force-stop", package],
+                timeout=30,
+            )
+            if stopped.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": "google_package_force_stop_failed",
+                }
+        roots = list(state["googleMarkerRoots"])
+        markers = manager.google_package_markers(
+            package,
+            str(state["transactionId"]),
+            roots,
+            capability,
+        )
+        if markers.get("ok") is not True:
+            return markers
+        present = list(markers.get("present") or [])
+        if present or not roots:
+            cleared_result = manager.clear_google_package(
+                package,
+                str(state["transactionId"]),
+                capability,
+            )
+            if cleared_result.get("ok") is not True:
+                return cleared_result
+            markers = manager.google_package_markers(
+                package,
+                str(state["transactionId"]),
+                roots,
+                capability,
+            )
+            if markers.get("ok") is not True:
+                return markers
+            if markers.get("present"):
+                return {
+                    "ok": False,
+                    "error": "google_package_clear_unverified",
+                }
+        journal.advance(
+            "google_wiping",
+            googleClearedPackages=[*cleared, package],
+            googleActivePackage=None,
+            googleMarkerRoots=[],
+            googlePackageArmed=False,
+        )
+
+
+def _restart_legacy_regeneration(
+    args: argparse.Namespace,
+    manager: RuntimeManager,
+    identity_store: DeviceIdentityStore,
+    journal: RegenerationJournal,
+) -> dict[str, Any]:
+    try:
+        existing = journal.load()
+    except IdentityError as exc:
+        if exc.code != "device_regeneration_legacy_pending":
+            raise
+        existing = None
+    if existing is not None:
+        if existing.get("legacyEvidenceSha256") is None:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "active regeneration is not a legacy restart",
+            )
+        return journal.finish_legacy_evidence()
+    try:
+        legacy_digest = journal.legacy_source_digest()
+    except FileNotFoundError as exc:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "legacy regeneration journal is missing",
+        ) from exc
+    identity = identity_store.load()
+    if identity is None:
+        identity = identity_store.initialize()
+    if identity.get("pendingStable") is not None:
+        identity_store.recover_orphaned_regeneration_stable()
+    legacy_storage = manager.complete_legacy_pending_storage(legacy_digest)
+    if legacy_storage.get("ok") is not True:
+        raise IdentityError(
+            str(
+                legacy_storage.get("error")
+                or "storage_v4_migration_failed"
+            ),
+            "legacy storage completion failed",
+        )
+    compatibility_executor = ConvergenceExecutor(manager)
+    compatibility_state = compatibility_executor.journal.load()
+    retained_transaction = (
+        compatibility_state.get("regenerationTransactionId")
+        if isinstance(compatibility_state, Mapping)
+        else None
+    )
+    transaction_id = (
+        str(retained_transaction)
+        if isinstance(retained_transaction, str)
+        else secrets.token_hex(16)
+    )
+    sim_epoch = hashlib.sha256(
+        b"xenoid-legacy-location-sim/v1\0"
+        + transaction_id.encode("ascii")
+    ).hexdigest()[:32]
+    def run_compatibility() -> None:
+        compatibility = compatibility_executor.run(
+            progress=_write_up_progress,
+            skip_build=bool(getattr(args, "skip_build", False)),
+            regeneration_capability={
+                "transactionId": transaction_id,
+                "legacyEvidenceSha256": legacy_digest,
+            },
+            retain_accepted_journal=True,
+        )
+        if compatibility.get("ok") is not True:
+            raise IdentityError(
+                str(
+                    compatibility.get("error")
+                    or "legacy_proxy_compatibility_failed"
+                ),
+                "legacy proxy compatibility convergence failed",
+            )
+
+    if isinstance(compatibility_state, Mapping):
+        if (
+            compatibility_state.get("operationId") != legacy_digest[:32]
+            or compatibility_state.get("regenerationTransactionId")
+            != transaction_id
+        ):
+            raise IdentityError(
+                "convergence_state_conflict",
+                "legacy compatibility journal identity mismatch",
+            )
+    else:
+        skip_build = bool(getattr(args, "skip_build", False))
+        plan = compatibility_executor.planner.inspect(skip_build=skip_build)
+        if plan.resolution == "requires-artifacts":
+            if skip_build:
+                raise IdentityError(
+                    "artifact_records_stale",
+                    "legacy compatibility artifacts are unavailable",
+                )
+            builder = compatibility_executor.artifact_builder
+            if builder is None:
+                raise IdentityError(
+                    "artifact_builder_unavailable",
+                    "legacy compatibility artifact builder is unavailable",
+                )
+            remaining = bounded_timeout(_UP_TIMEOUT_SECONDS)
+            artifact_deadline = time.monotonic() + (
+                float(remaining)
+                if remaining is not None
+                else _UP_TIMEOUT_SECONDS
+            )
+            built = builder.ensure(
+                plan.artifact_targets,
+                force=False,
+                deadline=artifact_deadline,
+            )
+            if not isinstance(built, Mapping) or built.get("ok") is not True:
+                raise IdentityError(
+                    "artifact_ensure_failed",
+                    "legacy compatibility artifacts failed",
+                )
+            plan = compatibility_executor.planner.inspect(skip_build=True)
+        if plan.resolution != "complete":
+            raise IdentityError(
+                "artifact_resolution_incomplete",
+                "legacy compatibility plan is unresolved",
+            )
+        location_store = LocationStateStore(args.context.state_root)
+        missing_location = location_store.load() is None
+        if missing_location:
+            plan = dataclasses.replace(
+                plan,
+                image_action="ensure-desired",
+                boot_seed_action="initialize_replace",
+                location_action="converge",
+                live_observation_required=True,
+                recreate_reasons=tuple(
+                    {
+                        *plan.recreate_reasons,
+                        "legacy_location_seed",
+                    }
+                ),
+                plan_digest="",
+            )
+        observation = manager.observe_convergence(skip_build=True)
+        runtime_observation = observation.get("runtime")
+        if not isinstance(runtime_observation, Mapping):
+            raise IdentityError(
+                "convergence_observation_invalid",
+                "legacy compatibility runtime observation is invalid",
+            )
+        boot_seed_target = None
+        if plan.boot_seed_action == "initialize_replace":
+            data_uuid = runtime_observation.get("dataUuid")
+            rootfs_uuid = runtime_observation.get("rootfsUuid")
+            if not isinstance(data_uuid, str) or not isinstance(
+                rootfs_uuid,
+                str,
+            ):
+                raise IdentityError(
+                    "storage_identity_mismatch",
+                    "legacy compatibility storage pins are unavailable",
+                )
+            boot_seed_target = {
+                "transactionId": secrets.token_hex(16),
+                "dataUuid": data_uuid,
+                "rootfsUuid": rootfs_uuid,
+            }
+        compatibility_executor.journal.create(
+            plan,
+            operation_id=legacy_digest[:32],
+            regeneration_transaction_id=transaction_id,
+            observation=observation,
+            boot_seed_target=boot_seed_target,
+        )
+        compatibility_state = compatibility_executor.journal.load()
+    location_store = LocationStateStore(args.context.state_root)
+    if location_store.load() is None:
+        location_target = missing_regeneration_target(
+            args.context.instance_id,
+            transaction_id,
+            sim_epoch,
+        )
+        location_store.initialize_regeneration_target(
+            args.context.instance_id,
+            transaction_id,
+            sim_epoch,
+            location_target["profileDigest"],
+        )
+    run_compatibility()
+    compatibility_state = compatibility_executor.journal.load()
+    if (
+        not isinstance(compatibility_state, Mapping)
+        or compatibility_state.get("phase") != "accepted"
+    ):
+        raise IdentityError(
+            "legacy_proxy_compatibility_failed",
+            "legacy compatibility acceptance is not durable",
+        )
+    before = manager.regeneration_snapshot()
+    network_epoch = secrets.token_hex(16)
+    while network_epoch == before["networkEpoch"]:
+        network_epoch = secrets.token_hex(16)
+    if sim_epoch == before["simEpoch"]:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "derived legacy SIM target matches current epoch",
+        )
+    storage_transaction = secrets.token_hex(16)
+    data_uuid = storage_rotation_target(storage_transaction)
+    rootfs_uuid = storage_rotation_target(storage_transaction, rootfs=True)
+    while (
+        data_uuid == before["dataFilesystemUuid"]
+        or rootfs_uuid == before["rootfsFilesystemUuid"]
+    ):
+        storage_transaction = secrets.token_hex(16)
+        data_uuid = storage_rotation_target(storage_transaction)
+        rootfs_uuid = storage_rotation_target(storage_transaction, rootfs=True)
+    identity = identity_store.prepare_regeneration_stable(transaction_id)
+    pending = identity["pendingStable"]
+    if not isinstance(pending, Mapping):
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "stable regeneration target was not persisted",
+        )
+    location_store = LocationStateStore(args.context.state_root)
+    location_target = (
+        missing_regeneration_target(
+            args.context.instance_id,
+            transaction_id,
+            sim_epoch,
+        )
+        if location_store.load() is None
+        else location_store.regeneration_target(sim_epoch)
+    )
+    target = {
+        "stableDigest": pending["digest"],
+        "networkEpoch": network_epoch,
+        "simEpoch": sim_epoch,
+        "storageTransactionId": storage_transaction,
+        "dataFilesystemUuid": data_uuid,
+        "rootfsFilesystemUuid": rootfs_uuid,
+        "locationProfileDigest": location_target["profileDigest"],
+        "proxyGeneration": before["proxyGeneration"],
+        "googleBindingDigest": before["googleBindingDigest"],
+    }
+    state = journal.prepare(
+        transaction_id,
+        before,
+        target,
+        legacy_evidence_sha256=legacy_digest,
+        legacy_restart=True,
+    )
+    finished = journal.finish_legacy_evidence()
+    if finished.get("transactionId") != state["transactionId"]:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "legacy evidence publication did not preserve regeneration",
+        )
+    if compatibility_executor.journal.exists():
+        retained = compatibility_executor.journal.load()
+        if (
+            retained is None
+            or retained.get("phase") != "accepted"
+            or retained.get("regenerationTransactionId") != transaction_id
+        ):
+            raise IdentityError(
+                "convergence_state_conflict",
+                "legacy compatibility journal is not accepted",
+            )
+        compatibility_executor.journal.clear()
+    return finished
+
+
+def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
     context = args.context
-    store = DeviceIdentityStore(context)
+    identity_store = DeviceIdentityStore(context)
     journal = RegenerationJournal(context)
     manager = runtime(args)
-    container_id = manager.location_runtime_container_id()
-    if args.dry_run:
-        state = store.load()
-        print_json({
-            "ok": True,
-            "dryRun": True,
-            "runtimeRunning": container_id is not None,
-            "identity": (
-                public_identity_state(state) if state is not None else {"initialized": False}
-            ),
-            "network": {"macAddress": args.lease.mac_address, "epoch": args.lease.network_epoch or None},
-            "actions": [
-                "rotate stable identity (android_id, serial, IMEI/IMEISV)",
-                "rotate the lease network epoch (container MAC)",
-                "stop the owned Android container",
-                "rotate data/rootfs filesystem UUIDs and reset the per-app SSAID store offline",
-                "rotate the SIM epoch (new IMSI/ICCID/MSISDN/cell for the same country)",
-                "rebuild and validate the runtime through the standard up pipeline",
-                "clear Google services app data so the app-readable advertising ID regenerates (GMS instances)",
-            ],
-        })
-        return 0
-    if not container_id:
-        # An interrupted regenerate can leave the container already removed
-        # with the journal and/or a marked pending storage transaction; allow
-        # resuming that instead of deadlocking against up's fail-closed checks.
-        try:
-            storage_state = StorageStateStore(context, args.lease).load()
-        except StorageError:
-            storage_state = None
-        resumable = journal.pending() or (
-            storage_state is not None
-            and storage_state["state"] == "pending"
-            and storage_state["temporaryImage"] == ""
-            and bool(storage_state["rotationTargetUuid"])
+    state = (
+        _restart_legacy_regeneration(
+            args,
+            manager,
+            identity_store,
+            journal,
         )
-        if not resumable:
-            print_json({
-                "ok": False,
-                "error": "device_runtime_not_running",
-                "message": "start the instance with ./xenoid up before regenerating its device identity",
-            })
-            return 1
-    journal.mark()
-    try:
-        state = store.load()
-        if state is None:
-            state = store.initialize()
-        store.rotate_stable()
-    except InstanceError as exc:
-        result = exc.as_dict()
-        result["message"] = str(exc)
-        print_json(result)
-        return 1
-    # Stop with the CURRENT lease first: proxy cleanup/owner state is bound to
-    # its lease digest, so the network epoch may rotate only after the engine
-    # state is wiped.
-    stopped = manager.stop()
-    if not isinstance(stopped, dict) or stopped.get("ok") is not True:
-        print_json({
-            "ok": False,
-            "error": "device_regenerate_stop_failed",
-            "stop": stopped,
-            "nextActions": [f"./xenoid --instance {context.instance_name} device regenerate"],
-        })
-        return 1
-    try:
-        rotate_instance_network(context)
+        if bool(getattr(args, "restart_legacy_transaction", False))
+        else journal.load()
+    )
+    if state is not None and state.get("legacyEvidenceSha256") is not None:
+        state = journal.finish_legacy_evidence()
+    resumed = state is not None
+    if state is None:
+        identity = identity_store.load()
+        if identity is None:
+            identity = identity_store.initialize()
+        if identity.get("pendingStable") is not None:
+            identity_store.recover_orphaned_regeneration_stable()
+        before = manager.regeneration_snapshot()
+        transaction_id = secrets.token_hex(16)
+        network_epoch = secrets.token_hex(16)
+        while network_epoch == before["networkEpoch"]:
+            network_epoch = secrets.token_hex(16)
+        sim_epoch = secrets.token_hex(16)
+        while sim_epoch == before["simEpoch"]:
+            sim_epoch = secrets.token_hex(16)
+        storage_transaction = secrets.token_hex(16)
+        data_uuid = storage_rotation_target(storage_transaction)
+        rootfs_uuid = storage_rotation_target(
+            storage_transaction,
+            rootfs=True,
+        )
+        while (
+            data_uuid == before["dataFilesystemUuid"]
+            or rootfs_uuid == before["rootfsFilesystemUuid"]
+        ):
+            storage_transaction = secrets.token_hex(16)
+            data_uuid = storage_rotation_target(storage_transaction)
+            rootfs_uuid = storage_rotation_target(
+                storage_transaction,
+                rootfs=True,
+            )
+        pending_identity = identity_store.prepare_regeneration_stable(
+            transaction_id
+        )
+        pending_stable = pending_identity["pendingStable"]
+        if not isinstance(pending_stable, Mapping):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "stable regeneration target was not persisted",
+            )
+        location_target = LocationStateStore(
+            context.state_root
+        ).regeneration_target(sim_epoch)
+        target = {
+            "stableDigest": pending_stable["digest"],
+            "networkEpoch": network_epoch,
+            "simEpoch": sim_epoch,
+            "storageTransactionId": storage_transaction,
+            "dataFilesystemUuid": data_uuid,
+            "rootfsFilesystemUuid": rootfs_uuid,
+            "locationProfileDigest": location_target["profileDigest"],
+            "proxyGeneration": before["proxyGeneration"],
+            "googleBindingDigest": before["googleBindingDigest"],
+        }
+        state = journal.prepare(
+            transaction_id,
+            before,
+            target,
+        )
+    else:
+        pending = identity_store.load()
+        pending_stable = pending.get("pendingStable") if isinstance(pending, Mapping) else None
+        mismatch = (
+            isinstance(pending_stable, Mapping)
+            and (
+                pending_stable.get("transactionId") != state["transactionId"]
+                or pending_stable.get("digest")
+                != state["target"]["stableDigest"]
+            )
+        )
+        if (
+            state["phase"] != "committed"
+            and (not isinstance(pending_stable, Mapping) or mismatch)
+            or state["phase"] == "committed"
+            and mismatch
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "regeneration journal and stable target disagree",
+            )
+    capability = {"transactionId": str(state["transactionId"])}
+    if state["phase"] == "committed":
+        current_identity = identity_store.load()
+        if (
+            current_identity is None
+            or stable_identity_digest(current_identity["stable"])
+            != state["target"]["stableDigest"]
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "committed regeneration stable identity does not match target",
+            )
+        if isinstance(pending_stable, Mapping):
+            identity_store.clear_regeneration_stable(state["transactionId"])
+        journal.clear()
+        return _regeneration_result(
+            state,
+            ok=True,
+            resumed=True,
+            cleaned=True,
+            legacyRestart=state.get("legacyEvidenceSha256") is not None,
+            factorsMayRotateAgain=state.get("legacyEvidenceSha256") is not None,
+        )
+    if not _regeneration_phase_at_least(state, "proxy_quarantined"):
+        quarantined = manager.quarantine_proxy_for_lifecycle(
+            str(state["before"]["dataFilesystemUuid"]),
+            str(state["transactionId"]),
+        )
+        if quarantined.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    quarantined.get("error")
+                    or quarantined.get("code")
+                    or "proxy_quarantine_failed"
+                ),
+            )
+        state = journal.advance("proxy_quarantined")
+    if not _regeneration_phase_at_least(state, "container_removed"):
+        location_store = LocationStateStore(context.state_root)
+        if location_store.load() is None:
+            if state.get("legacyEvidenceSha256") is None:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "Location state is missing outside legacy recovery",
+                )
+            location_store.initialize_regeneration_target(
+                context.instance_id,
+                str(state["transactionId"]),
+                str(state["target"]["simEpoch"]),
+                str(state["target"]["locationProfileDigest"]),
+            )
+        location_state = location_store.rotate_sim_identity(
+            sim_epoch=str(state["target"]["simEpoch"]),
+            expected_epoch=str(state["before"]["simEpoch"]),
+        )
+        pending_location = location_state.get("pending")
+        if (
+            not isinstance(pending_location, Mapping)
+            or pending_location.get("profileDigest")
+            != state["target"]["locationProfileDigest"]
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "fixed Location target was not persisted before replacement",
+            )
+        if state["before"]["containerId"] != "0" * 64:
+            active_container = manager.location_runtime_container_id()
+            if (
+                active_container is None
+                and state.get("legacyEvidenceSha256") is not None
+                and pending_location.get("phase") != "armed"
+            ):
+                started_legacy = manager.start_owned_container(
+                    expected_container_id=str(state["before"]["containerId"]),
+                    wait=True,
+                )
+                if started_legacy.get("ok") is not True:
+                    return _regeneration_result(
+                        state,
+                        ok=False,
+                        error=str(
+                            started_legacy.get("error")
+                            or "legacy_runtime_start_failed"
+                        ),
+                    )
+                try:
+                    builder = ArtifactBuilder(args.project_root)
+                    if not bool(getattr(args, "skip_build", False)):
+                        built = builder.ensure(["daemon"])
+                        if built.get("ok") is not True:
+                            raise IdentityError(
+                                "journal_artifact_unavailable",
+                                "daemon artifact build failed",
+                            )
+                    snapshot = builder.snapshot(["daemon"])
+                    daemon_record = next(
+                        record
+                        for record in snapshot.records
+                        if record.target == "daemon"
+                    )
+                    daemon_output = next(
+                        output
+                        for output in daemon_record.outputs
+                        if output.path.endswith("/app-debug.apk")
+                    )
+                    daemon_apk = (
+                        args.project_root
+                        / ".xenoid"
+                        / "cache"
+                        / "artifacts"
+                        / "objects"
+                        / "sha256"
+                        / daemon_output.sha256
+                    )
+                except (ArtifactError, IdentityError, OSError, StopIteration, ValueError) as exc:
+                    return _regeneration_result(
+                        state,
+                        ok=False,
+                        error=getattr(
+                            exc,
+                            "code",
+                            "journal_artifact_unavailable",
+                        ),
+                    )
+                installed_daemon = manager.install_daemon(str(daemon_apk))
+                if installed_daemon.get("ok") is not True:
+                    return _regeneration_result(
+                        state,
+                        ok=False,
+                        error=str(
+                            installed_daemon.get("error")
+                            or "daemon_install_failed"
+                        ),
+                    )
+                control = manager.reconcile_control_plane()
+                if control.get("controlReady") is not True:
+                    return _regeneration_result(
+                        state,
+                        ok=False,
+                        error=str(
+                            control.get("error")
+                            or "legacy_control_ready_failed"
+                        ),
+                    )
+                prepared_location = manager._prepare_location_for_replacement(
+                    str(state["before"]["containerId"])
+                )
+                if prepared_location.get("ok") is not True:
+                    return _regeneration_result(
+                        state,
+                        ok=False,
+                        error=str(
+                            prepared_location.get("error")
+                            or "location_stage_failed"
+                        ),
+                    )
+                pending_location = (
+                    location_store.load() or {}
+                ).get("pending")
+                active_container = manager.location_runtime_container_id()
+            if active_container is None:
+                expected_epoch = location_runtime_epoch(
+                    str(state["before"]["containerId"])
+                )
+                if (
+                    not isinstance(pending_location, Mapping)
+                    or pending_location.get("phase") != "armed"
+                    or pending_location.get("restartFromEpoch")
+                    != expected_epoch
+                ):
+                    raise IdentityError(
+                        "device_regeneration_state_invalid",
+                        "absent runtime lacks the recorded armed Location target",
+                    )
+            else:
+                prepared_location = manager._prepare_location_for_replacement(
+                    str(state["before"]["containerId"])
+                )
+                if prepared_location.get("ok") is not True:
+                    return _regeneration_result(
+                        state,
+                        ok=False,
+                        error=str(
+                            prepared_location.get("error")
+                            or "location_stage_failed"
+                        ),
+                    )
+        removed = manager.remove_owned_container_for_regenerate(
+            str(state["before"]["containerId"]),
+            regeneration_capability=capability,
+        )
+        if removed.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    removed.get("error")
+                    or "device_regenerate_container_remove_failed"
+                ),
+            )
+        state = journal.advance("container_removed")
+    if not _regeneration_phase_at_least(state, "stable_committed"):
+        committed_identity = identity_store.commit_regeneration_stable(
+            str(state["transactionId"])
+        )
+        if stable_identity_digest(committed_identity["stable"]) != state["target"]["stableDigest"]:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "stable identity did not reach its fixed target",
+            )
+        state = journal.advance("stable_committed")
+    if not _regeneration_phase_at_least(state, "network_committed"):
+        rotate_instance_network(
+            context,
+            target_epoch=str(state["target"]["networkEpoch"]),
+            expected_epoch=str(state["before"]["networkEpoch"]),
+        )
         args.context, args.config, args.lease = resolve_instance(
             args.instance_name,
             project_root=args.project_root,
         )
-    except InstanceError as exc:
-        print_json(exc.as_dict())
-        return 1
-    # Rotate the SIM epoch so the same country gets a new SIM (IMSI, ICCID,
-    # MSISDN, cell identity); the up pipeline's location apply restages and
-    # verifies it through the existing crash-safe transaction.
-    sim_rotation: dict[str, Any]
-    try:
-        location_store = LocationStateStore(context.state_root)
-        if location_store.load() is None:
-            sim_rotation = {"ok": True, "skipped": True, "reason": "location_uninitialized"}
-        else:
-            location_store.rotate_sim_identity()
-            sim_rotation = {"ok": True, "rotated": True}
-    except LocationError as exc:
-        print_json({"ok": False, "error": exc.code, "message": str(exc)})
-        return 1
-    manager = runtime(args)
-    surgery = manager.rotate_storage_identity()
-    if not isinstance(surgery, dict) or surgery.get("ok") is not True:
-        print_json({
-            "ok": False,
-            "error": "device_regenerate_storage_failed",
-            "storage": surgery,
-            "nextActions": [
-                f"./xenoid --instance {context.instance_name} device regenerate",
-            ],
-        })
-        return 1
-    # Every rotation is now committed in its own store (identity, lease,
-    # storage), so the standard up pipeline converges coherently from here;
-    # clear the crash journal before invoking it (up/start fail closed while
-    # the journal is present).
-    journal.clear()
-    script = context.project_root / "scripts" / "xenoid-up.sh"
-    cmd = [str(script), "--instance", context.instance_name]
-    if args.skip_build:
-        cmd.append("--skip-build")
-    proc = subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-        cwd=str(context.project_root),
-        env=command_env(args),
-    )
-    google_wipe: dict[str, Any] = {"ok": True, "skipped": True, "reason": "google_services_disabled"}
-    if (
-        proc.returncode == 0
-        and args.config.google_services_provider == PROVIDER_MINDTHEGAPPS
-    ):
-        # Verified on this runtime from a third-party app UID: the GMS
-        # advertising ID is app-readable, so a new device must regenerate it.
-        # The GSF Android ID is not third-party readable (READ_GSERVICES is
-        # signature-held); it is cleared anyway for one coherent Google state.
-        cleared_packages: list[str] = []
-        failed_packages: list[str] = []
-        for package in (
-            "com.google.android.gms",
-            "com.google.android.gsf",
-            "com.android.vending",
-        ):
-            cleared = manager.adb(
-                ["shell", "pm", "clear", "--user", "0", package],
-                timeout=60,
+        manager = runtime(args)
+        if args.lease.network_epoch != state["target"]["networkEpoch"]:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "network identity did not reach its fixed target",
             )
-            if (
-                isinstance(cleared, dict)
-                and cleared.get("ok") is True
-                and "Success" in str(cleared.get("stdout", ""))
-            ):
-                cleared_packages.append(package)
-            else:
-                failed_packages.append(package)
-        post_clear = build_doctor_report(
-            args.context,
-            args.config,
-            args.lease,
-            require_runtime=True,
+        state = journal.advance("network_committed")
+    if not _regeneration_phase_at_least(state, "sim_committed"):
+        location = LocationStateStore(context.state_root)
+        location_state = location.rotate_sim_identity(
+            sim_epoch=str(state["target"]["simEpoch"]),
+            expected_epoch=str(state["before"]["simEpoch"]),
         )
-        google_wipe = {
-            "ok": not failed_packages and post_clear.get("ok") is True,
-            "cleared": cleared_packages,
-            "failed": failed_packages,
-            "doctor": {
-                "ok": post_clear.get("ok"),
-                "complete": post_clear.get("complete"),
-            },
-        }
-    final_state = store.load()
-    result = {
-        "ok": proc.returncode == 0 and google_wipe.get("ok") is True,
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "script": str(script),
-        "regenerated": proc.returncode == 0,
-        "identity": (
-            public_identity_state(final_state)
-            if final_state is not None
-            else {"initialized": False}
-        ),
-        "network": {"macAddress": args.lease.mac_address, "epoch": args.lease.network_epoch},
-        "storage": {
-            "filesystemUuid": surgery.get("filesystemUuid"),
-            "previousFilesystemUuid": surgery.get("previousFilesystemUuid"),
-            "ssaidStore": "reset",
-        },
-        "sim": sim_rotation,
-        "googleWipe": google_wipe,
+        pending_location = location_state.get("pending")
+        if (
+            location_state.get("simEpoch") != state["target"]["simEpoch"]
+            or not isinstance(pending_location, Mapping)
+            or pending_location.get("profileDigest")
+            != state["target"]["locationProfileDigest"]
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "SIM/location identity did not reach its fixed target",
+            )
+        state = journal.advance("sim_committed")
+    if not _regeneration_phase_at_least(state, "storage_pending"):
+        state = journal.advance("storage_pending")
+    if not _regeneration_phase_at_least(state, "storage_committed"):
+        storage = manager.rotate_storage_identity(
+            transaction_id=str(state["target"]["storageTransactionId"]),
+            data_target_uuid=str(state["target"]["dataFilesystemUuid"]),
+            rootfs_target_uuid=str(state["target"]["rootfsFilesystemUuid"]),
+            expected_data_uuid=str(state["before"]["dataFilesystemUuid"]),
+            expected_rootfs_uuid=str(state["before"]["rootfsFilesystemUuid"]),
+            regeneration_capability=capability,
+        )
+        if storage.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    storage.get("error")
+                    or "device_regenerate_storage_failed"
+                ),
+            )
+        state = journal.advance("storage_committed")
+    convergence: dict[str, Any] = {
+        "schema": "dev.xenoid.convergence/v1",
+        "ok": True,
+        "resumed": True,
     }
+    if not _regeneration_phase_at_least(state, "runtime_converging"):
+        state = journal.advance("runtime_converging")
+    if not _regeneration_phase_at_least(state, "runtime_verified"):
+        convergence = _execute_convergence(
+            args,
+            manager=manager,
+            regeneration_capability=capability,
+        )
+        if convergence.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    convergence.get("error")
+                    or "device_regenerate_convergence_failed"
+                ),
+                convergence=convergence,
+            )
+        _verify_regeneration_target_state(manager, state)
+        pre_google = _regeneration_acceptance(
+            manager,
+            state,
+            mode="regenerate-pre-google",
+        )
+        if (
+            pre_google.get("ok") is not True
+            or pre_google.get("observationValid") is not True
+        ):
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    pre_google.get("errorCode")
+                    or "regenerate_pre_google_acceptance_failed"
+                ),
+                convergence=convergence,
+                acceptance=pre_google,
+            )
+        state = journal.advance("runtime_verified")
+    if not _regeneration_phase_at_least(state, "google_wiping"):
+        state = journal.advance("google_wiping")
+    google_wipe: dict[str, Any]
+    if args.config.google_services_provider == PROVIDER_MINDTHEGAPPS:
+        google_wipe = _wipe_regeneration_google_packages(
+            manager,
+            journal,
+            capability,
+        )
+        if google_wipe.get("ok") is not True:
+            state = journal.load() or state
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    google_wipe.get("error")
+                    or "google_package_clear_failed"
+                ),
+                googleWipe=google_wipe,
+            )
+    else:
+        google_wipe = {
+            "ok": True,
+            "skipped": True,
+            "reason": "google_services_disabled",
+        }
+    state = journal.load() or state
+    _verify_regeneration_target_state(manager, state)
+    final_acceptance = _regeneration_acceptance(
+        manager,
+        state,
+        mode="regenerate-final",
+    )
+    if (
+        final_acceptance.get("ok") is not True
+        or final_acceptance.get("observationValid") is not True
+    ):
+        return _regeneration_result(
+            state,
+            ok=False,
+            error=str(
+                final_acceptance.get("errorCode")
+                or "regenerate_final_acceptance_failed"
+            ),
+            googleWipe=google_wipe,
+            acceptance=final_acceptance,
+        )
+    state = journal.advance("committed")
+    identity_store.clear_regeneration_stable(str(state["transactionId"]))
+    journal.clear()
+    return {
+        **convergence,
+        "ok": True,
+        "regeneration": {
+            "schema": "dev.xenoid.device-regenerate/v2",
+            "transactionId": state["transactionId"],
+            "resumed": resumed,
+            "phase": "committed",
+            "googleWipe": google_wipe,
+            "acceptanceSha256": final_acceptance.get("observationSha256"),
+            "legacyRestart": state.get("legacyEvidenceSha256") is not None,
+            "factorsMayRotateAgain": state.get("legacyEvidenceSha256") is not None,
+        },
+    }
+
+
+def cmd_device_regenerate(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        state = RegenerationJournal(args.context).load()
+        result = {
+            "schema": "dev.xenoid.device-regenerate/v2",
+            "ok": True,
+            "dryRun": True,
+            "resumed": state is not None,
+            "phase": state.get("phase") if state is not None else None,
+            "legacyRestartRequired": bool(
+                state is not None
+                and state.get("legacyEvidenceSha256") is not None
+            ),
+            "actions": list(REGENERATION_PHASES),
+        }
+    else:
+        try:
+            result = _execute_device_regeneration(args)
+        except (IdentityError, InstanceError, LocationError, StorageError) as exc:
+            result = {
+                "schema": "dev.xenoid.device-regenerate/v2",
+                "ok": False,
+                "error": getattr(
+                    exc,
+                    "code",
+                    "device_regeneration_state_invalid",
+                ),
+            }
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -2479,6 +3392,19 @@ def cmd_automation_plan(args: argparse.Namespace) -> int:
 
 def cmd_automation_run_host(args: argparse.Namespace) -> int:
     manager = runtime(args)
+    if args.execute:
+        reconciled = manager.reconcile_bootstrap()
+        if (
+            reconciled.get("transportReady") is not True
+            or reconciled.get("controlReady") is not True
+        ):
+            result = {
+                "ok": False,
+                "error": _bootstrap_error(reconciled),
+                "bootstrap": reconciled,
+            }
+            print_json(result)
+            return 1
     result = manager.automation_run_host(
         args.script,
         execute=args.execute,
@@ -2489,7 +3415,7 @@ def cmd_automation_run_host(args: argparse.Namespace) -> int:
 
 
 def cmd_automation_run(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).run_automation(args.script)
+    result = bootstrap_client(args).run_automation(args.script)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2501,13 +3427,13 @@ def cmd_input_deploy(args: argparse.Namespace) -> int:
 
 
 def cmd_input_tap(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).tap(args.x, args.y)
+    result = bootstrap_client(args).tap(args.x, args.y)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_input_swipe(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).swipe(args.x1, args.y1, args.x2, args.y2, args.duration_ms)
+    result = bootstrap_client(args).swipe(args.x1, args.y1, args.x2, args.y2, args.duration_ms)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2521,24 +3447,24 @@ def cmd_app_install(args: argparse.Namespace) -> int:
         if not upload.get("ok"):
             print_json({"ok": False, "error": "APK upload failed", "upload": upload})
             return 1
-        result = daemon_ensured(args).app_install(remote)
+        result = bootstrap_client(args).app_install(remote)
         result["upload"] = upload
         result["cleanup"] = manager.adb(["shell", "rm", "-f", remote])
         result["source"] = str(source.resolve())
     else:
-        result = daemon_ensured(args).app_install(args.path)
+        result = bootstrap_client(args).app_install(args.path)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_app_uninstall(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).app_uninstall(args.package)
+    result = bootstrap_client(args).app_uninstall(args.package)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_app_launch(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).app_launch(args.component)
+    result = bootstrap_client(args).app_launch(args.component)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2588,14 +3514,14 @@ def cmd_hide_cleanup_overlay(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 def cmd_hide_status(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).hide_status()
+    result = bootstrap_client(args).hide_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_hide_apply(args: argparse.Namespace) -> int:
     policy = read_json_file(args.policy) if args.policy else None
-    result = daemon_ensured(args).hide_apply(policy)
+    result = bootstrap_client(args).hide_apply(policy)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2613,13 +3539,13 @@ def cmd_ota_install_bundle(args: argparse.Namespace) -> int:
 
 
 def cmd_ota_check(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).ota_check()
+    result = bootstrap_client(args).ota_check()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_ota_apply(args: argparse.Namespace) -> int:
-    result = daemon_ensured(args).ota_apply(args.channel)
+    result = bootstrap_client(args).ota_apply(args.channel)
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2629,91 +3555,36 @@ def cmd_ota_apply(args: argparse.Namespace) -> int:
 
 
 
-def _ebpf_script_args(args: argparse.Namespace) -> list[str]:
-    out: list[str] = []
-    mode = getattr(args, "mode", None)
-    if mode == "colima":
-        out.append("--colima")
-    elif mode == "local":
-        out.append("--local")
-    elif mode == "ssh":
-        out.extend(["--ssh", args.ssh])
-        if getattr(args, "ssh_port", None):
-            out.extend(["--ssh-port", str(args.ssh_port)])
-    return out
-
-
 def cmd_ebpf_build(args: argparse.Namespace) -> int:
-    script = args.context.project_root / "scripts" / "build-ebpf.sh"
-    cmd = [str(script), *_ebpf_script_args(args)]
-    proc = subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-        cwd=args.context.project_root,
-        env=command_env(args),
-    )
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script)}
-    # Prefer script JSON line when present.
-    for line in reversed((proc.stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                result.update(json.loads(line))
-            except Exception:
-                pass
-            break
+    result = runtime(args).build_shared_protection()
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_ebpf_action(args: argparse.Namespace) -> int:
-    script = args.context.project_root / "scripts" / "load-ebpf.sh"
+    manager = runtime(args)
     action = args.ebpf_action
-    cmd = [str(script), *_ebpf_script_args(args), action]
-    proc = subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-        cwd=args.context.project_root,
-        env=command_env(args),
-    )
-    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "script": str(script), "action": action}
-    for line in reversed((proc.stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                result.update(json.loads(line))
-            except Exception:
-                pass
-            break
+    if action == "load":
+        result = manager.maintain_shared_protection()
+    elif action == "status":
+        result = manager.shared_protection_status()
+    elif action == "smoke":
+        result = manager.smoke_shared_protection()
+    else:
+        result = manager.unload_shared_ebpf(
+            maintenance=bool(getattr(args, "maintenance", False)),
+        )
     print_json(result)
     return 0 if result.get("ok") else 1
 
 
 def cmd_mcp_config(args: argparse.Namespace) -> int:
-    project_root = args.context.project_root
-    launchers = (
-        project_root / "xenoid-mcp",
-        project_root / "bin" / "xenoid-mcp",
-    )
-    launcher = next(
-        (
-            candidate
-            for candidate in launchers
-            if candidate.is_file() and os.access(candidate, os.X_OK)
-        ),
-        None,
-    )
-    command = str(launcher) if launcher is not None else sys.executable
-    command_args = [] if launcher is not None else ["-m", "xenoid.mcp_server"]
     print_json({
         "mcpServers": {
             "xenoid": {
-                "command": command,
-                "args": command_args,
+                "command": "xenoid-mcp",
+                "args": [],
                 "env": {
-                    "XENOID_PROJECT": str(project_root),
                     "XENOID_INSTANCE": args.context.instance_name,
                 },
             }
@@ -2740,10 +3611,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", help="also write the JSON report to this path")
     s.set_defaults(func=cmd_doctor)
 
-    s = sub.add_parser("up", help="build and start full Xenoid stack")
+    s = sub.add_parser("up", help="converge the complete Xenoid production runtime")
     s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--skip-build", action="store_true", help="use prebuilt artifacts (release target); fails if any required binary is missing")
-    s.add_argument("--reuse-runtime", action="store_true", help="reuse an already running, identity-matched runtime")
+    s.add_argument("--skip-build", action="store_true", help="validate and use existing artifact records without compiling")
     s.set_defaults(func=cmd_up)
 
 
@@ -2755,7 +3625,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("runtime-build-image", help="build custom redroid Docker image with Xenoid payloads")
     s.add_argument("--image", help="base redroid image")
-    s.add_argument("--tag", default="xenoid/redroid:local")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_runtime_build_image)
 
@@ -2768,28 +3637,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("build", help="build daemon APK and native helpers")
     bsub = s.add_subparsers(required=True)
-    bd = bsub.add_parser("daemon")
-    bd.set_defaults(func=cmd_build_daemon)
-    bk = bsub.add_parser("keymint")
-    bk.set_defaults(func=cmd_build_keymint)
-    bi = bsub.add_parser("input")
-    bi.set_defaults(func=cmd_build_input)
-    bh = bsub.add_parser("hide")
-    bh.set_defaults(func=cmd_build_hide)
-    bp = bsub.add_parser("profile")
-    bp.set_defaults(func=cmd_build_profile)
-    bn = bsub.add_parser("netctl")
-    bn.set_defaults(func=cmd_build_netctl)
-    bg = bsub.add_parser("gralloc")
-    bg.set_defaults(func=cmd_build_gralloc)
-    bhwc = bsub.add_parser("hwcomposer")
-    bhwc.set_defaults(func=cmd_build_hwcomposer)
-    br = bsub.add_parser("ril")
-    br.set_defaults(func=cmd_build_ril)
-    brc = bsub.add_parser("radio-config")
-    brc.set_defaults(func=cmd_build_radio_config)
-    ba = bsub.add_parser("all")
-    ba.set_defaults(func=cmd_build_all)
+    for command, target in (
+        ("daemon", "daemon"),
+        ("keymint", "keymint"),
+        ("input", "input"),
+        ("hide", "hide"),
+        ("profile", "profile"),
+        ("netctl", "netctl"),
+        ("gralloc", "gralloc"),
+        ("hwcomposer", "hwcomposer"),
+        ("ril", "ril"),
+        ("radio-config", "radioConfig"),
+    ):
+        build_target = bsub.add_parser(command)
+        build_target.set_defaults(
+            artifact_target=target,
+            artifact_force=target == "keymint",
+            func=cmd_build_target,
+        )
+    build_all = bsub.add_parser("all")
+    build_all.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild every artifact and verify deterministic output",
+    )
+    build_all.set_defaults(func=cmd_build_all)
 
     s = sub.add_parser("verify-release", help="verify a Xenoid release bundle manifest and required artifacts")
     s.add_argument("archive")
@@ -2878,10 +3750,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-adb-root", action="store_true", help="skip adb root after boot")
     s.add_argument("--skip-preflight", action="store_true", help="skip runtime preflight checks")
     s.add_argument("--recreate", action="store_true", help="replace an existing container so image and runtime arguments take effect")
-    s.add_argument("--defer-proxy", action="store_true", help="defer proxy convergence to the caller (internal up/location path)")
     s.set_defaults(func=cmd_start)
 
-    s = sub.add_parser("stop", help="stop Android runtime")
+    s = sub.add_parser("stop", help="stop and retain the owned Android runtime container")
     s.set_defaults(func=cmd_stop)
 
     s = sub.add_parser("logs", help="collect Docker/ADB runtime logs")
@@ -2891,7 +3762,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("view", help="open scrcpy for the Xenoid Android target")
     s.set_defaults(func=cmd_view)
 
-    s = sub.add_parser("status", help="runtime status")
+    s = sub.add_parser("status", help="observe runtime state and report the recommended convergence action")
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("adb", help="run adb against xenoid target")
@@ -3036,6 +3907,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     proxy_off.set_defaults(func=cmd_proxy_enabled, proxy_enabled=False)
     proxy_clear = proxy.add_parser("clear", help="disable and clear the configured source")
+    proxy_clear.add_argument(
+        "--discard-unreadable-state",
+        action="store_true",
+        help=(
+            "explicitly quarantine and preserve evidence for unreadable daemon "
+            "state before a source-less cryptographic clear"
+        ),
+    )
     proxy_clear.set_defaults(func=cmd_proxy_clear)
     proxy_list = proxy.add_parser(
         "list",
@@ -3186,6 +4065,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rg.add_argument("--skip-build", action="store_true", help="validate prebuilt artifacts instead of rebuilding (same as up --skip-build)")
     rg.add_argument("--dry-run", action="store_true", help="show the rotation plan without changing anything")
+    rg.add_argument(
+        "--restart-legacy-transaction",
+        action="store_true",
+        help="explicitly snapshot and restart an interrupted v1 regeneration as v2",
+    )
     rg.set_defaults(func=cmd_device_regenerate)
 
     s = sub.add_parser("automation", help="automation tasks")
@@ -3252,19 +4136,32 @@ def build_parser() -> argparse.ArgumentParser:
     ha.set_defaults(func=cmd_hide_apply)
 
 
-    s = sub.add_parser("ebpf", help="host-side eBPF system hooks (path-hide); distinct from Frida app hooks")
+    s = sub.add_parser("ebpf", help="engine-host shared kmod/eBPF protection")
     eb = s.add_subparsers(required=True)
-    def _ebpf_mode(ep: argparse.ArgumentParser) -> None:
-        ep.add_argument("--mode", choices=["colima", "local", "ssh"], default=None, help="engine host mode (default: auto)")
-        ep.add_argument("--ssh", default=None, help="user@host when --mode ssh")
-        ep.add_argument("--ssh-port", default=None, help="ssh port when --mode ssh")
-    eb_build = eb.add_parser("build", help="build eBPF program + libbpf loader on engine host")
-    _ebpf_mode(eb_build)
+    eb_build = eb.add_parser(
+        "build",
+        help="build and validate shared protection replacements without loading",
+    )
     eb_build.set_defaults(func=cmd_ebpf_build)
-    for action, help_text in (("load", "load and attach eBPF path-hide"), ("status", "JSON status of pinned eBPF"), ("unload", "unpin/unload eBPF")):
-        ep = eb.add_parser(action, help=help_text)
-        _ebpf_mode(ep)
-        ep.set_defaults(func=cmd_ebpf_action, ebpf_action=action)
+    eb_load = eb.add_parser("load", help="converge shared engine-host protection")
+    eb_load.set_defaults(func=cmd_ebpf_action, ebpf_action="load")
+    eb_status = eb.add_parser("status", help="show safe shared protection status")
+    eb_status.set_defaults(func=cmd_ebpf_action, ebpf_action="status")
+    eb_smoke = eb.add_parser(
+        "smoke",
+        help="run fresh target-engine host and Android UID protection proofs",
+    )
+    eb_smoke.set_defaults(func=cmd_ebpf_action, ebpf_action="smoke")
+    eb_unload = eb.add_parser(
+        "unload",
+        help="maintenance-only eBPF unload with no active Xenoid runtimes",
+    )
+    eb_unload.add_argument(
+        "--maintenance",
+        action="store_true",
+        help="acknowledge engine-host maintenance",
+    )
+    eb_unload.set_defaults(func=cmd_ebpf_action, ebpf_action="unload")
 
 
     s = sub.add_parser("netctl", help="low-level rtnetlink network identity helper")
@@ -3327,11 +4224,13 @@ def _command_mutates_instance(args: argparse.Namespace) -> bool:
     handler_name = getattr(getattr(args, "func", None), "__name__", "")
     if handler_name in _READ_ONLY_INSTANCE_COMMANDS:
         return False
+    if handler_name == "cmd_up" and bool(getattr(args, "dry_run", False)):
+        return False
     if handler_name == "cmd_proxy_status" and not bool(getattr(args, "check", False)):
         return False
     if (
         handler_name == "cmd_ebpf_action"
-        and getattr(args, "ebpf_action", None) == "status"
+        and getattr(args, "ebpf_action", None) in {"status", "smoke"}
     ):
         return False
     return True
@@ -3350,6 +4249,57 @@ def _refresh_instance_under_lock(args: argparse.Namespace) -> None:
             "instance identity changed during an operation",
         )
     args.context, args.config, args.lease = context, config, lease
+
+
+def _legacy_proxy_recovery_allowed(
+    args: argparse.Namespace,
+    handler: str,
+) -> bool:
+    if handler == "cmd_proxy_clear" and not bool(
+        getattr(args, "discard_unreadable_state", False)
+    ):
+        return False
+    if handler not in {"cmd_proxy_set", "cmd_proxy_clear"}:
+        return False
+    journal = RegenerationJournal(args.context)
+    try:
+        digest = journal.legacy_source_digest()
+        convergence_state = ConvergenceExecutor(runtime(args)).journal.load()
+    except (IdentityError, InstanceError, OSError, ValueError):
+        return False
+    return bool(
+        isinstance(convergence_state, Mapping)
+        and convergence_state.get("operationId") == digest[:32]
+        and isinstance(
+            convergence_state.get("regenerationTransactionId"),
+            str,
+        )
+        and "quarantined" in convergence_state.get("completed", [])
+    )
+
+
+def _reject_unrelated_regeneration_mutation(args: argparse.Namespace) -> Optional[dict[str, Any]]:
+    handler = getattr(getattr(args, "func", None), "__name__", "")
+    if handler in {"cmd_up", "cmd_device_regenerate"}:
+        return None
+    try:
+        state = RegenerationJournal(args.context).load()
+    except IdentityError as exc:
+        if (
+            exc.code == "device_regeneration_legacy_pending"
+            and _legacy_proxy_recovery_allowed(args, handler)
+        ):
+            return None
+        raise
+    if state is None:
+        return None
+    return {
+        "schema": "dev.xenoid.device-regenerate/v2",
+        "ok": False,
+        "error": "device_regeneration_pending",
+        "phase": state["phase"],
+        "transactionId": state["transactionId"],
+    }
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -3390,6 +4340,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             with cli_operation_lock(args):
                 _refresh_instance_under_lock(args)
                 args._operation_lock_held = True
+                blocked = _reject_unrelated_regeneration_mutation(args)
+                if blocked is not None:
+                    print_json(blocked)
+                    return 1
+                if not bool(getattr(args, "dry_run", False)):
+                    runtime(args).migrate_legacy_token_state()
                 return int(args.func(args))
         return int(args.func(args))
     except InstanceError as exc:

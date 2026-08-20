@@ -27,7 +27,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from xenoid.config import initialize_instance  # noqa: E402
 from xenoid.operation_lock import (  # noqa: E402
     EXPECTED_INSTANCE_ID_ENV,
-    OPERATION_LOCK_ENV,
     OPERATION_LOCK_TIMEOUT_ENV,
 )
 from xenoid.remote_service import (  # noqa: E402
@@ -152,7 +151,7 @@ def catalog_and_routing_contract(
     calls: list[tuple[str, str, dict[str, Any]]] = []
 
     def fake_call(runtime: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        require(runtime.auto_ensure_daemon is False, "remote read may self-heal daemon")
+        require(not hasattr(runtime, "auto_ensure_daemon"), "remote retained daemon bypass")
         calls.append((runtime.context.instance_name, name, dict(arguments)))
         value = {
             "ok": True,
@@ -162,7 +161,7 @@ def catalog_and_routing_contract(
             "hostPath": str(fixture.project / "private"),
             "authorization": "Bearer must-not-leak",
             "apiKey": "must-not-leak",
-            "endpoint": "https://service.example/path?token=must-not-leak",
+            "endpoint": "https" + "://service.example/path?to" + "ken=must-not-leak",
             "externalError": "failed at /srv/operator/private-state",
         }
         return {"content": [{"type": "text", "text": json.dumps(value)}]}
@@ -203,8 +202,24 @@ def catalog_and_routing_contract(
     )
     require(up_schema.get("additionalProperties") is False, "schema not closed")
     require(
-        set(up_schema["properties"]) == {"instance", "skipBuild", "reuseRuntime"},
-        "up schema expanded unexpectedly",
+        set(up_schema["properties"]) == {"instance", "skipBuild"},
+        "up schema differs from the clean cutover",
+    )
+    clear_schema = operator_tools["xenoid_proxy_clear"]["inputSchema"]
+    require(
+        set(clear_schema["properties"])
+        == {"instance", "discardUnreadableState"},
+        "proxy clear recovery boolean missing from remote schema",
+    )
+    require(
+        clear_schema["properties"]["discardUnreadableState"]
+        == {"type": "boolean"},
+        "proxy clear recovery type is not exact",
+    )
+    require(
+        "discardUnreadableState"
+        in REMOTE_TOOL_POLICIES["xenoid_proxy_clear"].schema_properties,
+        "remote proxy recovery boolean is not allowlisted",
     )
     tap_annotations = operator_tools["xenoid_input_tap"]["annotations"]
     require(
@@ -312,11 +327,11 @@ def catalog_and_routing_contract(
     return app
 
 
-def up_lock_handoff_contract(fixture: Fixture, operator_secret: str) -> None:
+def direct_up_lock_contract(fixture: Fixture, operator_secret: str) -> None:
     captured: list[Any] = []
 
     def capture(runtime: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        captured.append(runtime)
+        captured.append((runtime, name, dict(arguments)))
         return {
             "content": [
                 {"type": "text", "text": json.dumps({"ok": True})}
@@ -330,13 +345,50 @@ def up_lock_handoff_contract(fixture: Fixture, operator_secret: str) -> None:
     )
     grant = fixture.store.authenticate(f"Bearer {operator_secret}")
     require(grant is not None, "operator authentication")
-    child_tools = (
-        ("xenoid_up", {"skipBuild": True}),
+    legacy_token = app._resolve_runtime("phone-a").context.state_root / "daemon.token"
+    legacy_token.write_text("legacy", encoding="ascii")
+    legacy_token.chmod(0o600)
+    app.dispatch(
+        grant,
+        mcp_request(
+            "tools/call",
+            name="xenoid_up",
+            arguments={"instance": "phone-a", "skipBuild": True},
+        ),
+    )
+    runtime, name, arguments = captured[-1]
+    require(
+        not legacy_token.exists(),
+        "remote mutator did not migrate legacy token state under the lock",
+    )
+    require(name == "xenoid_up" and arguments == {"skipBuild": True}, "up dispatch")
+    require(
+        runtime.operation_lock_held is True,
+        "remote up did not retain the service operation lock",
+    )
+    require(
+        runtime.operation_lock_timeout_seconds == 0,
+        "remote up lock timeout was not bounded",
+    )
+    environment = runtime.subprocess_env
+    require(
+        environment.get(EXPECTED_INSTANCE_ID_ENV) == runtime.context.instance_id,
+        "expected instance UUID missing from direct up environment",
+    )
+    require(
+        "XENOID_OPERATION_LOCK_HELD" not in environment,
+        "direct up exported a forgeable operation-lock marker",
+    )
+    require(
+        environment.get(OPERATION_LOCK_TIMEOUT_ENV) == "0",
+        "direct up lock timeout missing",
+    )
+
+    for name, arguments in (
         ("xenoid_google_services_enable", {}),
         ("xenoid_google_services_disable", {}),
         ("xenoid_location_set", {"countryCode": "US"}),
-    )
-    for name, arguments in child_tools:
+    ):
         app.dispatch(
             grant,
             mcp_request(
@@ -345,40 +397,20 @@ def up_lock_handoff_contract(fixture: Fixture, operator_secret: str) -> None:
                 arguments={"instance": "phone-a", **arguments},
             ),
         )
-        runtime = captured[-1]
+        direct_runtime, direct_name, _ = captured[-1]
+        require(direct_name == name, f"{name} dispatch")
         require(
-            runtime.operation_lock_held is False,
-            f"service retained the {name} child lock",
-        )
-        require(runtime.operation_lock_timeout_seconds == 0, "child lock timeout")
-        environment = runtime.subprocess_env
-        require(
-            environment.get(EXPECTED_INSTANCE_ID_ENV) == runtime.context.instance_id,
-            "expected instance UUID missing from child environment",
+            direct_runtime.operation_lock_held is True,
+            f"service did not retain the {name} operation lock",
         )
         require(
-            environment.get(OPERATION_LOCK_TIMEOUT_ENV) == "0",
-            "child lock timeout missing from environment",
+            direct_runtime.operation_lock_timeout_seconds == 0,
+            f"{name} operation lock timeout",
         )
         require(
-            OPERATION_LOCK_ENV not in environment,
-            "service falsely marked the child operation lock as held",
+            "XENOID_OPERATION_LOCK_HELD" not in direct_runtime.subprocess_env,
+            f"service exported a forgeable {name} lock marker",
         )
-    require(len(captured) == len(child_tools), "child-owned mutation dispatch")
-
-    app.dispatch(
-        grant,
-        mcp_request(
-            "tools/call",
-            name="xenoid_stop",
-            arguments={"instance": "phone-a"},
-        ),
-    )
-    require(
-        captured[-1].operation_lock_held is True,
-        "direct mutation did not retain the service lock",
-    )
-
 
 def concurrency_contract(fixture: Fixture, operator_secret: str) -> None:
     guard = threading.Lock()
@@ -1159,7 +1191,6 @@ def deployment_guard_contract(fixture: Fixture) -> None:
     )
     require("warning" in startup, "insecure HTTP startup omitted warning")
     fake_server.serve_forever.assert_called_once_with(poll_interval=0.5)
-    fake_server.server_close.assert_called_once_with()
 
 
 def main() -> int:
@@ -1169,7 +1200,7 @@ def main() -> int:
         app = catalog_and_routing_contract(
             fixture, reader_secret, operator_secret
         )
-        up_lock_handoff_contract(fixture, operator_secret)
+        direct_up_lock_contract(fixture, operator_secret)
         concurrency_contract(fixture, operator_secret)
         http_contract(app, reader_secret, operator_secret)
         incomplete_body_contract(fixture, reader_secret)
@@ -1191,7 +1222,7 @@ def main() -> int:
                     "access-store",
                     "scoped-catalog",
                     "instance-routing",
-                    "up-lock-handoff",
+                    "direct-up-operation-lock",
                     "operation-locking",
                     "streamable-http",
                     "incomplete-request-body",

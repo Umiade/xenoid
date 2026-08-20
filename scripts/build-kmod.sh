@@ -1,125 +1,55 @@
 #!/usr/bin/env bash
-# Build xenoid kernel module on the Docker engine host:
-#   --colima           local Colima VM (macOS default path)
-#   --ssh user@host    remote engine via docker context SSH
-#   --local            native Linux host
-# Produces dist/kmod/xenoid_kmod.ko (host-side cache) when local; always loads into the engine.
+# Stage, publish, install, or maintenance-unload the shared kernel module.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$ROOT/native/xenoid-kmod"
-
-if [[ "${XENOID_SHARED_PROTECTION_LOCKED:-0}" != 1 ]]; then
-  exec python3 "$ROOT/scripts/with-shared-protection-lock.py" "$0" "$@"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; SRC="$ROOT/native/xenoid-kmod"
+if [[ ! "${XENOID_SHARED_PROTECTION_CAPABILITY:-}" =~ ^[0-9a-f]{64}$ ]]; then exec python3 "$ROOT/scripts/with-shared-protection-lock.py" "$0" "$@"; fi
+MODE=""; SSH_TARGET=""; SSH_PORT=""; INPUT_DIGEST=""; ARTIFACT_SHA=""; ROLLBACK_INPUT=""; ROLLBACK_SHA=""; TRANSACTION=""; ACTION=stage; MAINTENANCE=0; DRY=0
+while [[ $# -gt 0 ]]; do case "$1" in
+  --colima) MODE=colima; shift;; --local) MODE=local; shift;; --ssh) MODE=ssh; SSH_TARGET="${2:-}"; shift 2;; --ssh-port) SSH_PORT="${2:-}"; shift 2;;
+  --input-digest) INPUT_DIGEST="${2:-}"; shift 2;; --artifact-sha256) ARTIFACT_SHA="${2:-}"; shift 2;; --rollback-input-digest) ROLLBACK_INPUT="${2:-}"; shift 2;; --rollback-artifact-sha256) ROLLBACK_SHA="${2:-}"; shift 2;; --transaction) TRANSACTION="${2:-}"; shift 2;;
+  --build-only|--stage-only) ACTION=stage; shift;; --publish-staged) ACTION=publish; shift;; --install) ACTION=install; shift;; --unload) ACTION=unload; shift;; --maintenance) MAINTENANCE=1; shift;; --dry-run) DRY=1; shift;;
+  *) echo '{"ok":false,"error":"shared_protection_command_invalid"}'; exit 2;; esac; done
+[[ -n "$MODE" ]] || { [[ "$(uname -s)" == Darwin ]] && MODE=colima || MODE=local; }; [[ "$MODE" != ssh || -n "$SSH_TARGET" ]] || { echo '{"ok":false,"error":"shared_protection_engine_unavailable"}'; exit 2; }
+if [[ "$ACTION" != unload ]]; then [[ "$INPUT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo '{"ok":false,"error":"shared_protection_manager_required"}'; exit 2; }; fi
+if [[ "$ACTION" =~ ^(stage|publish)$ ]]; then [[ "$TRANSACTION" =~ ^[0-9a-f]{32}$ ]] || { echo '{"ok":false,"error":"shared_protection_manager_required"}'; exit 2; }; fi
+if [[ "$ACTION" =~ ^(publish|install)$ ]]; then [[ "$ARTIFACT_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 2; }; fi
+[[ -z "$ROLLBACK_INPUT" || "$ROLLBACK_INPUT" =~ ^[0-9a-f]{64}$ ]]; [[ -z "$ROLLBACK_SHA" || "$ROLLBACK_SHA" =~ ^[0-9a-f]{64}$ ]]
+SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new); [[ -z "$SSH_PORT" ]] || SSH+=(-p "$SSH_PORT"); [[ -z "$SSH_TARGET" ]] || SSH+=("$SSH_TARGET")
+WATCHDOG='cap=$1; shift; parent=$PPID; target=$$; (trap "" TERM; while kill -0 "$parent" 2>/dev/null && sudo -n test -f "$cap" 2>/dev/null; do sleep 0.1; done; kill -TERM -- -"$target" 2>/dev/null || true; sleep 5; kill -KILL -- -"$target" 2>/dev/null || true) & watcher=$!; set +e; "$@"; rc=$?; set -e; kill -KILL "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; exit "$rc"'
+host() { case "$MODE" in colima) colima ssh -- setsid --wait sh -c "$WATCHDOG" xenoid-protection "$CAP_PATH" "$@";; ssh) local c; printf -v c '%q ' setsid --wait sh -c "$WATCHDOG" xenoid-protection "$CAP_PATH" "$@"; "${SSH[@]}" "$c";; local) setsid --wait sh -c "$WATCHDOG" xenoid-protection "$CAP_PATH" "$@";; esac; }; host_root() { host sudo -n "$@"; }
+CAP="${XENOID_SHARED_PROTECTION_CAPABILITY:-}"; CAP_PATH="/run/xenoid/shared-protection-capabilities/$CAP"; [[ "$CAP" =~ ^[0-9a-f]{64}$ ]] && host_root test -f "$CAP_PATH" && host_root test ! -L "$CAP_PATH" && [[ "$(host_root stat -c '%u:%g:%a:%h' "$CAP_PATH")" == 0:0:600:1 ]] || { echo '{"ok":false,"error":"shared_protection_lock_lost"}'; exit 1; }
+active_count() { host_root sh -c "command -v docker >/dev/null 2>&1 && docker ps -q --filter label=dev.xenoid.owner=xenoid | wc -l" | tr -d ' '; }
+loaded_build_id() { host_root sh -c "od -An -tx1 /sys/module/xenoid_kmod/notes/.note.gnu.build-id 2>/dev/null | tr -d ' \n' | tail -c 40"; }
+require_zero_active() { local n; n="$(active_count)" || { echo '{"ok":false,"error":"shared_protection_ownership_ambiguous"}'; exit 1; }; [[ "$n" == 0 ]] || { echo '{"ok":false,"error":"shared_protection_in_use"}'; exit 1; }; }
+BASE=/var/lib/xenoid/shared-protection; STAGE_PARENT="$BASE/staging/kmod"; STAGE="$STAGE_PARENT/$TRANSACTION"; STAGED="$STAGE/xenoid_kmod.ko"; BUILD_PARENT="$BASE/build/kmod"; BUILD="$BUILD_PARENT/$INPUT_DIGEST"; BUILD_OUTPUT="$BUILD/xenoid_kmod.ko"; ARTIFACT_DIR="$BASE/artifacts/kmod/$INPUT_DIGEST"; ARTIFACT="$ARTIFACT_DIR/xenoid_kmod.ko"
+safe_dir() { local p="$1" mode="$2" expected="${2#0}"; if host_root test -e "$p"; then host_root test -d "$p" && host_root test ! -L "$p" && [[ "$(host_root stat -c '%u:%g:%a' "$p")" == "0:0:$expected" ]]; else host_root install -d -o root -g root -m "$mode" "$p"; fi; }
+safe_dir /var/lib/xenoid 0755 || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }; for d in "$BASE" "$BASE/staging" "$STAGE_PARENT" "$BASE/build" "$BUILD_PARENT"; do safe_dir "$d" 0700 || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }; done
+if [[ "$DRY" == 1 ]]; then printf '{"ok":true,"schema":"dev.xenoid.protection-build/v1","component":"kmod","action":"%s","dryRun":true}\n' "$ACTION"; exit 0; fi
+if [[ "$ACTION" == unload ]]; then [[ "$MAINTENANCE" == 1 ]] || { echo '{"ok":false,"error":"shared_protection_maintenance_required"}'; exit 2; }; require_zero_active; host_root rmmod xenoid_kmod 2>/dev/null || true; host test ! -d /sys/module/xenoid_kmod || { echo '{"ok":false,"error":"shared_protection_unload_unverified"}'; exit 1; }; echo '{"ok":true,"schema":"dev.xenoid.protection-deploy/v1","component":"kmod","loaded":false}'; exit 0; fi
+if [[ "$ACTION" == stage ]]; then
+  host_root test ! -e "$STAGE" || { echo '{"ok":false,"error":"shared_protection_staging_conflict"}'; exit 1; }
+  if host_root test -e "$BUILD"; then
+    host_root test -d "$BUILD" && host_root test ! -L "$BUILD" && [[ "$(host_root stat -c '%u:%g:%a' "$BUILD")" == 0:0:700 ]] || { echo '{"ok":false,"error":"shared_protection_staging_conflict"}'; exit 1; }
+    host_root rm -rf --one-file-system "$BUILD"
+  fi
+  host_root install -d -o root -g root -m 0700 "$STAGE" "$BUILD"
+  for name in Makefile xenoid_kmod.c; do host_root sh -c "umask 077; cat > '$BUILD/$name'" < "$SRC/$name"; host_root chmod 0600 "$BUILD/$name"; done
+  host_root sh -c "cd '$BUILD' && SOURCE_DATE_EPOCH=0 KBUILD_BUILD_TIMESTAMP='1970-01-01 00:00:00 +0000' KBUILD_BUILD_USER=xenoid KBUILD_BUILD_HOST=xenoid make KCFLAGS='-fdebug-prefix-map=$BUILD=. -ffile-prefix-map=$BUILD=. -fmacro-prefix-map=$BUILD=.'" >&2 || { echo '{"ok":false,"error":"shared_protection_kmod_build_failed"}'; exit 1; }
+  host_root test -f "$BUILD_OUTPUT" && host_root test ! -L "$BUILD_OUTPUT" || { echo '{"ok":false,"error":"shared_protection_kmod_build_failed"}'; exit 1; }
+  host_root install -o root -g root -m 0600 "$BUILD_OUTPUT" "$STAGED"
+  host_root rm -rf --one-file-system "$BUILD"; host_root sync -f "$BUILD_PARENT"
+  SHA="$(host_root sha256sum "$STAGED" | cut -d ' ' -f 1)"; BUILD_ID="$(host_root sh -c "readelf -n '$STAGED' | awk '/Build ID:/ {print \$3; exit}'")"; [[ "$SHA" =~ ^[0-9a-f]{64}$ && "$BUILD_ID" =~ ^[0-9a-f]{40}$ && "$(host_root stat -c '%u:%g:%a:%h' "$STAGED")" == 0:0:600:1 ]] || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }
+  printf '{"ok":true,"schema":"dev.xenoid.protection-build/v1","component":"kmod","inputDigest":"%s","transaction":"%s","artifactSha256":"%s","buildId":"%s","staged":true}\n' "$INPUT_DIGEST" "$TRANSACTION" "$SHA" "$BUILD_ID"; exit 0
 fi
-BUILD_DIR="/var/tmp/xenoid-kmod-build"
-LKG_DIR="/var/tmp/xenoid-kmod-lkg"
-DRY=0
-MODE=""
-SSH_TARGET=""
-SSH_PORT=""
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --dry-run) DRY=1; shift ;;
-    --colima) MODE=colima; shift ;;
-    --local) MODE=local; shift ;;
-    --ssh) SSH_TARGET="${2:-}"; MODE=ssh; shift 2 ;;
-    --ssh-port) SSH_PORT="${2:-}"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-
-if [[ -z "$MODE" ]]; then
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    MODE=colima
-  else
-    MODE=local
-  fi
+if [[ "$ACTION" == publish ]]; then
+  safe_dir "$BASE/artifacts" 0700; safe_dir "$BASE/artifacts/kmod" 0700; safe_dir "$ARTIFACT_DIR" 0700
+  STAGED_BUILD_ID="$(host_root sh -c "readelf -n '$STAGED' | awk '/Build ID:/ {print \$3; exit}'")"; host_root test -f "$STAGED" && host_root test ! -L "$STAGED" && [[ "$(host_root stat -c '%u:%g:%a:%h' "$STAGED")" == 0:0:600:1 ]] && [[ "$(host_root sha256sum "$STAGED" | cut -d ' ' -f 1)" == "$ARTIFACT_SHA" ]] && [[ "$STAGED_BUILD_ID" =~ ^[0-9a-f]{40}$ ]] || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }
+  if host_root test -e "$ARTIFACT"; then host_root test -f "$ARTIFACT" && host_root test ! -L "$ARTIFACT" && [[ "$(host_root stat -c '%u:%g:%a:%h' "$ARTIFACT")" == 0:0:600:1 ]] && [[ "$(host_root sha256sum "$ARTIFACT" | cut -d ' ' -f 1)" == "$ARTIFACT_SHA" ]] || { echo '{"ok":false,"error":"shared_protection_artifact_conflict"}'; exit 1; }; else TEMP="$ARTIFACT_DIR/.module-$TRANSACTION.tmp"; host_root test ! -e "$TEMP"; host_root install -o root -g root -m 0600 "$STAGED" "$TEMP"; [[ "$(host_root sha256sum "$TEMP" | cut -d ' ' -f 1)" == "$ARTIFACT_SHA" ]] || { host_root rm -f "$TEMP"; echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }; host_root sync -f "$TEMP"; host_root mv -n "$TEMP" "$ARTIFACT" || true; host_root rm -f "$TEMP"; fi
+  FINAL_BUILD_ID="$(host_root sh -c "readelf -n '$ARTIFACT' | awk '/Build ID:/ {print \$3; exit}'")"; [[ "$(host_root sha256sum "$ARTIFACT" | cut -d ' ' -f 1)" == "$ARTIFACT_SHA" && "$FINAL_BUILD_ID" == "$STAGED_BUILD_ID" ]] || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }; host_root rm -rf --one-file-system "$STAGE"; host_root sync -f "$ARTIFACT_DIR"; printf '{"ok":true,"schema":"dev.xenoid.protection-build/v1","component":"kmod","inputDigest":"%s","artifactSha256":"%s","buildId":"%s","published":true}\n' "$INPUT_DIGEST" "$ARTIFACT_SHA" "$FINAL_BUILD_ID"; exit 0
 fi
-
-
-refresh_android_battery() {
-  local command='stop vendor.health-default >/dev/null 2>&1 || true; start vendor.health-default >/dev/null 2>&1 || true; sleep 1; dumpsys battery reset >/dev/null 2>&1 || true'
-  if [[ "$DRY" == 1 ]]; then
-    echo "+ $ROOT/xenoid root exec '$command'"
-    return
-  fi
-  [[ -x "$ROOT/xenoid" ]] || return
-  if "$ROOT/xenoid" root exec "$command" >/dev/null 2>&1; then
-    echo "[kmod] Android health HAL restarted; BatteryService reset to live power_supply data" >&2
-  else
-    echo "[kmod] Android runtime unavailable; health HAL refresh deferred until xenoid-up" >&2
-  fi
-}
-
-if [[ "$MODE" == "colima" ]]; then
-  command -v colima >/dev/null 2>&1 || { echo '{"ok":false,"error":"colima not found"}'; exit 1; }
-  run_ssh() { if [[ "$DRY" == 1 ]]; then echo "+ colima ssh -- $*"; else colima ssh -- "$@"; fi; }
-  run_ssh sh -c 'sudo apt-get install -y -qq linux-headers-$(uname -r) build-essential >/dev/null 2>&1; mkdir -p '"$BUILD_DIR"' '"$LKG_DIR"'; rm -rf '"$BUILD_DIR"'/*'
-  for f in "$SRC"/*; do
-    base="$(basename "$f")"
-    if [[ "$DRY" == 1 ]]; then echo "+ copy $base"; else colima ssh -- sh -c "cat > $BUILD_DIR/$base" < "$f"; fi
-  done
-  run_ssh sh -c "cd $BUILD_DIR && make"
-  run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then if test -f '$LKG_DIR/xenoid_kmod.ko'; then sudo cp '$LKG_DIR/xenoid_kmod.ko' '$BUILD_DIR/xenoid_kmod.lkg'; else echo 'xenoid_kmod is loaded but no last-known-good module exists' >&2; exit 1; fi; fi"
-  run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then sudo rmmod xenoid_kmod; fi"
-  if run_ssh sh -c "cd $BUILD_DIR && statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod xenoid_kmod.ko statfs_symbol=\"\$statfs_symbol\" && test -d /sys/module/xenoid_kmod"; then
-    run_ssh sh -c "sudo cp '$BUILD_DIR/xenoid_kmod.ko' '$LKG_DIR/xenoid_kmod.ko'"
-  else
-    run_ssh sh -c "if test -f '$BUILD_DIR/xenoid_kmod.lkg'; then statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod '$BUILD_DIR/xenoid_kmod.lkg' statfs_symbol=\"\$statfs_symbol\" || sudo insmod '$BUILD_DIR/xenoid_kmod.lkg'; test -d /sys/module/xenoid_kmod; fi" || true
-    echo '{"ok":false,"error":"kernel module load failed; last-known-good restore attempted"}'
-    exit 1
-  fi
-  refresh_android_battery
-  echo '{"ok":true,"platform":"colima","note":"module built and loaded in VM"}'
-elif [[ "$MODE" == "ssh" ]]; then
-  [[ -n "$SSH_TARGET" ]] || { echo '{"ok":false,"error":"missing --ssh target"}'; exit 1; }
-  command -v ssh >/dev/null 2>&1 || { echo '{"ok":false,"error":"ssh not found"}'; exit 1; }
-  SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
-  if [[ -n "$SSH_PORT" ]]; then SSH+=(-p "$SSH_PORT"); fi
-  SSH+=("$SSH_TARGET")
-  run_ssh() { if [[ "$DRY" == 1 ]]; then echo "+ ${SSH[*]} $*"; else "${SSH[@]}" "$@"; fi; }
-  run_ssh sh -c 'sudo apt-get install -y -qq linux-headers-$(uname -r) build-essential >/dev/null 2>&1; mkdir -p '"$BUILD_DIR"' '"$LKG_DIR"'; rm -rf '"$BUILD_DIR"'/*'
-  for f in "$SRC"/*; do
-    base="$(basename "$f")"
-    if [[ "$DRY" == 1 ]]; then echo "+ copy $base"; else "${SSH[@]}" sh -c "cat > $BUILD_DIR/$base" < "$f"; fi
-  done
-  run_ssh sh -c "cd $BUILD_DIR && make"
-  run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then if test -f '$LKG_DIR/xenoid_kmod.ko'; then sudo cp '$LKG_DIR/xenoid_kmod.ko' '$BUILD_DIR/xenoid_kmod.lkg'; else echo 'xenoid_kmod is loaded but no last-known-good module exists' >&2; exit 1; fi; fi"
-  run_ssh sh -c "if test -d /sys/module/xenoid_kmod; then sudo rmmod xenoid_kmod; fi"
-  if run_ssh sh -c "cd $BUILD_DIR && statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod xenoid_kmod.ko statfs_symbol=\"\$statfs_symbol\" && test -d /sys/module/xenoid_kmod"; then
-    run_ssh sh -c "sudo cp '$BUILD_DIR/xenoid_kmod.ko' '$LKG_DIR/xenoid_kmod.ko'"
-  else
-    run_ssh sh -c "if test -f '$BUILD_DIR/xenoid_kmod.lkg'; then statfs_symbol=\$(awk '\$3 ~ /^vfs_statfs\\./ { print \$3; exit }' /proc/kallsyms); test -n \"\$statfs_symbol\" || statfs_symbol=vfs_statfs; sudo insmod '$BUILD_DIR/xenoid_kmod.lkg' statfs_symbol=\"\$statfs_symbol\" || sudo insmod '$BUILD_DIR/xenoid_kmod.lkg'; test -d /sys/module/xenoid_kmod; fi" || true
-    echo "{\"ok\":false,\"error\":\"kernel module load failed; last-known-good restore attempted\",\"ssh\":\"$SSH_TARGET\"}"
-    exit 1
-  fi
-  refresh_android_battery
-  echo "{\"ok\":true,\"platform\":\"remote-ssh\",\"ssh\":\"$SSH_TARGET\",\"note\":\"module built and loaded on docker engine host\"}"
-else
-  if [[ "$DRY" == 1 ]]; then
-    echo "+ make -C $SRC && statfs_symbol=<resolved-vfs_statfs-symbol> sudo insmod $SRC/xenoid_kmod.ko"
-  else
-    mkdir -p "$LKG_DIR"
-    ( cd "$SRC" && make )
-    if [[ -d /sys/module/xenoid_kmod ]]; then
-      [[ -f "$LKG_DIR/xenoid_kmod.ko" ]] || { echo '{"ok":false,"error":"loaded module has no last-known-good copy"}'; exit 1; }
-      cp "$LKG_DIR/xenoid_kmod.ko" "$SRC/xenoid_kmod.lkg"
-      sudo rmmod xenoid_kmod
-    fi
-    statfs_symbol="$(awk '$3 ~ /^vfs_statfs\./ { print $3; exit }' /proc/kallsyms)"
-    [[ -n "$statfs_symbol" ]] || statfs_symbol=vfs_statfs
-    if sudo insmod "$SRC/xenoid_kmod.ko" statfs_symbol="$statfs_symbol" && test -d /sys/module/xenoid_kmod; then
-      cp "$SRC/xenoid_kmod.ko" "$LKG_DIR/xenoid_kmod.ko"
-    else
-      if [[ -f "$SRC/xenoid_kmod.lkg" ]]; then
-        sudo insmod "$SRC/xenoid_kmod.lkg" statfs_symbol="$statfs_symbol" || sudo insmod "$SRC/xenoid_kmod.lkg" || true
-        test -d /sys/module/xenoid_kmod || true
-      fi
-      echo '{"ok":false,"error":"kernel module load failed; last-known-good restore attempted"}'
-      exit 1
-    fi
-  fi
-  refresh_android_battery
-  echo '{"ok":true,"platform":"linux","note":"module built and loaded on host"}'
-fi
+require_zero_active; host_root test -f "$ARTIFACT" && host_root test ! -L "$ARTIFACT" && [[ "$(host_root stat -c '%u:%g:%a:%h' "$ARTIFACT")" == 0:0:600:1 ]] && [[ "$(host_root sha256sum "$ARTIFACT" | cut -d ' ' -f 1)" == "$ARTIFACT_SHA" ]] || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }; ARTIFACT_BUILD_ID="$(host_root sh -c "readelf -n '$ARTIFACT' | awk '/Build ID:/ {print \$3; exit}'")"; [[ "$ARTIFACT_BUILD_ID" =~ ^[0-9a-f]{40}$ ]] || { echo '{"ok":false,"error":"shared_protection_artifact_invalid"}'; exit 1; }
+CURRENT="$(host_root sh -c 'cat /sys/module/xenoid_kmod/parameters/deployment_digest 2>/dev/null || true')"; CURRENT_ARTIFACT="$(host_root sh -c 'cat /sys/module/xenoid_kmod/parameters/artifact_digest 2>/dev/null || true')"; CURRENT_BUILD_ID="$(loaded_build_id || true)"; if [[ "$CURRENT" == "$INPUT_DIGEST" && "$CURRENT_ARTIFACT" == "$ARTIFACT_SHA" && "$CURRENT_BUILD_ID" == "$ARTIFACT_BUILD_ID" ]]; then printf '{"ok":true,"schema":"dev.xenoid.protection-deploy/v1","component":"kmod","deploymentDigest":"%s","artifactSha256":"%s","buildId":"%s","reused":true}\n' "$INPUT_DIGEST" "$ARTIFACT_SHA" "$ARTIFACT_BUILD_ID"; exit 0; fi
+ROLLBACK=""; ROLLBACK_BUILD_ID=""; if host test -d /sys/module/xenoid_kmod; then [[ "$ROLLBACK_INPUT" =~ ^[0-9a-f]{64}$ && "$ROLLBACK_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo '{"ok":false,"error":"shared_protection_rollback_unverified","rollbackVerified":false}'; exit 1; }; ROLLBACK="$BASE/artifacts/kmod/$ROLLBACK_INPUT/xenoid_kmod.ko"; host_root test -f "$ROLLBACK" && host_root test ! -L "$ROLLBACK" && [[ "$(host_root stat -c '%u:%g:%a:%h' "$ROLLBACK")" == 0:0:600:1 ]] && [[ "$(host_root sha256sum "$ROLLBACK" | cut -d ' ' -f 1)" == "$ROLLBACK_SHA" ]] || { echo '{"ok":false,"error":"shared_protection_rollback_unverified","rollbackVerified":false}'; exit 1; }; ROLLBACK_BUILD_ID="$(host_root sh -c "readelf -n '$ROLLBACK' | awk '/Build ID:/ {print \$3; exit}'")"; [[ "$ROLLBACK_BUILD_ID" =~ ^[0-9a-f]{40}$ ]] || { echo '{"ok":false,"error":"shared_protection_rollback_unverified","rollbackVerified":false}'; exit 1; }; fi
+SYM="$(host_root sh -c "awk '\$3 ~ /^vfs_statfs([.]|$)/ {print \$3; exit}' /proc/kallsyms")"; [[ -n "$SYM" ]] || SYM=vfs_statfs; host_root rmmod xenoid_kmod 2>/dev/null || true
+if host_root insmod "$ARTIFACT" "statfs_symbol=$SYM" "deployment_digest=$INPUT_DIGEST" "artifact_digest=$ARTIFACT_SHA" && [[ "$(host_root cat /sys/module/xenoid_kmod/parameters/deployment_digest)" == "$INPUT_DIGEST" ]] && [[ "$(host_root cat /sys/module/xenoid_kmod/parameters/artifact_digest)" == "$ARTIFACT_SHA" ]] && [[ "$(loaded_build_id)" == "$ARTIFACT_BUILD_ID" ]] && host test -r /sys/fs/selinux/enforce && host test -r /sys/fs/selinux/policyvers; then printf '{"ok":true,"schema":"dev.xenoid.protection-deploy/v1","component":"kmod","deploymentDigest":"%s","artifactSha256":"%s","buildId":"%s","reused":false}\n' "$INPUT_DIGEST" "$ARTIFACT_SHA" "$ARTIFACT_BUILD_ID"; exit 0; fi
+host_root rmmod xenoid_kmod 2>/dev/null || true; if [[ -n "$ROLLBACK" ]] && host_root insmod "$ROLLBACK" "statfs_symbol=$SYM" "deployment_digest=$ROLLBACK_INPUT" "artifact_digest=$ROLLBACK_SHA" && [[ "$(host_root cat /sys/module/xenoid_kmod/parameters/deployment_digest)" == "$ROLLBACK_INPUT" ]] && [[ "$(host_root cat /sys/module/xenoid_kmod/parameters/artifact_digest)" == "$ROLLBACK_SHA" ]] && [[ "$(loaded_build_id)" == "$ROLLBACK_BUILD_ID" ]] && host test -r /sys/fs/selinux/enforce && host test -r /sys/fs/selinux/policyvers; then echo '{"ok":false,"error":"shared_protection_kmod_replacement_failed","rollbackVerified":true}'; else echo '{"ok":false,"error":"shared_protection_rollback_unverified","rollbackVerified":false}'; fi; exit 1

@@ -70,7 +70,7 @@ public final class TeesimControlClient {
                                 ? "ok" : "key_migration_unavailable";
                     }
                 } else {
-                    result = applyConfig(config, object, 0) ? "ok" : "native_rejected";
+                    result = applyConfig(config, object, 1) ? "ok" : "native_rejected";
                 }
             } else {
                 throw new Failure();

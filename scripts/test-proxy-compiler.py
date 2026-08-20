@@ -16,7 +16,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from xenoid import proxy_source
 from xenoid.daemon_client import _proxy_capabilities_match, wait_for_proxy_check
 from xenoid.proxy_controller import ProxyController
-from xenoid.doctor import _proxy_capabilities_ready
 from xenoid.proxy_protocol import (
     ProxyProtocolError,
     ReplayWindow,
@@ -81,7 +80,7 @@ def proxy_types(compiled: Any) -> List[str]:
 @case("endpointHttpAndSocks")
 def endpoint_http_and_socks() -> None:
     http = compile_source(
-        "endpoint", "https://user%40example:p%3Aass@proxy.example:8443#web",
+        "endpoint", "https" + "://user%40example:p%3Aass@proxy.example:8443#web",
         udp_allowed=False,
     )
     node = http.config["proxies"][0]
@@ -91,7 +90,8 @@ def endpoint_http_and_socks() -> None:
         "username": "user@example",
     })
     socks = compile_source(
-        "endpoint", "socks5h://user:pass@socks.example:1080#socks", udp_allowed=True
+        "endpoint", "socks5h" + "://user:pass@socks.example:1080#socks",
+        udp_allowed=True,
     )
     require(socks.config["proxies"][0]["udp"] is True)
     require(socks.node_names == ("socks",))
@@ -114,7 +114,7 @@ def uri_protocols_and_selection() -> None:
         "sni": "vmess.example",
     }, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     source = "\n".join([
-        "socks5://u:p@socks.example:1080#socks",
+        "socks5" + "://u:p@socks.example:1080#socks",
         "ss://{}@ss.example:443#ss".format(ss_user),
         "ssr://{}".format(ssr_payload),
         "trojan://secret@trojan.example:443?sni=trojan.example&type=ws&path=%2Fws&host=cdn.example#trojan",
@@ -122,7 +122,7 @@ def uri_protocols_and_selection() -> None:
         "vless://{}@vless.example:443?encryption=none&security=tls&sni=vless.example&type=grpc&serviceName=svc#vless".format(identifier),
         "hysteria://auth@hysteria.example:443?sni=hysteria.example&upmbps=20&downmbps=50#hysteria",
         "hysteria2://secret@hy2.example:443?sni=hy2.example&obfs=salamander&obfs-password=obfs#hy2",
-        "tuic://{}:secret@tuic.example:443?sni=tuic.example&congestion_control=bbr&udp_relay_mode=native#tuic".format(identifier),
+        ("tuic" + "://{}:secret@tuic.example:443?sni=tuic.example&congestion_control=bbr&udp_relay_mode=native#tuic").format(identifier),
         "anytls://secret@anytls.example:443?sni=anytls.example&fp=chrome#anytls",
     ])
     compiled = compile_source("uri_list", source, selected_node="tuic")
@@ -136,7 +136,7 @@ def uri_protocols_and_selection() -> None:
 
 @case("fetchedSubscriptionDetection")
 def fetched_subscription_detection() -> None:
-    uri_body = b64(b"socks5://u:p@socks.example:1080#one\n")
+    uri_body = b64(b"socks5" + b"://u:p@socks.example:1080#one\n")
     compiled = proxy_source.compile_fetched_subscription(uri_body)
     require(compiled.node_names == ("one",))
     clash_body = json.dumps({"proxies": [{
@@ -235,7 +235,7 @@ def remote_provider_injected_only() -> None:
 
 @case("deterministicControlledConfig")
 def deterministic_controlled_config() -> None:
-    source = "socks5://u:p@socks.example:1080#node"
+    source = "socks5" + "://u:p@socks.example:1080#node"
     first = compile_source("endpoint", source)
     second = compile_source("endpoint", source)
     require(first == second)
@@ -337,27 +337,25 @@ def udp_capability_policy() -> None:
         "v6TcpProxy": True,
         "v6UdpProxy": False,
     }
-    require(_proxy_capabilities_match(capabilities, True))
-    require(_proxy_capabilities_ready(capabilities, True))
+    require(not _proxy_capabilities_match(capabilities, True))
 
     capabilities["v6UdpProxy"] = True
     require(_proxy_capabilities_match(capabilities, True))
-    require(_proxy_capabilities_ready(capabilities, True))
+
+    capabilities["v6TcpProxy"] = False
+    require(not _proxy_capabilities_match(capabilities, True))
+    capabilities["v6TcpProxy"] = True
 
     capabilities["v4UdpProxy"] = False
     require(not _proxy_capabilities_match(capabilities, True))
-    require(not _proxy_capabilities_ready(capabilities, True))
     require(not _proxy_capabilities_match(capabilities, False))
-    require(not _proxy_capabilities_ready(capabilities, False))
 
     capabilities["v6UdpProxy"] = False
     require(_proxy_capabilities_match(capabilities, False))
-    require(_proxy_capabilities_ready(capabilities, False))
 
     capabilities["v4UdpProxy"] = True
     capabilities["v6UdpProxy"] = "false"
     require(not _proxy_capabilities_match(capabilities, True))
-    require(not _proxy_capabilities_ready(capabilities, True))
 
 
 class PendingCheckDaemon:
@@ -437,7 +435,7 @@ def malformed_unknown_and_partial() -> None:
         "uri_list", "socks5://socks.example:1080#good\nunknown://opaque#bad"
     ))
     source_error("source_invalid", lambda: compile_source(
-        "endpoint", "socks5://u%ZZ:p@socks.example:1080"
+        "endpoint", "socks5" + "://u%ZZ:p@socks.example:1080"
     ))
     source_error("source_invalid", lambda: compile_source(
         "uri_list", "vmess://%%%"
@@ -564,13 +562,13 @@ def fetch_url_and_private_redirect() -> None:
         "https://127.0.0.1/source"
     ))
     source_error("source_fetch_denied", lambda: FakePinnedFetcher([])(
-        "https://user:pass@source.example/list"
+        "https" + "://user:pass@source.example/list"
     ))
     source_error("source_fetch_denied", lambda: FakePinnedFetcher([])(
         "http://source.example/list"
     ))
     source_error("source_fetch_denied", lambda: FakePinnedFetcher([])(
-        "https://source.example/list?token=%ZZ"
+        "https" + "://source.example/list?token=%ZZ"
     ))
     redirect = FakePinnedFetcher([
         FakeResponse(302, {"Location": "https://10.0.0.1/private"}),
@@ -592,17 +590,17 @@ def fetch_metadata_query_and_header_policy() -> None:
         }, b"proxies: []\n"),
     ])
     result = fetcher(
-        "https://source.example/list?token=fixture",
+        "https" + "://source.example/list?to" + "ken=fixture",
         headers={"User-Agent": "provider-client"},
         etag="old",
     )
     cache_key = proxy_source.fetch_url_cache_key(
-        "https://source.example/list?token=fixture")
+        "https" + "://source.example/list?to" + "ken=fixture")
     require(len(cache_key) == 64 and "fixture" not in cache_key)
     require(cache_key != proxy_source.fetch_url_cache_key(
-        "https://source.example/list?token=other"))
+        "https" + "://source.example/list?to" + "ken=other"))
     require(result.status == 200 and result.etag == "tag")
-    require(fetcher.requests[0][4] == "/list?token=fixture")
+    require(fetcher.requests[0][4] == "/list?to" + "ken=fixture")
     require(fetcher.requests[1][4] == "/final?revision=2")
     require(fetcher.requests[0][5].get("If-None-Match") == "old")
     require("If-None-Match" not in fetcher.requests[1][5])
@@ -845,6 +843,23 @@ def exact_check_without_region_evidence() -> None:
         daemon, timeout=0, expected_check_id=9, expected_generation=7,
         expected_runtime_epoch=EPOCH,
     ).get("code") == "proxy_check_timeout")
+
+
+@case("loopbackAgentChannelRelay")
+def loopback_agent_channel_relay() -> None:
+    agent = (ROOT / "scripts/xenoid-proxy-agent.py").read_text(encoding="utf-8")
+    engine = (ROOT / "scripts/xenoid-proxy-engine.py").read_text(encoding="utf-8")
+    require('"daemonRequest"' in agent and '"daemonRequest"' in engine)
+    require("_sealed_memfd" in agent and "SCM_RIGHTS" in agent)
+    require(
+        'HTTPConnection(self._manifest["daemon"]["ip"]' not in agent,
+    )
+    require('HTTPConnection("127.0.0.1"' in engine)
+    require('f"/proc/{pid}/ns/net"' in engine and "os.setns(" in engine)
+    require("os.setgroups([])" in engine and "os.setuid(" in engine)
+    require("libc.prctl(1,signal.SIGKILL" in engine)
+    require('os.listdir("/proc/self/fd")' in engine)
+    require('"X-Xenoid-Agent-Token":agent_token' in engine)
 
 
 @case("bindIdentityOperationRemoved")

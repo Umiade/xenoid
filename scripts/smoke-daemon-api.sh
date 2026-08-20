@@ -7,11 +7,9 @@ START_MOCK="${1:-}"
 PID=""
 MOCK_ROOT=""
 MOCK_INSTANCE=""
+MOCK_LOG=""
 cleanup() {
   [[ -n "$PID" ]] && kill "$PID" >/dev/null 2>&1 || true
-  if [[ -n "$MOCK_INSTANCE" ]]; then
-    rm -rf -- "$ROOT/.xenoid/instances/$MOCK_INSTANCE"
-  fi
   [[ -z "$MOCK_ROOT" ]] || rm -rf -- "$MOCK_ROOT"
 }
 trap cleanup EXIT
@@ -19,20 +17,22 @@ if [[ "$START_MOCK" == "--mock" ]]; then
   MOCK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/xenoid-daemon-smoke.XXXXXX")"
   MOCK_INSTANCE="daemon-smoke-$$"
   export HOME="$MOCK_ROOT/home"
-  export XENOID_PROJECT="$ROOT"
+  export XENOID_PROJECT="$MOCK_ROOT/project"
   export XENOID_INSTANCE="$MOCK_INSTANCE"
-  mkdir -p "$HOME"
+  mkdir -p "$HOME" "$XENOID_PROJECT/src/xenoid"
   ./xenoid --instance "$MOCK_INSTANCE" init >/dev/null
   PORT="$(PYTHONPATH="$ROOT/src" python3 -c 'from xenoid.config import resolve_instance; print(resolve_instance()[2].host_daemon_port)')"
-  PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m xenoid.mock_daemon --port "$PORT" >/tmp/xenoid-mock-daemon.log 2>&1 &
+  MOCK_LOG="$MOCK_ROOT/mock-daemon.log"
+  PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m xenoid.mock_daemon --port "$PORT" >"$MOCK_LOG" 2>&1 &
   PID="$!"
   for i in {1..20}; do
-    grep -q mockDaemon /tmp/xenoid-mock-daemon.log 2>/dev/null && break
+    grep -q mockDaemon "$MOCK_LOG" 2>/dev/null && break
     sleep 0.1
   done
 fi
 SMOKE_STATE_ROOT="$(PYTHONPATH="$ROOT/src" python3 -c 'from xenoid.config import resolve_instance; print(resolve_instance()[0].state_root)')"
 ./xenoid daemon health
+if [[ "$START_MOCK" != "--mock" ]]; then
 ./xenoid root status
 ./xenoid frida start
 ./xenoid frida status
@@ -55,6 +55,7 @@ SMOKE_STATE_ROOT="$(PYTHONPATH="$ROOT/src" python3 -c 'from xenoid.config import
 ./xenoid hide status
 ./xenoid ota check
 ./xenoid ota apply --channel smoke
+fi
 if [[ "$START_MOCK" == "--mock" ]]; then
   MOCK_CAMERA_PORT="$PORT" PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
 import hashlib
@@ -72,12 +73,15 @@ from tempfile import TemporaryDirectory
 
 from xenoid import cli
 from xenoid.daemon_client import (
+    BOOTSTRAP_POLL_TIMEOUT_SECONDS,
+    BOOTSTRAP_WORKER_TIMEOUT_MS,
     CAMERA_MUTATION_TIMEOUT_SECONDS,
     KEYBOX_MAX_SOURCE_BYTES,
     KEYBOX_MUTATION_TIMEOUT_SECONDS,
     KEYBOX_STATUS_TIMEOUT_SECONDS,
     DaemonClient,
 )
+from xenoid.config import resolve_instance
 
 
 class DeadlineProbe(DaemonClient):
@@ -94,9 +98,10 @@ probe.camera_source("photo", "/stage", 1, "0" * 64)
 probe.camera_settings("faithful")
 probe.camera_clear("all")
 probe.camera_apply()
-assert CAMERA_MUTATION_TIMEOUT_SECONDS > 3005
 assert all(call[3] == CAMERA_MUTATION_TIMEOUT_SECONDS for call in probe.calls)
 assert probe.calls[-1][2] == {}
+assert BOOTSTRAP_POLL_TIMEOUT_SECONDS == 240.0
+assert BOOTSTRAP_WORKER_TIMEOUT_MS == 230000
 assert KEYBOX_STATUS_TIMEOUT_SECONDS == 30.0
 assert KEYBOX_MUTATION_TIMEOUT_SECONDS == 180.0
 
@@ -133,6 +138,36 @@ def api(method, path, body=None):
     )
     with urllib.request.urlopen(request, timeout=5) as response:
         return json.loads(response.read())
+mock_instance_id = resolve_instance()[0].instance_id
+transport = api("GET", "/bootstrap/transport")
+assert transport == {
+    "ok": True,
+    "schema": "dev.xenoid.daemon-transport/v1",
+    "service": "xenoid-daemon",
+    "transportReady": True,
+}
+bootstrap_request = {
+    "schema": "dev.xenoid.daemon-bootstrap/v1",
+    "instanceId": mock_instance_id,
+    "runtimeEpoch": "a" * 64,
+    "timeoutMs": 230000,
+}
+bootstrap = api("POST", "/bootstrap/reconcile", bootstrap_request)
+assert set(bootstrap) == {
+    "ok", "schema", "state", "generation", "instanceId", "runtimeEpoch", "components",
+}
+assert bootstrap["ok"] is True and bootstrap["state"] == "ready"
+assert bootstrap["schema"] == "dev.xenoid.daemon-bootstrap/v1"
+assert set(bootstrap["components"]) == {"root", "keybox", "proxy", "location", "camera"}
+assert api("GET", "/bootstrap/status") == bootstrap
+assert api(
+    "POST",
+    "/bootstrap/cancel",
+    {
+        "schema": "dev.xenoid.daemon-bootstrap/v1",
+        "generation": bootstrap["generation"],
+    },
+) == bootstrap
 
 
 proxy_cases = 0
@@ -265,11 +300,15 @@ expect(
     and repeated_keybox_clear["configured"] is False
     and repeated_keybox_clear["active"] is False
 )
+keybox_baseline = api("GET", "/keybox/status")
+expect_keybox_status(keybox_baseline)
 
 proxy_status_keys = {
     "ok",
     "schemaVersion",
     "instanceId",
+    "stateReadable",
+    "stateError",
     "generation",
     "enabled",
     "configured",
@@ -277,6 +316,7 @@ proxy_status_keys = {
     "selectedNode",
     "udpAllowed",
     "allowInsecureHttp",
+    "quarantined",
     "checkId",
     "runtimeEpoch",
     "report",
@@ -286,7 +326,9 @@ proxy_status = api("GET", "/proxy/status")
 expect(set(proxy_status) == proxy_status_keys)
 expect(
     proxy_status["ok"]
-    and proxy_status["schemaVersion"] == 1
+    and proxy_status["schemaVersion"] == 2
+    and proxy_status["stateReadable"] is True
+    and proxy_status["stateError"] is None
     and proxy_status["instanceId"] == ""
     and proxy_status["generation"] == 0
     and proxy_status["checkId"] == 0
@@ -295,8 +337,22 @@ expect(
     and proxy_status["sourceKind"] is None
     and proxy_status["selectedNode"] == ""
     and proxy_status["udpAllowed"] is False
+    and proxy_status["quarantined"] is False
     and proxy_status["allowInsecureHttp"] is False
 )
+
+proxy_mutation_keys = {
+    "ok", "generation", "checkId", "enabled", "configured", "quarantined",
+}
+
+def expect_proxy_mutation(value, *, enabled, configured):
+    expect(set(value) == proxy_mutation_keys)
+    expect(
+        value["ok"]
+        and value["enabled"] is enabled
+        and value["configured"] is configured
+        and value["quarantined"] is True
+    )
 
 for method, path in (
     ("POST", "/proxy/status"),
@@ -328,7 +384,16 @@ expect_error("POST", "/proxy/select", {"name": 1}, "invalid_request_schema")
 expect_error("POST", "/proxy/select", {"name": "n" * 129}, "invalid_request_schema")
 expect_error("POST", "/proxy/select", {"name": "node", "extra": 1}, "invalid_request_schema")
 expect_error("POST", "/proxy/select", {"name": "node"}, "source_invalid")
-expect_error("POST", "/proxy/clear", {"extra": 1}, "invalid_request_schema")
+expect_error("POST", "/proxy/clear", {}, "invalid_request_schema")
+expect_error(
+    "POST",
+    "/proxy/clear",
+    {"discardUnreadableState": False, "extra": 1},
+    "invalid_request_schema",
+)
+expect_error(
+    "POST", "/proxy/clear", {"discardUnreadableState": 0}, "invalid_request_schema"
+)
 expect_error("POST", "/proxy/check", {"extra": 1}, "invalid_request_schema")
 expect_error("POST", "/proxy/check", None, "invalid_request_body")
 expect_error("POST", "/proxy/check", {}, "proxy_disabled")
@@ -387,14 +452,12 @@ expect_error("POST", "/proxy/source", [], "invalid_request_schema")
 proxy_status = api("GET", "/proxy/status")
 expect(proxy_status["generation"] == 0 and proxy_status["checkId"] == 0)
 
-proxy_status = api("POST", "/proxy/source", source_request)
-expect(
-    proxy_status["ok"]
-    and proxy_status["generation"] == 1
-    and proxy_status["checkId"] == 1
-)
-generation = proxy_status["generation"]
+mutation = api("POST", "/proxy/source", source_request)
+expect_proxy_mutation(mutation, enabled=True, configured=True)
+expect(mutation["generation"] == 1 and mutation["checkId"] == 1)
+generation = mutation["generation"]
 repeated = api("POST", "/proxy/source", source_request)
+expect_proxy_mutation(repeated, enabled=True, configured=True)
 expect(repeated["generation"] == generation and repeated["checkId"] == 1)
 
 settings_request = {
@@ -402,40 +465,42 @@ settings_request = {
     "udpAllowed": True,
     "allowInsecureHttp": True,
 }
-proxy_status = api("POST", "/proxy/source", settings_request)
+mutation = api("POST", "/proxy/source", settings_request)
+expect_proxy_mutation(mutation, enabled=True, configured=True)
+expect(mutation["generation"] == generation + 1 and mutation["checkId"] == 2)
+proxy_status = api("GET", "/proxy/status")
 expect(
-    proxy_status["generation"] == generation + 1
-    and proxy_status["checkId"] == 2
-    and proxy_status["udpAllowed"] is True
+    proxy_status["udpAllowed"] is True
     and proxy_status["allowInsecureHttp"] is True
 )
-generation = proxy_status["generation"]
+generation = mutation["generation"]
 repeated = api("POST", "/proxy/source", settings_request)
+expect_proxy_mutation(repeated, enabled=True, configured=True)
 expect(repeated["generation"] == generation and repeated["checkId"] == 2)
 
-proxy_status = api("POST", "/proxy/select", {"name": "fixture-node"})
-expect(
-    proxy_status["generation"] == generation + 1
-    and proxy_status["checkId"] == 3
-    and proxy_status["selectedNode"] == "fixture-node"
-)
-generation = proxy_status["generation"]
+mutation = api("POST", "/proxy/select", {"name": "fixture-node"})
+expect_proxy_mutation(mutation, enabled=True, configured=True)
+expect(mutation["generation"] == generation + 1 and mutation["checkId"] == 3)
+proxy_status = api("GET", "/proxy/status")
+expect(proxy_status["selectedNode"] == "fixture-node")
+generation = mutation["generation"]
 repeated = api("POST", "/proxy/select", {"name": "fixture-node"})
+expect_proxy_mutation(repeated, enabled=True, configured=True)
 expect(repeated["generation"] == generation and repeated["checkId"] == 3)
 
-proxy_status = api("POST", "/proxy/check", {})
-expect(proxy_status["generation"] == generation and proxy_status["checkId"] == 4)
-proxy_status = api("POST", "/proxy/check", {})
-expect(proxy_status["generation"] == generation and proxy_status["checkId"] == 5)
+proxy_check = api("POST", "/proxy/check", {})
+expect(set(proxy_check) == {"ok", "generation", "checkId"})
+expect(proxy_check["generation"] == generation and proxy_check["checkId"] == 4)
+proxy_check = api("POST", "/proxy/check", {})
+expect(set(proxy_check) == {"ok", "generation", "checkId"})
+expect(proxy_check["generation"] == generation and proxy_check["checkId"] == 5)
 
-proxy_status = api("POST", "/proxy/enabled", {"enabled": False})
-expect(
-    proxy_status["generation"] == generation + 1
-    and proxy_status["enabled"] is False
-    and proxy_status["checkId"] == 5
-)
-generation = proxy_status["generation"]
+mutation = api("POST", "/proxy/enabled", {"enabled": False})
+expect_proxy_mutation(mutation, enabled=False, configured=True)
+expect(mutation["generation"] == generation + 1 and mutation["checkId"] == 5)
+generation = mutation["generation"]
 repeated = api("POST", "/proxy/enabled", {"enabled": False})
+expect_proxy_mutation(repeated, enabled=False, configured=True)
 expect(repeated["generation"] == generation and repeated["checkId"] == 5)
 
 proxy_status = api("GET", "/proxy/status")
@@ -475,27 +540,30 @@ expect(
     }
 )
 
-proxy_status = api("POST", "/proxy/enabled", {"enabled": True})
-expect(
-    proxy_status["generation"] == generation + 1
-    and proxy_status["enabled"] is True
-    and proxy_status["checkId"] == 6
+mutation = api("POST", "/proxy/enabled", {"enabled": True})
+expect_proxy_mutation(mutation, enabled=True, configured=True)
+expect(mutation["generation"] == generation + 1 and mutation["checkId"] == 6)
+generation = mutation["generation"]
+mutation = api(
+    "POST", "/proxy/clear", {"discardUnreadableState": False}
 )
-generation = proxy_status["generation"]
-proxy_status = api("POST", "/proxy/clear", {})
+expect_proxy_mutation(mutation, enabled=False, configured=False)
+expect(mutation["generation"] == generation + 1 and mutation["checkId"] == 6)
+proxy_status = api("GET", "/proxy/status")
 expect(
-    proxy_status["generation"] == generation + 1
-    and proxy_status["checkId"] == 6
-    and proxy_status["enabled"] is False
+    proxy_status["enabled"] is False
     and proxy_status["configured"] is False
     and proxy_status["sourceKind"] is None
     and proxy_status["selectedNode"] == ""
     and proxy_status["udpAllowed"] is False
     and proxy_status["allowInsecureHttp"] is False
 )
-generation = proxy_status["generation"]
+generation = mutation["generation"]
 expect(api("GET", "/proxy/export")["source"] is None)
-repeated = api("POST", "/proxy/clear", {})
+repeated = api(
+    "POST", "/proxy/clear", {"discardUnreadableState": False}
+)
+expect_proxy_mutation(repeated, enabled=False, configured=False)
 expect(repeated["generation"] == generation and repeated["checkId"] == 6)
 expect_error("POST", "/proxy/check", {}, "proxy_disabled")
 proxy_status = api("GET", "/proxy/status")
@@ -508,11 +576,12 @@ subscription_request = {
     "value": subscription_source,
     "enable": False,
 }
-proxy_status = api("POST", "/proxy/source", subscription_request)
+mutation = api("POST", "/proxy/source", subscription_request)
+expect_proxy_mutation(mutation, enabled=False, configured=True)
+expect(mutation["generation"] == generation + 1 and mutation["checkId"] == 6)
+proxy_status = api("GET", "/proxy/status")
 expect(
-    proxy_status["generation"] == generation + 1
-    and proxy_status["checkId"] == 6
-    and proxy_status["sourceKind"] == "subscription"
+    proxy_status["sourceKind"] == "subscription"
     and proxy_status["configured"] is True
 )
 serialized_status = json.dumps(proxy_status, ensure_ascii=False)
@@ -522,14 +591,16 @@ expect(
     and "feed.invalid" not in serialized_status
 )
 expect(api("GET", "/proxy/export")["source"]["value"] == subscription_source)
-generation = proxy_status["generation"]
-proxy_status = api("POST", "/proxy/clear", {})
-expect(
-    proxy_status["generation"] == generation + 1
-    and proxy_status["checkId"] == 6
-    and proxy_status["configured"] is False
-    and api("GET", "/proxy/export")["source"] is None
+generation = mutation["generation"]
+mutation = api(
+    "POST", "/proxy/clear", {"discardUnreadableState": False}
 )
+expect_proxy_mutation(mutation, enabled=False, configured=False)
+expect(mutation["generation"] == generation + 1 and mutation["checkId"] == 6)
+expect(api("GET", "/proxy/export")["source"] is None)
+keybox_after_proxy = api("GET", "/keybox/status")
+expect_keybox_status(keybox_after_proxy)
+expect(keybox_after_proxy == keybox_baseline)
 
 
 camera_keys = {
@@ -746,7 +817,7 @@ with TemporaryDirectory(prefix="xenoid-keybox-contract-") as directory:
             manager = KeyboxStagingManager()
             client = KeyboxClient(outcome)
             cli._keybox_mutation_client = (
-                lambda _args, manager=manager, client=client: (manager, client)
+                lambda _args, manager=manager, client=client: (manager, client, None)
             )
             output = io.StringIO()
             with redirect_stdout(output):
@@ -779,7 +850,7 @@ try:
             staging = root / f"controlled-stage-{index}"
             manager = StagingManager(payload, staging)
             client = SourceClient(outcome)
-            cli._camera_ready = lambda _args, manager=manager, client=client: (manager, client)
+            cli._camera_ready = lambda _args, manager=manager, client=client: (manager, client, None)
             with redirect_stdout(io.StringIO()):
                 code = cli.cmd_camera_set(Namespace(file=local, kind="photo"))
             assert code == expected_code
@@ -808,7 +879,7 @@ try:
 
     manager = AuthorizationManager()
     client = RejectingAuthorizationClient()
-    cli._camera_ready = lambda _args: (manager, client)
+    cli._camera_ready = lambda _args: (manager, client, None)
     with redirect_stdout(io.StringIO()):
         code = cli.cmd_camera_status(Namespace(check=True))
     assert code == 1 and client.started and manager.launches == 0
@@ -817,8 +888,10 @@ finally:
 print(json.dumps({"ok": True, "cases": proxy_cases}, separators=(",", ":")))
 PY
 fi
+if [[ "$START_MOCK" != "--mock" ]]; then
 ./xenoid camera status
 ./xenoid camera mode faithful
 ./xenoid camera mode naturalized
 ./xenoid camera clear all
 ./xenoid camera apply
+fi

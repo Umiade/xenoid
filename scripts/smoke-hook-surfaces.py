@@ -250,8 +250,11 @@ checks = {
     ),
     "ebpf_loader": (
         "bpf_lsm_active" in ebpf_loader
-        and 'strcmp(attach_out, "lsm/file_open")' in ebpf_loader
-        and "mode == MODE_LSM && !bpf_lsm_active()" in ebpf_loader
+        and "policy_identity" in ebpf_loader
+        and "cmd_stage" in ebpf_loader
+        and "cmd_prove" in ebpf_loader
+        and "cmd_activate" in ebpf_loader
+        and "rename(PIN_CURRENT, rollback)" in ebpf_loader
     ),
     "ebpf_scripts": (
         (ROOT / "scripts/build-ebpf.sh").exists()

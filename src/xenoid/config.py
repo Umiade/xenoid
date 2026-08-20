@@ -32,6 +32,17 @@ LEASE_SCHEMA_VERSION = 1
 INSTANCE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 RESOURCE_TAG_RE = re.compile(r"^[0-9a-f]{12}$")
 _RESOURCE_TAG_DOMAIN = b"xenoid-instance/v1\0"
+_IMAGE_PATH_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*"
+_IMAGE_REGISTRY = (
+    r"(?:localhost|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)"
+    r"(?::[0-9]{1,5})?"
+)
+_IMAGE_NAME_RE = re.compile(
+    rf"^(?:(?:{_IMAGE_REGISTRY})/)?"
+    rf"{_IMAGE_PATH_COMPONENT}(?:/{_IMAGE_PATH_COMPONENT})*$"
+)
+_IMAGE_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _LEASE_EPOCH_DOMAIN = b"xenoid-lease-network-epoch/v1\0"
 _NETWORK_EPOCH_RE = re.compile(r"^[0-9a-f]{32}$")
 _LEASE_SLOTS = 1000
@@ -120,6 +131,60 @@ def validate_instance_name(value: str) -> str:
             "instance_identity_mismatch",
             "instance name must match [a-z][a-z0-9-]{0,31}",
         )
+    return value
+
+
+def validate_image_reference(
+    value: str,
+    *,
+    require_tag: bool = False,
+    allow_digest: bool = True,
+) -> str:
+    """Validate a named local Docker image reference without normalizing it."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or value != value.strip()
+        or value.startswith("-")
+        or "://" in value
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise InstanceError("runtime_image_reference_invalid", "invalid Docker image reference")
+    if value.count("@") > 1:
+        raise InstanceError("runtime_image_reference_invalid", "invalid Docker image reference")
+    named, separator, digest = value.partition("@")
+    if separator and (not allow_digest or _IMAGE_DIGEST_RE.fullmatch(digest) is None):
+        raise InstanceError(
+            "runtime_image_reference_invalid",
+            "Docker image digest must be an exact lowercase sha256 reference",
+        )
+    slash = named.rfind("/")
+    colon = named.rfind(":")
+    tag = ""
+    repository = named
+    if colon > slash:
+        repository = named[:colon]
+        tag = named[colon + 1 :]
+        if _IMAGE_TAG_RE.fullmatch(tag) is None:
+            raise InstanceError("runtime_image_reference_invalid", "invalid Docker image tag")
+    if require_tag and not tag:
+        raise InstanceError(
+            "runtime_image_reference_invalid",
+            "runtime image namespace must include an explicit tag",
+        )
+    if _IMAGE_NAME_RE.fullmatch(repository) is None:
+        raise InstanceError("runtime_image_reference_invalid", "invalid Docker image repository")
+    first_component = repository.split("/", 1)[0]
+    if "/" in repository and ":" in first_component:
+        _, port = first_component.rsplit(":", 1)
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise InstanceError(
+                "runtime_image_reference_invalid",
+                "invalid Docker registry port",
+            )
+    if separator and not repository:
+        raise InstanceError("runtime_image_reference_invalid", "digest reference must name a repository")
     return value
 
 
@@ -306,6 +371,17 @@ def _validate_config(cfg: XenoidConfig) -> None:
         raise InstanceError("instance_identity_mismatch", "unsupported instance config schema")
     if cfg.backend not in {"colima-docker", "macos-colima", "linux-docker"}:
         raise InstanceError("resource_conflict", "unsupported backend")
+    validate_image_reference(cfg.image)
+    validate_image_reference(
+        cfg.runtime_image_tag,
+        require_tag=True,
+        allow_digest=False,
+    )
+    if not isinstance(cfg.auto_build_runtime_image, bool):
+        raise InstanceError(
+            "runtime_image_reference_invalid",
+            "auto_build_runtime_image must be boolean",
+        )
     if not isinstance(cfg.google_services_provider, str) or not isinstance(cfg.google_services_release, str):
         raise InstanceError("google_services_spec_mismatch", "invalid Google services provider configuration")
     valid_google_pair = (
@@ -760,8 +836,16 @@ def _write_instance_transaction(
             )
         if initialize_identity:
             from .device_identity import DeviceIdentityStore
+            from .location import DEFAULT_COUNTRY, LocationStateStore
 
             DeviceIdentityStore(context).initialize()
+            location_store = LocationStateStore(context.state_root)
+            location_state, _ = location_store.ensure(
+                context.instance_id,
+                DEFAULT_COUNTRY,
+            )
+            if location_state.get("pending") is None:
+                location_store.set_desired(DEFAULT_COUNTRY)
         registry["leases"][context.instance_id] = asdict(committed)
         registry["pending"].pop(lease.transaction_id, None)
         _atomic_json(allocation_path, asdict(committed))
@@ -775,6 +859,7 @@ def _write_instance_transaction(
             allocation_path,
             context.config_path,
             context.state_root / "device-identity.json",
+            context.state_root / "location-identity.json",
         ):
             try:
                 path.unlink()
@@ -783,17 +868,35 @@ def _write_instance_transaction(
         raise
 
 
-def rotate_instance_network(context: InstanceContext) -> InstanceLease:
-    """Rotate the instance's network identity epoch and persist the new lease.
+def rotate_instance_network(
+    context: InstanceContext,
+    *,
+    target_epoch: str,
+    expected_epoch: Optional[str] = None,
+) -> InstanceLease:
+    """Converge the lease network identity to one journal-pinned epoch.
 
-    Slot, subnets, ports, and resource names stay fixed so multi-instance
-    allocation invariants and the docker network remain untouched; only the
-    container-visible MAC is re-derived from a fresh epoch. The rotation is one
-    journaled registry transaction: the pending candidate is written first,
-    then the allocation file, then the committed registry lease. A crash in
-    any gap is rolled forward by the standard pending-transaction recovery on
-    the next registry read.
+    A retry with the same target is a no-op.  When ``expected_epoch`` is
+    supplied, any value matching neither the recorded before-state nor the
+    target fails closed instead of rotating a third identity.
     """
+    if (
+        not isinstance(target_epoch, str)
+        or _NETWORK_EPOCH_RE.fullmatch(target_epoch) is None
+    ):
+        raise InstanceError(
+            "device_regeneration_state_invalid",
+            "invalid fixed network identity target",
+        )
+    if expected_epoch is not None and (
+        not isinstance(expected_epoch, str)
+        or expected_epoch != ""
+        and _NETWORK_EPOCH_RE.fullmatch(expected_epoch) is None
+    ):
+        raise InstanceError(
+            "device_regeneration_state_invalid",
+            "invalid expected network identity",
+        )
     allocation_path = context.state_root / "allocation.json"
     registry_path = context.registry_root / "registry.json"
     with _registry_lock(context.registry_root):
@@ -804,21 +907,25 @@ def rotate_instance_network(context: InstanceContext) -> InstanceLease:
         current = InstanceLease.from_dict(raw)
         if current.instance_name != context.instance_name:
             raise InstanceError("instance_identity_mismatch", "registry identity mismatch")
-        candidate: Optional[InstanceLease] = None
-        for _ in range(64):
-            epoch = secrets.token_hex(16)
-            proposal = _lease_for_slot(
-                current.instance_name,
-                current.instance_id,
-                current.slot,
-                current.transaction_id,
-                network_epoch=epoch,
+        if current.network_epoch == target_epoch:
+            return current
+        if expected_epoch is not None and current.network_epoch != expected_epoch:
+            raise InstanceError(
+                "device_regeneration_state_invalid",
+                "network identity matches neither regeneration before nor target",
             )
-            if proposal.mac_address != current.mac_address:
-                candidate = proposal
-                break
-        if candidate is None:
-            raise InstanceError("resource_pool_exhausted", "cannot derive a distinct network identity")
+        candidate = _lease_for_slot(
+            current.instance_name,
+            current.instance_id,
+            current.slot,
+            current.transaction_id,
+            network_epoch=target_epoch,
+        )
+        if candidate.mac_address == current.mac_address:
+            raise InstanceError(
+                "device_regeneration_state_invalid",
+                "fixed network target does not rotate the container MAC",
+            )
         registry["pending"][candidate.transaction_id] = {
             "lease": asdict(replace(candidate, state="pending")),
             "configPath": str(context.config_path),
@@ -926,7 +1033,7 @@ def _legacy_policy_and_identity(data: Mapping[str, Any]) -> tuple[dict[str, Any]
 
 def _copy_legacy_state(project_root: Path, context: InstanceContext) -> None:
     legacy_root = project_root / ".xenoid"
-    sources = [legacy_root / name for name in ("daemon.token", "rootd.token", "logs", "ota", "frida")]
+    sources = [legacy_root / name for name in ("logs", "ota", "frida")]
     for source in sources:
         if source.is_symlink():
             raise InstanceError("resource_conflict", "legacy state contains a symlink")
@@ -934,11 +1041,6 @@ def _copy_legacy_state(project_root: Path, context: InstanceContext) -> None:
             for candidate in source.rglob("*"):
                 if candidate.is_symlink():
                     raise InstanceError("resource_conflict", "legacy state contains a symlink")
-    for name in ("daemon.token", "rootd.token"):
-        source = legacy_root / name
-        destination = context.state_root / name
-        if source.is_file() and not destination.exists():
-            _atomic_write(destination, source.read_bytes(), 0o600)
     for name in ("logs", "ota", "frida"):
         source = legacy_root / name
         destination = context.state_root / name

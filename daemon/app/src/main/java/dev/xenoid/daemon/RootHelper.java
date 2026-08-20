@@ -3,31 +3,127 @@ package dev.xenoid.daemon;
 import java.io.*;
 import java.util.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
+import org.json.JSONObject;
 
 final class RootHelper {
-    private static String cachedRootdToken = "";
+    private static final int ROOTD_PORT = 18767;
+    private static final int MAX_COMMAND_BYTES = 4096;
+    private static final int MAX_RESPONSE_BYTES = 400 * 1024;
+    private static final int MAX_OUTPUT_CHARS = 64 * 1024;
+    private static final int MIN_TIMEOUT_MS = 100;
+    private static final int MAX_TIMEOUT_MS = 230000;
+    private static final ThreadLocal<ConnectionHandle> THREAD_CONNECTION = new ThreadLocal<>();
+    private static char[] cachedRootdToken = new char[0];
+
+    static final class ConnectionHandle implements AutoCloseable {
+        private HttpURLConnection active;
+        private boolean cancelled;
+        private long deadlineElapsedMs = Long.MAX_VALUE;
+
+        synchronized boolean attach(HttpURLConnection connection) {
+            if (cancelled || active != null) return false;
+            active = connection;
+            return true;
+        }
+
+        synchronized void detach(HttpURLConnection connection) {
+            if (active == connection) active = null;
+        }
+
+        synchronized boolean isCancelled() {
+            return cancelled;
+        }
+        synchronized void setTimeoutCapMs(int timeoutCapMs) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            long cap = Math.max(0L, Math.min((long) MAX_TIMEOUT_MS, (long) timeoutCapMs));
+            long candidate = now > Long.MAX_VALUE - cap ? Long.MAX_VALUE : now + cap;
+            deadlineElapsedMs = Math.min(deadlineElapsedMs, candidate);
+        }
+
+        synchronized int boundedTimeoutMs(int requestedTimeoutMs) {
+            if (cancelled) return -1;
+            long remaining = deadlineElapsedMs == Long.MAX_VALUE
+                    ? MAX_TIMEOUT_MS
+                    : deadlineElapsedMs - android.os.SystemClock.elapsedRealtime();
+            if (remaining < MIN_TIMEOUT_MS) return 0;
+            long requested = Math.max(
+                    (long) MIN_TIMEOUT_MS,
+                    Math.min((long) MAX_TIMEOUT_MS, (long) requestedTimeoutMs));
+            return (int) Math.min(requested, remaining);
+        }
+
+        synchronized void cancel() {
+            cancelled = true;
+            if (active != null) active.disconnect();
+        }
+
+        @Override public synchronized void close() {
+            if (active != null) {
+                active.disconnect();
+                active = null;
+            }
+        }
+    }
+
+    static final class ConnectionScope implements AutoCloseable {
+        private final ConnectionHandle previous;
+        private boolean closed;
+
+        ConnectionScope(ConnectionHandle handle) {
+            previous = THREAD_CONNECTION.get();
+            THREAD_CONNECTION.set(handle);
+        }
+
+        @Override public void close() {
+            if (closed) return;
+            closed = true;
+            if (previous == null) THREAD_CONNECTION.remove();
+            else THREAD_CONNECTION.set(previous);
+        }
+    }
+
+    static ConnectionHandle newConnectionHandle() {
+        return new ConnectionHandle();
+    }
+
+    static ConnectionScope bindConnectionHandle(ConnectionHandle handle) {
+        if (handle == null) throw new IllegalArgumentException("rootd_handle_required");
+        return new ConnectionScope(handle);
+    }
 
     static Map<String,Object> status() {
-        Map<String,Object> out = execRootd("id; getenforce 2>/dev/null || true");
+        return status(10000, THREAD_CONNECTION.get());
+    }
+
+    static Map<String,Object> status(int timeoutMs, ConnectionHandle handle) {
+        Map<String,Object> out = execRootd(
+                "id; getenforce 2>/dev/null || true", timeoutMs, handle);
         out.put("root", String.valueOf(out.get("stdout")).contains("uid=0"));
         return out;
     }
 
     static Map<String,Object> exec(String command) {
-        return execRootd(command);
+        return execRootd(command, 20000, THREAD_CONNECTION.get());
     }
 
-    /** The service injects its app-private daemon token; it is never staged in /data/local/tmp. */
+    static Map<String,Object> exec(String command, int timeoutMs, ConnectionHandle handle) {
+        return execRootd(command, timeoutMs, handle);
+    }
+
+    /** The service injects its app-private daemon token; it is never staged elsewhere. */
     static synchronized void setRootdToken(String token) {
-        cachedRootdToken = token == null ? "" : token.trim();
+        Arrays.fill(cachedRootdToken, '\0');
+        cachedRootdToken = token != null && token.matches("[0-9a-f]{32}")
+                ? token.toCharArray() : new char[0];
     }
 
     static synchronized String rootdToken() {
-        return cachedRootdToken;
+        return new String(cachedRootdToken);
     }
 
     static Map<String,Object> execRootd(String command) {
-        return execRootd(command, 20000);
+        return execRootd(command, 20000, THREAD_CONNECTION.get());
     }
 
     static boolean persistLocationState(File source, int appUid) {
@@ -114,40 +210,140 @@ final class RootHelper {
         execRootd("rm -f /data/vendor/radio/xenoid/state.v1", 20000);
     }
 
-    private static Map<String,Object> execRootd(String command, int readTimeoutMs) {
+    private static Map<String,Object> execRootd(String command, int timeoutMs) {
+        return execRootd(command, timeoutMs, THREAD_CONNECTION.get());
+    }
+    /** Authenticated POST /exec only: command and token never enter the request target. */
+
+    private static Map<String,Object> execRootd(
+            String command, int timeoutMs, ConnectionHandle suppliedHandle) {
         Map<String,Object> out = new LinkedHashMap<>();
-        HttpURLConnection c = null;
+        byte[] bodyBytes = command == null ? new byte[0]
+                : command.getBytes(StandardCharsets.UTF_8);
+        if (bodyBytes.length == 0 || bodyBytes.length > MAX_COMMAND_BYTES) {
+            Arrays.fill(bodyBytes, (byte) 0);
+            return rootdFailure("rootd_command_invalid");
+        }
+        ConnectionHandle handle = suppliedHandle;
+        boolean ownsHandle = false;
+        if (handle == null) {
+            handle = newConnectionHandle();
+            ownsHandle = true;
+        }
+        int boundedTimeout = handle.boundedTimeoutMs(timeoutMs);
+        if (boundedTimeout < 0) {
+            Arrays.fill(bodyBytes, (byte) 0);
+            return rootdFailure("rootd_cancelled");
+        }
+        if (boundedTimeout == 0) {
+            Arrays.fill(bodyBytes, (byte) 0);
+            return rootdFailure("rootd_command_timeout");
+        }
+        HttpURLConnection connection = null;
+        String requestId = UUID.randomUUID().toString().replace("-", "");
         try {
-            String encoded = URLEncoder.encode(command, "UTF-8");
-            if (encoded.length() > 1900) {
-                out.put("ok", false);
-                return out;
+            URL endpoint = new URL("http://127.0.0.1:" + ROOTD_PORT + "/exec");
+            connection = (HttpURLConnection) endpoint.openConnection();
+            if (!handle.attach(connection)) return rootdFailure("rootd_cancelled");
+            connection.setRequestMethod("POST");
+            connection.setConnectTimeout(Math.min(1000, boundedTimeout));
+            connection.setReadTimeout(boundedTimeout);
+            connection.setUseCaches(false);
+            connection.setDoOutput(true);
+            connection.setInstanceFollowRedirects(false);
+            connection.setRequestProperty("Connection", "close");
+            connection.setRequestProperty("Content-Type", "text/plain; charset=utf-8");
+            connection.setRequestProperty("X-Xenoid-Request-Id", requestId);
+            connection.setRequestProperty(
+                    "X-Xenoid-Timeout-Ms", Integer.toString(boundedTimeout));
+            String token = rootdToken();
+            if (!token.isEmpty()) {
+                connection.setRequestProperty("X-Xenoid-Token", token);
             }
-            URL u = new URL("http://127.0.0.1:18767/exec?cmd=" + encoded);
-            c = (HttpURLConnection) u.openConnection();
-            c.setConnectTimeout(1000);
-            c.setReadTimeout(readTimeoutMs);
-            c.setUseCaches(false);
-            String tok = rootdToken();
-            if (tok != null && !tok.isEmpty()) c.setRequestProperty("X-Xenoid-Token", tok);
-            int code = c.getResponseCode();
-            InputStream stream = code >= 400 ? c.getErrorStream() : c.getInputStream();
-            String body = stream != null ? readLimited(stream, 65536) : "";
+            connection.setFixedLengthStreamingMode(bodyBytes.length);
+            try (OutputStream stream = connection.getOutputStream()) {
+                stream.write(bodyBytes);
+                stream.flush();
+            }
+            int statusCode = connection.getResponseCode();
+            InputStream stream = statusCode >= 400
+                    ? connection.getErrorStream() : connection.getInputStream();
+            String response = stream == null ? "" : readLimited(stream, MAX_RESPONSE_BYTES);
             out.put("rootdReachable", true);
-            out.put("httpStatus", code);
-            if (code == 401) {
+            out.put("httpStatus", statusCode);
+            if (statusCode != 200) {
+                String errorCode = safeRootdError(response,
+                        statusCode == 401 ? "rootd_unauthorized" : "rootd_request_failed");
                 out.put("ok", false);
-                out.put("error", "unauthorized");
+                out.put("errorCode", errorCode);
+                out.put("error", statusCode == 401 ? "unauthorized" : errorCode);
                 return out;
             }
-            out.put("ok", code == 200 && body.contains("\"ok\":true"));
-            out.put("stdout", body);
-        } catch (Exception e) {
-            out.put("ok", false);
+            JSONObject result = new JSONObject(response);
+            if (!"dev.xenoid.rootd-exec/v1".equals(result.optString("schema", ""))
+                    || !requestId.equals(result.optString("requestId", ""))
+                    || !result.has("ok") || !result.has("exitCode")
+                    || !result.has("stdout")) {
+                return rootdFailure("rootd_protocol_error", true, statusCode);
+            }
+            String stdout = result.getString("stdout");
+            if (stdout.length() > MAX_OUTPUT_CHARS) {
+                return rootdFailure("rootd_protocol_error", true, statusCode);
+            }
+            int exitCode = result.getInt("exitCode");
+            boolean ok = result.getBoolean("ok");
+            String errorCode = result.optString("errorCode", "");
+            if ((ok && (exitCode != 0 || !errorCode.isEmpty()))
+                    || (!ok && !errorCode.matches("rootd_[a-z_]{3,48}"))) {
+                return rootdFailure("rootd_protocol_error", true, statusCode);
+            }
+            out.put("ok", ok);
+            out.put("exit", exitCode);
+            out.put("stdout", stdout);
+            if (!ok) {
+                out.put("errorCode", errorCode);
+                out.put("error", errorCode);
+            }
+        } catch (SocketTimeoutException timeout) {
+            return rootdFailure("rootd_command_timeout");
+        } catch (Exception failure) {
+            return rootdFailure(handle.isCancelled()
+                    ? "rootd_cancelled" : "rootd_unavailable");
         } finally {
-            if (c != null) c.disconnect();
+            Arrays.fill(bodyBytes, (byte) 0);
+            if (connection != null) {
+                handle.detach(connection);
+                connection.disconnect();
+            }
+            if (ownsHandle) handle.close();
         }
         return out;
+    }
+
+    private static Map<String,Object> rootdFailure(String errorCode) {
+        return rootdFailure(errorCode, false, 0);
+    }
+
+    private static Map<String,Object> rootdFailure(
+            String errorCode, boolean reachable, int httpStatus) {
+        Map<String,Object> out = new LinkedHashMap<>();
+        out.put("ok", false);
+        out.put("errorCode", errorCode);
+        out.put("error", errorCode);
+        if (reachable) {
+            out.put("rootdReachable", true);
+            out.put("httpStatus", httpStatus);
+        }
+        return out;
+    }
+
+    private static String safeRootdError(String response, String fallback) {
+        try {
+            String error = new JSONObject(response).optString("errorCode", "");
+            return error.matches("rootd_[a-z_]{3,48}") ? error : fallback;
+        } catch (Throwable ignored) {
+            return fallback;
+        }
     }
 
 
@@ -389,21 +585,21 @@ final class RootHelper {
     static Map<String,Object> uninstallPackage(String pkg) { return exec("pm uninstall " + shellQuote(pkg)); }
     static Map<String,Object> launchComponent(String component) { return exec("am start -n " + shellQuote(component)); }
     static String shellQuote(String s) { return "'" + s.replace("'", "'\\''") + "'"; }
-    private static String read(InputStream is) throws IOException {
-        return readLimited(is, Integer.MAX_VALUE);
-    }
 
-    private static String readLimited(InputStream is, int limit) throws IOException {
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        byte[] buf = new byte[4096];
-        int n;
-        while ((n = is.read(buf)) >= 0) {
-            if (b.size() + n > limit) {
-                b.write(buf, 0, limit - b.size());
-                break;
+    private static String readLimited(InputStream input, int limit) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream(Math.min(limit, 8192));
+        byte[] buffer = new byte[4096];
+        try {
+            int count;
+            while ((count = input.read(buffer)) >= 0) {
+                if (count == 0) continue;
+                if (output.size() + count > limit) throw new IOException("bounded_response_exceeded");
+                output.write(buffer, 0, count);
             }
-            b.write(buf, 0, n);
+            return output.toString("UTF-8");
+        } finally {
+            Arrays.fill(buffer, (byte) 0);
+            input.close();
         }
-        return b.toString("UTF-8");
     }
 }

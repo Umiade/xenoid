@@ -3,7 +3,7 @@
 # persistent /data/xenoid-data.img. The caller owns the Docker volume and keeps
 # a crash-safe storage transaction in private instance state.
 #
-# Usage: make-rootfs-image.sh IMAGE VOLUME ROOTFS_MB DATA_BYTES ACTION EXPECTED_UUID TRANSACTION [LEGACY_VOLUME] [BACKUP_IMAGE] [BACKUP_UUID] [GOOGLE_PROVIDER]
+# Usage: make-rootfs-image.sh IMAGE VOLUME ROOTFS_MB DATA_BYTES ACTION EXPECTED_UUID TRANSACTION [LEGACY_VOLUME] [BACKUP_IMAGE] [BACKUP_UUID] [GOOGLE_PROVIDER] [EXPECTED_ROOTFS_UUID]
 # ACTION is initialize, preserve, grow, or migrate. There is deliberately no
 # implicit "missing means mkfs" fallback.
 # Requires: docker, e2fsprogs (mkfs.ext4/blkid) on the Docker engine host.
@@ -20,12 +20,14 @@ LEGACY_VOLUME="${8:--}"
 BACKUP_IMAGE="${9:--}"
 BACKUP_UUID="${10:--}"
 GOOGLE_PROVIDER="${11:-none}"
+EXPECTED_ROOTFS_UUID="${12:--}"
 [[ "$DATA_ACTION" =~ ^(initialize|preserve|grow|migrate)$ ]] || { echo "explicit data action required" >&2; exit 2; }
 [[ "$EXPECTED_UUID" == "-" || "$EXPECTED_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "invalid expected data UUID" >&2; exit 2; }
 [[ "$STORAGE_TRANSACTION" == "-" || "$STORAGE_TRANSACTION" =~ ^[0-9a-f]{32}$ ]] || { echo "invalid storage transaction" >&2; exit 2; }
 [[ "$LEGACY_VOLUME" == "-" || "$LEGACY_VOLUME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || { echo "invalid legacy volume" >&2; exit 2; }
 [[ "$BACKUP_IMAGE" == "-" || "$BACKUP_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo "invalid backup image" >&2; exit 2; }
 [[ "$BACKUP_UUID" == "-" || "$BACKUP_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "invalid backup UUID" >&2; exit 2; }
+[[ "$EXPECTED_ROOTFS_UUID" == "-" || "$EXPECTED_ROOTFS_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "invalid expected rootfs UUID" >&2; exit 2; }
 [[ "$GOOGLE_PROVIDER" == "none" || "$GOOGLE_PROVIDER" == "mindthegapps" ]] || { echo "invalid Google services provider" >&2; exit 2; }
 [[ "$DATA_SIZE_BYTES" =~ ^[0-9]+$ ]] && (( DATA_SIZE_BYTES == 128000000000 )) || {
   echo "data image size must be the canonical 128000000000 bytes" >&2
@@ -74,14 +76,38 @@ VOL_PATH="$("${DOCKER[@]}" volume inspect "$VOLUME" --format '{{.Mountpoint}}')"
 [[ -n "$VOL_PATH" ]] || { echo "cannot resolve Docker volume $VOLUME" >&2; exit 1; }
 
 digest="$("${DOCKER[@]}" image inspect "$SRC_IMAGE" --format '{{.Id}}')"
-[[ -n "$digest" ]] || { echo "image $SRC_IMAGE not found" >&2; exit 1; }
-
-cur="$(host_sh "cat '$VOL_PATH/xenoid-rootfs.img.sha256' 2>/dev/null" || true)"
-if [[ "$cur" == "$digest" ]] && host_sh "test -s '$VOL_PATH/xenoid-rootfs.img'" >/dev/null 2>&1; then
-  echo "rootfs image current ($digest)"
+[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "image $SRC_IMAGE has invalid immutable identity" >&2; exit 1; }
+SCRIPT_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$0")"
+E2FSPROGS_IDENTITY="$(host_sh "mkfs.ext4 -V 2>&1 | tr '\\n' ' '")"
+ROOTFS_SOURCE_SHA256="$(python3 -c 'import hashlib,json,sys; print(hashlib.sha256(json.dumps({"runtimeImageId":sys.argv[1],"recipeSha256":sys.argv[2],"rootfsSizeMiB":int(sys.argv[3]),"googleProvider":sys.argv[4],"e2fsprogs":sys.argv[5]},sort_keys=True,separators=(",",":")).encode("ascii")).hexdigest())' "$digest" "$SCRIPT_SHA256" "$SIZE_MB" "$GOOGLE_PROVIDER" "$E2FSPROGS_IDENTITY")"
+ROOTFS_SOURCE_UUID="$(python3 -c 'import sys,uuid; print(uuid.uuid5(uuid.UUID("542fba76-f57d-5f23-8a61-9b5d02a9f38c"),sys.argv[1]))' "$ROOTFS_SOURCE_SHA256")"
+ROOTFS_PUBLISH_UUID="$ROOTFS_SOURCE_UUID"
+if [[ "$EXPECTED_ROOTFS_UUID" != "-" ]]; then
+  ROOTFS_PUBLISH_UUID="$(printf '%s' "$EXPECTED_ROOTFS_UUID" | tr 'A-F' 'a-f')"
+fi
+cur="$(host_sh "cat '$VOL_PATH/xenoid-rootfs.img.source.sha256' 2>/dev/null" || true)"
+rootfs_uuid="$(host_sh "blkid -p -s UUID -o value -- '$VOL_PATH/xenoid-rootfs.img' 2>/dev/null | tr A-F a-f" || true)"
+if [[ "$cur" == "$ROOTFS_SOURCE_SHA256" && "$rootfs_uuid" == "$ROOTFS_PUBLISH_UUID" ]] && host_sh "set -eu; p='$VOL_PATH/xenoid-rootfs.img'; m='$VOL_PATH/xenoid-rootfs.img.source.sha256'; expected=$((SIZE_MB * 1024 * 1024)); test -f \"\$m\"; test ! -L \"\$m\"; test \"\$(stat -c %u -- \"\$m\")\" -eq 0; test -f \"\$p\"; test ! -L \"\$p\"; test -s \"\$p\"; test \"\$(blkid -p -s TYPE -o value -- \"\$p\" 2>/dev/null)\" = ext4; test \"\$(stat -c %s -- \"\$p\")\" -eq \"\$expected\"; set -- \$(tune2fs -l \"\$p\" 2>/dev/null | awk -F: '/Block count:/ {gsub(/[[:space:]]/,\"\",\$2); c=\$2} /Block size:/ {gsub(/[[:space:]]/,\"\",\$2); s=\$2} END {print c,s}'); test \"\$#\" -eq 2; test \$((\$1 * \$2)) -eq \"\$expected\"" >/dev/null 2>&1; then
+  echo "rootfs image current ($ROOTFS_SOURCE_SHA256)"
 else
-  echo "building rootfs image from $SRC_IMAGE ($digest)"
-  work_dir="/tmp/xenoid-rf-${VOLUME}-$$"
+  echo "building rootfs image from immutable source ($ROOTFS_SOURCE_SHA256)"
+  docker_root="$("${DOCKER[@]}" info --format '{{.DockerRootDir}}')"
+  [[ "$docker_root" =~ ^/[A-Za-z0-9._/-]+$ && "$docker_root" != *"/../"* ]] || {
+    echo "Docker root directory is unsafe" >&2
+    exit 1
+  }
+  scratch_root="$docker_root/xenoid-rootfs-work"
+  work_dir="$scratch_root/${VOLUME}-${STORAGE_TRANSACTION}"
+  host_sh "set -eu
+root='$scratch_root'
+if [ -e \"\$root\" ]; then
+  [ -d \"\$root\" ] && [ ! -L \"\$root\" ] && [ \"\$(stat -c %u -- \"\$root\")\" -eq 0 ]
+else
+  mkdir -m 0700 -- \"\$root\"
+fi
+chmod 0700 -- \"\$root\"
+rm -rf -- '$work_dir'
+mkdir -m 0700 -- '$work_dir'"
   rootfs_new="$VOL_PATH/.xenoid-rootfs.img.$$"
   cid="$("${DOCKER[@]}" create "$SRC_IMAGE")"
   cleanup_rootfs_build() {
@@ -96,6 +122,7 @@ else
   cid=""
   host_sh "$(cat <<EOF
 set -e
+export E2FSPROGS_FAKE_TIME=0 SOURCE_DATE_EPOCH=0
 cd '$work_dir'
 rm -rf proc sys dev data mnt tmp run oldroot .dockerenv
 mkdir -p proc sys dev data mnt tmp oldroot xenoid
@@ -106,7 +133,7 @@ if [ '$GOOGLE_PROVIDER' = mindthegapps ]; then
   [ ! -e system/system_ext/priv-app/Provision ] ||
     { echo 'failed to remove conflicting AOSP Provision package' >&2; exit 61; }
 fi
-mkfs.ext4 -q -F -d '$work_dir' '$rootfs_new' ${SIZE_MB}M
+mkfs.ext4 -q -F -U '$ROOTFS_SOURCE_UUID' -d '$work_dir' '$rootfs_new' ${SIZE_MB}M
 rootfs_stats="\$(tune2fs -l '$rootfs_new' 2>/dev/null | awk -F: '
   /Block count:/ { gsub(/[[:space:]]/, "", \$2); blocks=\$2 }
   /Free blocks:/ { gsub(/[[:space:]]/, "", \$2); free=\$2 }
@@ -118,14 +145,72 @@ set -- \$rootfs_stats
 free_bytes=\$((\$2 * \$3))
 [ "\$free_bytes" -ge \$((128 * 1024 * 1024)) ] ||
   { echo 'generated rootfs has less than 128 MiB free' >&2; exit 61; }
+if [ '$ROOTFS_SOURCE_UUID' != '$ROOTFS_PUBLISH_UUID' ]; then
+  tune2fs -U '$ROOTFS_PUBLISH_UUID' '$rootfs_new' >/dev/null ||
+    { echo 'cannot retarget staged rootfs identity' >&2; exit 60; }
+fi
+[ "\$(blkid -p -s UUID -o value -- '$rootfs_new' | tr A-F a-f)" = '$ROOTFS_PUBLISH_UUID' ] ||
+  { echo 'staged rootfs identity verification failed' >&2; exit 60; }
+rootfs_backup='$VOL_PATH/xenoid-rootfs.img.pre-source-$STORAGE_TRANSACTION'
+if [ -e '$VOL_PATH/xenoid-rootfs.img' ]; then
+  [ -f '$VOL_PATH/xenoid-rootfs.img' ] && [ ! -L '$VOL_PATH/xenoid-rootfs.img' ] &&
+    [ "\$(blkid -p -s TYPE -o value -- '$VOL_PATH/xenoid-rootfs.img' 2>/dev/null)" = ext4 ] ||
+    { echo 'existing rootfs image is invalid' >&2; exit 41; }
+  [ '$STORAGE_TRANSACTION' != - ] ||
+    { echo 'rootfs replacement requires a storage transaction' >&2; exit 43; }
+  if [ -e "\$rootfs_backup" ]; then
+    [ -f "\$rootfs_backup" ] && [ ! -L "\$rootfs_backup" ] &&
+      [ "\$(blkid -p -s TYPE -o value -- "\$rootfs_backup" 2>/dev/null)" = ext4 ] ||
+      { echo 'rootfs backup is invalid' >&2; exit 41; }
+    rm -- '$VOL_PATH/xenoid-rootfs.img'
+  else
+    mv '$VOL_PATH/xenoid-rootfs.img' "\$rootfs_backup"
+  fi
+  sync -f '$VOL_PATH'
+fi
 mv '$rootfs_new' '$VOL_PATH/xenoid-rootfs.img'
-printf '%s' '$digest' > '$VOL_PATH/xenoid-rootfs.img.sha256'
-rm -rf '$work_dir'
+printf '%s' '$digest' > '$VOL_PATH/.xenoid-rootfs.img.sha256.$$'
+chmod 0644 '$VOL_PATH/.xenoid-rootfs.img.sha256.$$'
+mv '$VOL_PATH/.xenoid-rootfs.img.sha256.$$' '$VOL_PATH/xenoid-rootfs.img.sha256'
+printf '%s' '$ROOTFS_SOURCE_SHA256' > '$VOL_PATH/.xenoid-rootfs.img.source.sha256.$$'
+chmod 0644 '$VOL_PATH/.xenoid-rootfs.img.source.sha256.$$'
+mv '$VOL_PATH/.xenoid-rootfs.img.source.sha256.$$' '$VOL_PATH/xenoid-rootfs.img.source.sha256'
+sync -f '$VOL_PATH'
 EOF
 )"
   trap - EXIT
   echo "rootfs image rebuilt"
 fi
+
+ROOTFS_INFO="$(host_sh "$(cat <<EOF
+set -eu
+rootfs='$VOL_PATH/xenoid-rootfs.img'
+[ -f "\$rootfs" ] && [ ! -L "\$rootfs" ] && [ -s "\$rootfs" ] &&
+  [ "\$(blkid -p -s TYPE -o value -- "\$rootfs" 2>/dev/null)" = ext4 ] ||
+  { echo 'rootfs image missing or invalid' >&2; exit 41; }
+actual="\$(blkid -p -s UUID -o value -- "\$rootfs" | tr A-F a-f)"
+[ "\$actual" = '$ROOTFS_PUBLISH_UUID' ] ||
+  { echo 'rootfs image UUID mismatch' >&2; exit 42; }
+marker='$VOL_PATH/xenoid-rootfs.img.source.sha256'
+[ -f "\$marker" ] && [ ! -L "\$marker" ] &&
+  [ "\$(stat -c %u -- "\$marker")" = 0 ] ||
+  { echo 'rootfs source marker is unsafe' >&2; exit 41; }
+[ "\$(cat '$VOL_PATH/xenoid-rootfs.img.source.sha256' 2>/dev/null)" = '$ROOTFS_SOURCE_SHA256' ] ||
+  { echo 'rootfs source marker mismatch' >&2; exit 41; }
+printf 'XENOID_ROOTFS_UUID=%s\n' "\$actual"
+printf 'XENOID_ROOTFS_SOURCE_SHA256=%s\n' '$ROOTFS_SOURCE_SHA256'
+printf 'XENOID_ROOTFS_LOGICAL_SIZE=%s\n' "\$(stat -c %s -- "\$rootfs")"
+backup='$VOL_PATH/xenoid-rootfs.img.pre-source-$STORAGE_TRANSACTION'
+if [ '$STORAGE_TRANSACTION' != - ] && [ -e "\$backup" ]; then
+  [ -f "\$backup" ] && [ ! -L "\$backup" ] && [ -s "\$backup" ] &&
+    [ "\$(blkid -p -s TYPE -o value -- "\$backup" 2>/dev/null)" = ext4 ] ||
+    { echo 'rootfs backup is invalid' >&2; exit 41; }
+  printf 'XENOID_ROOTFS_BACKUP_IMAGE=%s\n' 'xenoid-rootfs.img.pre-source-$STORAGE_TRANSACTION'
+  printf 'XENOID_ROOTFS_BACKUP_UUID=%s\n' "\$(blkid -p -s UUID -o value -- "\$backup" | tr A-F a-f)"
+  printf 'XENOID_ROOTFS_BACKUP_SIZE=%s\n' "\$(stat -c %s -- "\$backup")"
+fi
+EOF
+)")"
 
 DATA_PATH="$VOL_PATH/xenoid-data.img"
 SOURCE_VOL_PATH=""
@@ -248,7 +333,11 @@ case "\$action" in
     if [ ! -e "\$tmp" ]; then
       backing_guard
       truncate -s "\$data_size_bytes" "\$tmp"
-      mkfs.ext4 -q -F "\$tmp" ||
+      if [ "\$expected_uuid" = - ]; then
+        mkfs.ext4 -q -F "\$tmp"
+      else
+        mkfs.ext4 -q -F -U "\$(lower_uuid "\$expected_uuid")" "\$tmp"
+      fi ||
         { echo 'mkfs.ext4 failed, possibly due to backing storage exhaustion' >&2; exit 62; }
       sync -f "\$tmp"
     fi
@@ -315,5 +404,6 @@ case "\$action" in
 esac
 EOF
 )" )"
+printf '%s\n' "$ROOTFS_INFO"
 printf '%s\n' "$data_info"
 echo "OK rootfs=$VOL_PATH/xenoid-rootfs.img data=$DATA_PATH action=$DATA_ACTION"

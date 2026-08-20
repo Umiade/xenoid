@@ -49,6 +49,10 @@ while IFS= read -r source; do SRCS+=("$source"); done < <(find "$GEN" -name '*.c
 OUT="$HAL/$SERVICE"
 "$CXX" -std=c++17 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
   -fvisibility=hidden -fvisibility-inlines-hidden -fno-rtti \
+  "-ffile-prefix-map=$HAL=android/hardware/radio/config/default" \
+  "-fmacro-prefix-map=$HAL=android/hardware/radio/config/default" \
+  "-ffile-prefix-map=$SDK=android-sdk" \
+  "-fmacro-prefix-map=$SDK=android-sdk" \
   -ffunction-sections -fdata-sections --sysroot="$SYSROOT" -I"$GEN" -I"$SYSROOT/usr/include" \
   -o "$OUT" "${SRCS[@]}" -L"$SYSROOT/usr/lib/$TRIPLE/30" \
   "$HAL/libbinder_ndk.so" -llog -static-libstdc++ \

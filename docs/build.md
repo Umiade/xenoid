@@ -1,5 +1,21 @@
 # Build Xenoid Components
 
+## Artifact records and reuse
+
+All production build consumers use `ArtifactBuilder`; no image, OTA, package, deploy, or `up` path silently compiles a second artifact set. The 20 public targets are published as `dev.xenoid.artifact/v1` records over immutable SHA-256 objects. Each record binds declared sources, command/flags, normalized build environment, resolved toolchain identities, and every output path, mode, size, architecture, and digest. The aggregate manifest digest excludes timestamps and logs.
+
+Normal `./xenoid build all` hashes inputs and reuses valid records. Missing mutable public outputs are rematerialized from the immutable objects without compilation. Stale targets build under normalized output-directory locks with at most four workers and a shared CPU-slot budget; disjoint targets may run concurrently, while helpers that share an output directory serialize. Failed targets publish no record, and dependents are reported blocked.
+
+`./xenoid build all --force` deliberately rebuilds every target. If the same input/tool identity produces different bytes, modes, or sizes, it fails `artifact_nondeterministic` and retains the prior successful record. `./xenoid up --skip-build` is validation-only: it refuses missing/stale records, unsafe or changed objects, wrong modes/architecture, and source/tool drift instead of compiling.
+
+The `runtimeContext`, `liveDeploy`, and `release` consumers stage only validated record/object snapshots. Generated runtime contexts are canonical: paths are sorted, modes and timestamps are fixed, symlinks/special files are rejected, and `context-manifest.json` records each relative path/type/mode/size/SHA-256. Both patched JAR producers use the same pinned apktool and canonical ZIP writer.
+
+## Content-addressed runtime images
+
+`./xenoid runtime-build-image` and production `up` share `RuntimeImageBuilder`. Its full `inputSha256` covers the immutable ARM64 base image ID, validated runtime-context artifact tuples, canonical recipes and redroid sources, Python/zlib/Java/BuildKit identities, pinned apktool, and sorted Google inputs. `bootInputSha256` substitutes the daemon seed integration contract for ordinary daemon APK bytes, so an update-compatible APK-only change can be live-installed without recreating storage ownership.
+
+The configured `runtime_image_tag` is a repository namespace, not a mutable effective tag. Publication uses `<repository>:xenoid-<first-32-input-hex>` and labels the full input, boot input, and immutable base ID under an engine-host lock. Production base references should be digest-pinned. Mutable tags remain explicit locally observed update inputs and are never implicitly pulled by `up`; an explicit digest must match. A conflicting occupied content tag, changed base/input during build, or unsupported reproducibility control fails without replacing the prior image. `start --recreate` consumes a verified image and never builds one.
+
 ## Host CLI/MCP
 
 No external Python dependencies are required.
@@ -51,6 +67,8 @@ The transparent data plane runs on the selected Docker engine host. On first `pr
 
 The daemon APK contains the encrypted desired-state manager and ordinary-app IPv4/IPv6 DNS, TCP, and UDP probes. Host Python modules and the engine/agent scripts are included in release bundles.
 
+The daemon's proxy desired state uses its own app-private v2 AES-256-GCM key and crash-resume transaction store; it has no build-time or KeyMint-key dependency. No proxy source, URL credential, private cache, quarantine byte, key material, or evidence object may enter an artifact record, context, image, package, or log. Unreadable state is recovered only by authenticated import or explicit evidence-preserving discard.
+
 
 ## Daemon APK
 
@@ -79,6 +97,8 @@ The mock daemon API smoke is runtime-free and uses generated dummy keybox bytes 
 ```bash
 scripts/smoke-daemon-api.sh --mock
 ```
+
+Daemon startup is listener-first. Transport binds before component reconciliation; the host then authenticates rootd and joins one bounded generation for root, Keybox, proxy, location, and camera. Aggregate `/health` remains a final acceptance check, not a prerequisite. The host never creates or caches daemon/root tokens, and artifacts/progress/results must not contain those credentials.
 
 ## Android 13 KeyMint HAL service
 
@@ -158,30 +178,25 @@ The contract requires the implemented back/front cameras, rear flash, accelerome
 
 ```bash
 ./xenoid build all
+./xenoid build all --force
 ```
 
-Expected verification on Apple Silicon macOS:
+The result is one `dev.xenoid.artifacts/v1` JSON document with each target in `reused`, `built`, `failed`, or `blocked` state, duration, and the aggregate manifest digest. Only failed targets may carry sanitized bounded tails. A warm unchanged build launches no compiler/Gradle/Cargo child. `--force` is the clean deterministic evidence path for release/debug work; it is not the normal `up` behavior.
 
+Runtime images do not read these mutable output paths. They consume the `runtimeContext` artifact snapshot and publish by verified content identity. Daemon-only full-image drift may remain deferred on a boot-compatible running image when PackageManager proves the seed contract and nondecreasing update compatibility; base/framework/HAL/Google/create-spec drift selects a new image and recreate.
 
-- daemon APK: built and signed
-- native input helper: built for `aarch64-linux-android21`
-- camera provider: built for Android ARM64 with stable-AIDL VINTF registration
-- enhanced gralloc: built for Android ARM64 with legacy RGB/framebuffer ABI preserved
-- Android 13 KeyMint HAL service from external TEESimulator sources: validated ARM64 PIE executable with VINTF registration
-- doctor: passed
-
-## Verify and bundle OTA
+## OTA and release chain
 
 ```bash
-./xenoid doctor
 ./xenoid ota make --version 0.1.0-dev
+./scripts/verify.sh --fresh
+./xenoid package-release --version 0.1.0-dev
+./xenoid verify-release dist/release/xenoid-0.1.0-dev.tar.gz
 ```
 
-Bundle output:
+OTA/context/package consumers never compile a missing artifact. Release packaging runs the acyclic release gate profile with `--fresh`, stages an invocation-private validated artifact snapshot, creates canonical OTA and package archives with fixed `SOURCE_DATE_EPOCH`, and mandates `verify-release` on the candidate before atomic publication. A second package operation with the same source/tool/epoch inputs must produce the same archive SHA-256.
 
-```text
-dist/ota/xenoid-0.1.0-dev.tar.gz
-```
+The archive contains sanitized `dev.xenoid.gates/v1` evidence and an explicitly offline `doctor.json` with `complete=false`; packaging never claims live runtime acceptance. Public release material may contain source, fixed tool/artifact/content digests, signer/package inventory, and reproducibility metadata. It must not contain local paths, endpoints, credentials/tokens/cookies, proxy sources or keys, Keybox material, imported Google bytes, device captures/identifiers, runtime state, or assessment details.
 
 ## Hide helper and runtime context
 
@@ -189,6 +204,8 @@ dist/ota/xenoid-0.1.0-dev.tar.gz
 ./xenoid build hide
 ./xenoid runtime-context
 ```
+
+`runtime-context` validates and stages the complete `runtimeContext` snapshot; it never invokes a fallback build. The canonical manifest and all staged bytes/modes/times must verify before image build.
 
 Outputs:
 
@@ -210,21 +227,17 @@ An operator-provided official archive is deeply verified during `google-services
 
 The generated ZIP, PEM, expanded payload, probe APK, and runtime context are private or regenerable artifacts. Only `data/google-services/mindthegapps-13.0.0-arm64-20231025_200931.json` is tracked. Release packaging and verification reject `.xenoid/`, ZIP/PEM payloads, and unregistered Google metadata.
 
-## Verification coverage
+## Validation DAG and observational acceptance
 
-`./xenoid doctor` checks:
+`scripts/verify.sh` is a thin caller of the digest-aware `GateRunner` DAG. Successful runtime-free gates may be reused only when their complete source/data/tool/artifact input digest still matches. `--fresh` deliberately ignores prior successes; sensitive-data audit always recomputes the tracked/untracked candidate inventory and bytes. Independent gates run concurrently, dependencies block after failure, and stdout is one `dev.xenoid.verify/v1` document while stderr carries sanitized JSONL progress.
 
-- host dependencies and redroid preflight
-- Python compilation
-- CLI dry-run, MCP tool/handler dispatch parity, and remote service contracts
-- mock daemon API contract
-- deterministic proxy source compilation, bounded subscription fetching, authenticated/replay-safe engine protocol, and fixed-instance controller race contracts
-- ADB/boot/daemon/root state when Android is running
+`scripts/ci.sh` selects the same non-recursive catalog: static by default, `--runtime` for explicit fresh convergence/protection/persistence/dual-instance work, and `--full` for the additional cellular/camera/Google/release gates. No audit-bypass environment variable exists, and no gate recursively invokes verify, CI, doctor, or itself.
 
-`./xenoid doctor --full --require-runtime` additionally rebuilds artifacts and
-checks OTA, runtime context, hook surfaces, and the live runtime smoke path.
+`doctor` is observational. It consumes selected GateRunner records plus a fresh `LiveAcceptance` result for an already-running runtime. `doctor --full` selects the broader doctor-safe record set, but never builds artifacts/images, packages, calls `up`, ensures daemon/rootd, or invokes mutating runtime/release gates. Cache hits cannot make `complete=true`; only a fresh live observation can.
 
-Kernel module builds are transactional. `scripts/build-kmod.sh` compiles in a staging directory, preserves the previous module as a last-known-good copy, replaces the loaded module only after compilation succeeds, and attempts to restore the previous module if `insmod` or a required probe registration fails. The required permission probes are `security_socket_create` and `security_netlink_send`; a vendor kernel that does not expose them fails the load before Android startup. The cellular runtime probe uses schema v2 and must show ordinary-app `RTM_GETLINK` `sendto` as `EACCES`, ordinary GETADDR/GETROUTE success, isolated non-Unix socket `EACCES`, and privileged `xenoid-netctl` success.
+`LiveAcceptance` never converges. It reads immutable runtime/storage identity, ADB boot, daemon transport and component status, rootd, location/camera, exact proxy proof, Google binding, aggregate health, and shared protection. Production convergence and regeneration journal acceptance only from that fresh observer, never from doctor or a suite.
+
+Kmod/eBPF are one engine-host shared deployment. Their digest includes selected engine/kernel/config/BTF/header/source/tool/loader/probe inputs. Replacement artifacts are built and validated before the last-known-good deployment is touched. A matching module/link/map inventory is reused; eBPF stages transactional pins, while kmod replacement requires zero active owned runtimes. Active siblings yield `shared_protection_reload_requires_maintenance` without unloading protection. Direct unload requires explicit maintenance and zero active runtimes; `stop` never unloads it.
 
 ## Location cellular runtime (RIL / RadioConfig)
 

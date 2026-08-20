@@ -138,6 +138,12 @@ if [[ "$BUILD_MODE" != "1" ]]; then
   printf '%s\n' 'native/xenoid-keymint/xenoid-keymint'
   exit 0
 fi
+JOBS="${XENOID_BUILD_JOBS:-1}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "invalid artifact build allocation" >&2
+  exit 64
+}
+export CARGO_BUILD_JOBS="$JOBS"
 
 # --build: compile from the in-tree sources.
 [[ -f "$ARTIFACT_DIR/CMakeLists.txt" && -f "$ARTIFACT_DIR/src/keymint_service.cpp" ]] \
@@ -228,7 +234,8 @@ if ! ANDROID_HOME="$SDK" ANDROID_SDK_ROOT="$SDK" ANDROID_NDK="$NDK" \
   fail "source_configure_failed"
 fi
 if ! ANDROID_HOME="$SDK" ANDROID_SDK_ROOT="$SDK" ANDROID_NDK="$NDK" \
-  "$CMAKE" --build "$BUILD" --target xenoid_keymint_service >"$LOG" 2>&1; then
+  "$CMAKE" --build "$BUILD" --target xenoid_keymint_service \
+    --parallel "$JOBS" >"$LOG" 2>&1; then
   fail "source_build_failed"
 fi
 

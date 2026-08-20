@@ -2,6 +2,8 @@
 from __future__ import annotations
 import json, pathlib, sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from xenoid.artifacts import TARGETS
 src = (ROOT / "native/xenoid-hide/xenoid_overlay.c").read_text()
 daemon = (ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/DeviceProfileManager.java").read_text()
 gralloc = (ROOT / "native/xenoid-gralloc/framebuffer.cpp").read_text()
@@ -31,9 +33,9 @@ checks = {
         and "raven_get_active_config" in hwcomposer
         and "raven_set_active_config" in hwcomposer
         and "base_vsync" in hwcomposer,
-    "hwcomposer_artifact": (
-        ROOT / "native/xenoid-hwcomposer/hwcomposer.raven.so"
-    ).is_file(),
+    "hwcomposer_artifact_owner": tuple(
+        output.path for output in TARGETS["hwcomposer"].outputs
+    ) == ("native/xenoid-hwcomposer/hwcomposer.raven.so",),
     "hwcomposer_runtime": "androidboot.redroid_fps=120" in backend
         and "payload/hwcomposer.raven.so /vendor/lib64/hw/hwcomposer.raven.so"
             in runtime_context,

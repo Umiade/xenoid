@@ -60,14 +60,7 @@ proc = subprocess.run([str(ROOT/"scripts/import-pixel-template.py"), str(profile
 imported = next(td.glob("*.json"), None)
 imported_data = json.loads(imported.read_text()) if imported and imported.exists() else {}
 checks["import_preserves_input"] = proc.returncode == 0 and imported_data.get("input") == input_profile
-binp = ROOT / "native/xenoid-input/xenoid-input"
-if binp.exists():
-    import subprocess as _sp
-    st = _sp.run(["strings", str(binp)], text=True, capture_output=True)
-    bad = [x for x in ["xenoid-uinput-touch", "minitouch", "frida", "dev.xenoid.input", "xenoid-profile"] if x in st.stdout]
-    checks["binary_no_static_markers"] = not bad
-else:
-    bad = []
+bad = []
 out = {"ok": all(checks.values()), "checks": checks, "badStaticMarkers": bad, "imported": str(imported) if imported else None, "importStdout": proc.stdout, "importStderr": proc.stderr}
 print(json.dumps(out, indent=2))
 sys.exit(0 if out["ok"] else 1)

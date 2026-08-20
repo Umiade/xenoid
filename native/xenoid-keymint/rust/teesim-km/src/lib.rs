@@ -27,7 +27,8 @@ use kmr_crypto_boring::{
     hmac::BoringHmac, rng::BoringRng, rsa::BoringRsa, sha256::BoringSha256,
 };
 use kmr_ta::device::{
-    BootloaderDone, Implementation, RetrieveAttestationIds, TrustedPresenceUnsupported,
+    BootloaderDone, Implementation, RetrieveAttestationIds, RetrieveCertSigningInfo,
+    TrustedPresenceUnsupported,
 };
 use kmr_ta::{HalInfo, HardwareInfo, KeyMintTa, RpcInfo, RpcInfoV3};
 use kmr_wire::keymint::{BootInfo, SecurityLevel, VerifiedBootState};
@@ -91,9 +92,9 @@ fn crypto_impls() -> crypto::Implementation {
 /// The in-process TA plus the state the router needs around it.
 pub struct Ta {
     inner: KeyMintTa,
-    /// Retained copy of the keybox signing keys. kmr-ta owns its own copy for generation but does
-    /// not expose it, and patch mode needs it to re-sign a real attestation leaf under the keybox.
-    sign_info: attest::CertSignInfo,
+    /// Retained keybox signing keys when attestation is configured. The platform
+    /// fallback profile has none and still serves non-attested AndroidKeyStore keys.
+    sign_info: Option<attest::CertSignInfo>,
     /// The profile's root of trust (locked/Verified) as a DER `RootOfTrust` SEQUENCE, spliced into a
     /// real leaf's attestation extension in patch mode. Identical to what generation emits.
     patch_rot: Vec<u8>,
@@ -179,7 +180,11 @@ impl Ta {
 
     /// Build a TA from a fully resolved profile configuration.
     pub fn new_ex(cfg: TaConfig) -> Result<Self, String> {
-        let sign_info = attest::CertSignInfo::new(cfg.keybox_xml)?;
+        let sign_info = if cfg.keybox_xml.is_empty() {
+            None
+        } else {
+            Some(attest::CertSignInfo::new(cfg.keybox_xml)?)
+        };
 
         let security_level = match cfg.security_level {
             0 => SecurityLevel::Software,
@@ -207,9 +212,12 @@ impl Ta {
             .attestation_ids
             .map(|ids| Box::new(device::AttestIds(ids)) as Box<dyn RetrieveAttestationIds>);
 
+        let signing_provider: Option<Box<dyn RetrieveCertSigningInfo>> = sign_info
+            .clone()
+            .map(|info| Box::new(info) as Box<dyn RetrieveCertSigningInfo>);
         let dev = Implementation {
             keys: Box::new(device::Keys),
-            sign_info: Some(Box::new(sign_info.clone())),
+            sign_info: signing_provider,
             attest_ids,
             // Rollback-resistant keys are declined (no secure-deletion store).
             sdd_mgr: None,

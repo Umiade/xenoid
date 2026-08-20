@@ -1,0 +1,1516 @@
+#!/usr/bin/env python3
+"""Runtime-free contracts for the single resumable convergence owner.
+
+The fakes model immutable engine/runtime observations and low-level idempotent
+manager calls.  They never execute Docker, ADB, a build wrapper, a CLI, or a
+network request.
+"""
+from __future__ import annotations
+
+import contextlib
+import copy
+import dataclasses
+import inspect
+import json
+import os
+import stat
+import tempfile
+from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT / "src"))
+
+from xenoid import convergence  # noqa: E402
+
+
+INSTANCE_ID = "10000000-0000-4000-8000-000000000001"
+DATA_UUID = "20000000-0000-4000-8000-000000000001"
+ROOTFS_UUID = "30000000-0000-4000-8000-000000000001"
+TARGET_DATA_UUID = "40000000-0000-4000-8000-000000000001"
+TARGET_ROOTFS_UUID = "50000000-0000-4000-8000-000000000001"
+OLD_CONTAINER = "a" * 64
+SEED_CONTAINER = "b" * 64
+NEW_CONTAINER = "c" * 64
+INPUT_DIGEST = "1" * 64
+BOOT_DIGEST = "2" * 64
+IMAGE_ID = "sha256:" + "3" * 64
+OBSERVATION_DIGEST = "4" * 64
+PROTECTION_DIGEST = "5" * 64
+PROTECTION_ENGINE_ID = "7" * 64
+ARTIFACT_DIGEST = "6" * 64
+PLAN_KEYS = {
+    "schema",
+    "resolution",
+    "artifactTargets",
+    "artifactRecords",
+    "imageAction",
+    "desiredImageInputSha256",
+    "desiredImageBootInputSha256",
+    "selectedImageRecord",
+    "runtimeAction",
+    "bootSeedAction",
+    "recreateReasons",
+    "liveObservationRequired",
+    "daemonAction",
+    "deployComponents",
+    "identityAction",
+    "locationAction",
+    "proxyAction",
+    "keyboxAction",
+    "cameraAction",
+    "googleAction",
+    "protectionAction",
+    "acceptanceChecks",
+    "planDigest",
+}
+JOURNAL_KEYS = {
+    "schema",
+    "instanceId",
+    "operationId",
+    "regenerationTransactionId",
+    "plan",
+    "planDigest",
+    "phase",
+    "selectedImageInputSha256",
+    "selectedImageBootInputSha256",
+    "protectionEngineId",
+    "protectionExpectedDigest",
+    "oldContainerId",
+    "seedContainerId",
+    "newContainerId",
+    "observedDataUuid",
+    "observedRootfsUuid",
+    "bootSeedTarget",
+    "proxyGeneration",
+    "proxyEnabled",
+    "proxyQuarantineRequired",
+    "proxyQuarantined",
+    "liveResolution",
+    "completed",
+    "createdAt",
+    "updatedAt",
+}
+PHASES = (
+    "planned",
+    "quarantined",
+    "image_ensured",
+    "runtime_quiesced",
+    "shared_protection_maintained",
+    "seed_runtime_started",
+    "seed_initialized",
+    "container_removed",
+    "storage_converged",
+    "container_created",
+    "runtime_started",
+    "live_resolved",
+    "components_deployed",
+    "control_ready",
+    "identity_converged",
+    "location_converged",
+    "keybox_converged",
+    "camera_converged",
+    "google_converged",
+    "proxy_converged",
+    "protection_converged",
+    "accepted",
+)
+
+Case = Callable[[], None]
+CASES: dict[str, Case] = {}
+
+
+class ContractFailure(AssertionError):
+    pass
+
+
+def case(name: str) -> Callable[[Case], Case]:
+    def register(function: Case) -> Case:
+        if name in CASES:
+            raise RuntimeError(f"duplicate case: {name}")
+        CASES[name] = function
+        return function
+    return register
+
+
+def require(value: bool, message: str) -> None:
+    if not value:
+        raise ContractFailure(message)
+
+
+def selected_image() -> dict[str, Any]:
+    return {
+        "schema": "dev.xenoid.runtime-image/v1",
+        "inputSha256": INPUT_DIGEST,
+        "bootInputSha256": BOOT_DIGEST,
+        "imageId": IMAGE_ID,
+        "derivedTag": "xenoid/redroid:xenoid-" + INPUT_DIGEST[:32],
+    }
+
+
+def artifact_record(target: str = "daemon") -> dict[str, Any]:
+    return {
+        "schema": "dev.xenoid.artifact/v1",
+        "target": target,
+        "inputSha256": ARTIFACT_DIGEST,
+        "toolSha256": "7" * 64,
+        "outputs": [
+            {
+                "path": f"out/{target}",
+                "mode": 0o755,
+                "size": 4,
+                "sha256": "8" * 64,
+            }
+        ],
+    }
+
+
+def healthy_snapshot() -> dict[str, Any]:
+    return {
+        "instanceId": INSTANCE_ID,
+        "artifactTargets": [],
+        "artifactRecords": [artifact_record()],
+        "desiredImageInputSha256": INPUT_DIGEST,
+        "desiredImageBootInputSha256": BOOT_DIGEST,
+        "selectedImageRecord": selected_image(),
+        "runtime": {
+            "state": "running",
+            "containerId": OLD_CONTAINER,
+            "ownershipValid": True,
+            "integrationIdentityValid": True,
+            "storageValid": True,
+            "createSpecMatches": True,
+            "networkMatches": True,
+            "volumeMatches": True,
+            "imageInputSha256": INPUT_DIGEST,
+            "imageBootInputSha256": BOOT_DIGEST,
+            "dataUuid": DATA_UUID,
+            "rootfsUuid": ROOTFS_UUID,
+            "bootSeedRequired": False,
+        },
+        "components": {
+            "daemon": {"state": "matching"},
+            "deploy": {
+                "input": "matching",
+                "hide": "matching",
+                "profile": "matching",
+                "rootd": "matching",
+                "netctl": "matching",
+                "ssaid": "matching",
+            },
+            "identity": {"state": "matching"},
+            "location": {"state": "matching"},
+            "proxy": {
+                "state": "matching",
+                "generation": 7,
+                "enabled": False,
+                "quarantineRequired": False,
+            },
+            "keybox": {"state": "matching"},
+            "camera": {"state": "matching"},
+            "google": {"state": "matching"},
+            "protection": {
+                "state": "matching",
+                "expectedDigest": PROTECTION_DIGEST,
+                "currentDigest": PROTECTION_DIGEST,
+                "replacementRequired": False,
+                "maintenanceRequired": False,
+                "observed": {
+                    "ok": True,
+                    "engineId": PROTECTION_ENGINE_ID,
+                    "expectedDigest": PROTECTION_DIGEST,
+                    "currentDigest": PROTECTION_DIGEST,
+                    "replacementRequired": False,
+                    "maintenanceRequired": False,
+                },
+            },
+        },
+        "acceptanceChecks": [
+            "container",
+            "storage",
+            "identity",
+            "daemon",
+            "rootd",
+            "location",
+            "keybox",
+            "camera",
+            "google",
+            "proxy",
+            "protection",
+        ],
+    }
+
+
+class FakeManager:
+    def __init__(self, root: Path, snapshot: Mapping[str, Any]) -> None:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
+        self.context = SimpleNamespace(state_root=root, instance_id=INSTANCE_ID)
+        self.snapshot = copy.deepcopy(dict(snapshot))
+        self.calls: list[tuple[str, Any]] = []
+        self.observe_count = 0
+        self.fail_once: dict[str, str] = {}
+        self.interrupt_once: set[str] = set()
+        self.cancelled = 0
+        self.convergence_deadline: float | None = None
+        self._seed_container: str | None = None
+
+    def observe_convergence(self, skip_build: bool = False) -> dict[str, Any]:
+        self.observe_count += 1
+        self.calls.append(("observe", skip_build))
+        return copy.deepcopy(self.snapshot)
+
+    @contextlib.contextmanager
+    def instance_operation_lock(self) -> Iterator[None]:
+        self.calls.append(("lock", "enter"))
+        try:
+            yield
+        finally:
+            self.calls.append(("lock", "exit"))
+
+    def acceptance_context(self) -> Any:
+        self.calls.append(("acceptance-context", {}))
+        return {"manager": self}
+
+    def cancel_convergence(self, reason: str = "convergence_cancelled") -> None:
+        self.calls.append(("cancel", reason))
+        self.cancelled += 1
+
+    def _result(self, name: str, **values: Any) -> dict[str, Any]:
+        self.calls.append((name, copy.deepcopy(values)))
+        if name in self.interrupt_once:
+            self.interrupt_once.remove(name)
+            raise KeyboardInterrupt
+        code = self.fail_once.pop(name, None)
+        if code is not None:
+            return {
+                "ok": False,
+                "error": code,
+                "message": "/private/operator token=must-not-leak",
+            }
+        return {"ok": True, **values}
+
+    def quarantine_proxy_for_lifecycle(
+        self, expected_data_uuid: str | None, operation_id: str
+    ) -> dict[str, Any]:
+        return self._result(
+            "quarantine",
+            dataUuid=expected_data_uuid,
+            quarantined=True,
+            operationId=operation_id,
+        )
+
+    def ensure_runtime_image(
+        self, expected_input_sha256: str, expected_boot_input_sha256: str
+    ) -> dict[str, Any]:
+        record = selected_image()
+        self.snapshot["selectedImageRecord"] = record
+        return self._result("image", selectedImageRecord=record)
+
+    def quiesce_owned_container(
+        self, expected_container_id: str | None
+    ) -> dict[str, Any]:
+        self.snapshot["runtime"]["state"] = "stopped"
+        return self._result("quiesce", containerId=expected_container_id, preserved=True)
+
+    def maintain_shared_protection(
+        self, expected_digest: str | None
+    ) -> dict[str, Any]:
+        protection = self.snapshot["components"]["protection"]
+        protection.update(
+            {
+                "state": "matching",
+                "currentDigest": expected_digest,
+                "replacementRequired": False,
+                "maintenanceRequired": False,
+            }
+        )
+        protection["observed"].update(
+            {
+                "ok": True,
+                "currentDigest": expected_digest,
+                "replacementRequired": False,
+                "maintenanceRequired": False,
+            }
+        )
+        return self._result(
+            "maintain-protection",
+            currentDigest=expected_digest,
+        )
+
+    def start_seed_runtime(
+        self, image_record: Mapping[str, Any], boot_seed_target: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        del image_record, boot_seed_target
+        self._seed_container = SEED_CONTAINER
+        self.snapshot["runtime"].update({"state": "running", "containerId": SEED_CONTAINER})
+        return self._result("seed-start", containerId=SEED_CONTAINER)
+
+    def initialize_seed_runtime(
+        self, expected_container_id: str, boot_seed_target: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        del boot_seed_target
+        self.snapshot["runtime"]["bootSeedRequired"] = False
+        return self._result("seed-initialize", containerId=expected_container_id)
+
+    def remove_owned_container_for_recreate(
+        self,
+        expected_container_id: str | None = None,
+        *,
+        prepare_location: bool = False,
+    ) -> dict[str, Any]:
+        self.snapshot["runtime"].update({"state": "absent", "containerId": None})
+        return self._result(
+            "remove",
+            oldContainerId=expected_container_id,
+            removed=True,
+            prepareLocation=prepare_location,
+        )
+
+    def remove_owned_container_for_regenerate(
+        self, expected_container_id: str | None = None
+    ) -> dict[str, Any]:
+        return self.remove_owned_container_for_recreate(expected_container_id)
+
+    def converge_storage(
+        self,
+        boot_seed_target: Mapping[str, Any] | None,
+        regeneration_capability: Any,
+    ) -> dict[str, Any]:
+        del regeneration_capability
+        data_uuid = (
+            boot_seed_target.get("dataUuid")
+            if isinstance(boot_seed_target, Mapping)
+            else DATA_UUID
+        ) or DATA_UUID
+        rootfs_uuid = (
+            boot_seed_target.get("rootfsUuid")
+            if isinstance(boot_seed_target, Mapping)
+            else ROOTFS_UUID
+        ) or ROOTFS_UUID
+        self.snapshot["runtime"].update(
+            {"dataUuid": data_uuid, "rootfsUuid": rootfs_uuid, "storageValid": True}
+        )
+        return self._result("storage", dataUuid=data_uuid, rootfsUuid=rootfs_uuid)
+
+    def create_owned_container(
+        self,
+        image_record: Mapping[str, Any],
+        expected_data_uuid: str | None,
+        expected_rootfs_uuid: str | None,
+    ) -> dict[str, Any]:
+        del image_record
+        self.snapshot["runtime"].update(
+            {
+                "state": "stopped",
+                "containerId": NEW_CONTAINER,
+                "dataUuid": expected_data_uuid,
+                "rootfsUuid": expected_rootfs_uuid,
+                "imageInputSha256": INPUT_DIGEST,
+                "imageBootInputSha256": BOOT_DIGEST,
+                "createSpecMatches": True,
+                "networkMatches": True,
+                "volumeMatches": True,
+            }
+        )
+        return self._result("create", containerId=NEW_CONTAINER)
+
+    def start_owned_container(self, expected_container_id: str, wait: bool = True) -> dict[str, Any]:
+        self.snapshot["runtime"].update(
+            {"state": "running", "containerId": expected_container_id}
+        )
+        return self._result("start", containerId=expected_container_id, waited=wait)
+
+    def deploy_components(
+        self,
+        mapping: Mapping[str, Any],
+        artifact_records: Any,
+        expected_container_id: str,
+    ) -> dict[str, Any]:
+        del artifact_records
+        daemon = mapping.get("daemon")
+        if daemon in {"install", "reconcile"}:
+            self.snapshot["components"]["daemon"]["state"] = "matching"
+        deploy = {name: action for name, action in mapping.items() if name != "daemon"}
+        if isinstance(deploy, Mapping):
+            for name, action in deploy.items():
+                if action not in {None, "reuse", "inspect"}:
+                    self.snapshot["components"]["deploy"][name] = "matching"
+        return self._result(
+            "deploy", actions=dict(mapping), containerId=expected_container_id
+        )
+
+    def reconcile_control_plane(self) -> dict[str, Any]:
+        self.snapshot["components"]["daemon"]["state"] = "matching"
+        return self._result("control", controlReady=True)
+
+    def _component(self, name: str, action: Any) -> dict[str, Any]:
+        self.snapshot["components"][name]["state"] = "matching"
+        return self._result(name, action=action)
+
+    def reconcile_identity(self, action: Any, regeneration_capability: Any) -> dict[str, Any]:
+        del regeneration_capability
+        return self._component("identity", action)
+
+    def reconcile_location(self, action: Any, regeneration_capability: Any) -> dict[str, Any]:
+        del regeneration_capability
+        return self._component("location", action)
+
+    def reconcile_keybox(self, action: Any) -> dict[str, Any]:
+        return self._component("keybox", action)
+
+    def reconcile_camera(self, action: Any) -> dict[str, Any]:
+        return self._component("camera", action)
+
+    def reconcile_google(
+        self,
+        action: Any,
+        fresh_bootstrap: bool = False,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            (
+                "google-bootstrap",
+                {"freshBootstrap": fresh_bootstrap},
+            )
+        )
+        return self._component("google", action)
+
+    def reconcile_proxy_desired(self) -> dict[str, Any]:
+        proxy = self.snapshot["components"]["proxy"]
+        proxy["state"] = "matching"
+        proxy["generation"] = 7
+        enabled = proxy.get("enabled")
+        return self._result(
+            "proxy",
+            generation=7,
+            enabled=enabled if isinstance(enabled, bool) else False,
+            dataPlaneVerified=True,
+        )
+
+    def reconcile_protection(self, action: Any, expected_digest: str | None) -> dict[str, Any]:
+        self.snapshot["components"]["protection"]["state"] = "matching"
+        return self._result("protection", action=action, currentDigest=expected_digest)
+
+class FakeArtifacts:
+    def __init__(self, manager: FakeManager, *, resolve: bool = True) -> None:
+        self.manager = manager
+        self.resolve = resolve
+        self.calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def ensure(
+        self,
+        targets: Any,
+        force: bool = False,
+        *,
+        deadline: float | None = None,
+        cancelled: Any = None,
+    ) -> dict[str, Any]:
+        del deadline, cancelled
+        names = tuple(targets)
+        self.calls.append((names, force))
+        if self.resolve:
+            self.manager.snapshot["artifactTargets"] = []
+            self.manager.snapshot["artifactRecords"] = [
+                artifact_record(name) for name in names
+            ]
+        return {
+            "ok": True,
+            "schema": "dev.xenoid.artifacts/v1",
+            "targets": {
+                name: {"status": "reused", "durationMs": 0} for name in names
+            },
+        }
+
+
+class FakeAcceptance:
+    def __init__(self, manager: FakeManager) -> None:
+        self.manager = manager
+        self.calls: list[dict[str, Any]] = []
+        self.fail_final = False
+        self.drift_after: list[Callable[[], None]] = []
+
+    def observe(
+        self,
+        context: Any,
+        expected: Mapping[str, Any],
+        mode: str,
+        deadline: float | None,
+        progress: Callable[[Mapping[str, Any]], None] | None,
+    ) -> dict[str, Any]:
+        del context, deadline
+        self.calls.append({"mode": mode, "expected": dict(expected)})
+        if progress is not None:
+            progress(
+                {
+                    "schema": "dev.xenoid.progress/v1",
+                    "command": "up",
+                    "phase": "acceptance",
+                    "state": "running",
+                    "durationMs": 0,
+                    "detail": "observing",
+                }
+            )
+        if mode == "convergence-resolve":
+            return {
+                "ok": False,
+                "observationValid": True,
+                "observationSha256": OBSERVATION_DIGEST,
+                "componentActions": {
+                    "daemon": "install",
+                    "deploy": {
+                        name: "deploy"
+                        for name in self.manager.snapshot["components"]["deploy"]
+                    },
+                    "identity": "converge",
+                    "location": "converge",
+                    "proxy": "reconcile",
+                    "keybox": "reconcile",
+                    "camera": "reconcile",
+                    "google": "reconcile",
+                    "protection": "reconcile",
+                },
+                "acceptanceChecks": list(self.manager.snapshot["acceptanceChecks"]),
+                "errorCode": "components_not_converged",
+            }
+        if self.fail_final:
+            return {
+                "ok": False,
+                "observationSha256": OBSERVATION_DIGEST,
+                "errorCode": "acceptance_failed",
+            }
+        if self.drift_after:
+            self.drift_after.pop(0)()
+        return {
+            "ok": True,
+            "schema": "dev.xenoid.live-acceptance/v1",
+            "observationSha256": OBSERVATION_DIGEST,
+            "acceptanceChecks": list(self.manager.snapshot["acceptanceChecks"]),
+        }
+
+
+class FakeClock:
+    def __init__(self, value: float = 100.0) -> None:
+        self.value = value
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+@contextlib.contextmanager
+def manager_fixture(snapshot: Mapping[str, Any] | None = None) -> Iterator[FakeManager]:
+    with tempfile.TemporaryDirectory(prefix="xenoid-convergence-contract-") as directory:
+        root = Path(directory) / "state"
+        yield FakeManager(root, snapshot or healthy_snapshot())
+
+
+def planner_for(snapshot: Mapping[str, Any], *, skip_build: bool = False) -> convergence.ConvergencePlan:
+    with manager_fixture(snapshot) as manager:
+        return convergence.ConvergencePlanner(manager).inspect(skip_build=skip_build)
+
+
+def expect_error(function: Callable[[], Any], code: str | None = None) -> Any:
+    try:
+        function()
+    except convergence.ConvergenceError as exc:
+        if code is not None:
+            require(exc.code == code, f"expected {code}, got {exc.code}")
+        return exc
+    raise ContractFailure("expected ConvergenceError")
+
+
+@case("canonicalPlanAndDigest")
+def canonical_plan_and_digest() -> None:
+    snapshot = healthy_snapshot()
+    plan = planner_for(snapshot)
+    payload = plan.to_dict()
+    require(set(payload) == PLAN_KEYS, "canonical plan field set drifted")
+    require(payload["schema"] == "dev.xenoid.convergence-plan/v1", "plan schema")
+    require(
+        isinstance(payload["planDigest"], str)
+        and len(payload["planDigest"]) == 64
+        and set(payload["planDigest"]) <= set("0123456789abcdef"),
+        "plan digest is not lowercase SHA-256",
+    )
+    require(convergence.ConvergencePlan.from_dict(payload) == plan, "plan round trip")
+    noisy = copy.deepcopy(snapshot)
+    noisy["observedAt"] = "secret timestamp"
+    noisy["log"] = "/private/operator raw child output"
+    require(planner_for(noisy).plan_digest == plan.plan_digest, "noise changed plan digest")
+    changed = copy.deepcopy(snapshot)
+    changed["components"]["proxy"]["state"] = "drift"
+    require(planner_for(changed).plan_digest != plan.plan_digest, "action drift kept digest")
+    try:
+        plan.runtime_action = "recreate"  # type: ignore[misc]
+    except (dataclasses.FrozenInstanceError, AttributeError):
+        pass
+    else:
+        raise ContractFailure("ConvergencePlan is mutable")
+    invalid = dict(payload)
+    invalid["unknown"] = True
+    expect_error(lambda: convergence.ConvergencePlan.from_dict(invalid))
+
+
+@case("minimumActionMatrixAndPrecedence")
+def minimum_action_matrix_and_precedence() -> None:
+    observed: set[str] = set()
+
+    healthy = planner_for(healthy_snapshot())
+    observed.add(convergence.recommended_action(healthy))
+    require(healthy.runtime_action == "reuse", "healthy runtime not reused")
+    require(healthy.image_action == "reuse-selected", "healthy image not reused")
+
+    stopped_snapshot = healthy_snapshot()
+    stopped_snapshot["runtime"]["state"] = "stopped"
+    stopped = planner_for(stopped_snapshot)
+    require(stopped.runtime_action == "start", "stopped runtime not started")
+    observed.add(convergence.recommended_action(stopped))
+
+    absent_snapshot = healthy_snapshot()
+    absent_snapshot["runtime"].update({"state": "absent", "containerId": None})
+    absent = planner_for(absent_snapshot)
+    require(absent.runtime_action == "create", "absent runtime not created")
+    require(absent.image_action == "ensure-desired", "create did not ensure image")
+    observed.add(convergence.recommended_action(absent))
+
+    recreate_snapshot = healthy_snapshot()
+    recreate_snapshot["runtime"]["createSpecMatches"] = False
+    recreate = planner_for(recreate_snapshot)
+    require(recreate.runtime_action == "recreate", "create-spec drift did not recreate")
+    observed.add(convergence.recommended_action(recreate))
+
+    image_required = dataclasses.replace(
+        healthy,
+        image_action="ensure-desired",
+        selected_image_record=None,
+        plan_digest="",
+    )
+    observed.add(convergence.recommended_action(image_required))
+
+    daemon_snapshot = healthy_snapshot()
+    daemon_snapshot["components"]["daemon"]["state"] = "drift"
+    daemon = planner_for(daemon_snapshot)
+    require(daemon.daemon_action == "install", "daemon drift not install-only")
+    require(daemon.runtime_action == "reuse", "daemon drift recreated runtime")
+    observed.add(convergence.recommended_action(daemon))
+
+    helper_snapshot = healthy_snapshot()
+    helper_snapshot["components"]["deploy"]["input"] = "drift"
+    helper = planner_for(helper_snapshot)
+    require(helper.runtime_action == "reuse", "helper drift recreated runtime")
+    require(helper.deploy_components is not None, "helper drift not deployed")
+    observed.add(convergence.recommended_action(helper))
+
+    proxy_snapshot = healthy_snapshot()
+    proxy_snapshot["components"]["proxy"]["state"] = "drift"
+    proxy = planner_for(proxy_snapshot)
+    require(proxy.runtime_action == "reuse", "proxy drift recreated runtime")
+    observed.add(convergence.recommended_action(proxy))
+
+    protection_snapshot = healthy_snapshot()
+    protection_snapshot["components"]["protection"]["state"] = "maintenance"
+    protection = planner_for(protection_snapshot)
+    observed.add(convergence.recommended_action(protection))
+    observed.add(convergence.recommended_action(healthy, resumed=True))
+
+    for code in (
+        "daemon_seed_contract_incompatible",
+        "device_regeneration_legacy_pending",
+        "resource_conflict",
+    ):
+        observed.add(convergence.ConvergenceError(code).recommended_action)
+
+    require(
+        observed
+        == {
+            "no-op",
+            "resume",
+            "start",
+            "create",
+            "recreate",
+            "image-required",
+            "daemon-only",
+            "helper-only",
+            "proxy-recovery",
+            "protection-maintenance",
+            "daemon-incompatible",
+            "legacy-regeneration-recovery",
+            "resource-conflict",
+        },
+        f"recommended action enum incomplete: {sorted(observed)}",
+    )
+
+    conflict = healthy_snapshot()
+    conflict["runtime"]["ownershipValid"] = False
+    conflict["runtime"]["integrationIdentityValid"] = False
+    error = expect_error(lambda: planner_for(conflict))
+    require(error.recommended_action == "resource-conflict", "ownership precedence weakened")
+
+    incompatible = healthy_snapshot()
+    incompatible["components"]["daemon"]["state"] = "incompatible"
+    error = expect_error(lambda: planner_for(incompatible))
+    require(error.recommended_action == "daemon-incompatible", "daemon identity not fail-closed")
+
+
+@case("artifactResolutionOneReplanAndSkipBuild")
+def artifact_resolution_one_replan_and_skip_build() -> None:
+    unresolved = healthy_snapshot()
+    unresolved["artifactTargets"] = ["daemon"]
+    unresolved["artifactRecords"] = []
+    with manager_fixture(unresolved) as manager:
+        artifacts = FakeArtifacts(manager)
+        acceptance = FakeAcceptance(manager)
+        progress: list[Mapping[str, Any]] = []
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=artifacts,
+        ).run(progress=progress.append)
+        require(result["ok"] is True, f"resolved convergence failed: {result.get('error')}")
+        require(len(artifacts.calls) == 1, "artifact closure was not ensured exactly once")
+        require(manager.observe_count >= 2, "artifact resolution did not re-inspect")
+        require(result["resolvedPlanDigest"] is not None, "resolved plan digest missing")
+        first_mutation = next(
+            (index for index, call in enumerate(manager.calls) if call[0] not in {"observe", "lock", "acceptance-context"}),
+            len(manager.calls),
+        )
+        last_observe = max(index for index, call in enumerate(manager.calls) if call[0] == "observe")
+        require(last_observe < first_mutation, "runtime mutated before artifact replan")
+
+    with manager_fixture(unresolved) as manager:
+        artifacts = FakeArtifacts(manager, resolve=False)
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=artifacts,
+        ).run()
+        require(result["ok"] is False, "still-unresolved artifact plan mutated")
+        require(len(artifacts.calls) == 1, "executor retried artifact resolution")
+        require(
+            all(call[0] in {"observe", "lock"} for call in manager.calls),
+            "unresolved artifact failure reached a runtime mutator",
+        )
+        require(not (manager.context.state_root / "convergence-v1.json").exists(), "unresolved plan created a journal")
+
+    with manager_fixture(unresolved) as manager:
+        artifacts = FakeArtifacts(manager)
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=artifacts,
+        ).run(skip_build=True)
+        require(result["ok"] is False, "skip-build accepted missing records")
+        require(artifacts.calls == [], "skip-build invoked the artifact builder")
+
+
+@case("dryRunIsReadOnlyAndExplicit")
+def dry_run_is_read_only_and_explicit() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["artifactTargets"] = ["daemon"]
+    snapshot["artifactRecords"] = []
+    with manager_fixture(snapshot) as manager:
+        artifacts = FakeArtifacts(manager)
+        acceptance = FakeAcceptance(manager)
+        progress: list[Mapping[str, Any]] = []
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=artifacts,
+        ).run(progress=progress.append, dry_run=True)
+        require(result["schema"] == "dev.xenoid.convergence/v1", "dry-run schema")
+        require(result["dryRun"] is True and result["ok"] is True, "dry-run result")
+        require(result["plan"]["resolution"] == "requires-artifacts", "dry-run guessed artifacts")
+        require(artifacts.calls == [], "dry-run built artifacts")
+        require(acceptance.calls == [], "dry-run performed live acceptance")
+        require(
+            all(call[0] in {"lock", "observe"} for call in manager.calls),
+            "dry-run mutated manager",
+        )
+        require(not (manager.context.state_root / "convergence-v1.json").exists(), "dry-run wrote journal")
+        require(progress and progress[0]["phase"] == "inspecting", "pre-hash inspecting event missing")
+
+
+
+def _create_journal(journal: Any, plan: Any) -> dict[str, Any]:
+    values = {
+        "operation_id": "9" * 32,
+        "regeneration_transaction_id": None,
+        "selected_image_input_sha256": INPUT_DIGEST,
+        "selected_image_boot_input_sha256": BOOT_DIGEST,
+        "old_container_id": OLD_CONTAINER,
+        "observed_data_uuid": DATA_UUID,
+        "observed_rootfs_uuid": ROOTFS_UUID,
+        "boot_seed_target": None,
+        "proxy_generation": 7,
+        "proxy_enabled": False,
+        "proxy_quarantine_required": False,
+        "observation": healthy_snapshot(),
+    }
+    parameters = inspect.signature(journal.create).parameters
+    kwargs = {name: values[name] for name in parameters if name in values}
+    created = journal.create(plan, **kwargs)
+    return dict(created)
+
+
+def _phase_updates(phase: str) -> dict[str, Any]:
+    common = {
+        "selectedImageInputSha256": INPUT_DIGEST,
+        "selectedImageBootInputSha256": BOOT_DIGEST,
+        "oldContainerId": OLD_CONTAINER,
+        "seedContainerId": SEED_CONTAINER,
+        "newContainerId": NEW_CONTAINER,
+        "observedDataUuid": DATA_UUID,
+        "observedRootfsUuid": ROOTFS_UUID,
+        "proxyGeneration": 7,
+        "proxyQuarantined": True,
+        "liveResolution": {
+            "observationSha256": OBSERVATION_DIGEST,
+            "componentActions": {
+                "daemon": "reuse",
+                "deploy": {},
+                "identity": "reuse",
+                "location": "reuse",
+                "proxy": "reuse",
+                "keybox": "reuse",
+                "camera": "reuse",
+                "google": "reuse",
+                "protection": "reuse",
+            },
+            "acceptanceChecks": ["container"],
+        },
+    }
+    if phase == "planned":
+        return {}
+    return common
+
+
+@case("journalStrictnessAndEveryCrashBoundary")
+def journal_strictness_and_every_crash_boundary() -> None:
+    with manager_fixture() as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect()
+        journal = convergence.ConvergenceJournal(manager)
+        record = _create_journal(journal, plan)
+        path = manager.context.state_root / "convergence-v1.json"
+        require(path.exists(), "journal not created")
+        require(stat.S_IMODE(path.stat().st_mode) == 0o600, "journal mode is not 0600")
+        require(set(record) == JOURNAL_KEYS, "journal field set drifted")
+        require(record["schema"] == "dev.xenoid.convergence-journal/v1", "journal schema")
+        require(record["phase"] == "planned", "journal did not start planned")
+        require(record["completed"] == ["planned"], "planned completion missing")
+        require(len(path.read_bytes()) <= 256 * 1024, "journal exceeded 256 KiB")
+
+        # Before and after every phase boundary must independently reload.  This
+        # models process death on either side of each atomic rename.
+        seen = ["planned"]
+        before_after: list[tuple[str, bytes, bytes]] = []
+        for phase in PHASES[1:]:
+            before = path.read_bytes()
+            journal.advance(phase, **_phase_updates(phase))
+            after = path.read_bytes()
+            before_after.append((phase, before, after))
+            loaded = convergence.ConvergenceJournal(manager).load()
+            seen.append(phase)
+            require(loaded["phase"] == phase, f"{phase}: phase not durable")
+            require(loaded["completed"] == seen, f"{phase}: completion order drifted")
+        for phase, before, after in before_after:
+            path.write_bytes(before)
+            path.chmod(0o600)
+            require(convergence.ConvergenceJournal(manager).load() is not None, f"{phase}: pre-crash did not resume")
+            path.write_bytes(after)
+            path.chmod(0o600)
+            require(convergence.ConvergenceJournal(manager).load()["phase"] == phase, f"{phase}: post-crash did not resume")
+
+        valid = path.read_bytes()
+        valid_payload = json.loads(valid)
+        corruptions = []
+        malformed = dict(valid_payload)
+        malformed["unknown"] = True
+        corruptions.append(json.dumps(malformed).encode())
+        malformed = dict(valid_payload)
+        malformed["schema"] = "dev.xenoid.convergence/v2"
+        corruptions.append(json.dumps(malformed).encode())
+        malformed = dict(valid_payload)
+        malformed["planDigest"] = "0" * 64
+        corruptions.append(json.dumps(malformed).encode())
+        malformed = dict(valid_payload)
+        malformed["completed"] = ["accepted", "planned"]
+        corruptions.append(json.dumps(malformed).encode())
+        corruptions.append(b"{not-json")
+        for payload in corruptions:
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            expect_error(lambda: convergence.ConvergenceJournal(manager).load())
+
+        path.write_bytes(valid)
+        path.chmod(0o644)
+        expect_error(lambda: convergence.ConvergenceJournal(manager).load(), "convergence_state_invalid")
+        path.unlink()
+        target = manager.context.state_root / "journal-target"
+        target.write_bytes(valid)
+        target.chmod(0o600)
+        path.symlink_to(target)
+        expect_error(lambda: convergence.ConvergenceJournal(manager).load(), "convergence_state_invalid")
+
+
+@case("legacyMissingRootfsUuidJournalsAsNull")
+def legacy_missing_rootfs_uuid_journals_as_null() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["rootfsUuid"] = ""
+    with manager_fixture(snapshot) as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect()
+        journal = convergence.ConvergenceJournal(manager)
+        created = journal.create(
+            plan,
+            operation_id="8" * 32,
+            observation=snapshot,
+        )
+        require(
+            created["observedRootfsUuid"] is None,
+            "missing legacy rootfs UUID was not normalized",
+        )
+        convergence.ConvergenceExecutor(manager)._validate_resume_state(
+            created,
+            snapshot,
+        )
+
+
+@case("storageOwnerCrashResumesBeforeStateRefresh")
+def storage_owner_crash_resumes_before_state_refresh() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["createSpecMatches"] = False
+    with manager_fixture(snapshot) as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect()
+        journal = convergence.ConvergenceJournal(manager)
+        state = _create_journal(journal, plan)
+        state = journal.advance("quarantined", proxyQuarantined=True)
+        state = journal.advance("container_removed", oldContainerId=OLD_CONTAINER)
+        interrupted = copy.deepcopy(snapshot)
+        interrupted["runtime"].update(
+            {
+                "state": "absent",
+                "containerId": None,
+                "storageValid": False,
+            }
+        )
+        convergence.ConvergenceExecutor(manager)._validate_resume_state(
+            state,
+            interrupted,
+        )
+        committed = journal.advance(
+            "storage_converged",
+            observedDataUuid=DATA_UUID,
+            observedRootfsUuid=ROOTFS_UUID,
+        )
+        expect_error(
+            lambda: convergence.ConvergenceExecutor(manager)._validate_resume_state(
+                committed,
+                interrupted,
+            ),
+            "convergence_state_conflict",
+        )
+
+
+@case("quarantineImageLiveResolutionAndReplacementLimits")
+def quarantine_image_live_resolution_and_replacement_limits() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"].update(
+        {
+            "state": "absent",
+            "containerId": None,
+            "dataUuid": TARGET_DATA_UUID,
+            "rootfsUuid": TARGET_ROOTFS_UUID,
+            "bootSeedRequired": True,
+        }
+    )
+    snapshot["selectedImageRecord"] = None
+    snapshot["components"]["proxy"].update(
+        {"state": "unknown", "quarantineRequired": True}
+    )
+    for name in ("daemon", "identity", "location", "keybox", "camera", "google"):
+        snapshot["components"][name]["state"] = "unknown"
+    for name in snapshot["components"]["deploy"]:
+        snapshot["components"]["deploy"][name] = "unknown"
+    snapshot["components"]["protection"]["state"] = "unknown"
+    with manager_fixture(snapshot) as manager:
+        acceptance = FakeAcceptance(manager)
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(result["ok"] is True, f"fresh convergence failed: {result.get('error')}")
+        names = [name for name, _ in manager.calls]
+        require(
+            [
+                value
+                for name, value in manager.calls
+                if name == "google-bootstrap"
+            ]
+            == [{"freshBootstrap": True}],
+            "fresh Google binding capability was not pinned to boot seed",
+        )
+        require(names.index("quarantine") < names.index("image"), "image ensure preceded quarantine")
+        require(names.index("image") < names.index("seed-start"), "seed boot preceded image ensure")
+        require(names.index("start") < names.index("acceptance-context"), "live resolution preceded final runtime")
+        require(names.index("deploy") < names.index("proxy"), "proxy released before component deployment")
+        require(names.count("seed-start") == 1, "fresh seed runtime repeated")
+        require(names.count("create") == 1, "final runtime replacement repeated")
+        require(names.count("remove") <= 1, "plan performed more than one replacement")
+        modes = [entry["mode"] for entry in acceptance.calls]
+        require(modes[0] == "convergence-resolve", "live resolution observer missing")
+        require(modes[-1] == "convergence-final", "fresh final observer missing")
+        require(not (manager.context.state_root / "convergence-v1.json").exists(), "accepted journal retained")
+        phases = [entry.get("phase") for entry in result["phases"]]
+        require(phases.index("quarantined") < phases.index("image_ensured"), "result phase order")
+        require(phases.index("live_resolved") < phases.index("components_deployed"), "live resolution not journaled first")
+
+    replacement = healthy_snapshot()
+    replacement["runtime"]["createSpecMatches"] = False
+    for component in (
+        "daemon",
+        "identity",
+        "keybox",
+        "camera",
+        "google",
+        "protection",
+    ):
+        replacement["components"][component]["state"] = "unknown"
+    replacement["components"]["proxy"]["state"] = "unknown"
+    for component in replacement["components"]["deploy"]:
+        replacement["components"]["deploy"][component] = "unknown"
+    replacement["components"]["location"]["state"] = "pending"
+    with manager_fixture(replacement) as manager:
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+
+        require(result["ok"] is True, "location-coalesced recreate failed")
+        removals = [value for name, value in manager.calls if name == "remove"]
+        require(len(removals) == 1, "location drift caused multiple replacements")
+        require(
+            removals[0].get("prepareLocation") is True,
+            "pending Location state was not armed before replacement",
+        )
+
+
+@case("retainedCompatibilityJournalResumesBeforeSnapshot")
+def retained_compatibility_journal_resumes_before_snapshot() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["createSpecMatches"] = False
+    for component in (
+        "daemon",
+        "identity",
+        "location",
+        "proxy",
+        "keybox",
+        "camera",
+        "google",
+        "protection",
+    ):
+        snapshot["components"][component]["state"] = "unknown"
+    for component in snapshot["components"]["deploy"]:
+        snapshot["components"]["deploy"][component] = "unknown"
+    capability = {
+        "transactionId": "ab" * 16,
+        "legacyEvidenceSha256": "cd" * 32,
+    }
+    with manager_fixture(snapshot) as manager:
+        executor = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        )
+        first = executor.run(
+            regeneration_capability=capability,
+            retain_accepted_journal=True,
+        )
+        require(first["ok"] is True, "compatibility convergence failed")
+        retained = executor.journal.load()
+        require(retained is not None, "accepted compatibility journal cleared")
+        require(retained["phase"] == "accepted", "compatibility journal not accepted")
+        require(
+            retained["operationId"] == capability["legacyEvidenceSha256"][:32],
+            "compatibility journal not bound to v1 evidence",
+        )
+        calls_before = list(manager.calls)
+        resumed = executor.run(
+            regeneration_capability=capability,
+            retain_accepted_journal=True,
+        )
+        require(resumed["ok"] is True, "accepted compatibility resume failed")
+        new_mutations = [
+            name
+            for name, _ in manager.calls[len(calls_before):]
+            if name in {"create", "remove", "seed-start"}
+        ]
+        require(not new_mutations, "accepted compatibility resume replayed mutation")
+        executor.journal.clear()
+
+
+@case("mutationCrashAfterEngineBoundaryResumes")
+def mutation_crash_after_engine_boundary_resumes() -> None:
+    def replacement_snapshot() -> dict[str, Any]:
+        snapshot = healthy_snapshot()
+        snapshot["runtime"]["createSpecMatches"] = False
+        for component in (
+            "daemon",
+            "identity",
+            "location",
+            "proxy",
+            "keybox",
+            "camera",
+            "google",
+            "protection",
+        ):
+            snapshot["components"][component]["state"] = "unknown"
+        for component in snapshot["components"]["deploy"]:
+            snapshot["components"]["deploy"][component] = "unknown"
+        return snapshot
+
+    with manager_fixture(replacement_snapshot()) as manager:
+        manager.interrupt_once.add("remove")
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False
+            and first["error"] == "convergence_cancelled"
+            and manager.snapshot["runtime"]["state"] == "absent",
+            "remove crash fixture did not reach the after-state",
+        )
+        resumed = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(resumed["ok"] is True, "remove after-state was not resumed")
+        require(
+            [name for name, _ in manager.calls].count("remove") == 2,
+            "idempotent remove was not retried exactly once",
+        )
+
+    with manager_fixture(replacement_snapshot()) as manager:
+        manager.interrupt_once.add("create")
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False
+            and first["error"] == "convergence_cancelled"
+            and manager.snapshot["runtime"]["state"] == "stopped"
+            and manager.snapshot["runtime"]["containerId"] == NEW_CONTAINER,
+            "create crash fixture did not retain the stopped after-state",
+        )
+        resumed = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(resumed["ok"] is True, "stopped create after-state was not adopted")
+        require(
+            not (manager.context.state_root / "convergence-v1.json").exists(),
+            "accepted create resume retained its journal",
+        )
+
+    maintenance = healthy_snapshot()
+    maintenance["runtime"]["createSpecMatches"] = False
+    maintenance["components"]["protection"].update(
+        {
+            "state": "maintenance",
+            "currentDigest": None,
+            "replacementRequired": True,
+            "maintenanceRequired": True,
+        }
+    )
+    maintenance["components"]["protection"]["observed"].update(
+        {
+            "ok": False,
+            "currentDigest": None,
+            "replacementRequired": True,
+            "maintenanceRequired": True,
+        }
+    )
+    class MaintenanceResumeAcceptance(FakeAcceptance):
+        def observe(
+            self,
+            context: Any,
+            expected: Mapping[str, Any],
+            mode: str,
+            deadline: float | None,
+            progress: Callable[[Mapping[str, Any]], None] | None,
+        ) -> dict[str, Any]:
+            result = super().observe(
+                context,
+                expected,
+                mode,
+                deadline,
+                progress,
+            )
+            if mode == "convergence-resolve":
+                result["componentActions"]["location"] = "reuse"
+                result["componentActions"]["protection"] = "maintenance"
+            return result
+
+    with manager_fixture(maintenance) as manager:
+        manager.fail_once["start"] = "adb_authorization_failed"
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=MaintenanceResumeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False
+            and first["error"] == "adb_authorization_failed"
+            and manager.snapshot["runtime"]["state"] == "running",
+            "post-start failure fixture did not retain its running state",
+        )
+        resumed = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=MaintenanceResumeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            resumed["ok"] is True,
+            f"post-maintenance running resume failed: {resumed.get('error')}",
+        )
+        require(
+            [name for name, _ in manager.calls].count("quiesce") == 1,
+            "resume repeated an already-completed protection quiesce",
+        )
+
+
+
+
+@case("thirdStateResumeRefusesMutation")
+def third_state_resume_refuses_mutation() -> None:
+    with manager_fixture() as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect()
+        journal = convergence.ConvergenceJournal(manager)
+        _create_journal(journal, plan)
+        journal.advance("quarantined", **_phase_updates("quarantined"))
+        manager.snapshot["runtime"]["containerId"] = "d" * 64
+        before = list(manager.calls)
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(result["ok"] is False, "third runtime state was accepted")
+        require(result["error"] == "convergence_state_conflict", "third-state error changed")
+        new_calls = manager.calls[len(before):]
+        require(
+            all(name in {"observe", "lock"} for name, _ in new_calls),
+            "third-state resume performed a mutation",
+        )
+        require((manager.context.state_root / "convergence-v1.json").exists(), "conflict deleted journal")
+
+
+@case("componentOnlyUpdateAndLiveAcceptanceOnly")
+def component_only_update_and_live_acceptance_only() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["components"]["daemon"]["state"] = "drift"
+    snapshot["components"]["deploy"]["input"] = "drift"
+    snapshot["components"]["proxy"]["state"] = "drift"
+    snapshot["components"]["proxy"]["generation"] = None
+    with manager_fixture(snapshot) as manager:
+        acceptance = FakeAcceptance(manager)
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(result["ok"] is True, f"component convergence failed: {result.get('error')}")
+        names = [name for name, _ in manager.calls]
+        require("deploy" in names and "proxy" in names, "component updates missing")
+        require(not ({"image", "remove", "create", "seed-start"} & set(names)), "component drift replaced runtime")
+        require(acceptance.calls[-1]["mode"] == "convergence-final", "final acceptance owner bypassed")
+        require(
+            acceptance.calls[-1]["expected"].get("proxyGeneration") == 7,
+            "final acceptance was not bound to reconciled proxy generation",
+        )
+
+    source = (ROOT / "src/xenoid/convergence.py").read_text(encoding="utf-8")
+    forbidden = (
+        "build_doctor_report",
+        "GateRunner",
+        "verify.sh",
+        "ci.sh",
+        "xenoid-up.sh",
+        "subprocess.run",
+        "subprocess.Popen",
+    )
+    for token in forbidden:
+        require(token not in source, f"convergence retained forbidden acceptance path {token}")
+    require(
+        "self._acceptance_owner()" in source and "LiveAcceptance" in source,
+        "accepted does not use LiveAcceptance",
+    )
+
+
+@case("inputDriftGetsOneFollowUpOnly")
+def input_drift_gets_one_follow_up_only() -> None:
+    with manager_fixture() as manager:
+        acceptance = FakeAcceptance(manager)
+
+        def drift_once() -> None:
+            manager.snapshot["artifactRecords"][0]["inputSha256"] = "0" * 64
+        acceptance.drift_after = [drift_once]
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(result["ok"] is True, f"follow-up convergence failed: {result.get('error')}")
+        require(result["followUpPlanDigest"] is not None, "input drift did not create follow-up")
+        require([name for name, _ in manager.calls].count("deploy") <= 1, "follow-up repeated component deployment")
+
+    with manager_fixture() as manager:
+        acceptance = FakeAcceptance(manager)
+
+        def drift_again() -> None:
+            record = manager.snapshot["artifactRecords"][0]
+            value = record["inputSha256"]
+            record["inputSha256"] = "0" * 64 if value != "0" * 64 else "1" * 64
+
+        acceptance.drift_after = [drift_again, drift_again]
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(result["ok"] is False, "second input drift looped convergence")
+        require(result["error"] == "convergence_inputs_changed", "second drift error changed")
+
+
+@case("deadlineCancellationProgressHeartbeatAndRedaction")
+def deadline_cancellation_progress_heartbeat_and_redaction() -> None:
+    with manager_fixture() as manager:
+        clock = FakeClock()
+        manager.convergence_deadline = clock.value
+        progress: list[Mapping[str, Any]] = []
+        with mock.patch.object(convergence.time, "monotonic", clock.monotonic):
+            result = convergence.ConvergenceExecutor(
+                manager,
+                live_acceptance=FakeAcceptance(manager),
+                artifact_builder=FakeArtifacts(manager),
+            ).run(progress=progress.append)
+        require(result["ok"] is False, "expired outer deadline succeeded")
+        require(result["error"].endswith("_timeout"), "deadline error is not phase-specific")
+        require(
+            all(call[0] in {"observe", "lock", "cancel"} for call in manager.calls),
+            "deadline mutated runtime",
+        )
+        require(any(event["state"] == "timed_out" for event in progress), "timed-out progress missing")
+
+    snapshot = healthy_snapshot()
+    snapshot["components"]["daemon"]["state"] = "drift"
+    with manager_fixture(snapshot) as manager:
+        manager.interrupt_once.add("deploy")
+        progress = []
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run(progress=progress.append)
+        require(result["ok"] is False and result["error"] == "convergence_cancelled", "SIGINT result changed")
+        require(manager.cancelled == 1, "SIGINT did not cancel in-flight convergence")
+        require((manager.context.state_root / "convergence-v1.json").exists(), "cancel deleted journal")
+
+    with manager_fixture(snapshot) as manager:
+        manager.fail_once["deploy"] = "component_deploy_failed"
+        progress = []
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run(progress=progress.append)
+        rendered = json.dumps({"result": result, "progress": progress})
+        require("/private/operator" not in rendered, "private path leaked")
+        require("must-not-leak" not in rendered, "token leaked")
+        require(all(set(event) == {"schema", "command", "phase", "state", "durationMs", "detail"} for event in progress), "progress schema drifted")
+        require(all(event["schema"] == "dev.xenoid.progress/v1" for event in progress), "progress version drifted")
+        terminal = [
+            event
+            for event in progress
+            if event["phase"] == "components_deployed"
+            and event["state"] in {"failed", "timed_out"}
+        ]
+        require(len(terminal) == 1, "failed phase emitted duplicate terminal progress")
+        result_terminal = [
+            phase
+            for phase in result["phases"]
+            if phase["phase"] == "components_deployed"
+            and phase["state"] in {"failed", "timed_out"}
+        ]
+        require(len(result_terminal) == 1, "failed phase duplicated in final result")
+
+    source = (ROOT / "src/xenoid/convergence.py").read_text(encoding="utf-8")
+    require("5.0" in source and "heartbeat" in source.lower(), "five-second heartbeat owner missing")
+    require("thread" in source.lower(), "long operations cannot emit concurrent heartbeat")
+
+
+@case("directCallersAndRemovedShellAliases")
+def direct_callers_and_removed_shell_aliases() -> None:
+    require(not (ROOT / "scripts/xenoid-up.sh").exists(), "shell up pipeline still exists")
+    require(not (ROOT / "scripts/with-up-lock.py").exists(), "shell up lock still exists")
+    cli = (ROOT / "src/xenoid/cli.py").read_text(encoding="utf-8")
+    mcp = (ROOT / "src/xenoid/mcp_server.py").read_text(encoding="utf-8")
+    remote = (ROOT / "src/xenoid/remote_service.py").read_text(encoding="utf-8")
+    for token in ("--reuse-runtime", "REUSE_RUNTIME", "XENOID_UP_LOCK"):
+        require(token not in cli + mcp + remote, f"removed alias retained: {token}")
+    require("ConvergenceExecutor" in cli and "ConvergenceExecutor" in mcp, "direct executor callers missing")
+    require("_run_up_cli_process" not in mcp, "MCP still spawns CLI up")
+    require("xenoid_up\": _remote_policy(\"control\", True, \"skipBuild\")" in remote, "remote up schema not clean")
+    require("reuseRuntime" not in remote, "remote reuse alias retained")
+
+
+def main() -> int:
+    selected = sys.argv[1:]
+    unknown = [name for name in selected if name not in CASES]
+    if unknown:
+        print(json.dumps({"ok": False, "error": "unknown_case", "cases": unknown}))
+        return 2
+    results: list[dict[str, Any]] = []
+    ok = True
+    for name in selected or list(CASES):
+        try:
+            CASES[name]()
+            results.append({"name": name, "ok": True})
+        except Exception as exc:
+            ok = False
+            results.append(
+                {
+                    "name": name,
+                    "ok": False,
+                    "error": type(exc).__name__,
+                    "detail": str(exc)[:300],
+                }
+            )
+    print(
+        json.dumps(
+            {
+                "schema": "dev.xenoid.convergence-contract/v1",
+                "ok": ok,
+                "cases": results,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

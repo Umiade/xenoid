@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unicodedata
 import zipfile
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ from typing import Any, Iterator, Mapping, Optional
 
 from .config import InstanceContext, InstanceError, InstanceLease, XenoidConfig
 from .util import which
+from .process import run_bounded
 
 GOOGLE_RELEASE_SCHEMA = "dev.xenoid.google-release/v1"
 GOOGLE_BINDING_SCHEMA = "dev.xenoid.google-runtime-binding/v1"
@@ -94,6 +96,10 @@ _RUNTIME_CONTEXT_OWNER = "dev.xenoid.google-runtime-context/v1\n"
 _MAX_COMPONENT_BYTES = 255
 _MAX_PATH_BYTES = 1024
 _COPY_CHUNK = 1024 * 1024
+_RUNTIME_CONTEXT_SCHEMA = "dev.xenoid.runtime-context/v1"
+_RUNTIME_CONTEXT_KEYS = {"schema", "entries"}
+_RUNTIME_CONTEXT_ENTRY_KEYS = {"path", "type", "mode", "size", "sha256"}
+_MAX_CONTEXT_MANIFEST_BYTES = 16 * 1024 * 1024
 
 
 class GoogleServicesError(InstanceError):
@@ -636,12 +642,22 @@ def _verify_signed_member_coverage(bundle: zipfile.ZipFile, spec: ReleaseSpec) -
 
 def _run_checked(command: list[str], code: str, message: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as exc:
+        bounded = run_bounded(
+            command,
+            cwd=Path.cwd(),
+            deadline=time.monotonic() + timeout,
+            project_root=Path.cwd(),
+        )
+    except OSError as exc:
         raise GoogleServicesError(code, message) from exc
-    if result.returncode != 0:
+    if not bounded.ok:
         raise GoogleServicesError(code, message)
-    return result
+    return subprocess.CompletedProcess(
+        command,
+        bounded.returncode or 0,
+        bounded.stdout_tail,
+        bounded.stderr_tail,
+    )
 
 
 def _tool_paths() -> dict[str, str]:
@@ -1085,18 +1101,29 @@ def _stage_manifests(spec: ReleaseSpec) -> tuple[dict[str, dict[str, Any]], dict
         if member["selected"] is not True:
             continue
         relative = str(member["runtimePath"]).lstrip("/")
+        source_mode = int(member["mode"])
+        mode = 0o755 if source_mode & 0o111 else 0o644
         files[relative] = {
             "sha256": member["sha256"],
             "size": member["size"],
-            "mode": member["mode"],
-            "mtimeUtc": member["mtimeUtc"],
+            "mode": mode,
         }
         components = relative.split("/")[:-1]
         for length in range(1, len(components) + 1):
             directory = "/".join(components[:length])
-            current = directories.setdefault(directory, {"mode": 0o755, "mtimeUtc": 0})
-            current["mtimeUtc"] = max(int(current["mtimeUtc"]), int(member["mtimeUtc"]))
+            directories.setdefault(directory, {"mode": 0o755})
     return files, directories
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "short write")
+        view = view[written:]
+
+
 
 
 def _stage_payload(zip_path: Path, spec: ReleaseSpec) -> StageHandle:
@@ -1138,12 +1165,11 @@ def _stage_payload(zip_path: Path, spec: ReleaseSpec) -> StageHandle:
                             if count > member["size"] or total > spec.archive["maxExpandedBytes"]:
                                 raise GoogleServicesError("google_services_asset_invalid", "Google services stage exceeds pinned limits")
                             digest.update(chunk)
-                            os.write(descriptor, chunk)
+                            _write_all(descriptor, chunk)
                     if count != member["size"] or digest.hexdigest() != member["sha256"]:
                         raise GoogleServicesError("google_services_asset_invalid", "Google services staged member pin mismatch")
-                    os.fchmod(descriptor, int(member["mode"]))
-                    timestamp_ns = int(member["mtimeUtc"]) * 1_000_000_000
-                    os.utime(descriptor, ns=(timestamp_ns, timestamp_ns))
+                    os.fchmod(descriptor, int(files[relative]["mode"]))
+                    os.utime(descriptor, ns=(0, 0))
                     os.fsync(descriptor)
                 finally:
                     if descriptor >= 0:
@@ -1154,8 +1180,7 @@ def _stage_payload(zip_path: Path, spec: ReleaseSpec) -> StageHandle:
             descriptor = _open_directory_chain(root_descriptor, tuple(relative.split("/")), False)
             try:
                 os.fchmod(descriptor, int(expected["mode"]))
-                timestamp_ns = int(expected["mtimeUtc"]) * 1_000_000_000
-                os.utime(descriptor, ns=(timestamp_ns, timestamp_ns))
+                os.utime(descriptor, ns=(0, 0))
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
@@ -1220,24 +1245,139 @@ def _walk_tree(root: Path) -> tuple[dict[str, os.stat_result], dict[str, os.stat
     return files, directories
 
 
+def _load_context_manifest_entries(context_root: Path) -> dict[str, Mapping[str, Any]]:
+    manifest_path = context_root / "context-manifest.json"
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(manifest_path, flags)
+    except OSError as exc:
+        raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest is missing or unsafe") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o644
+            or info.st_mtime_ns != 0
+            or info.st_size > _MAX_CONTEXT_MANIFEST_BYTES
+        ):
+            raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest metadata is invalid")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            payload = stream.read(_MAX_CONTEXT_MANIFEST_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) > _MAX_CONTEXT_MANIFEST_BYTES:
+        raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest is too large")
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, ValueError) as exc:
+        raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest is invalid") from exc
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _RUNTIME_CONTEXT_KEYS
+        or value.get("schema") != _RUNTIME_CONTEXT_SCHEMA
+        or not isinstance(value.get("entries"), list)
+        or payload
+        != (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+    ):
+        raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest is not canonical")
+    entries: dict[str, Mapping[str, Any]] = {}
+    previous: Optional[bytes] = None
+    for raw in value["entries"]:
+        if not isinstance(raw, Mapping) or set(raw) != _RUNTIME_CONTEXT_ENTRY_KEYS:
+            raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest entry is invalid")
+        relative = raw.get("path")
+        if not isinstance(relative, str) or relative == "context-manifest.json":
+            raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest path is invalid")
+        _safe_member_name(relative)
+        encoded = relative.encode("utf-8")
+        if previous is not None and encoded <= previous:
+            raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest entries are not bytewise sorted")
+        previous = encoded
+        entry_type = raw.get("type")
+        mode = raw.get("mode")
+        size = raw.get("size")
+        digest = raw.get("sha256")
+        if entry_type == "directory":
+            valid = (
+                mode == "0755"
+                and isinstance(size, int)
+                and not isinstance(size, bool)
+                and size == 0
+                and digest is None
+            )
+        elif entry_type == "file":
+            valid = (
+                mode in {"0644", "0755"}
+                and isinstance(size, int)
+                and not isinstance(size, bool)
+                and size >= 0
+                and isinstance(digest, str)
+                and _HEX64.fullmatch(digest) is not None
+            )
+        else:
+            valid = False
+        if not valid:
+            raise GoogleServicesError("google_services_asset_invalid", "runtime context manifest entry metadata is invalid")
+        entries[relative] = raw
+    return entries
+
+
 def verify_context_copy(context_root: Path, spec: ReleaseSpec, stage: StageHandle) -> dict[str, Any]:
     payload_root = context_root / "payload" / "google-services"
     actual_files, actual_directories = _walk_tree(payload_root)
     if set(actual_files) != set(stage.file_manifest) or set(actual_directories) != set(stage.directory_manifest):
         raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context inventory mismatch")
+    manifest_entries = _load_context_manifest_entries(context_root)
+    manifest_prefix = "payload/google-services/"
+    google_entries = {
+        path: entry
+        for path, entry in manifest_entries.items()
+        if path.startswith(manifest_prefix)
+    }
+    expected_paths = {
+        *(f"{manifest_prefix}{relative}" for relative in stage.file_manifest),
+        *(f"{manifest_prefix}{relative}" for relative in stage.directory_manifest),
+    }
+    if set(google_entries) != expected_paths:
+        raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context manifest inventory mismatch")
     for relative, expected in stage.file_manifest.items():
         path = payload_root / relative
         info = actual_files[relative]
+        digest = _stream_sha256(path, int(expected["size"]))[1]
+        manifest_entry = google_entries[f"{manifest_prefix}{relative}"]
         if (
             info.st_size != expected["size"]
             or stat.S_IMODE(info.st_mode) != expected["mode"]
-            or int(info.st_mtime) != expected["mtimeUtc"]
-            or _stream_sha256(path, int(expected["size"]))[1] != expected["sha256"]
+            or info.st_mtime_ns != 0
+            or digest != expected["sha256"]
+            or manifest_entry
+            != {
+                "path": f"{manifest_prefix}{relative}",
+                "type": "file",
+                "mode": f"0{int(expected['mode']):03o}",
+                "size": int(expected["size"]),
+                "sha256": expected["sha256"],
+            }
         ):
             raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context file mismatch")
     for relative, expected in stage.directory_manifest.items():
         info = actual_directories[relative]
-        if stat.S_IMODE(info.st_mode) != expected["mode"] or int(info.st_mtime) != expected["mtimeUtc"]:
+        manifest_entry = google_entries[f"{manifest_prefix}{relative}"]
+        if (
+            stat.S_IMODE(info.st_mode) != expected["mode"]
+            or info.st_mtime_ns != 0
+            or manifest_entry
+            != {
+                "path": f"{manifest_prefix}{relative}",
+                "type": "directory",
+                "mode": "0755",
+                "size": 0,
+                "sha256": None,
+            }
+        ):
             raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context directory mismatch")
     dockerfile = context_root / "Dockerfile"
     try:

@@ -8,6 +8,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+
+DAEMON_TRANSPORT_SCHEMA = "dev.xenoid.daemon-transport/v1"
+DAEMON_BOOTSTRAP_SCHEMA = "dev.xenoid.daemon-bootstrap/v1"
+_UUID_V4 = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+_RUNTIME_EPOCH = re.compile(r"[0-9a-f]{64}")
+
 def _pending_camera(facing: str, state: str) -> dict[str, Any]:
     return {"facing": facing, "state": state, "ok": False}
 
@@ -102,7 +110,7 @@ STATE = {
     "cameraSelfTestSucceeds": True,
     "cameraSelfTestAuthorization": None,
     "proxy": {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "instanceId": "",
         "generation": 0,
         "enabled": False,
@@ -111,6 +119,9 @@ STATE = {
         "udpAllowed": False,
         "allowInsecureHttp": False,
         "checkId": 0,
+        "stateReadable": True,
+        "stateError": None,
+        "quarantined": False,
     },
     "keybox": {
         "configured": False,
@@ -122,6 +133,12 @@ STATE = {
             "rsaChainCount": 0,
             "ecdsaChainCount": 0,
         },
+    },
+    "bootstrap": {
+        "state": "transport_ready",
+        "generation": 0,
+        "instanceId": "",
+        "runtimeEpoch": "",
     },
 }
 
@@ -164,6 +181,120 @@ _KEYBOX_STAGING_PATH = re.compile(
     r"/data/local/tmp/\.keybox-upload-[0-9a-f]{32}"
 )
 _KEYBOX_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _bootstrap_components(ready: bool) -> dict[str, Any]:
+    pending = "pending"
+    return {
+        "root": {"ok": ready, "state": "ready" if ready else pending},
+        "keybox": {
+            "ok": ready,
+            "state": "unconfigured" if ready else pending,
+            "configured": False,
+            "active": False,
+            "algorithms": {
+                "rsa": False,
+                "ecdsa": False,
+                "rsaChainCount": 0,
+                "ecdsaChainCount": 0,
+            },
+        },
+        "proxy": {
+            "ok": ready,
+            "state": "ready" if ready else pending,
+            "configured": False,
+            "enabled": False,
+            "generation": STATE["proxy"]["generation"],
+            "quarantined": False,
+        },
+        "location": {
+            "ok": ready,
+            "state": "ready" if ready else pending,
+            "configured": False,
+            "locationEpoch": "0" * 64,
+        },
+        "camera": {
+            "ok": ready,
+            "state": "ready" if ready else pending,
+            "configured": False,
+            "generation": STATE["camera"]["generation"],
+            "active": ready,
+            "publicationReady": ready,
+        },
+    }
+
+
+def _bootstrap_status() -> dict[str, Any]:
+    bootstrap = STATE["bootstrap"]
+    ready = bootstrap["state"] == "ready"
+    return {
+        "ok": ready,
+        "schema": DAEMON_BOOTSTRAP_SCHEMA,
+        "state": bootstrap["state"],
+        "generation": bootstrap["generation"],
+        "instanceId": bootstrap["instanceId"],
+        "runtimeEpoch": bootstrap["runtimeEpoch"],
+        "components": _bootstrap_components(ready),
+    }
+
+
+def _bootstrap_response(path: str, method: str, body: Any) -> dict[str, Any]:
+    if path == "/bootstrap/transport":
+        if method != "GET" or body:
+            return {"ok": False, "error": "invalid_request"}
+        return {
+            "ok": True,
+            "schema": DAEMON_TRANSPORT_SCHEMA,
+            "service": "xenoid-daemon",
+            "transportReady": True,
+        }
+    if path == "/bootstrap/status":
+        if method != "GET" or body:
+            return {"ok": False, "error": "invalid_request"}
+        return _bootstrap_status()
+    if path == "/bootstrap/reconcile":
+        valid = (
+            method == "POST"
+            and isinstance(body, dict)
+            and set(body) == {"schema", "instanceId", "runtimeEpoch", "timeoutMs"}
+            and body.get("schema") == DAEMON_BOOTSTRAP_SCHEMA
+            and isinstance(body.get("instanceId"), str)
+            and _UUID_V4.fullmatch(body["instanceId"]) is not None
+            and isinstance(body.get("runtimeEpoch"), str)
+            and _RUNTIME_EPOCH.fullmatch(body["runtimeEpoch"]) is not None
+            and isinstance(body.get("timeoutMs"), int)
+            and not isinstance(body.get("timeoutMs"), bool)
+            and 1000 <= body["timeoutMs"] <= 230000
+        )
+        if not valid:
+            return {"ok": False, "error": "invalid_request"}
+        bootstrap = STATE["bootstrap"]
+        if bootstrap["instanceId"] not in {"", body["instanceId"]}:
+            return {"ok": False, "error": "bootstrap_instance_mismatch"}
+        same_input = (
+            bootstrap["instanceId"] == body["instanceId"]
+            and bootstrap["runtimeEpoch"] == body["runtimeEpoch"]
+        )
+        if not (same_input and bootstrap["state"] == "ready"):
+            bootstrap["generation"] += 1
+            bootstrap["instanceId"] = body["instanceId"]
+            bootstrap["runtimeEpoch"] = body["runtimeEpoch"]
+            bootstrap["state"] = "ready"
+        return _bootstrap_status()
+    if path == "/bootstrap/cancel":
+        valid = (
+            method == "POST"
+            and isinstance(body, dict)
+            and set(body) == {"schema", "generation"}
+            and body.get("schema") == DAEMON_BOOTSTRAP_SCHEMA
+            and isinstance(body.get("generation"), int)
+            and not isinstance(body.get("generation"), bool)
+            and body["generation"] > 0
+        )
+        if not valid:
+            return {"ok": False, "error": "invalid_request"}
+        return _bootstrap_status()
+    raise AssertionError(f"unhandled bootstrap route: {path}")
 
 
 def _keybox_error(error: str) -> dict[str, Any]:
@@ -264,18 +395,22 @@ def _valid_proxy_name(value: Any, *, allow_empty: bool) -> bool:
 
 def _proxy_status() -> dict[str, Any]:
     proxy = STATE["proxy"]
-    source = proxy["source"]
+    readable = proxy["stateReadable"]
+    source = proxy["source"] if readable else None
     return {
-        "ok": True,
+        "ok": readable,
         "schemaVersion": proxy["schemaVersion"],
-        "instanceId": proxy["instanceId"],
-        "generation": proxy["generation"],
-        "enabled": proxy["enabled"],
-        "configured": source is not None,
+        "stateReadable": readable,
+        "stateError": proxy["stateError"],
+        "instanceId": proxy["instanceId"] if readable else None,
+        "generation": proxy["generation"] if readable else None,
+        "enabled": proxy["enabled"] if readable else None,
+        "configured": source is not None if readable else None,
         "sourceKind": None if source is None else source["kind"],
-        "selectedNode": proxy["selectedNode"],
-        "udpAllowed": proxy["udpAllowed"],
-        "allowInsecureHttp": proxy["allowInsecureHttp"],
+        "selectedNode": proxy["selectedNode"] if readable else None,
+        "udpAllowed": proxy["udpAllowed"] if readable else None,
+        "allowInsecureHttp": proxy["allowInsecureHttp"] if readable else None,
+        "quarantined": proxy["quarantined"] if readable else True,
         "checkId": proxy["checkId"],
         "runtimeEpoch": "",
         "report": None,
@@ -285,6 +420,8 @@ def _proxy_status() -> dict[str, Any]:
 
 def _proxy_export() -> dict[str, Any]:
     proxy = STATE["proxy"]
+    if not proxy["stateReadable"]:
+        return _proxy_error(proxy["stateError"] or "proxy_state_invalid")
     stored = proxy["source"]
     source = None
     if stored is not None:
@@ -325,6 +462,17 @@ def _commit_proxy_mutation(before: tuple[Any, ...]) -> None:
     proxy["generation"] += 1
     if proxy["enabled"]:
         proxy["checkId"] += 1
+
+def _proxy_mutation() -> dict[str, Any]:
+    proxy = STATE["proxy"]
+    return {
+        "ok": True,
+        "generation": proxy["generation"],
+        "checkId": proxy["checkId"],
+        "enabled": proxy["enabled"],
+        "configured": proxy["source"] is not None,
+        "quarantined": True,
+    }
 
 
 
@@ -384,27 +532,39 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
             if value_size > PROXY_SOURCE_MAX_BYTES:
                 return _proxy_error("invalid_request_schema")
 
-            before = _proxy_desired_state()
             proxy = STATE["proxy"]
+            recovering = not proxy["stateReadable"]
+            before = _proxy_desired_state()
             proxy["source"] = {"kind": kind, "value": value}
             proxy["enabled"] = enabled
             proxy["selectedNode"] = selected_node
             proxy["udpAllowed"] = udp_allowed
             proxy["allowInsecureHttp"] = allow_insecure_http
+            proxy["stateReadable"] = True
+            proxy["stateError"] = None
+            proxy["quarantined"] = True
+            generation_before = proxy["generation"]
             _commit_proxy_mutation(before)
-            return _proxy_status()
+            if recovering and proxy["generation"] == generation_before:
+                proxy["generation"] += 1
+                if proxy["enabled"]:
+                    proxy["checkId"] += 1
+            return _proxy_mutation()
 
         if path == "/proxy/enabled":
             if set(body) != {"enabled"} or not isinstance(body["enabled"], bool):
                 return _proxy_error("invalid_request_schema")
             proxy = STATE["proxy"]
+            if not proxy["stateReadable"]:
+                return _proxy_error(proxy["stateError"] or "proxy_state_invalid")
             enabled = body["enabled"]
             if enabled and proxy["source"] is None:
                 return _proxy_error("source_invalid")
             before = _proxy_desired_state()
             proxy["enabled"] = enabled
+            proxy["quarantined"] = True
             _commit_proxy_mutation(before)
-            return _proxy_status()
+            return _proxy_mutation()
 
         if path == "/proxy/select":
             if set(body) != {"name"} or not _valid_proxy_name(
@@ -412,34 +572,54 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
             ):
                 return _proxy_error("invalid_request_schema")
             proxy = STATE["proxy"]
+            if not proxy["stateReadable"]:
+                return _proxy_error(proxy["stateError"] or "proxy_state_invalid")
             if proxy["source"] is None:
                 return _proxy_error("source_invalid")
             before = _proxy_desired_state()
             proxy["selectedNode"] = body["name"]
+            proxy["quarantined"] = True
             _commit_proxy_mutation(before)
-            return _proxy_status()
+            return _proxy_mutation()
 
         if path == "/proxy/clear":
-            if body:
+            if set(body) != {"discardUnreadableState"} or not isinstance(
+                body["discardUnreadableState"], bool
+            ):
                 return _proxy_error("invalid_request_schema")
-            before = _proxy_desired_state()
             proxy = STATE["proxy"]
+            recovering = not proxy["stateReadable"]
+            if recovering and not body["discardUnreadableState"]:
+                return _proxy_error(proxy["stateError"] or "proxy_state_invalid")
+            generation_before = proxy["generation"]
+            before = _proxy_desired_state()
             proxy["enabled"] = False
             proxy["source"] = None
             proxy["selectedNode"] = ""
             proxy["udpAllowed"] = False
             proxy["allowInsecureHttp"] = False
+            proxy["stateReadable"] = True
+            proxy["stateError"] = None
+            proxy["quarantined"] = True
             _commit_proxy_mutation(before)
-            return _proxy_status()
+            if recovering and proxy["generation"] == generation_before:
+                proxy["generation"] += 1
+            return _proxy_mutation()
 
         if path == "/proxy/check":
             if body:
                 return _proxy_error("invalid_request_schema")
             proxy = STATE["proxy"]
+            if not proxy["stateReadable"]:
+                return _proxy_error(proxy["stateError"] or "proxy_state_invalid")
             if not proxy["enabled"] or proxy["source"] is None:
                 return _proxy_error("proxy_disabled")
             proxy["checkId"] += 1
-            return _proxy_status()
+            return {
+                "ok": True,
+                "generation": proxy["generation"],
+                "checkId": proxy["checkId"],
+            }
 
     raise AssertionError(f"unhandled proxy route: {path}")
 
@@ -447,6 +627,8 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
 
 
 def response(path: str, method: str, body: Any) -> dict[str, Any]:
+    if path.startswith("/bootstrap/"):
+        return _bootstrap_response(path, method, body)
     if path in _KEYBOX_METHODS:
         return _keybox_response(path, method, body)
     if path in _PROXY_METHODS:

@@ -21,6 +21,21 @@ struct {
 	__type(value, __u64);
 } deny_count SEC(".maps");
 
+struct xenoid_policy_identity {
+	__u8 input_digest[32];
+	__u8 artifact_digest[32];
+	__u32 program_ids[4];
+	__u8 program_tags[4][8];
+	__u32 attach_mode;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct xenoid_policy_identity);
+} policy_identity SEC(".maps");
+
 static __always_inline void bump_deny(void)
 {
 	__u32 key = 0;
@@ -204,19 +219,26 @@ static __always_inline int should_deny_file(struct file *file)
 }
 
 SEC("lsm/file_open")
-int BPF_PROG(xenoid_lsm_file_open, struct file *file)
+int BPF_PROG(xenoid_lsm_file_open, struct file *file, int ret)
 {
+	if (ret)
+		return ret;
 	return should_deny_file(file);
 }
 
 SEC("fmod_ret/security_file_open")
-int BPF_PROG(xenoid_fmod_security_file_open, struct file *file)
+int BPF_PROG(xenoid_fmod_security_file_open, struct file *file, int ret)
 {
+	if (ret)
+		return ret;
 	return should_deny_file(file);
 }
 SEC("lsm/inode_permission")
-int BPF_PROG(xenoid_lsm_inode_permission, struct inode *inode, int mask)
+int BPF_PROG(xenoid_lsm_inode_permission, struct inode *inode, int mask,
+	     int ret)
 {
+	if (ret)
+		return ret;
 	return should_deny_inode(inode, mask);
 }
 

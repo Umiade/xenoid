@@ -18,6 +18,7 @@ from xenoid.cellular import (PROFILE_SCHEMA, CellularError, dataset_countries,
                              masked_profile_summary, validate_profile)
 from xenoid.location import (DEFAULT_COUNTRY, LocationError, LocationStateStore,
                              convergence_action, location_runtime_epoch, normalize_country,
+                             missing_regeneration_target,
                              public_summary, supported_countries)
 
 INSTANCE = "123e4567-e89b-42d3-a456-426614174000"
@@ -226,12 +227,18 @@ def test_sim_epoch_rotation_renews_same_country() -> None:
         store.set_desired("SG")
         before = store.load()
         sg_profile = before["profiles"]["SG"]["profile"]
-        rotated = store.rotate_sim_identity()
-        require(rotated["simEpoch"] != "")
+        target_epoch = "ab" * 16
+        target = store.regeneration_target(target_epoch)
+        rotated = store.rotate_sim_identity(
+            sim_epoch=target_epoch,
+            expected_epoch=before["simEpoch"],
+        )
+        require(rotated["simEpoch"] == target_epoch)
         pending = rotated["pending"]
         require(pending is not None and pending["phase"] == "new")
         require(pending["country"] == "SG")
         new_profile = rotated["profiles"]["SG"]["profile"]
+        require(pending["profileDigest"] == target["profileDigest"])
         require(pending["profileDigest"] == new_profile["identityDigest"])
         for field in ("imsi", "iccid", "msisdn"):
             require(new_profile["sim"][field] != sg_profile["sim"][field])
@@ -248,11 +255,83 @@ def test_sim_epoch_rotation_renews_same_country() -> None:
         store.set_desired("SG")
         require(store.load()["profiles"]["SG"]["profile"]["sim"]["imsi"]
                 == new_profile["sim"]["imsi"])
+        retried = store.rotate_sim_identity(
+            sim_epoch=target_epoch,
+            expected_epoch=before["simEpoch"],
+        )
+        require(retried["pending"] == store.load()["pending"])
+        third = dict(store.load())
+        third["simEpoch"] = "cd" * 16
+        store.save(third)
+        expect(
+            "device_regeneration_state_invalid",
+            lambda: store.rotate_sim_identity(
+                sim_epoch=target_epoch,
+                expected_epoch=before["simEpoch"],
+            ),
+        )
         # A stale-epoch active record tolerates the refreshed entry.
         current = dict(store.load())
         current["pending"] = None
         store._write(current)
         store.set_desired("SG")
+
+
+def test_missing_location_regeneration_target_is_journal_bound() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        transaction = "ab" * 16
+        sim_epoch = "cd" * 16
+        target = missing_regeneration_target(
+            INSTANCE,
+            transaction,
+            sim_epoch,
+        )
+        journal = root / "device-regenerate-v2.json"
+        journal.write_text(
+            json.dumps(
+                {
+                    "schema": "dev.xenoid.device-regenerate/v2",
+                    "instanceId": INSTANCE,
+                    "transactionId": transaction,
+                    "target": {
+                        "simEpoch": sim_epoch,
+                        "locationProfileDigest": target["profileDigest"],
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        journal.chmod(0o600)
+        store = LocationStateStore(root)
+        created = store.initialize_regeneration_target(
+            INSTANCE,
+            transaction,
+            sim_epoch,
+            target["profileDigest"],
+        )
+        require(created["pending"]["phase"] == "new")
+        require(created["pending"]["profileDigest"] == target["profileDigest"])
+        require(
+            store.initialize_regeneration_target(
+                INSTANCE,
+                transaction,
+                sim_epoch,
+                target["profileDigest"],
+            )
+            == created
+        )
+        expect(
+            "device_regeneration_state_invalid",
+            lambda: store.initialize_regeneration_target(
+                INSTANCE,
+                transaction,
+                "ef" * 16,
+                target["profileDigest"],
+            ),
+        )
 
 
 def test_state_permissions_and_corruption() -> None:
@@ -351,6 +430,7 @@ def main() -> int:
     test_crash_safe_recreate_exactly_once()
     test_rotation_and_cached_restore()
     test_sim_epoch_rotation_renews_same_country()
+    test_missing_location_regeneration_target_is_journal_bound()
     test_state_permissions_and_corruption()
     test_public_summary_masks_secrets()
     test_legacy_state_cleanup()

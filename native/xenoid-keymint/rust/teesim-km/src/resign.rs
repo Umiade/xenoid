@@ -75,7 +75,8 @@ impl Ta {
         // with its EC key) and reports which key it returned, so `is_ec` here is the signing key's
         // algorithm — what the signature fields must describe, not the attested key's.
         let want_ec = tbs.subject_public_key_info.algorithm.oid == ID_EC_PUBLIC_KEY;
-        let (batch_key, batch_chain, is_ec) = self.sign_info.batch(want_ec);
+        let sign_info = self.sign_info.as_ref().ok_or_else(|| err("keybox is not configured"))?;
+        let (batch_key, batch_chain, is_ec) = sign_info.batch(want_ec);
         let batch_leaf = batch_chain.first().ok_or_else(|| err("keybox chain is empty"))?;
         let batch_leaf =
             Certificate::from_der(&batch_leaf.encoded_certificate).map_err(wrap("parse keybox leaf"))?;

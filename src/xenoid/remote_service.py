@@ -39,9 +39,10 @@ from .config import (
     validate_instance_name,
 )
 from .daemon_client import DaemonClient
+from .device_identity import IdentityError, RegenerationJournal
 from .mcp_server import (
-    CHILD_LOCK_TOOL_NAMES,
     MCPRuntime,
+    _legacy_proxy_recovery_allowed,
     call_tool,
     tools as local_tools,
 )
@@ -107,13 +108,18 @@ REMOTE_TOOL_POLICIES: dict[str, RemoteToolPolicy] = {
     "xenoid_hide_status": _remote_policy("read", False),
     "xenoid_hide_overlay_status": _remote_policy("read", False),
     "xenoid_ota_check": _remote_policy("read", False),
-    "xenoid_up": _remote_policy("control", True, "skipBuild", "reuseRuntime"),
+    "xenoid_up": _remote_policy("control", True, "skipBuild"),
     "xenoid_stop": _remote_policy("control", True, destructive=True),
     "xenoid_google_services_enable": _remote_policy("control", True, "release"),
     "xenoid_google_services_disable": _remote_policy("control", True, destructive=True),
     "xenoid_proxy_on": _remote_policy("control", True),
     "xenoid_proxy_off": _remote_policy("control", True),
-    "xenoid_proxy_clear": _remote_policy("control", True, destructive=True),
+    "xenoid_proxy_clear": _remote_policy(
+        "control",
+        True,
+        "discardUnreadableState",
+        destructive=True,
+    ),
     "xenoid_proxy_select": _remote_policy("control", True, "name"),
     "xenoid_location_set": _remote_policy("control", True, "countryCode"),
     "xenoid_input_tap": _remote_policy("control", True, "x", "y"),
@@ -695,15 +701,14 @@ class ServiceApplication:
         )
         manager = RuntimeManager(context, config, lease)
         daemon = DaemonClient(context, lease, manager.docker_base_cmd())
-        # Network calls never self-start the daemon as a side effect of a read.
-        # The caller must use the explicit full-convergence xenoid_up tool.
+        # Feature tools use MCPRuntime's shared bootstrap prerequisite; explicit
+        # observational tools such as health/status remain non-converging.
         return MCPRuntime(
             context,
             config,
             lease,
             manager,
             daemon,
-            auto_ensure_daemon=False,
             operation_lock_timeout_seconds=0,
         )
 
@@ -863,23 +868,6 @@ class ServiceApplication:
             return invoke(initial)
 
         with self._thread_operation_lock(initial.context.instance_id):
-            # CLI-backed mutations acquire and retain the cross-process lock
-            # in the child, so a service crash cannot release the lock while
-            # that operation keeps running.
-            if name in CHILD_LOCK_TOOL_NAMES:
-                try:
-                    current = self._resolve_runtime(instance)
-                except (InstanceError, OSError):
-                    value = {"ok": False, "error": "instance_not_available"}
-                    return _complete_result(value, is_error=True)
-                if (
-                    current.context.instance_id != initial.context.instance_id
-                    or not grant.permits_instance(current.context)
-                ):
-                    value = {"ok": False, "error": "instance_not_available"}
-                    return _complete_result(value, is_error=True)
-                return invoke(current)
-
             with _instance_operation_lock(initial.context):
                 try:
                     current = self._resolve_runtime(instance)
@@ -893,6 +881,34 @@ class ServiceApplication:
                     value = {"ok": False, "error": "instance_not_available"}
                     return _complete_result(value, is_error=True)
                 current = replace(current, operation_lock_held=True)
+                current.manager.operation_lock_held = True
+                if name != "xenoid_up":
+                    try:
+                        regeneration = RegenerationJournal(
+                            current.context
+                        ).load()
+                    except IdentityError as exc:
+                        if (
+                            exc.code == "device_regeneration_legacy_pending"
+                            and _legacy_proxy_recovery_allowed(
+                                current,
+                                name,
+                                validated,
+                            )
+                        ):
+                            regeneration = None
+                        else:
+                            value = {"ok": False, "error": exc.code}
+                            return _complete_result(value, is_error=True)
+                    if regeneration is not None:
+                        value = {
+                            "ok": False,
+                            "error": "device_regeneration_pending",
+                            "phase": regeneration["phase"],
+                        }
+                        return _complete_result(value, is_error=True)
+                if not bool(validated.get("dryRun", False)):
+                    current.manager.migrate_legacy_token_state()
                 return invoke(current)
 
     def dispatch(

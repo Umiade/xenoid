@@ -1,470 +1,585 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, hashlib, inspect, json, os, pathlib, subprocess, tarfile, tempfile, sys
-GENERIC_CAMERA_PATHS = [
-  'native/xenoid-camerahal/android.hardware.camera.provider-service-aidl',
-  'native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml',
-  'native/xenoid-camerahal/media_profiles_V1_0.xml',
-  'native/xenoid-gralloc/gralloc.redroid.so',
-  'artifacts/android.hardware.camera.provider-service-aidl',
-  'artifacts/android.hardware.camera.provider.ICameraProvider.xml',
-  'artifacts/media_profiles_V1_0.xml',
-  'artifacts/gralloc.redroid.so',
-]
-RETIRED_CAMERA_BASENAMES = {
-  'xenoid-camerahal',
-  'xenoid-camerahal.rc',
+
+import argparse
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import sys
+import tarfile
+from typing import Any
+import zipfile
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from xenoid.sensitive import SensitiveByteScanner
+
+RELEASE_SCHEMA = "dev.xenoid.release/v1"
+VERIFY_SCHEMA = "dev.xenoid.release-verification/v1"
+_MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_MEMBERS = 20_000
+_MAX_TEXT_BYTES = 8 * 1024 * 1024
+_MAX_OTA_BYTES = 512 * 1024 * 1024
+_MAX_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
+_REQUIRED = {
+    "README.md",
+    "README_CN.md",
+    "RUNBOOK.md",
+    "doctor.json",
+    "gate-evidence.json",
+    "manifest.json",
+    "bin/xenoid",
+    "bin/xenoid-mcp",
+    "bin/xenoid-service",
+    "src/xenoid/gates.py",
+    "src/xenoid/sensitive.py",
+    "src/xenoid/process.py",
+    "src/xenoid/doctor.py",
+    "src/xenoid/live_observe.py",
+    "scripts/verify.sh",
+    "scripts/ci.sh",
+    "scripts/audit-sensitive-data.py",
+    "scripts/canonical-tar.py",
+    "scripts/run-bounded-command.py",
+    "scripts/make-ota-bundle.sh",
+    "scripts/package-release.sh",
+    "scripts/verify-release.py",
+    "daemon/app/build/outputs/apk/debug/app-debug.apk",
+    "artifacts/xenoid-daemon.apk",
+    "artifacts/xenoid-rootd-arm64",
+    "artifacts/xenoid-keymint",
+    "artifacts/xenoid-proxy-sandbox",
+    "native/xenoid-keymint/xenoid-keymint",
+    "native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",
 }
-GENERIC_RUNTIME_CAMERA_TOKENS = (
-  'service vendor.camera-provider-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl',
-  'COPY payload/android.hardware.camera.provider-service-aidl /system/bin/hw/android.hardware.camera.provider-service-aidl',
-  'COPY --chmod=644 payload/gralloc.redroid.so /vendor/lib64/hw/gralloc.redroid.so',
-  'COPY --chmod=644 payload/media_profiles_V1_0.xml /vendor/etc/media_profiles_V1_0.xml',
-)
-RETIRED_RUNTIME_CAMERA_TOKENS = (
-  'service xenoid-camerahal ',
-  '/system/bin/xenoid-camerahal',
-  '/system/bin/hw/xenoid-camerahal',
-  'init.svc.xenoid-camerahal',
-)
-KEYMINT_NATIVE_PATHS = (
-  'native/xenoid-keymint/xenoid-keymint',
-)
-KEYMINT_ARTIFACT_PATHS = (
-  'artifacts/xenoid-keymint',
-)
-KEYMINT_RUNTIME_TOKENS = (
-  'COPY --chmod=755 payload/android.hardware.security.keymint-service /system/bin/hw/android.hardware.security.keymint-service',
-  'COPY --chmod=644 payload/android.hardware.security.keymint-service.rc /system/etc/init/android.hardware.security.keymint-service.rc',
-  'COPY payload/android.hardware.security.keymint.IKeyMintDevice.xml /vendor/etc/vintf/manifest/android.hardware.security.keymint.IKeyMintDevice.xml',
-)
-KEYMINT_SOURCE_PATHS = (
-  'scripts/build-keymint.sh',
-  'scripts/fetch-keymint-deps.sh',
-  'native/xenoid-keymint/CMakeLists.txt',
-  'native/xenoid-keymint/src/keymint_service.cpp',
-  'native/xenoid-keymint/src/keymint_router.cpp',
-  'native/xenoid-keymint/src/control.cpp',
-  'native/xenoid-keymint/src/control.h',
-  'native/xenoid-keymint/src/json.cpp',
-  'native/xenoid-keymint/src/json.hpp',
-  'native/xenoid-keymint/src/logging.hpp',
-  'native/xenoid-keymint/src/crypto_compat.c',
-  'native/xenoid-keymint/src/libcrypto.syms',
-  'native/xenoid-keymint/rust/Cargo.toml',
-  'native/xenoid-keymint/rust/build.sh',
-  'native/xenoid-keymint/rust/teesim-km/Cargo.toml',
-  'native/xenoid-keymint/rust/teesim-km/include/teesim_km.h',
-  'native/xenoid-keymint/rust/patches/kmr-crypto-boring.patch',
-  'native/xenoid-keymint/rust/patches/kmr-crypto-boring-ec-group.patch',
-  'native/xenoid-keymint/rust/patches/kmr-ta-authtoken.patch',
-  'native/xenoid-keymint/rust/patches/kmr-ta-seclevel.patch',
-  'native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml',
-)
+_ARTIFACT_PAIRS = {
+    "artifacts/xenoid-daemon.apk": "daemon/app/build/outputs/apk/debug/app-debug.apk",
+    "artifacts/xenoid-input": "native/xenoid-input/xenoid-input",
+    "artifacts/xenoid-hide-helper": "native/xenoid-hide/xenoid-hide",
+    "artifacts/xenoid-profile-helper": "native/xenoid-profile/xenoid-profile",
+    "artifacts/xenoid-netctl": "native/xenoid-netctl/xenoid-netctl",
+    "artifacts/xenoid-rootd-arm64": "native/xenoid-rootd/xenoid-rootd-arm64",
+    "artifacts/xenoid-keymint": "native/xenoid-keymint/xenoid-keymint",
+    "artifacts/xenoid-proxy-sandbox": "native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",
+    "artifacts/libxenoid_zygote.so": "native/xenoid-zygote/libxenoid_zygote.so",
+    "artifacts/libxenoid_shim-arm64.so": "native/xenoid-shim/libxenoid_shim-arm64.so",
+    "artifacts/xenoid-pivot": "native/xenoid-pivot/xenoid-pivot",
+    "artifacts/xenoid-sensorshal": "native/xenoid-sensorshal/xenoid-sensorshal",
+    "artifacts/android.hardware.sensors.ISensors.xml": "native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml",
+    "artifacts/android.hardware.camera.provider-service-aidl": "native/xenoid-camerahal/android.hardware.camera.provider-service-aidl",
+    "artifacts/android.hardware.camera.provider.ICameraProvider.xml": "native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml",
+    "artifacts/media_profiles_V1_0.xml": "native/xenoid-camerahal/media_profiles_V1_0.xml",
+    "artifacts/gralloc.redroid.so": "native/xenoid-gralloc/gralloc.redroid.so",
+    "artifacts/hwcomposer.raven.so": "native/xenoid-hwcomposer/hwcomposer.raven.so",
+    "artifacts/xenoid-overlay-helper": "native/xenoid-hide/xenoid-overlay",
+    "artifacts/xenoid-prop-area": "native/xenoid-hide/xenoid-prop-area",
+    "artifacts/xenoid-ssaid": "native/xenoid-hide/xenoid-ssaid",
+    "scripts/xenoid-proxy-sandbox": "native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",
+    "artifacts/libxenoid-ril.so": "native/xenoid-ril/libxenoid-ril.so",
+    "artifacts/android.hardware.radio.config-service.xenoid": "native/xenoid-radio-config/android.hardware.radio.config-service.xenoid",
+}
+_TEXT_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".java", ".json", ".md", ".py", ".sh", ".txt", ".xml", ".yml", ".yaml"}
 
-CAMERA_HARNESS_JAVA_PREFIX = 'tests/camera-runtime-probe/java/org/example/cameraruntimeprobe/'
-CAMERA_HARNESS_JAVA_PATHS = [
-  CAMERA_HARNESS_JAVA_PREFIX + name
-  for name in (
-    'CamcorderProfilesProbeActivity.java',
-    'Camera2ProbeActivity.java',
-    'CameraSupport.java',
-    'FrameSeriesProbeActivity.java',
-    'FixtureActivity.java',
-    'IsolationProbeService.java',
-    'LegacyProbeActivity.java',
-    'NdkProbeActivity.java',
-    'PrivacyProbeActivity.java',
-    'ProbeIo.java',
-    'RecorderProbeActivity.java',
-    'ReplayProbeActivity.java',
-    'UpdateProbeActivity.java',
-  )
-]
 
-REQUIRED = [
-  'README.md', 'README_CN.md', 'RUNBOOK.md', 'doctor.json', 'manifest.json',
-  'docs/remote-service.md',
-  'bin/xenoid', 'bin/xenoid-mcp', 'bin/xenoid-service',
-  'src/xenoid/__init__.py', 'src/xenoid/cli.py', 'src/xenoid/backend.py',
-  'src/xenoid/config.py', 'src/xenoid/storage.py', 'src/xenoid/device_identity.py',
-  'src/xenoid/util.py', 'src/xenoid/daemon_client.py',
-  'src/xenoid/proxy_controller.py', 'src/xenoid/proxy_protocol.py',
-  'src/xenoid/proxy_source.py', 'src/xenoid/mcp_server.py',
-  'src/xenoid/remote_service.py', 'src/xenoid/operation_lock.py',
-  'src/xenoid/doctor.py', 'scripts/xenoid-up.sh',
-  'src/xenoid/google_services.py',
-  'scripts/make-runtime-context.sh', 'scripts/make-rootfs-image.sh',
-  'scripts/patch-services-runtime.py', 'scripts/redroid-preflight.sh',
-  'scripts/build-kmod.sh', 'scripts/build-ebpf.sh', 'scripts/load-ebpf.sh',
-  'scripts/with-shared-protection-lock.py', 'scripts/with-up-lock.py',
-  'examples/fingerprints/pixel-raven-android13.json', 'examples/hide/default-policy.json',
-  'scripts/build-proxy-sandbox.sh', 'scripts/xenoid-proxy-engine.py',
-  'scripts/xenoid-proxy-agent.py', 'scripts/xenoid-proxy-compile-worker.py',
-  'scripts/xenoid-proxy-fetch-worker.py',
-  'scripts/xenoid-proxy-agent@.service', 'scripts/proxy-engine-assets.json',
-  'scripts/xenoid-proxy-sandbox',
-  'daemon/app/build/outputs/apk/debug/app-debug.apk',
-  'native/xenoid-input/xenoid-input', 'native/xenoid-hide/xenoid-hide',
-  'native/xenoid-hide/xenoid-overlay', 'native/xenoid-hide/xenoid-prop-area',
-  'native/xenoid-hide/xenoid-ssaid', 'native/xenoid-profile/xenoid-profile',
-  'native/xenoid-netctl/xenoid-netctl', 'native/xenoid-rootd/xenoid-rootd-arm64',
-  'native/xenoid-zygote/libxenoid_zygote.so',
-  'native/xenoid-shim/libxenoid_shim-arm64.so',
-  'native/xenoid-pivot/xenoid-pivot',
-  *KEYMINT_SOURCE_PATHS,
-  'scripts/smoke-app-process-needed.py',
-  *KEYMINT_NATIVE_PATHS, *KEYMINT_ARTIFACT_PATHS,
-  'native/xenoid-sensorshal/xenoid-sensorshal',
-  'native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml',
-  'native/xenoid-proxy-sandbox/Makefile',
-  'native/xenoid-proxy-sandbox/xenoid_proxy_sandbox.c',
-  'native/xenoid-proxy-sandbox/xenoid-proxy-sandbox',
-  *GENERIC_CAMERA_PATHS[:3],
-  'artifacts/xenoid-daemon.apk', 'artifacts/xenoid-input',
-  'artifacts/xenoid-hide-helper', 'artifacts/xenoid-profile-helper',
-  'artifacts/xenoid-netctl', 'artifacts/xenoid-rootd-arm64',
-  'artifacts/libxenoid_zygote.so', 'artifacts/libxenoid_shim-arm64.so',
-  'artifacts/xenoid-pivot', 'artifacts/xenoid-sensorshal',
-  'artifacts/android.hardware.sensors.ISensors.xml',
-  *GENERIC_CAMERA_PATHS[3:],
-  'artifacts/xenoid-overlay-helper', 'artifacts/xenoid-prop-area',
-  'artifacts/xenoid-ssaid', 'config/config-macos-colima.json',
-  'artifacts/xenoid-proxy-sandbox',
-  'config/config-linux-arm.json',
-  'skills/xenoid/SKILL.md',
-  'scripts/smoke-camera-runtime.sh',
-  'scripts/smoke-filesystem-runtime.sh',
-  'tests/filesystem-runtime-probe/AndroidManifest.xml',
-  'tests/filesystem-runtime-probe/build.sh',
-  'tests/filesystem-runtime-probe/native/filesystem_probe.cpp',
-  'tests/filesystem-runtime-probe/java/org/example/filesystemruntimeprobe/ProbeActivity.java',
-  'tests/filesystem-runtime-probe/java/org/example/filesystemruntimeprobe/IsolationProbeService.java',
-  'scripts/smoke-persistence-runtime.sh',
-  'tests/persistence-runtime-probe/AndroidManifest.xml',
-  'tests/persistence-runtime-probe/build.sh',
-  'tests/persistence-runtime-probe/java/org/example/persistenceruntimeprobe/ProbeActivity.java',
-  'scripts/smoke-google-services-runtime.sh',
-  'scripts/smoke-google-services-convergence.sh',
-  'scripts/test-google-services.py',
-  'tests/google-services-runtime-probe/AndroidManifest.xml',
-  'tests/google-services-runtime-probe/build.sh',
-  'tests/google-services-runtime-probe/java/org/example/googleservicesruntimeprobe/ProbeActivity.java',
-  'tests/camera-runtime-probe/AndroidManifest.xml',
-  'tests/camera-runtime-probe/build.sh',
-  'tests/camera-runtime-probe/native/ndk_probe.cpp',
-  *CAMERA_HARNESS_JAVA_PATHS,
-  'daemon/app/src/main/java/dev/xenoid/daemon/ProxyManager.java',
-  'daemon/app/src/main/java/dev/xenoid/daemon/ProxyAgentChannel.java',
-  'daemon/app/src/main/java/dev/xenoid/daemon/LocationIdentityManager.java',
-  'src/xenoid/location.py', 'src/xenoid/cellular.py',
-  'data/cellular/provenance.json', 'data/cellular/carriers.json',
-  'data/cellular/LICENSES.txt',
-  'scripts/build-ril.sh', 'scripts/build-radio-config.sh',
-  'scripts/test-cellular-profile.py',
-  'scripts/test-ril-source.py', 'scripts/smoke-cellular-runtime.sh',
-  'scripts/patch-telephony-legacy-lte-band.py',
-  'scripts/smoke-hardware-features.py',
-  'native/xenoid-ril/xenoid_ril.c',
-  'native/xenoid-ril/include/telephony/ril.h',
-  'native/xenoid-ril/android.hardware.radio.IRadio.xml',
-  'native/xenoid-ril/libxenoid-ril.so',
-  'native/xenoid-radio-config/radio_config.cpp',
-  'native/xenoid-radio-config/framework-min.aidl',
-  'native/xenoid-radio-config/android.hardware.radio.config.IRadioConfig.xml',
-  'native/xenoid-radio-config/android.hardware.radio.config-service.xenoid',
-  'runtime/redroid/xenoid-cellular-overlay/system/etc/apns-conf.xml',
-  'runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/xenoid-cellular-features.xml',
-  'runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/privapp-permissions-xenoid.xml',
-  'runtime/redroid/xenoid-hardware-features.xml',
-  'tests/cellular-runtime-probe/AndroidManifest.xml',
-  'tests/cellular-runtime-probe/build.sh',
-  'tests/cellular-runtime-probe/native/net_probe.cpp',
-  'tests/cellular-runtime-probe/java/org/example/cellularruntimeprobe/ProbeActivity.java',
-  'tests/cellular-runtime-probe/java/org/example/cellularruntimeprobe/IsolationProbeService.java',
-  'skills/xenoid-development/SKILL.md',
-  'scripts/test-remote-service.py',
-  'scripts/test-mcp-contract.py',
-  'artifacts/libxenoid-ril.so',
-  'artifacts/android.hardware.radio.config-service.xenoid',
-  'data/google-services/mindthegapps-13.0.0-arm64-20231025_200931.json',
-]
-def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
-def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('archive'); args=ap.parse_args()
-    archive=pathlib.Path(args.archive).resolve()
-    out={'ok': False, 'archive': str(archive), 'checks': []}
-    if not archive.exists():
-        out['error']='archive not found'; print(json.dumps(out,indent=2)); return 1
-    with tempfile.TemporaryDirectory() as td:
-        td=pathlib.Path(td)
-        with tarfile.open(archive,'r:gz') as tf:
-            if any(member.issym() or member.islnk() for member in tf.getmembers()):
-                out['error']='archive links are not allowed'
-                print(json.dumps(out, indent=2))
-                return 1
-            for member in tf.getmembers():
-                target = (td / member.name).resolve()
-                if pathlib.Path(target).is_relative_to(td.resolve()) is False:
-                    out['error'] = f'unsafe archive member: {member.name}'
-                    print(json.dumps(out, indent=2))
-                    return 1
-            kwargs = {"filter": "data"} if "filter" in inspect.signature(tf.extractall).parameters else {}
-            tf.extractall(td, **kwargs)
-        roots=[p for p in td.iterdir() if p.is_dir()]
-        if len(roots) != 1:
-            out['error']=f'expected one root dir, found {len(roots)}'; print(json.dumps(out,indent=2)); return 1
-        root=roots[0]
-        manifest_path=root/'manifest.json'
-        if not manifest_path.exists():
-            out['error']='manifest missing'; print(json.dumps(out,indent=2)); return 1
-        manifest=json.loads(manifest_path.read_text())
-        entries=manifest.get('files', [])
-        if not isinstance(entries, list) or any(not isinstance(f, dict) or not isinstance(f.get('path'), str) for f in entries):
-            out['error']='invalid manifest file list'; print(json.dumps(out,indent=2)); return 1
-        files={f['path']: f for f in entries}
-        if len(files) != len(entries):
-            out['error']='duplicate manifest paths'; print(json.dumps(out,indent=2)); return 1
-        for rel in files:
-            rel_path=pathlib.Path(rel)
-            if rel_path.is_absolute() or '..' in rel_path.parts:
-                out['checks'].append({'name':'safe-manifest-path:'+rel,'ok':False,'detail':rel})
-        for req in REQUIRED:
-            p=root/req
-            listed=req == 'manifest.json' or req in files
-            ok=p.is_file() and listed
-            out['checks'].append({'name':'required:'+req,'ok':ok,'detail':str(p),'listed':listed})
-        for rel in ('bin/xenoid', 'bin/xenoid-mcp', 'bin/xenoid-service'):
-            executable = root / rel
-            out['checks'].append({
-                'name': 'executable:' + rel,
-                'ok': executable.is_file() and bool(executable.stat().st_mode & 0o111),
-                'detail': str(executable),
-            })
-        sandbox = root/'native/xenoid-proxy-sandbox/xenoid-proxy-sandbox'
-        try:
-            sandbox_data = sandbox.read_bytes()
-            sandbox_mode = sandbox.stat().st_mode
-        except OSError:
-            sandbox_data = b''
-            sandbox_mode = 0
-        program_offset = int.from_bytes(sandbox_data[32:40], 'little')
-        program_size = int.from_bytes(sandbox_data[54:56], 'little')
-        program_count = int.from_bytes(sandbox_data[56:58], 'little')
-        sandbox_static = (
-            len(sandbox_data) >= 64
-            and program_size >= 4
-            and program_offset + program_size * program_count <= len(sandbox_data)
-            and all(
-                int.from_bytes(
-                    sandbox_data[
-                        program_offset + index * program_size:
-                        program_offset + index * program_size + 4
-                    ],
-                    'little',
-                ) != 3
-                for index in range(program_count)
-            )
+def _check(checks: list[dict[str, Any]], name: str, ok: bool, error: str | None = None) -> None:
+    value: dict[str, Any] = {"name": name, "ok": bool(ok)}
+    if not ok:
+        value["errorCode"] = error or "release_check_failed"
+    checks.append(value)
+
+
+def _canonical_json(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _sha_stream(
+    stream: Any,
+    capture_limit: int = _MAX_TEXT_BYTES,
+    *,
+    scan_private: bool = False,
+) -> tuple[str, bytes | None, bytes, bool]:
+    digest = hashlib.sha256()
+    captured = bytearray()
+    prefix = bytearray()
+    scanner = SensitiveByteScanner() if scan_private else None
+    keep = True
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+        if scanner is not None:
+            scanner.feed(chunk)
+        if len(prefix) < 64:
+            prefix.extend(chunk[: 64 - len(prefix)])
+        if keep and len(captured) + len(chunk) <= capture_limit:
+            captured.extend(chunk)
+        else:
+            keep = False
+            captured.clear()
+    return (
+        digest.hexdigest(),
+        bytes(captured) if keep else None,
+        bytes(prefix),
+        bool(scanner and scanner.findings),
+    )
+
+
+def _arm64_elf(data: bytes | None) -> bool:
+    return bool(
+        data is not None
+        and len(data) >= 64
+        and data[:6] == b"\x7fELF\x02\x01"
+        and int.from_bytes(data[18:20], "little") == 183
+    )
+
+
+
+def _canonical_nested_archive(data: bytes | None, epoch: int) -> bool:
+    if (
+        data is None
+        or len(data) < 10
+        or data[:2] != b"\x1f\x8b"
+        or int.from_bytes(data[4:8], "little") != epoch
+    ):
+        return False
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            members = archive.getmembers()
+    except (OSError, tarfile.TarError):
+        return False
+    names = [member.name for member in members]
+    safe_names = all(
+        not PurePosixPath(name).is_absolute()
+        and ".." not in PurePosixPath(name).parts
+        and bool(PurePosixPath(name).parts)
+        for name in names
+    )
+    roots = {
+        PurePosixPath(name).parts[0]
+        for name in names
+        if PurePosixPath(name).parts
+    }
+    return bool(
+        members
+        and len(members) <= _MAX_MEMBERS
+        and safe_names
+        and len(roots) == 1
+        and names == sorted(names, key=lambda value: value.encode("utf-8"))
+        and len(names) == len(set(names))
+        and all(
+            not member.issym()
+            and not member.islnk()
+            and (member.isdir() or member.isfile())
+            and member.uid == 0
+            and member.gid == 0
+            and member.uname == ""
+            and member.gname == ""
+            and member.mtime == epoch
+            and not member.pax_headers
+            and member.mode
+            == (0o755 if member.isdir() or member.mode & 0o111 else 0o644)
+            for member in members
         )
-        sandbox_linux_arm64 = (
-            len(sandbox_data) >= 64
-            and sandbox_data[:6] == b'\x7fELF\x02\x01'
-            and int.from_bytes(sandbox_data[18:20], 'little') == 183
-            and sandbox_static
-            and b'/system/bin/linker64' not in sandbox_data
-            and bool(sandbox_mode & 0o111)
-        )
-        out['checks'].append({
-            'name':'linux-arm64-proxy-sandbox',
-            'ok':sandbox_linux_arm64,
-            'detail':str(sandbox),
-        })
-        artifact_sandbox = root/'artifacts/xenoid-proxy-sandbox'
-        staged_sandbox = root/'scripts/xenoid-proxy-sandbox'
-        out['checks'].append({
-            'name':'proxy-sandbox-artifact-match',
-            'ok':artifact_sandbox.is_file()
-                 and staged_sandbox.is_file()
-                 and sandbox.is_file()
-                 and sha(artifact_sandbox) == sha(sandbox)
-                 and sha(staged_sandbox) == sha(sandbox),
-            'detail':str(artifact_sandbox),
-        })
-        for native_rel, artifact_rel in zip(
-            KEYMINT_NATIVE_PATHS, KEYMINT_ARTIFACT_PATHS
-        ):
-            native = root/native_rel
-            artifact = root/artifact_rel
-            try:
-                native_data = native.read_bytes()
-                native_mode = native.stat().st_mode
-            except OSError:
-                native_data = b''
-                native_mode = 0
-            android_arm64_pie_executable = (
-                len(native_data) >= 64
-                and native_data[:6] == b'\x7fELF\x02\x01'
-                and int.from_bytes(native_data[16:18], 'little') == 3
-                and int.from_bytes(native_data[18:20], 'little') == 183
-                and bool(native_mode & 0o111)
-            )
-            matching_artifact = (
-                artifact.is_file()
-                and android_arm64_pie_executable
-                and sha(artifact) == sha(native)
-            )
-            if native_rel.endswith('xenoid-keymint'):
-                matching_artifact = (
-                    matching_artifact
-                    and b'android.hardware.security.keymint.IKeyMintDevice' in native_data
-                )
-            out['checks'].append({
-                'name':'keymint-artifact-match:'+pathlib.PurePosixPath(native_rel).name,
-                'ok':matching_artifact,
-                'detail':{'native':native_rel,'artifact':artifact_rel},
-            })
-        try:
-            keymint_validation = subprocess.run(
-                [str(root/'scripts/build-keymint.sh')],
-                cwd=root,
-                text=True,
-                capture_output=True,
-                timeout=30,
-            )
-            keymint_validation_ok = keymint_validation.returncode == 0
-            keymint_validation_detail = keymint_validation.stderr.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            keymint_validation_ok = False
-            keymint_validation_detail = 'keymint_validator_failed'
-        out['checks'].append({
-            'name':'keymint-prebuilt-validation',
-            'ok':keymint_validation_ok,
-            'detail':keymint_validation_detail,
-        })
-        runtime_context_path = root/'scripts/make-runtime-context.sh'
-        try:
-            runtime_context = runtime_context_path.read_text()
-        except OSError:
-            runtime_context = ''
-        generic_runtime_paths = (
-            all(token in runtime_context for token in GENERIC_RUNTIME_CAMERA_TOKENS)
-            and not any(
-                token in runtime_context
-                for token in RETIRED_RUNTIME_CAMERA_TOKENS
-            )
-        )
-        out['checks'].append({
-            'name':'generic-camera-runtime-paths',
-            'ok':generic_runtime_paths,
-            'detail':str(runtime_context_path),
-        })
-        out['checks'].append({
-            'name':'keymint-runtime-context',
-            'ok':all(token in runtime_context for token in KEYMINT_RUNTIME_TOKENS)
-                 and 'patch-keystore2-rc.py' not in runtime_context
-                 and 'libteesim_keymint' not in runtime_context
-                 and 'libxenoid_keymint_bootstrap' not in runtime_context
-                 and 'keybox.xml' not in runtime_context.lower()
-                 and '.keybox-upload-' not in runtime_context.lower(),
-            'detail':str(runtime_context_path),
-        })
-        harness_java_sources = sorted(
-            rel for rel in files
-            if rel.startswith(CAMERA_HARNESS_JAVA_PREFIX) and rel.endswith('.java')
-        )
-        out['checks'].append({
-            'name':'camera-runtime-harness-java-sources',
-            'ok':bool(harness_java_sources)
-                 and all((root/rel).is_file() for rel in harness_java_sources),
-            'detail':harness_java_sources,
-        })
-        for rel, meta in files.items():
-            if rel == "manifest.json":
-                continue
-            p=root/rel
-            ok=p.exists() and sha(p)==meta.get('sha256') and p.stat().st_size==meta.get('size')
-            if not ok or rel in REQUIRED:
-                out['checks'].append({'name':'sha:'+rel,'ok':ok,'detail':str(p)})
-        archive_files={
-            p.relative_to(root).as_posix()
-            for p in root.rglob('*')
-            if p.is_file() and p.name != 'manifest.json'
-        }
-        sys.path.insert(0, str(root/'src'))
-        from xenoid.google_services import registered_metadata_files
-        registered_google = registered_metadata_files()
-        for rel, expected_sha256 in sorted(registered_google.items()):
-            p = root/rel
-            metadata_ok = (
-                rel in files
-                and p.is_file()
-                and sha(p) == expected_sha256
-                and files[rel].get('sha256') == expected_sha256
-            )
-            out['checks'].append({
-                'name':'google-release-metadata:'+rel,
-                'ok':metadata_ok,
-                'detail':rel,
-            })
-        proprietary_paths = sorted(
-            rel for rel in set(files) | archive_files
-            if rel.startswith('.xenoid/')
-            or pathlib.PurePosixPath(rel).suffix.lower() in {'.zip', '.pem'}
-            or (
-                rel.startswith('data/google-services/')
-                and rel not in registered_google
-            )
-        )
-        out['checks'].append({
-            'name':'google-proprietary-payload-excluded',
-            'ok':not proprietary_paths,
-            'detail':proprietary_paths,
-        })
-        keybox_private_paths = sorted(
-            rel for rel in set(files) | archive_files
-            if '.keybox-upload-' in rel.lower()
-            or pathlib.PurePosixPath(rel).name.lower() in {
-                'keybox.xml', 'keybox.json', 'keybox.pem', 'keybox.der'
+    )
+
+
+
+def _zip_private_content(data: bytes | None) -> bool:
+    if data is None:
+        return True
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if (
+                len(entries) > _MAX_MEMBERS
+                or sum(entry.file_size for entry in entries) > _MAX_OTA_BYTES
+            ):
+                return True
+            for entry in entries:
+                path = PurePosixPath(entry.filename)
+                if path.is_absolute() or ".." in path.parts or entry.is_dir():
+                    continue
+                with archive.open(entry) as stream:
+                    if _sha_stream(stream, 0, scan_private=True)[3]:
+                        return True
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile):
+        return True
+    return False
+
+
+def _ota_payloads_valid(data: bytes | None) -> bool:
+    if data is None:
+        return False
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            members = {
+                member.name: member
+                for member in archive.getmembers()
+                if member.isfile()
             }
-        )
-        out['checks'].append({
-            'name':'keybox-private-payload-excluded',
-            'ok':not keybox_private_paths,
-            'detail':keybox_private_paths,
-        })
-        private_key_markers = sorted(
-            rel for rel in archive_files
-            if pathlib.PurePosixPath(rel).suffix.lower()
-               in {'.c', '.cc', '.cpp', '.h', '.java', '.md', '.py', '.sh', '.txt'}
-            and any(
-                marker in (root/rel).read_bytes()
-                for marker in (
-                    b'-----BEGIN ' + b'PRIVATE KEY-----',
-                    b'-----BEGIN RSA ' + b'PRIVATE KEY-----',
-                    b'-----BEGIN EC ' + b'PRIVATE KEY-----',
-                    b'<' + b'Keybox',
+            manifest_names = [
+                name for name in members if name.endswith("/manifest.json")
+            ]
+            if len(manifest_names) != 1:
+                return False
+            root = manifest_names[0].rsplit("/", 1)[0]
+            stream = archive.extractfile(members[manifest_names[0]])
+            manifest_bytes = stream.read() if stream is not None else b""
+            manifest = json.loads(manifest_bytes) if manifest_bytes else None
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("schema") != "dev.xenoid.ota/v1"
+            ):
+                return False
+            payloads = manifest.get("payloads")
+            expected_paths = {
+                "daemonApk": "payload/xenoid-daemon.apk",
+                "inputHelper": "payload/xenoid-input",
+                "hideHelper": "payload/xenoid-hide-helper",
+                "profileHelper": "payload/xenoid-profile-helper",
+                "netctlHelper": "payload/xenoid-netctl",
+            }
+            if manifest.get("apply") != list(expected_paths):
+                return False
+            expected_members = {manifest_names[0]} | {
+                f"{root}/{relative}" for relative in expected_paths.values()
+            }
+            if set(members) != expected_members:
+                return False
+            if _canonical_json(manifest) != manifest_bytes:
+                return False
+            if not isinstance(payloads, dict) or set(payloads) != set(expected_paths):
+                return False
+            for key, relative in expected_paths.items():
+                value = payloads.get(key)
+                if not isinstance(value, dict) or value.get("path") != relative:
+                    return False
+                expected = value.get("sha256")
+                member = members.get(f"{root}/{relative}")
+                payload_stream = (
+                    archive.extractfile(member) if member is not None else None
                 )
+                if payload_stream is None or not isinstance(expected, str):
+                    return False
+                payload = payload_stream.read()
+                scanner = SensitiveByteScanner()
+                scanner.feed(payload)
+                if (
+                    scanner.findings
+                    or hashlib.sha256(payload).hexdigest() != expected
+                ):
+                    return False
+    except (OSError, ValueError, tarfile.TarError):
+        return False
+    return True
+
+
+def _self_check(root: Path) -> int:
+    checks: list[dict[str, Any]] = []
+    package = (root / "scripts/package-release.sh").read_text(encoding="utf-8")
+    verifier = (root / "scripts/verify-release.py").read_text(encoding="utf-8")
+    canonical = root / "scripts/canonical-tar.py"
+    _check(checks, "fresh-gate-owner", "xenoid.gates release --fresh" in package)
+    _check(checks, "artifact-snapshot", "ArtifactBuilder" in package and ".stage(" in package)
+    _check(checks, "canonical-ota", "make-ota-bundle.sh" in package and canonical.is_file())
+    _check(checks, "canonical-release", "canonical-tar.py" in package)
+    _check(checks, "mandatory-verification", "verify-release.py" in package and "archiveSha256" in verifier)
+    _check(
+        checks,
+        "bounded-release-tools",
+        package.count("run-bounded-command.py") >= 3,
+    )
+    _check(checks, "no-audit-bypass", ("XENOID_" + "SKIP_AUDIT") not in package + verifier)
+    report = {
+        "schema": "dev.xenoid.release-source-check/v1",
+        "ok": all(item["ok"] for item in checks),
+        "checks": checks,
+    }
+    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    return 0 if report["ok"] else 1
+
+
+def verify(archive: Path) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    report: dict[str, Any] = {
+        "schema": VERIFY_SCHEMA,
+        "ok": False,
+        "archive": archive.name,
+        "checks": checks,
+    }
+    try:
+        descriptor = os.open(
+            archive,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        stream = os.fdopen(descriptor, "rb")
+        info = os.fstat(stream.fileno())
+    except OSError:
+        report["errorCode"] = "release_archive_missing"
+        return report
+    if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_ARCHIVE_BYTES:
+        stream.close()
+        report["errorCode"] = "release_archive_invalid"
+        return report
+    digest = hashlib.sha256()
+    prefix = b""
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        if not prefix:
+            prefix = chunk[:10]
+        digest.update(chunk)
+    report["archiveSha256"] = digest.hexdigest()
+    if len(prefix) < 10 or prefix[:2] != b"\x1f\x8b":
+        stream.close()
+        report["errorCode"] = "release_gzip_invalid"
+        return report
+    gzip_mtime = int.from_bytes(prefix[4:8], "little")
+    stream.seek(0)
+    try:
+        tar = tarfile.open(fileobj=stream, mode="r:gz")
+    except (OSError, tarfile.TarError):
+        stream.close()
+        report["errorCode"] = "release_tar_invalid"
+        return report
+    with stream, tar:
+        members = tar.getmembers()
+        if not members or len(members) > _MAX_MEMBERS:
+            report["errorCode"] = "release_member_count_invalid"
+            return report
+        if sum(member.size for member in members if member.isfile()) > _MAX_EXPANDED_BYTES:
+            report["errorCode"] = "release_expanded_size_invalid"
+            return report
+        names = [member.name for member in members]
+        _check(checks, "canonical-member-order", names == sorted(names, key=lambda value: value.encode("utf-8")), "release_member_order_invalid")
+        _check(checks, "unique-members", len(names) == len(set(names)), "release_duplicate_member")
+        roots = {PurePosixPath(name).parts[0] for name in names if PurePosixPath(name).parts}
+        if len(roots) != 1:
+            report["errorCode"] = "release_root_invalid"
+            return report
+        root_name = next(iter(roots))
+        files: dict[str, dict[str, Any]] = {}
+        file_bytes: dict[str, bytes] = {}
+        file_prefixes: dict[str, bytes] = {}
+        canonical_metadata = True
+        safe_members = True
+        private_content = False
+        private_content_paths: list[str] = []
+        for member in members:
+            pure = PurePosixPath(member.name)
+            if pure.is_absolute() or ".." in pure.parts or not pure.parts or pure.parts[0] != root_name:
+                safe_members = False
+                continue
+            if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+                safe_members = False
+                continue
+            expected_mode = 0o755 if member.isdir() or member.mode & 0o111 else 0o644
+            canonical_metadata = canonical_metadata and (
+                member.uid == 0
+                and member.gid == 0
+                and member.uname == ""
+                and member.gname == ""
+                and member.mode == expected_mode
+                and member.mtime == gzip_mtime
+                and not member.pax_headers
             )
+            if not member.isfile():
+                continue
+            relative = PurePosixPath(*pure.parts[1:]).as_posix()
+            stream = tar.extractfile(member)
+            if stream is None:
+                safe_members = False
+                continue
+            if (
+                (
+                    relative.startswith("artifacts/xenoid-")
+                    and relative.endswith(".tar.gz")
+                )
+                or relative.endswith(".apk")
+            ):
+                capture_limit = _MAX_OTA_BYTES
+            elif PurePosixPath(relative).suffix.lower() in _TEXT_SUFFIXES:
+                capture_limit = _MAX_TEXT_BYTES
+            else:
+                capture_limit = 0
+            digest, captured, prefix, marker_found = _sha_stream(
+                stream,
+                capture_limit,
+                scan_private=True,
+            )
+            if marker_found:
+                private_content_paths.append(relative)
+                private_content = True
+            files[relative] = {
+                "sha256": digest,
+                "size": member.size,
+                "mode": member.mode,
+            }
+            if captured is not None:
+                file_bytes[relative] = captured
+            file_prefixes[relative] = prefix
+        _check(checks, "safe-members", safe_members, "release_member_unsafe")
+        _check(checks, "canonical-member-metadata", canonical_metadata, "release_member_metadata_invalid")
+
+    manifest_bytes = file_bytes.get("manifest.json")
+    try:
+        manifest = json.loads(manifest_bytes) if manifest_bytes is not None else None
+    except json.JSONDecodeError:
+        manifest = None
+    if not isinstance(manifest, dict) or set(manifest) != {"schema", "sourceDateEpoch", "gateEvidenceSha256", "files"}:
+        report["errorCode"] = "release_manifest_invalid"
+        return report
+    _check(checks, "manifest-canonical-json", manifest_bytes == _canonical_json(manifest), "release_manifest_not_canonical")
+    epoch = manifest.get("sourceDateEpoch")
+    _check(checks, "source-date-epoch", isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 and gzip_mtime == epoch, "release_epoch_mismatch")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        report["errorCode"] = "release_manifest_invalid"
+        return report
+    listed: dict[str, dict[str, Any]] = {}
+    valid_entries = True
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "mode", "size", "sha256"}:
+            valid_entries = False
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str) or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts or path in listed:
+            valid_entries = False
+            continue
+        listed[path] = entry
+    _check(checks, "manifest-entries", valid_entries and list(listed) == sorted(listed, key=lambda value: value.encode("utf-8")), "release_manifest_entries_invalid")
+    actual_without_manifest = set(files) - {"manifest.json"}
+    _check(checks, "manifest-complete", set(listed) == actual_without_manifest, "release_manifest_incomplete")
+    manifest_hashes_ok = all(
+        path in files
+        and files[path]["sha256"] == entry.get("sha256")
+        and files[path]["size"] == entry.get("size")
+        and files[path]["mode"] == entry.get("mode")
+        for path, entry in listed.items()
+    )
+    _check(checks, "manifest-hashes", manifest_hashes_ok, "release_manifest_hash_mismatch")
+    _check(checks, "required-files", _REQUIRED <= set(files), "release_required_file_missing")
+
+    gate_bytes = file_bytes.get("gate-evidence.json")
+    try:
+        gate_evidence = json.loads(gate_bytes) if gate_bytes is not None else None
+    except json.JSONDecodeError:
+        gate_evidence = None
+    gate_ok = (
+        isinstance(gate_evidence, dict)
+        and gate_evidence.get("schema") == "dev.xenoid.gates/v1"
+        and gate_evidence.get("ok") is True
+        and gate_evidence.get("profile") == "release"
+        and gate_evidence.get("fresh") is True
+        and gate_evidence.get("failedGate") is None
+        and isinstance(gate_evidence.get("gates"), dict)
+        and gate_evidence["gates"].get("sensitive-data", {}).get("cacheHit") is False
+    )
+    gate_digest = hashlib.sha256(gate_bytes or b"").hexdigest()
+    _check(checks, "fresh-gate-evidence", gate_ok and manifest.get("gateEvidenceSha256") == gate_digest, "release_gate_evidence_invalid")
+
+    doctor_bytes = file_bytes.get("doctor.json")
+    try:
+        doctor = json.loads(doctor_bytes) if doctor_bytes is not None else None
+    except json.JSONDecodeError:
+        doctor = None
+    doctor_ok = (
+        isinstance(doctor, dict)
+        and doctor.get("schema") == "dev.xenoid.doctor/v1"
+        and doctor.get("complete") is False
+        and doctor.get("runtimeAvailable") is False
+        and doctor.get("runtimeRequired") is False
+        and doctor.get("sections", {}).get("offlineBuildEvidence", {}).get("complete") is False
+        and doctor.get("sections", {}).get("offlineBuildEvidence", {}).get("gateEvidenceSha256") == gate_digest
+    )
+    _check(checks, "offline-doctor-evidence", doctor_ok, "release_doctor_evidence_invalid")
+
+    pair_ok = all(
+        alias in files and source in files and files[alias]["sha256"] == files[source]["sha256"]
+        for alias, source in _ARTIFACT_PAIRS.items()
+    )
+    _check(checks, "artifact-aliases", pair_ok, "release_artifact_mismatch")
+    _check(checks, "keymint-arm64", _arm64_elf(file_prefixes.get("artifacts/xenoid-keymint")), "release_keymint_invalid")
+    _check(checks, "proxy-sandbox-arm64", _arm64_elf(file_prefixes.get("artifacts/xenoid-proxy-sandbox")), "release_proxy_sandbox_invalid")
+    non_elf_aliases = {
+        "artifacts/xenoid-daemon.apk",
+        "artifacts/android.hardware.sensors.ISensors.xml",
+        "artifacts/android.hardware.camera.provider.ICameraProvider.xml",
+        "artifacts/media_profiles_V1_0.xml",
+    }
+    elf_aliases = set(_ARTIFACT_PAIRS) - non_elf_aliases
+    _check(
+        checks,
+        "all-arm64-artifacts",
+        all(
+            _arm64_elf(file_prefixes.get(path))
+            and files.get(path, {}).get("mode") == 0o755
+            for path in elf_aliases
+        ),
+        "release_artifact_architecture_invalid",
+    )
+
+    private_paths = [
+        path
+        for path in files
+        if path.startswith(".xenoid/")
+        or PurePosixPath(path).suffix.lower() in {".pem", ".zip"}
+        or ".keybox-upload-" in path.lower()
+        or PurePosixPath(path).name.lower()
+        in {"keybox.xml", "keybox.json", "keybox.pem", "keybox.der"}
+    ]
+    _check(checks, "private-path-exclusion", not private_paths, "release_private_path")
+    nested_private_paths = [
+        path
+        for path in files
+        if path.endswith(".apk")
+        and _zip_private_content(file_bytes.get(path))
+    ]
+    if nested_private_paths:
+        private_content = True
+        private_content_paths.extend(nested_private_paths)
+    if private_content_paths:
+        report["privateContentPaths"] = sorted(
+            set(private_content_paths),
+            key=lambda value: value.encode("utf-8"),
+        )[:64]
+    _check(checks, "private-content-exclusion", not private_content, "release_private_content")
+
+    ota_paths = sorted(path for path in files if path.startswith("artifacts/xenoid-") and path.endswith(".tar.gz"))
+    _check(checks, "canonical-ota-present", len(ota_paths) == 1, "release_ota_missing")
+    if len(ota_paths) == 1:
+        ota_ok = (
+            _canonical_nested_archive(file_bytes.get(ota_paths[0]), epoch)
+            and _ota_payloads_valid(file_bytes.get(ota_paths[0]))
         )
-        out['checks'].append({
-            'name':'keybox-private-content-excluded',
-            'ok':not private_key_markers,
-            'detail':private_key_markers,
-        })
-        retired_camera_paths = sorted(
-            rel for rel in set(files) | archive_files
-            if pathlib.PurePosixPath(rel).name in RETIRED_CAMERA_BASENAMES
-        )
-        out['checks'].append({
-            'name':'retired-camera-artifact-aliases',
-            'ok':not retired_camera_paths,
-            'detail':retired_camera_paths,
-        })
-        for rel in sorted(archive_files - set(files)):
-            out['checks'].append({'name':'unlisted:'+rel,'ok':False,'detail':str(root/rel)})
-        out['schema']=manifest.get('schema')
-        out['fileCount']=len(files)
-        out['ok']=all(c['ok'] for c in out['checks']) and out['schema']=='dev.xenoid.release/v1'
-    print(json.dumps(out, indent=2))
-    return 0 if out['ok'] else 2
-if __name__=='__main__': sys.exit(main())
+        _check(checks, "canonical-ota", ota_ok, "release_ota_not_canonical")
+
+    report["releaseSchema"] = manifest.get("schema")
+    report["fileCount"] = len(files)
+    report["ok"] = manifest.get("schema") == RELEASE_SCHEMA and all(item["ok"] for item in checks)
+    if not report["ok"]:
+        report["errorCode"] = next((item["errorCode"] for item in checks if not item["ok"]), "release_verification_failed")
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("archive", nargs="?", type=Path)
+    parser.add_argument("--self-check", action="store_true")
+    arguments = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    if arguments.self_check:
+        return _self_check(root)
+    if arguments.archive is None:
+        parser.error("archive is required")
+    report = verify(arguments.archive.resolve())
+    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    return 0 if report.get("ok") is True else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

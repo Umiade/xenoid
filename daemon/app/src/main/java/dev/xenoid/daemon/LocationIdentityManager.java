@@ -13,6 +13,8 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 
 import java.io.File;
+import java.io.FileDescriptor;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -53,20 +55,26 @@ final class LocationIdentityManager {
 
     private final Context context;
     private final File stateFile;
+    private String bootstrapError;
 
     LocationIdentityManager(Context context) {
         this.context = context.getApplicationContext();
         this.stateFile = new File(context.getNoBackupFilesDir(), STATE_NAME);
         try {
-            Map<String, Object> state = loadState();
-            if (state != null) purgeLegacyState();
+            Map<String, Object> state = loadPrivateState();
+            if (state != null) purgeLegacyPrivateState();
         } catch (Exception ignored) {
-            android.util.Log.e("xenoid-daemon", "location identity initialization failed");
+            bootstrapError = "location_state_invalid";
         }
     }
 
     /** Removes product-owned pre-location state once the new identity exists. */
     private void purgeLegacyState() {
+        purgeLegacyPrivateState();
+        RootHelper.purgeLegacyRegionalState();
+    }
+
+    private void purgeLegacyPrivateState() {
         File legacy = new File(context.getNoBackupFilesDir(), LEGACY_STATE_NAME);
         if (legacy.exists() && !legacy.delete()) {
             android.util.Log.e("xenoid-daemon", "legacy regional state cleanup failed");
@@ -79,41 +87,99 @@ final class LocationIdentityManager {
         if (legacyTmp.exists() && !legacyTmp.delete()) {
             android.util.Log.e("xenoid-daemon", "legacy regional temp cleanup failed");
         }
-        RootHelper.purgeLegacyRegionalState();
     }
 
     synchronized void restoreDataPlane() throws Exception {
+        restoreDataPlane(Long.MAX_VALUE, null);
+    }
+
+    synchronized BootstrapCoordinator.ComponentStatus reconcileBootstrap(
+            long deadline, BootstrapCoordinator.CancellationSignal cancellation) {
+        if ("location_state_invalid".equals(bootstrapError)) {
+            return BootstrapCoordinator.ComponentStatus.failed(bootstrapError);
+        }
+        if (cancellation.isCancelled()) {
+            return BootstrapCoordinator.ComponentStatus.cancelled();
+        }
+        if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+            return BootstrapCoordinator.ComponentStatus.timedOut();
+        }
+        try {
+            Map<String, Object> restored = restoreDataPlane(deadline, cancellation);
+            if (cancellation.isCancelled()) {
+                return BootstrapCoordinator.ComponentStatus.cancelled();
+            }
+            if (android.os.SystemClock.elapsedRealtime() > deadline) {
+                return BootstrapCoordinator.ComponentStatus.timedOut();
+            }
+            if (restored == null) {
+                return BootstrapCoordinator.ComponentStatus.ready(
+                        "unconfigured", map("configured", false));
+            }
+            purgeLegacyState();
+            Map<String, Object> fields = new LinkedHashMap<>();
+            fields.put("configured", true);
+            Object epoch = restored.get("runtimeEpoch");
+            if (epoch instanceof String && ((String) epoch).matches("[0-9a-f]{64}")) {
+                fields.put("locationEpoch", epoch);
+            }
+            bootstrapError = null;
+            return BootstrapCoordinator.ComponentStatus.ready("ready", fields);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return BootstrapCoordinator.ComponentStatus.cancelled();
+        } catch (Throwable ignored) {
+            bootstrapError = "location_restore_failed";
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    bootstrapError, map("configured", stateFile.exists()));
+        }
+    }
+
+    private Map<String, Object> restoreDataPlane(long deadline,
+            BootstrapCoordinator.CancellationSignal cancellation) throws Exception {
         Map<String, Object> state = loadState();
-        if (state == null) return;
+        if (state == null) return null;
         String numeric = bounded(string(state, "operatorNumeric"), 5, 6);
-        if (!numeric.matches("[0-9]{5,6}")) throw new IllegalStateException("location_state_invalid");
+        if (!numeric.matches("[0-9]{5,6}")) {
+            throw new IllegalStateException("location_state_invalid");
+        }
         String name = bounded(string(state, "carrier"), 1, 128);
         String apn = bounded(string(state, "apn"), 1, 128);
         Exception failure = null;
         for (int attempt = 0; attempt < 20; attempt++) {
+            if ((cancellation != null && cancellation.isCancelled())
+                    || android.os.SystemClock.elapsedRealtime() >= deadline) {
+                throw new InterruptedException();
+            }
             try {
                 configureApn(name, numeric.substring(0, 3), numeric.substring(3), apn);
-                if (apnPresent(numeric, apn)) return;
+                if (apnPresent(numeric, apn)) return state;
                 failure = new IllegalStateException("location_apn_verify_failed");
             } catch (Exception retryable) {
                 failure = retryable;
             }
-            try {
-                Thread.sleep(500);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw interrupted;
-            }
+            long remaining = deadline - android.os.SystemClock.elapsedRealtime();
+            if (remaining <= 0) throw new InterruptedException();
+            Thread.sleep(Math.min(500L, remaining));
         }
         throw new IllegalStateException("location_apn_restore_failed", failure);
     }
 
     synchronized Map<String, Object> status() throws Exception {
-        Map<String, Object> state = loadState();
+        Map<String, Object> state = loadPrivateState();
         if (state == null) return map("ok", true, "state", "absent");
         Map<String, Object> result = publicState(state);
         result.put("ok", true);
         return result;
+    }
+
+    synchronized boolean healthReady() {
+        try {
+            Map<String, Object> state = loadPrivateState();
+            return state == null || "active".equals(state.get("state"));
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     synchronized Map<String, Object> stage(Map<String, Object> request) throws Exception {
@@ -193,6 +259,7 @@ final class LocationIdentityManager {
         state.put("imeBefore", imeBefore);
         state.put("imeAfter", previous == null ? null : previous.get("imeAfter"));
         saveState(state);
+        bootstrapError = null;
         Map<String, Object> result = publicState(state);
         result.put("ok", true);
         result.put("recreateRequired", true);
@@ -251,6 +318,7 @@ final class LocationIdentityManager {
         state.put("state", "active");
         state.put("runtimeEpoch", bounded(string(request, "runtimeEpoch"), 1, 192));
         saveState(state);
+        bootstrapError = null;
         purgeLegacyState();
         Map<String, Object> result = publicState(state);
         result.put("ok", true);
@@ -683,17 +751,62 @@ final class LocationIdentityManager {
     }
 
     private Map<String, Object> loadState() throws Exception {
-        if (!stateFile.exists()
-                && !RootHelper.restoreLocationState(stateFile, android.os.Process.myUid())) return null;
-        if (!stateFile.isFile() || (android.system.Os.stat(stateFile.getAbsolutePath()).st_mode & 0077) != 0) throw new IllegalStateException("location_state_invalid");
-        byte[] bytes = Files.readAllBytes(stateFile.toPath());
-        if (bytes.length == 0 || bytes.length > 64 * 1024) throw new IllegalStateException("location_state_invalid");
-        Object parsed = new JSONTokener(new String(bytes, StandardCharsets.UTF_8)).nextValue();
-        java.util.Arrays.fill(bytes, (byte) 0);
-        if (!(parsed instanceof JSONObject)) throw new IllegalStateException("location_state_invalid");
-        Map<String, Object> state = jsonObject((JSONObject) parsed);
-        if (!STATE_SCHEMA.equals(state.get("schema"))) throw new IllegalStateException("location_state_invalid");
-        return state;
+        return loadState(true);
+    }
+
+    private Map<String, Object> loadPrivateState() throws Exception {
+        return loadState(false);
+    }
+
+    private Map<String, Object> loadState(boolean allowRootRestore) throws Exception {
+        android.system.StructStat stat;
+        try {
+            stat = android.system.Os.lstat(stateFile.getAbsolutePath());
+        } catch (android.system.ErrnoException missing) {
+            if (missing.errno != android.system.OsConstants.ENOENT) throw missing;
+            if (!allowRootRestore
+                    || !RootHelper.restoreLocationState(
+                            stateFile, android.os.Process.myUid())) return null;
+            stat = android.system.Os.lstat(stateFile.getAbsolutePath());
+        }
+        if ((stat.st_mode & android.system.OsConstants.S_IFMT)
+                        != android.system.OsConstants.S_IFREG
+                || (stat.st_mode & 07777) != 0600
+                || stat.st_uid != android.os.Process.myUid()
+                || stat.st_nlink != 1 || stat.st_size <= 0 || stat.st_size > 64 * 1024) {
+            throw new IllegalStateException("location_state_invalid");
+        }
+        byte[] bytes = new byte[(int) stat.st_size];
+        FileDescriptor descriptor = android.system.Os.open(stateFile.getAbsolutePath(),
+                android.system.OsConstants.O_RDONLY | android.system.OsConstants.O_NOFOLLOW, 0);
+        try (FileInputStream input = new FileInputStream(descriptor)) {
+            descriptor = null;
+            int offset = 0;
+            while (offset < bytes.length) {
+                int count = input.read(bytes, offset, bytes.length - offset);
+                if (count <= 0) throw new IllegalStateException("location_state_invalid");
+                offset += count;
+            }
+            if (input.read() != -1) throw new IllegalStateException("location_state_invalid");
+        } finally {
+            if (descriptor != null) {
+                try { android.system.Os.close(descriptor); } catch (Throwable ignored) { }
+            }
+        }
+        try {
+            JSONTokener tokener = new JSONTokener(new String(bytes, StandardCharsets.UTF_8));
+            Object parsed = tokener.nextValue();
+            if (!(parsed instanceof JSONObject) || tokener.nextClean() != 0) {
+                throw new IllegalStateException("location_state_invalid");
+            }
+            Map<String, Object> state = jsonObject((JSONObject) parsed);
+            if (!STATE_SCHEMA.equals(state.get("schema"))) {
+                throw new IllegalStateException("location_state_invalid");
+            }
+            return state;
+        } finally {
+            java.util.Arrays.fill(bytes, (byte) 0);
+        }
     }
 
     private void saveState(Map<String, Object> state) throws Exception {

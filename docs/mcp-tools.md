@@ -1,58 +1,55 @@
 # Xenoid MCP tool contract
 
-The `xenoid-mcp` stdio server exposes the catalog below to a trusted local agent
-for one fixed `XENOID_INSTANCE`. The catalog is generated from code; this
-document intentionally does not hard-code a count. Every tool returns a JSON
-object; `ok` indicates success. Daemon-backed tools require the runtime up and
-the daemon reachable (the daemon control channel is authenticated with the
-per-instance `X-Xenoid-Token`).
+The `xenoid-mcp` stdio server exposes the catalog below to a trusted local agent for one fixed `XENOID_INSTANCE`. The catalog is generated from code; this document intentionally does not hard-code a count. Every call accepts exactly the documented camelCase properties and returns one JSON object with `ok`.
 
-`xenoid-service` derives a smaller, scope-filtered network catalog from this
-local catalog. It adds a required `instance` parameter to every instance tool,
-supports `xenoid_instances_list`, disables implicit daemon self-healing, and
-excludes unrestricted host paths/code, builds, packaging, deployment, binderfs,
-and host protection changes. See [`remote-service.md`](remote-service.md) for
-the remote scope and transport contract.
+Runtime-dependent tools share the listener-first authenticated bootstrap path. The daemon credential is app-private and may be held only in a container-ID-bound host memory buffer; neither MCP adapter persists or returns it. Component tools require their own component readiness, while aggregate daemon health is final acceptance rather than a bootstrap prerequisite.
+
+`xenoid-service` derives a smaller, scope-filtered network catalog from this local catalog. It adds required `instance` to every instance tool, supports `xenoid_instances_list`, keeps reads observational, and excludes unrestricted host paths/code, builds, packaging, deployment, binderfs, and host protection changes. See [`remote-service.md`](remote-service.md).
+
+Both adapters redact credentials, proxy sources/keys, Keybox/SIM bytes, private paths/endpoints, raw commands/responses, and child streams. `xenoid_up` calls the shared executor directly and returns safe phase summaries in one final result; it never spawns/parses another CLI.
 
 
 ## Runtime lifecycle
 
 ### `xenoid_doctor`
-Check installation, host dependencies, and the live runtime.
-  - `full` (boolean): include builds and exhaustive runtime smoke checks
-  - `requireRuntime` (boolean): fail when Android is not running and ready
+Observe host dependencies, selected digest-bound GateRunner records, and an already-running runtime.
+  - `full` (boolean): select the broader doctor-safe static record set
+  - `requireRuntime` (boolean): fail when fresh `LiveAcceptance` cannot observe a ready runtime
+
+Doctor is non-converging even with `full`: it never calls `up`, ensures daemon/rootd, builds/packages, runs mutating gates, or recursively invokes a suite. Runtime absence can be `ok=true, complete=false` unless `requireRuntime` is true.
 
 ### `xenoid_install_runtime_plan`
 Dry-run macOS runtime dependency install plan
 _No parameters._
 
 ### `xenoid_up_plan`
-Dry-run full Xenoid startup plan
+Return the exact read-only initial or resumable convergence plan.
 _No parameters._
 
 ### `xenoid_up`
 Run the canonical full Xenoid production convergence path.
-  - `skipBuild` (boolean): use already built/packaged artifacts
-  - `reuseRuntime` (boolean): require and reuse an identity-matched running runtime
+  - `skipBuild` (boolean): validate required artifact records/objects and fail on stale or missing inputs instead of compiling
 
-Successful `xenoid_up` means the same complete runtime, daemon, profile,
-protection, and live-check contract as `./xenoid up`. Its remote result is stable
-and does not include subprocess stdout/stderr or host paths.
+Reuse is automatic; no runtime-reuse field exists. The executor chooses no-op, resume, start, create, or recreate and independently refines component actions. Results use `schema=dev.xenoid.convergence/v1` and include `plan`, `resumed`, safe `phases`, immutable `before`/`after`, and `nextActions`. CLI callers additionally receive pre-hash `dev.xenoid.progress/v1` JSONL and five-second heartbeats on stderr; MCP receives only the final bounded result.
+
+`xenoid_up` also resumes a validated `dev.xenoid.device-regenerate/v2` transaction using its recorded fixed targets. A v1-only regeneration remains blocked; the evidence-preserving `device regenerate --restart-legacy-transaction` escape is trusted-local CLI only and is not an MCP tool.
 
 ### `xenoid_start`
-Start Xenoid Android runtime
+Start the low-level Android runtime without full state convergence or acceptance.
   - `dryRun` (boolean)
   - `startColima` (boolean)
   - `installDaemonApk` (string)
   - `adbRoot` (boolean)
   - `recreate` (boolean)
 
+`recreate` selects an already verified runtime image; it never builds artifacts/images. Normal operators should use `xenoid_up`.
+
 ### `xenoid_stop`
-Stop Xenoid Android runtime
+Quarantine, sync, and stop the owned Android runtime while retaining its immutable container ID and data volume.
 _No parameters._
 
 ### `xenoid_status`
-Get runtime status
+Observe runtime/cache/image/protection state. Important fields include `recommendedAction`, `driftReasons`, `pendingJournalPhase`, and content digests. A valid stopped container is not an error; status never mutates.
 _No parameters._
 
 ### `xenoid_logs`
@@ -64,14 +61,15 @@ Open scrcpy for Xenoid Android target
 _No parameters._
 
 ### `xenoid_runtime_context`
-Create custom redroid Docker build context with Xenoid payloads
+Create a canonical custom redroid context from validated artifact/object records.
   - `image` (string)
 
 ### `xenoid_runtime_build_image`
-Build or dry-run custom redroid Docker image
+Ensure or inspect the configured content-addressed runtime image.
   - `image` (string)
-  - `tag` (string)
   - `dryRun` (boolean)
+
+The configured runtime tag is only a repository namespace; no per-call tag field exists. The effective tag is derived from the full input SHA-256 and publication verifies full/boot/base identity labels.
 
 ### `xenoid_linux_binderfs`
 Run/dry-run Linux binderfs setup
@@ -100,12 +98,14 @@ _No parameters._
 ## Daemon & root
 
 ### `xenoid_daemon_health`
-Check Android daemon health
+Observe aggregate Android daemon health. It does not start or repair bootstrap.
 _No parameters._
 
 ### `xenoid_daemon_ensure`
-Ensure Android daemon API is reachable
+Join the shared listener-first transport/root/component reconciliation path.
 _No parameters._
+
+This tool never uses aggregate health as an early bootstrap prerequisite and never creates a host credential cache.
 
 ### `xenoid_daemon_install`
 Install and start daemon APK
@@ -133,7 +133,9 @@ _No parameters._
 
 ### `xenoid_proxy_clear`
 Disable proxying and erase the configured source.
-_No parameters._
+  - `discardUnreadableState` (boolean): explicit evidence-preserving quarantine and cryptographic clear when daemon state is unreadable
+
+Ordinary clear (`false` or omitted) never silently discards unreadable bytes or releases quarantine. Authenticated import through trusted-local CLI is the other recovery path; source-bearing import remains absent from MCP.
 
 ### `xenoid_proxy_select`
 Select one node already present in the redacted agent observation.
@@ -158,12 +160,14 @@ Select the device location country and converge SIM, carrier, LTE cell, locale, 
 
 
 ### `xenoid_root_status`
-Check daemon root/su helper status
+Check the authenticated loopback root helper status.
 _No parameters._
 
 ### `xenoid_root_exec`
-Run command through daemon root helper
+Run a bounded command through the daemon/rootd boundary.
   - `command` (string) **(required)**
+
+The helper exposes no application-visible `su`, host token file/cache, or credential-bearing argv/result.
 
 
 ## Device fingerprint & profile
@@ -328,25 +332,27 @@ Set interface MAC through xenoid-netctl RTM_SETLINK path
   - `ifname` (string)
 
 
-## System-layer eBPF (host)
+## Shared engine-host protection
 
-Host-side path-hide hooks (`native/xenoid-ebpf`). Distinct from Frida (app-layer) and from Magisk/Zygisk.
+The tools below address one digest-bound kmod/eBPF deployment shared by every Xenoid runtime on the selected Docker engine host. They are local stdio tools and are excluded from the remote network catalog.
 
 ### `xenoid_ebpf_build`
-Build eBPF program + libbpf loader on Colima/Linux engine host
+Build and validate shared protection replacement artifacts without replacing the active deployment.
 _No parameters._
 
 ### `xenoid_ebpf_load`
-Load/attach host-side eBPF path-hide
+Converge shared engine-host kmod/eBPF protection, reusing a matching deployment.
 _No parameters._
 
 ### `xenoid_ebpf_status`
-JSON status for pinned eBPF path-hide
+Return safe shared-protection scope, hashed engine identity, expected/current digests, inventory, and replacement/maintenance state.
 _No parameters._
 
 ### `xenoid_ebpf_unload`
-Unload/unpin host-side eBPF path-hide
-_No parameters._
+Maintenance-only eBPF unload; zero active owned runtimes is required.
+  - `maintenance` (boolean) **(required)**: must be `true`
+
+Normal `stop` never unloads protection. If a sibling runtime is active, replacement/unload fails closed and retains the verified deployment.
 
 
 ## Apps & OTA & release
@@ -386,3 +392,5 @@ Package transferable Xenoid release bundle
 ### `xenoid_verify_release`
 Verify a Xenoid release bundle
   - `archive` (string) **(required)**
+
+Release packaging consumes fresh non-recursive gate evidence and validated artifact snapshots, emits canonical archives, and mandates verification before publication. Its packaged doctor evidence is explicitly offline (`complete=false`). Release results and archives exclude credentials, private paths/endpoints, proxy/Keybox material, imported proprietary payloads, runtime captures, and assessment details.

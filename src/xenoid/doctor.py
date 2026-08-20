@@ -1,85 +1,74 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from .backend import RuntimeManager
 from .config import InstanceContext, InstanceLease, XenoidConfig
-from .daemon_client import DaemonClient
-
-
-
-_PROXY_CAPABILITY_KEYS = {
-    "v4DnsProxy",
-    "v4TcpProxy",
-    "v4UdpProxy",
-    "v6DnsProxy",
-    "v6TcpProxy",
-    "v6UdpProxy",
-}
-
-
-def _proxy_capabilities_ready(value: Any, udp_allowed: bool) -> bool:
-    return (
-        isinstance(value, dict)
-        and set(value) == _PROXY_CAPABILITY_KEYS
-        and all(isinstance(value.get(key), bool) for key in _PROXY_CAPABILITY_KEYS)
-        and value.get("v4DnsProxy") is True
-        and value.get("v6DnsProxy") is True
-        and value.get("v4TcpProxy") is True
-        and value.get("v6TcpProxy") is True
-        and value.get("v4UdpProxy") is udp_allowed
-        and (udp_allowed or value.get("v6UdpProxy") is False)
-    )
-
-
-def _run(
-    command: list[str],
-    *,
-    timeout: int = 180,
-    env: dict[str, str] | None = None,
-    cwd: Path,
-) -> dict[str, Any]:
-    try:
-        proc = subprocess.run(
-            command,
-            cwd=cwd,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            env=env,
-        )
-    except Exception as exc:
-        return {"ok": False, "command": command, "error": str(exc)}
-
-    stdout = proc.stdout.strip()
-    stderr = proc.stderr.strip()
-    result: dict[str, Any] = {
-        "ok": proc.returncode == 0,
-        "command": command,
-        "returncode": proc.returncode,
-    }
-    if stdout:
-        try:
-            result["data"] = json.loads(stdout)
-        except json.JSONDecodeError:
-            result["stdout"] = stdout[-4000:]
-    if stderr:
-        result["stderr"] = stderr[-4000:]
-    return result
+from .gates import GateRunner
+from .live_observe import LiveAcceptance
+from .process import Redactor, run_bounded
 
 
 def _summary(name: str, section: dict[str, Any]) -> dict[str, Any]:
-    summary = {"name": name, "ok": bool(section.get("ok"))}
-    if section.get("skipped"):
+    summary: dict[str, Any] = {"name": name, "ok": section.get("ok") is True}
+    if section.get("skipped") is True:
         summary["skipped"] = True
-    if section.get("reason"):
-        summary["reason"] = section["reason"]
+    reason = section.get("reason")
+    if isinstance(reason, str):
+        summary["reason"] = reason
     return summary
+
+
+def _sanitize(value: Any, redactor: Redactor) -> Any:
+    if isinstance(value, str):
+        return redactor(value)
+    if isinstance(value, list):
+        return [_sanitize(item, redactor) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize(item, redactor)
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return "unsupported"
+
+
+def _preflight(
+    manager: RuntimeManager,
+    project_root: Path,
+    deadline: float,
+) -> dict[str, Any]:
+    result = run_bounded(
+        [str(project_root / "scripts/redroid-preflight.sh"), "--observe-only"],
+        cwd=project_root,
+        deadline=deadline,
+        env={**manager.docker_env(), "LC_ALL": "C", "TZ": "UTC"},
+        project_root=project_root,
+    )
+    data: dict[str, Any]
+    try:
+        parsed = json.loads(result.stdout_tail) if result.stdout_tail else None
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        data = dict(parsed)
+        data["ok"] = result.ok and data.get("ok") is True
+    else:
+        data = {
+            "ok": False,
+            "state": result.state,
+            "errorCode": result.error_code or "runtime_preflight_failed",
+        }
+    data["durationMs"] = result.duration_ms
+    if not result.ok and result.stderr_tail:
+        data["stderrTail"] = result.stderr_tail
+    return data
 
 
 def build_doctor_report(
@@ -90,268 +79,155 @@ def build_doctor_report(
     full: bool = False,
     require_runtime: bool = False,
 ) -> dict[str, Any]:
+    """Build one strictly observational doctor report.
+
+    Static evidence comes only from GateRunner. Live evidence comes only from a
+    fresh LiveAcceptance observation; doctor never starts or repairs Android,
+    ensures daemon/rootd, converges, builds artifacts/images, or packages a
+    release.
+    """
+
+    started = time.monotonic()
     manager = RuntimeManager(context, cfg, lease)
+    redactor = Redactor(project_root=context.project_root)
+
     host_checks = [asdict(check) for check in manager.doctor()]
     host_ok = all(check["ok"] or check["name"] == "scrcpy" for check in host_checks)
-    host = {"ok": host_ok, "checks": host_checks}
-
-    preflight = manager.runtime_preflight()
-    preflight["ok"] = bool(preflight.get("ok"))
-    storage = manager.storage_status()
-    storage["ok"] = bool(storage.get("ok"))
-
-
-    instance_env = {
-        **os.environ,
-        "XENOID_PROJECT": str(context.project_root),
-        "XENOID_INSTANCE": context.instance_name,
-    }
-    verify_env = {**instance_env, "XENOID_SKIP_AUDIT": "1"}
-    verification = _run(
-        [str(context.project_root / "scripts" / "verify.sh")],
-        timeout=180,
-        env=verify_env,
-        cwd=context.project_root,
-    )
+    host = {"ok": host_ok, "checks": _sanitize(host_checks, redactor)}
 
     status = manager.status()
-    running = bool(status.get("ok") and status.get("running"))
-    google_services = status.get("googleServices")
-    if not isinstance(google_services, dict):
-        google_services = manager.google_services_status(
-            require_runtime=require_runtime,
-        )
-    runtime: dict[str, Any] = {
-        "ok": not require_runtime,
-        "running": running,
-        "status": status,
-    }
-    runtime_ready = False
-    if running:
-        connect = manager.adb_connect()
-        boot = manager.adb(["shell", "getprop", "sys.boot_completed"])
-        boot_ok = bool(boot.get("ok") and "1" in str(boot.get("stdout") or ""))
-        forward = manager.forward_daemon_port()
-        daemon = DaemonClient(
-            context,
-            lease,
-            manager.docker_base_cmd(),
-        )
-        health = daemon.health()
-        root = daemon.root_status() if health.get("ok") else {"ok": False, "skipped": True}
-        sentinel = (
-            manager.data_sentinel(create=False)
-            if root.get("ok")
-            else {"ok": False, "skipped": True}
-        )
-        runtime_ready = bool(
-            connect.get("ok")
-            and boot_ok
-            and forward.get("ok")
-            and health.get("ok")
-            and root.get("ok")
-            and sentinel.get("ok")
-        )
-        runtime.update({
-            "ok": runtime_ready,
-            "adbConnect": connect,
-            "bootCompleted": boot,
-            "daemonForward": forward,
-            "daemonHealth": health,
-            "rootStatus": root,
-            "dataSentinel": sentinel,
-        })
+    running = bool(status.get("running"))
+    status_healthy = status.get("ok") is True
+    preflight = _preflight(
+        manager,
+        context.project_root,
+        time.monotonic() + (300.0 if full else 120.0),
+    )
+
+    observed_storage = manager.storage_status()
+    if (
+        not running
+        and not require_runtime
+        and observed_storage.get("error")
+        in {"storage_not_initialized", "storage_volume_missing"}
+    ):
+        storage: dict[str, Any] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "runtime-absent",
+            "observation": observed_storage,
+        }
     else:
-        runtime.update({"skipped": True, "reason": "Android runtime is not running"})
+        storage = dict(observed_storage)
+        storage["ok"] = storage.get("ok") is True
 
-    protection: dict[str, Any] = {
-        "ok": not require_runtime,
-        "skipped": True,
-        "reason": "Android runtime is not ready",
+    gate_profile = "doctor-full" if full else "doctor"
+    gate_runner = GateRunner(context.project_root)
+    gate_report = gate_runner.observe_profile(gate_profile)
+    records_complete = gate_report.get("complete") is True
+    gates = {
+        "ok": records_complete if full else True,
+        "complete": records_complete,
+        "skipped": not records_complete and not full,
+        "reason": None if records_complete else "gate-records-incomplete",
+        "schema": gate_report.get("schema"),
+        "profile": gate_profile,
+        "fresh": False,
+        "failedGate": gate_report.get("failedGate"),
+        "errorCode": gate_report.get("errorCode"),
+        "durationMs": gate_report.get("durationMs", 0),
+        "records": gate_report.get("gates", {}),
     }
-    if runtime_ready:
-        kernel_module = manager.kernel_module_status()
-        ebpf = manager.ebpf_status()
-        image = manager.image_protection_status()
-        hide = daemon.hide_status()
-        protection = {
-            "ok": all(bool(step.get("ok")) for step in (kernel_module, ebpf, image, hide)),
-            "kernelModule": kernel_module,
-            "ebpf": ebpf,
-            "image": image,
-            "android": hide,
-        }
-    proxy: dict[str, Any] = {
-        "ok": not require_runtime,
-        "skipped": True,
-        "reason": "Android runtime is not ready",
-    }
-    if runtime_ready:
-        daemon_proxy = daemon.proxy_status()
-        engine_proxy = manager.proxy_engine_status()
-        enabled = daemon_proxy.get("enabled")
-        generation = daemon_proxy.get("generation")
-        check_id = daemon_proxy.get("checkId")
-        epoch = daemon_proxy.get("runtimeEpoch")
-        udp_allowed = daemon_proxy.get("udpAllowed")
-        identity_ok = (
-            daemon_proxy.get("ok") is True
-            and isinstance(enabled, bool)
-            and isinstance(generation, int)
-            and not isinstance(generation, bool)
-            and generation >= 0
-            and isinstance(epoch, str)
-            and bool(epoch)
-            and isinstance(udp_allowed, bool)
-            and daemon_proxy.get("instanceId") == context.instance_id
-            and engine_proxy.get("ok") is True
-            and engine_proxy.get("instanceId") == context.instance_id
-            and engine_proxy.get("resourceTag") == context.resource_tag
-            and engine_proxy.get("runtimeEpoch") == epoch
-            and engine_proxy.get("generation") == generation
+
+    if running:
+        live = LiveAcceptance(manager).observe(
+            manager,
+            {},
+            gate_profile,
+            time.monotonic() + (900.0 if full else 300.0),
+            None,
         )
-        if enabled is True:
-            report = daemon_proxy.get("report")
-            probe = daemon_proxy.get("probe")
-            ready = (
-                identity_ok
-                and isinstance(check_id, int)
-                and not isinstance(check_id, bool)
-                and check_id > 0
-                and isinstance(report, dict)
-                and report.get("generation") == generation
-                and report.get("checkId") == check_id
-                and report.get("phase") == "active"
-                and report.get("structuralApplied") is True
-                and report.get("dataPlaneVerified") is True
-                and report.get("errorCode", "") == ""
-                and _proxy_capabilities_ready(report.get("capabilities"), udp_allowed)
-                and isinstance(probe, dict)
-                and probe.get("checkId") == check_id
-                and probe.get("errorCode") == ""
-                and _proxy_capabilities_ready(probe.get("capabilities"), udp_allowed)
-                and engine_proxy.get("phase") == "active"
-                and engine_proxy.get("structuralApplied") is True
-            )
-        else:
-            ready = (
-                identity_ok
-                and engine_proxy.get("phase") == "off"
-                and engine_proxy.get("structuralApplied") is True
-                and engine_proxy.get("dataPlaneVerified") is True
-            )
-        proxy = {
-            "ok": bool(ready),
-            "enabled": enabled,
-            "daemon": daemon_proxy,
-            "engine": engine_proxy,
+        live["fresh"] = True
+    else:
+        live = {
+            "ok": not require_runtime,
+            "fresh": True,
+            "skipped": True,
+            "reason": "runtime-absent",
         }
 
-
+    runtime = {
+        "ok": live.get("ok") is True and status_healthy,
+        "running": running,
+        "statusHealthy": status_healthy,
+        "status": status,
+        "acceptance": live,
+    }
+    if full:
+        live_checks = live.get("checks")
+        required_full = (
+            "storageIdentity",
+            "cellular",
+            "camera",
+            "googleBinding",
+            "sharedProtection",
+        )
+        current_matrix_ok = isinstance(live_checks, dict) and all(
+            isinstance(live_checks.get(name), dict)
+            and live_checks[name].get("ok") is True
+            for name in required_full
+        )
+        live_identity = live.get("observation")
+        full_evidence = gate_runner.observe_full_evidence(
+            context.instance_name,
+            context.instance_id,
+            live_identity if isinstance(live_identity, dict) else {},
+        )
+        full_matrix_ok = (
+            current_matrix_ok and full_evidence.get("ok") is True
+        )
+    else:
+        required_full = ()
+        full_evidence = {"ok": True}
+        full_matrix_ok = True
     sections: dict[str, dict[str, Any]] = {
         "host": host,
         "preflight": preflight,
         "storage": storage,
-        "verification": verification,
+        "gates": gates,
         "runtime": runtime,
-        "protection": protection,
-        "proxy": proxy,
-        "googleServices": google_services,
     }
-
     if full:
-        xenoid = context.project_root / "xenoid"
-        if not xenoid.exists():
-            xenoid = context.project_root / "bin" / "xenoid"
-        selected_cli = [str(xenoid), "--instance", context.instance_name]
-        sections["build"] = _run(
-            [*selected_cli, "build", "all"],
-            timeout=900,
-            env=instance_env,
-            cwd=context.project_root,
-        )
-        sections["ota"] = _run(
-            [*selected_cli, "ota", "make", "--version", "doctor"],
-            timeout=300,
-            env=instance_env,
-            cwd=context.project_root,
-        )
-        sections["runtimeContext"] = _run(
-            [*selected_cli, "runtime-context"],
-            timeout=300,
-            env=instance_env,
-            cwd=context.project_root,
-        )
-        sections["hookSurfaces"] = _run(
-            ["python3", "scripts/smoke-hook-surfaces.py"],
-            timeout=180,
-            env=instance_env,
-            cwd=context.project_root,
-        )
-        if runtime_ready:
-            sections["runtimeSmoke"] = _run(
-                [str(context.project_root / "scripts" / "smoke-runtime.sh"), "/tmp/xenoid-doctor-runtime.json"],
-                timeout=360,
-                env=instance_env,
-                cwd=context.project_root,
-            )
-        else:
-            sections["runtimeSmoke"] = {
-                "ok": not require_runtime,
-                "skipped": True,
-                "reason": "Android runtime is not ready",
-            }
-        if cfg.google_services_provider != "none":
-            sections["googleServicesSmoke"] = (
-                _run(
-                    [
-                        str(
-                            context.project_root
-                            / "scripts"
-                            / "smoke-google-services-runtime.sh"
-                        ),
-                        "--instance",
-                        context.instance_name,
-                    ],
-                    timeout=600,
-                    env=instance_env,
-                    cwd=context.project_root,
-                )
-                if runtime_ready
-                else {
-                    "ok": False,
-                    "skipped": True,
-                    "reason": "Android runtime is not ready",
-                }
-            )
-
+        sections["fullLiveMatrix"] = {
+            "ok": full_matrix_ok,
+            "fresh": True,
+            "required": list(required_full),
+            "reason": None if full_matrix_ok else "full-live-evidence-incomplete",
+            "evidence": full_evidence,
+        }
     checks = [_summary(name, section) for name, section in sections.items()]
     ok = all(check["ok"] for check in checks)
-    complete = bool(ok and runtime_ready and (not full or sections["runtimeSmoke"].get("ok")))
-    next_actions: list[str] = []
+    complete = bool(
+        ok
+        and records_complete
+        and full_matrix_ok
+        and running
+        and live.get("ok") is True
+        and live.get("fresh") is True
+    )
+
     selected = f"./xenoid --instance {context.instance_name}"
-    if not host_ok or not preflight.get("ok"):
+    next_actions: list[str] = []
+    if not host_ok or preflight.get("ok") is not True:
         next_actions.append(f"{selected} install-runtime")
     if not running:
         next_actions.append(f"{selected} up")
-    elif not runtime_ready:
-        next_actions.extend([f"{selected} logs", f"{selected} daemon health"])
-    if not protection.get("ok") and running:
-        next_actions.append(f"{selected} up")
-    if full and not sections["runtimeSmoke"].get("ok"):
-        next_actions.append(f"{selected} doctor --full --require-runtime")
-    if (
-        cfg.google_services_provider != "none"
-        and not google_services.get("ok")
-    ):
-        next_actions.append(
-            f"{selected} google-services status --require-runtime"
-        )
+    elif live.get("ok") is not True:
+        next_actions.extend([f"{selected} status", f"{selected} logs"])
+    if gates.get("ok") is not True and isinstance(gates.get("failedGate"), str):
+        next_actions.append(f"rerun-gate:{gates['failedGate']}")
 
-    if not ok and not next_actions:
-        next_actions.append(f"{selected} doctor {'--full' if full else ''}".rstrip())
-
-    return {
+    report = {
         "instance": {
             **context.public_dict(),
             "slot": lease.slot,
@@ -365,5 +241,7 @@ def build_doctor_report(
         "runtimeAvailable": running,
         "checks": checks,
         "sections": sections,
+        "durationMs": max(0, int((time.monotonic() - started) * 1000)),
         "nextActions": list(dict.fromkeys(next_actions)),
     }
+    return _sanitize(report, redactor)

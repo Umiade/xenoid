@@ -99,7 +99,10 @@ int main(void) {
 '''
 with tempfile.TemporaryDirectory() as td:
     t = pathlib.Path(td)
-    (t/'probe.c').write_text(source)
+    marker = t/'frida-marker'
+    hidden_dir = t/'xenoid-shim-dir'
+    probe_source = source.replace('/tmp/frida-marker', str(marker)).replace('/tmp/xenoid-shim-dir', str(hidden_dir))
+    (t/'probe.c').write_text(probe_source)
     prof = t/'profile'; prof.mkdir()
     (prof/'boot_id').write_text('profile-boot-id\n')
     (prof/'cpu_0_maximumFrequencyKhz').write_text('1800000\n')
@@ -116,11 +119,11 @@ with tempfile.TemporaryDirectory() as td:
     (t/'canonical').mkdir()
     (t/'reader/mounts').write_text('overlay / overlay rw,lowerdir=/var/lib/docker 0 0\n')
     (t/'canonical/mounts').write_text('/dev/block/platform/14700000.ufs/by-name/userdata /data f2fs rw,nosuid,nodev,noatime 0 0\n')
-    os.makedirs('/tmp/xenoid-shim-dir', exist_ok=True)
-    pathlib.Path('/tmp/xenoid-shim-dir/frida-server').write_text('x')
-    pathlib.Path('/tmp/xenoid-shim-dir/normal').write_text('x')
-    pathlib.Path('/tmp/frida-marker').write_text('x')
-    shim = ROOT/'native/xenoid-shim/libxenoid_shim-host.so'
+    hidden_dir.mkdir()
+    (hidden_dir/'frida-server').write_text('x')
+    (hidden_dir/'normal').write_text('x')
+    marker.write_text('x')
+    shim = t/'libxenoid_shim-host.so'
     build = subprocess.run([CC, '-shared', '-fPIC', '-O2', '-Wall', '-Wextra', '-DXENOID_HOST_TEST', '-DXENOID_ENABLE_PROPERTY_GET', '-o', str(shim), str(ROOT/'native/xenoid-shim/xenoid_shim.c'), '-ldl'], text=True, capture_output=True)
     if build.returncode != 0:
         print(json.dumps({'ok': False, 'stage': 'build-host-shim', 'stderr': build.stderr})); sys.exit(1)
@@ -137,7 +140,7 @@ with tempfile.TemporaryDirectory() as td:
         'XENOID_TEST_MOUNTS_PATH': str(t/'reader/mounts'),
         'XENOID_TEST_CANONICAL_MOUNTS_PATH': str(t/'canonical/mounts'),
         'XENOID_TEST_DATA_PATH': str(t),
-        'XENOID_TEST_HIDE_PATH': '/tmp/frida-marker',
+        'XENOID_TEST_HIDE_PATH': str(marker),
         'XENOID_TEST_HIDE_DIRENT': 'frida-server',
         'XENOID_TEST_FORCE_APP_UID': '1',
     })

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Prove that two reuse convergences keep the same container, image, rootfs source,
-# data filesystem, and immutable Google binding while retaining live readiness.
+# Prove that two automatic no-op convergences keep the same container, image,
+# rootfs source, data filesystem, and immutable Google binding.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -24,8 +24,8 @@ capture() {
 capture before
 for pass in 1 2; do
   echo "[google-convergence] reuse pass $pass" >&2
-  xenoid_cli up --reuse-runtime --skip-build >/dev/null \
-    || { echo "reuse convergence pass $pass failed" >&2; exit 1; }
+  xenoid_cli up --skip-build >/dev/null \
+    || { echo "automatic reuse convergence pass $pass failed" >&2; exit 1; }
   capture "pass$pass"
 done
 

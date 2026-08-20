@@ -91,11 +91,6 @@ public final class CameraMediaManager {
     public static synchronized CameraMediaManager get(Context context) {
         if (instance == null) {
             instance = new CameraMediaManager(context.getApplicationContext());
-        } else if (!RootHelper.rootdToken().isEmpty()) {
-            synchronized (instance) {
-                instance.refreshReconciliationLocked();
-                instance.scheduleReconciliationLocked();
-            }
         }
         return instance;
     }
@@ -149,23 +144,115 @@ public final class CameraMediaManager {
         state = initial;
         stateAvailable = true;
         boolean cleanupReady = cleanupLocalFiles();
-        if (cleanupReady || recovered) {
-            reconcilePublicationLocked();
-            if (!cleanupReady && publicationReady) lastError = "orphan cleanup pending";
-        } else {
+        publicationReady = false;
+        if (!cleanupReady && !recovered) {
             stateAvailable = false;
             lastError = "state unavailable";
+        } else {
+            lastError = cleanupReady ? "activation reconciliation pending"
+                    : "orphan cleanup pending";
         }
     }
 
     public synchronized Map<String,Object> status() {
         try {
             refreshReconciliationLocked();
-            scheduleReconciliationLocked();
             return statusLocked(stateAvailable && publicationReady);
         } catch (Throwable ignored) {
             return minimalFailure("status unavailable");
         }
+    }
+
+    synchronized boolean healthReady() {
+        return stateAvailable && publicationReady;
+    }
+
+    synchronized BootstrapCoordinator.ComponentStatus reconcileBootstrap(
+            long deadline, BootstrapCoordinator.CancellationSignal cancellation) {
+        if (!stateAvailable) {
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    "camera_state_unavailable", bootstrapFields());
+        }
+        if (cancellation.isCancelled()) {
+            return BootstrapCoordinator.ComponentStatus.cancelled();
+        }
+        long remaining = deadline - SystemClock.elapsedRealtime();
+        if (remaining <= 0) return BootstrapCoordinator.ComponentStatus.timedOut();
+
+        final State expectedState = state;
+        final long expectedEpoch = ++publicationEpoch;
+        final RootHelper.ConnectionHandle connection = cancellation.currentHandle();
+        if (connection == null) {
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    "camera_publication_unavailable", bootstrapFields());
+        }
+        Future<PublicationResult> future = publicationExecutor.submit(() -> {
+            boolean ready;
+            try (RootHelper.ConnectionScope ignored =
+                         RootHelper.bindConnectionHandle(connection)) {
+                ready = reconcilePublicationNow(expectedState);
+            } catch (Throwable ignored) {
+                ready = false;
+            }
+            return new PublicationResult(expectedState, expectedEpoch, ready);
+        });
+        reconciliationFuture = future;
+        try {
+            PublicationResult result = future.get(remaining, TimeUnit.MILLISECONDS);
+            reconciliationFuture = null;
+            if (result.state != state || result.epoch != publicationEpoch) {
+                publicationReady = false;
+                lastError = "activation reconciliation pending";
+                return BootstrapCoordinator.ComponentStatus.failed(
+                        "camera_state_changed", bootstrapFields());
+            }
+            publicationReady = result.ready;
+            lastError = result.ready ? "" : "activation reconciliation pending";
+            if (cancellation.isCancelled()) {
+                return BootstrapCoordinator.ComponentStatus.cancelled();
+            }
+            if (SystemClock.elapsedRealtime() > deadline) {
+                return BootstrapCoordinator.ComponentStatus.timedOut();
+            }
+            if (!publicationReady) {
+                return BootstrapCoordinator.ComponentStatus.failed(
+                        "camera_publication_unavailable", bootstrapFields());
+            }
+            return BootstrapCoordinator.ComponentStatus.ready(
+                    configuredForBootstrap() ? "ready" : "unconfigured",
+                    bootstrapFields());
+        } catch (TimeoutException timeout) {
+            future.cancel(true);
+            RootHelper.ConnectionHandle handle = cancellation.currentHandle();
+            if (handle != null) handle.cancel();
+            reconciliationFuture = null;
+            publicationReady = false;
+            lastError = "activation reconciliation pending";
+            return BootstrapCoordinator.ComponentStatus.timedOut();
+        } catch (InterruptedException interrupted) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            return BootstrapCoordinator.ComponentStatus.cancelled();
+        } catch (ExecutionException failed) {
+            future.cancel(true);
+            reconciliationFuture = null;
+            publicationReady = false;
+            lastError = "activation reconciliation pending";
+            return BootstrapCoordinator.ComponentStatus.failed(
+                    "camera_publication_unavailable", bootstrapFields());
+        }
+    }
+
+    private boolean configuredForBootstrap() {
+        return state.photo != null || state.video != null;
+    }
+
+    private Map<String, Object> bootstrapFields() {
+        return XenoidDaemonService.map(
+                "configured", configuredForBootstrap(),
+                "generation", state.generation,
+                "active", state.active && publicationReady,
+                "publicationReady", publicationReady);
     }
 
     public synchronized Map<String,Object> importStaged(

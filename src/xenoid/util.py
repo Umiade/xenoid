@@ -12,6 +12,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
+from .process import run_bounded
 
 
 _RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -106,7 +107,40 @@ def bounded_timeout(timeout: Optional[float] = None) -> Optional[float]:
 
 
 def run(cmd: list[str], *, check: bool = False, capture: bool = True, timeout=None, stdin=None, env=None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, check=check, text=True, capture_output=capture, timeout=bounded_timeout(timeout), stdin=stdin, env=env)
+    effective = bounded_timeout(timeout)
+    if stdin is not None:
+        # Secret-stream callers retain their dedicated pipe owner and bounded
+        # transport; copying those bytes into a generic result is prohibited.
+        return subprocess.run(
+            cmd,
+            check=check,
+            text=True,
+            capture_output=capture,
+            timeout=effective,
+            stdin=stdin,
+            env=env,
+        )
+    result = run_bounded(
+        cmd,
+        cwd=Path.cwd(),
+        deadline=time.monotonic() + (effective if effective is not None else 3600.0),
+        env=env,
+        project_root=Path.cwd(),
+    )
+    completed = subprocess.CompletedProcess(
+        cmd,
+        result.returncode if result.returncode is not None else (0 if result.ok else 1),
+        result.stdout_tail if capture else "",
+        result.stderr_tail if capture else "",
+    )
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            cmd,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
 
 
 def host_info() -> dict[str, str]:

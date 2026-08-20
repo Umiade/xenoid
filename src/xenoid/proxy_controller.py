@@ -3,14 +3,15 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-import secrets
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from .backend import RuntimeManager
 from .config import InstanceContext, InstanceError, InstanceLease, XenoidConfig
 from .daemon_client import PROXY_CHECK_TIMEOUT_SECONDS, DaemonClient, wait_for_proxy_check
+from .operation_lock import instance_operation_lock, operation_lock_is_held
 
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ACTIVE_PHASES = {
@@ -35,7 +36,7 @@ def _failure(code: str) -> dict[str, Any]:
 
 def _error_code(value: Any, fallback: str) -> str:
     if isinstance(value, dict):
-        for name in ("code", "error", "errorCode"):
+        for name in ("code", "error", "errorCode", "stateError"):
             candidate = value.get(name)
             if isinstance(candidate, str) and _SAFE_CODE.fullmatch(candidate):
                 return candidate
@@ -126,51 +127,127 @@ class ProxyController:
             return _failure(_error_code(result, "engine_unavailable"))
         return result
 
+    @contextmanager
+    def _mutation_scope(self) -> Iterator[None]:
+        if operation_lock_is_held(self._context.instance_id):
+            yield
+            return
+        with instance_operation_lock(self._context.state_root):
+            yield
+
+    def _quarantine_for_mutation(self) -> dict[str, Any]:
+        prerequisite = self._manager_call("proxy_prerequisite")
+        if prerequisite.get("ok") is not True:
+            return prerequisite
+        guarded = self._manager_call("proxy_quarantine")
+        if guarded.get("ok") is not True:
+            return guarded
+        return {"ok": True, "quarantined": True}
+
+    def _release_direct(
+        self,
+        mutation: dict[str, Any],
+        *,
+        configured: bool,
+    ) -> dict[str, Any]:
+        generation = mutation.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            self._manager_call("proxy_quarantine")
+            return _failure("daemon_response_invalid")
+        current = self._daemon.proxy_status()
+        runtime_epoch = self._runtime_epoch()
+        if (
+            current.get("ok") is not True
+            or current.get("generation") != generation
+            or current.get("enabled") is not False
+            or current.get("configured") is not configured
+            or not isinstance(runtime_epoch, str)
+            or not runtime_epoch
+        ):
+            self._manager_call("proxy_quarantine", generation)
+            return _failure(_error_code(current, "daemon_response_invalid"))
+        released = self._manager_call(
+            "proxy_off",
+            generation,
+            runtime_epoch=runtime_epoch,
+        )
+        released_epoch = released.get("runtimeEpoch")
+        if (
+            released.get("ok") is not True
+            or released.get("generation") != generation
+            or not isinstance(released_epoch, str)
+            or not released_epoch
+            or released.get("phase") != "off"
+            or released.get("structuralApplied") is not True
+            or released.get("dataPlaneVerified") is not True
+            or released.get("agentAbsent") is not True
+            or released.get("routingAbsent") is not True
+        ):
+            self._manager_call("proxy_quarantine", generation)
+            return (
+                released
+                if released.get("ok") is not True
+                else _failure("off_unverified")
+            )
+        return {
+            "ok": True,
+            "generation": generation,
+            "enabled": False,
+            "configured": configured,
+            "runtimeEpoch": released_epoch,
+            "phase": "off",
+            "structuralApplied": True,
+            "dataPlaneVerified": True,
+            "agentAbsent": True,
+            "routingAbsent": True,
+        }
+
     def _runtime_epoch(self) -> str:
-        return f"v1-{self._lease.resource_tag}-{secrets.token_hex(16)}"
+        status = self._daemon.bootstrap_status()
+        runtime_epoch = (
+            status.get("runtimeEpoch")
+            if isinstance(status, dict)
+            else None
+        )
+        return (
+            runtime_epoch
+            if isinstance(runtime_epoch, str)
+            and re.fullmatch(r"[0-9a-f]{64}", runtime_epoch) is not None
+            else ""
+        )
 
     def _ensure_agent(self, status: dict[str, Any]) -> dict[str, Any]:
         generation = status.get("generation")
-        daemon_epoch = status.get("runtimeEpoch")
+        runtime_epoch = self._runtime_epoch()
         enabled = status.get("enabled")
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
             return _failure("daemon_response_invalid")
-        if not isinstance(enabled, bool):
-            return _failure("daemon_response_invalid")
-
-        if enabled:
-            prerequisite = self._manager_call("proxy_prerequisite")
-            if prerequisite.get("ok") is not True:
-                return prerequisite
-
+        if enabled is not True:
+            return _failure("proxy_disabled")
+        prerequisite = self._manager_call("proxy_prerequisite")
+        if prerequisite.get("ok") is not True:
+            return prerequisite
         engine_status = self._manager_call("proxy_engine_status")
         same_agent = (
             engine_status.get("ok") is True
             and engine_status.get("instanceId") == self._context.instance_id
             and engine_status.get("resourceTag") == self._context.resource_tag
-            and isinstance(daemon_epoch, str)
-            and bool(daemon_epoch)
-            and engine_status.get("runtimeEpoch") == daemon_epoch
+            and bool(runtime_epoch)
+            and engine_status.get("runtimeEpoch") == runtime_epoch
             and engine_status.get("phase") in _ACTIVE_PHASES
         )
-        if same_agent and (not enabled or engine_status.get("phase") != "off"):
-            if enabled:
-                prepared = self._manager_call("proxy_prepare_asset", None)
-                if prepared.get("ok") is not True:
-                    self._manager_call("proxy_quarantine", generation)
-                    return prepared
+        if same_agent and engine_status.get("phase") != "off":
+            prepared = self._manager_call("proxy_prepare_asset", None)
+            if prepared.get("ok") is not True:
+                self._manager_call("proxy_quarantine", generation)
+                return prepared
             return engine_status
 
-        if not enabled:
-            prerequisite = self._manager_call("proxy_prerequisite")
-            if prerequisite.get("ok") is not True:
-                return prerequisite
-        elif engine_status.get("ok") is True:
+        if engine_status.get("ok") is True:
             quarantined = self._manager_call("proxy_quarantine", generation)
             if quarantined.get("ok") is not True:
                 return quarantined
 
-        runtime_epoch = self._runtime_epoch()
         bootstrap = self._daemon.proxy_agent_bootstrap(self._context.instance_id, runtime_epoch)
         if (
             not isinstance(bootstrap, dict)
@@ -186,22 +263,28 @@ class ProxyController:
             or not _valid_secret(bootstrap.get("agentToken"))
         ):
             return _failure(_error_code(bootstrap, "agent_bootstrap_failed"))
-        started = self._manager_call(
-            "proxy_start_agent",
-            runtime_epoch=runtime_epoch,
-            generation=generation,
-            master_key=bootstrap["masterKey"],
-            agent_token=bootstrap["agentToken"],
-            enabled=enabled,
-        )
+        master_key = bootstrap.pop("masterKey")
+        agent_token = bootstrap.pop("agentToken")
+        try:
+            started = self._manager_call(
+                "proxy_start_agent",
+                runtime_epoch=runtime_epoch,
+                generation=generation,
+                master_key=master_key,
+                agent_token=agent_token,
+                enabled=True,
+            )
+        finally:
+            bootstrap.clear()
+            del master_key
+            del agent_token
         if started.get("ok") is not True:
             self._manager_call("proxy_quarantine", generation)
             return started
-        if enabled:
-            prepared = self._manager_call("proxy_prepare_asset", None)
-            if prepared.get("ok") is not True:
-                self._manager_call("proxy_quarantine", generation)
-                return prepared
+        prepared = self._manager_call("proxy_prepare_asset", None)
+        if prepared.get("ok") is not True:
+            self._manager_call("proxy_quarantine", generation)
+            return prepared
         return started
 
     def _wait_generation(
@@ -247,6 +330,7 @@ class ProxyController:
             return _failure("daemon_response_invalid")
         status = self._daemon.proxy_status()
         if status.get("ok") is not True or status.get("generation") != generation:
+            self._manager_call("proxy_quarantine", generation)
             return _failure(_error_code(status, "daemon_response_invalid"))
         ensured = self._ensure_agent(status)
         if ensured.get("ok") is not True:
@@ -254,6 +338,7 @@ class ProxyController:
             return ensured
         current = self._daemon.proxy_status()
         if current.get("ok") is not True or current.get("generation") != generation:
+            self._manager_call("proxy_quarantine", generation)
             return _failure(_error_code(current, "daemon_response_invalid"))
         runtime_epoch = current.get("runtimeEpoch")
         if not isinstance(runtime_epoch, str) or not runtime_epoch:
@@ -261,15 +346,28 @@ class ProxyController:
             return _failure("agent_stale")
         if fresh_check:
             check_id = current.get("checkId")
+            report = current.get("report")
+            probe = current.get("probe")
+            terminal_evidence = (
+                _completed_check(current)
+                or isinstance(report, dict)
+                and report.get("checkId") == check_id
+                and (
+                    bool(report.get("errorCode"))
+                    or report.get("phase") in {"active", "off"}
+                )
+                or isinstance(probe, dict)
+                and probe.get("checkId") == check_id
+            )
             if (
                 isinstance(check_id, int)
                 and not isinstance(check_id, bool)
                 and check_id > 0
-                and not _completed_check(current)
+                and not terminal_evidence
             ):
-                # Mutations and runtime rebinding allocate a check before the
-                # agent starts. Reuse that unconsumed check instead of racing
-                # the in-flight probe with a newer checkId.
+                # A mutation allocates its check before the agent starts. Reuse
+                # only genuinely in-flight evidence; terminal success or failure
+                # must allocate a fresh readiness check.
                 checked = wait_for_proxy_check(
                     self._daemon,
                     expected_check_id=check_id,
@@ -277,7 +375,6 @@ class ProxyController:
                     expected_runtime_epoch=runtime_epoch,
                 )
             else:
-                # Completed evidence belongs to an older readiness operation.
                 checked = wait_for_proxy_check(self._daemon)
             if checked.get("ok") is not True:
                 self._manager_call("proxy_quarantine", generation)
@@ -289,15 +386,18 @@ class ProxyController:
         return settled
 
     def status(self, *, check: bool = False) -> dict[str, Any]:
-        status = self._daemon.proxy_status()
-        if status.get("ok") is not True or not check:
-            return status
-        if status.get("enabled") is not True:
-            return _failure("proxy_disabled")
-        return self._converge(
-            {"ok": True, "generation": status.get("generation")},
-            fresh_check=True,
-        )
+        if not check:
+            return self._daemon.proxy_status()
+        with self._mutation_scope():
+            status = self._daemon.proxy_status()
+            if status.get("ok") is not True:
+                return status
+            if status.get("enabled") is not True:
+                return _failure("proxy_disabled")
+            return self._converge(
+                {"ok": True, "generation": status.get("generation")},
+                fresh_check=True,
+            )
 
     def set_source(
         self,
@@ -309,75 +409,109 @@ class ProxyController:
         udp_allowed: bool = True,
         allow_insecure_http: bool = False,
     ) -> dict[str, Any]:
-        mutation = self._daemon.proxy_source(
-            kind,
-            value,
-            enable,
-            selected_node=selected_node,
-            udp_allowed=udp_allowed,
-            allow_insecure_http=allow_insecure_http,
-        )
-        return self._converge(mutation, fresh_check=enable)
+        with self._mutation_scope():
+            guarded = self._quarantine_for_mutation()
+            if guarded.get("ok") is not True:
+                return guarded
+            mutation = self._daemon.proxy_source(
+                kind,
+                value,
+                enable,
+                selected_node=selected_node,
+                udp_allowed=udp_allowed,
+                allow_insecure_http=allow_insecure_http,
+            )
+            if mutation.get("ok") is not True:
+                return mutation
+            if enable:
+                return self._converge(mutation, fresh_check=True)
+            return self._release_direct(mutation, configured=True)
 
     def set_enabled(self, enabled: bool) -> dict[str, Any]:
-        mutation = self._daemon.proxy_enabled(enabled)
-        return self._converge(mutation, fresh_check=enabled)
+        with self._mutation_scope():
+            guarded = self._quarantine_for_mutation()
+            if guarded.get("ok") is not True:
+                return guarded
+            mutation = self._daemon.proxy_enabled(enabled)
+            if mutation.get("ok") is not True:
+                return mutation
+            if enabled:
+                return self._converge(mutation, fresh_check=True)
+            configured = mutation.get("configured")
+            if not isinstance(configured, bool):
+                return _failure("daemon_response_invalid")
+            return self._release_direct(mutation, configured=configured)
 
-    def clear(self) -> dict[str, Any]:
-        mutation = self._daemon.proxy_clear()
-        return self._converge(mutation, fresh_check=False)
+    def clear(self, *, discard_unreadable_state: bool = False) -> dict[str, Any]:
+        with self._mutation_scope():
+            guarded = self._quarantine_for_mutation()
+            if guarded.get("ok") is not True:
+                return guarded
+            mutation = self._daemon.proxy_clear(discard_unreadable_state)
+            if mutation.get("ok") is not True:
+                return mutation
+            return self._release_direct(mutation, configured=False)
 
     def select(self, name: str) -> dict[str, Any]:
-        mutation = self._daemon.proxy_select(name)
-        if mutation.get("ok") is not True:
-            return mutation
-        status = self._daemon.proxy_status()
-        return self._converge(
-            mutation,
-            fresh_check=status.get("ok") is True and status.get("enabled") is True,
-        )
+        with self._mutation_scope():
+            guarded = self._quarantine_for_mutation()
+            if guarded.get("ok") is not True:
+                return guarded
+            mutation = self._daemon.proxy_select(name)
+            if mutation.get("ok") is not True:
+                return mutation
+            enabled = mutation.get("enabled")
+            if not isinstance(enabled, bool):
+                return _failure("daemon_response_invalid")
+            if enabled:
+                return self._converge(mutation, fresh_check=True)
+            return self._release_direct(mutation, configured=True)
 
     def reconcile_for_list(self) -> dict[str, Any]:
-        status = self._daemon.proxy_status()
-        if status.get("ok") is not True or status.get("configured") is not True:
-            return status
-        return self._converge(
-            {"ok": True, "generation": status.get("generation")},
-            fresh_check=False,
-        )
+        with self._mutation_scope():
+            status = self._daemon.proxy_status()
+            if status.get("ok") is not True or status.get("configured") is not True:
+                return status
+            if status.get("enabled") is not True:
+                return status
+            return self._converge(
+                {"ok": True, "generation": status.get("generation")},
+                fresh_check=False,
+            )
 
     def reconcile_desired(self) -> dict[str, Any]:
-        status = self._daemon.proxy_status()
-        if status.get("ok") is not True:
-            return status
-        enabled = status.get("enabled")
-        if not isinstance(enabled, bool):
-            return _failure("daemon_response_invalid")
-        configured = status.get("configured")
-        if not isinstance(configured, bool):
-            return _failure("daemon_response_invalid")
-        if not configured:
+        with self._mutation_scope():
+            status = self._daemon.proxy_status()
+            if status.get("ok") is not True:
+                return status
+            enabled = status.get("enabled")
+            if not isinstance(enabled, bool):
+                return _failure("daemon_response_invalid")
+            configured = status.get("configured")
+            if not isinstance(configured, bool):
+                return _failure("daemon_response_invalid")
+            if not enabled:
+                return self._release_direct(
+                    {
+                        "ok": True,
+                        "generation": status.get("generation"),
+                    },
+                    configured=configured,
+                )
             return self._converge(
                 {
                     "ok": True,
                     "generation": status.get("generation"),
-                    "enabled": False,
+                    "checkId": status.get("checkId"),
+                    "enabled": True,
                 },
-                fresh_check=False,
+                fresh_check=True,
             )
-        return self._converge(
-            {
-                "ok": True,
-                "generation": status.get("generation"),
-                "checkId": status.get("checkId"),
-                "enabled": enabled,
-            },
-            fresh_check=enabled,
-        )
 
     def prepare(self, asset_path: Optional[str] = None) -> dict[str, Any]:
-        prerequisite = self._manager_call("proxy_prerequisite")
-        if prerequisite.get("ok") is not True:
-            return prerequisite
-        asset = Path(asset_path).expanduser() if asset_path is not None else None
-        return self._manager_call("proxy_prepare_asset", asset)
+        with self._mutation_scope():
+            prerequisite = self._manager_call("proxy_prerequisite")
+            if prerequisite.get("ok") is not True:
+                return prerequisite
+            asset = Path(asset_path).expanduser() if asset_path is not None else None
+            return self._manager_call("proxy_prepare_asset", asset)

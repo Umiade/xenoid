@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+OBSERVE_ONLY=false
+[[ "${1:-}" == "--observe-only" ]] && OBSERVE_ONLY=true
 json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
 find_cmd() { command -v "$1" 2>/dev/null || { [[ "$1" == docker && -x /Applications/Docker.app/Contents/Resources/bin/docker ]] && echo /Applications/Docker.app/Contents/Resources/bin/docker; } || { [[ "$1" == colima && -x /opt/homebrew/bin/colima ]] && echo /opt/homebrew/bin/colima; } || { [[ "$1" == brew && -x /opt/homebrew/bin/brew ]] && echo /opt/homebrew/bin/brew; } || true; }
 check_cmd() { [[ -n "$(find_cmd "$1")" ]]; }
@@ -16,8 +18,8 @@ add_check() {
 add_check host true "$OS $ARCH" ""
 DOCKER_BIN="$(find_cmd docker)"
 if [[ -n "$DOCKER_BIN" ]]; then
-  if "$DOCKER_BIN" info >/tmp/xenoid-docker-info.out 2>/tmp/xenoid-docker-info.err; then add_check docker true "$(head -5 /tmp/xenoid-docker-info.out | tr '\n' ' ')" ""
-  else add_check docker false "$(cat /tmp/xenoid-docker-info.err)" "start Docker/Colima daemon"
+  if DOCKER_INFO="$("$DOCKER_BIN" info 2>&1)"; then add_check docker true "$(printf '%s\n' "$DOCKER_INFO" | sed -n '1,5p' | tr '\n' ' ')" ""
+  else add_check docker false "$DOCKER_INFO" "start Docker/Colima daemon"
   fi
 else add_check docker false "not found" "macOS: brew install docker colima; Linux: install docker"
 fi
@@ -27,7 +29,11 @@ if [[ "$OS" == Darwin ]]; then
   add_check binder true "macOS has no host binder; the Colima Linux VM provides it and xenoid start ensures it automatically" ""
 
   if [[ -n "${COLIMA_BIN:-}" ]]; then
-    BINDER_PROBE="$($COLIMA_BIN ssh -- sh -c 'test -e /dev/binderfs/binder-control && echo binderfs-ready || (sudo modprobe binder_linux 2>/dev/null && echo modprobe-ok) || echo missing' 2>/dev/null || true)"
+    if [[ "$OBSERVE_ONLY" == true ]]; then
+      BINDER_PROBE="$($COLIMA_BIN ssh -- sh -c 'test -e /dev/binderfs/binder-control && echo binderfs-ready || echo missing' 2>/dev/null || true)"
+    else
+      BINDER_PROBE="$($COLIMA_BIN ssh -- sh -c 'test -e /dev/binderfs/binder-control && echo binderfs-ready || (sudo modprobe binder_linux 2>/dev/null && echo modprobe-ok) || echo missing' 2>/dev/null || true)"
+    fi
     case "$BINDER_PROBE" in
       *binderfs-ready*) add_check colima_binder true "binderfs mounted inside Colima VM" "" ;;
       *modprobe-ok*) add_check colima_binder true "binder_linux module loaded inside Colima VM (binderfs mount pending)" "" ;;
@@ -42,7 +48,7 @@ else
   fi
 fi
 
-if [[ "$OS" == Darwin && -n "${DOCKER_BIN:-}" && -z "${COLIMA_BIN:-}" ]]; then
+if [[ "$OBSERVE_ONLY" != true && "$OS" == Darwin && -n "${DOCKER_BIN:-}" && -z "${COLIMA_BIN:-}" ]]; then
   if "$DOCKER_BIN" image inspect redroid/redroid:13.0.0_64only-latest >/dev/null 2>&1; then
     PROBE_JSON="$(./scripts/probe-redroid-docker.sh 2>/dev/null || true)"
     if echo "$PROBE_JSON" | grep -q '"ExitCode": 129'; then

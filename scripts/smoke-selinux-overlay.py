@@ -45,7 +45,7 @@ checks = {
     and "mask & (MAY_READ | MAY_WRITE)" in bpf
     and "security_inode_permission" in bpf
     and "return -EACCES;" in bpf
-    and "PIN_PERMISSION_LINK" in loader
+    and '"selinux_permission_link"' in loader
     and "xenoid_fmod_security_inode_permission" in loader,
 }
 out = {"ok": all(checks.values()), "checks": checks}

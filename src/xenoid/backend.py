@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import base64
 import hashlib
 import os
@@ -15,28 +16,43 @@ import stat
 import tarfile
 import selectors
 import time
+import threading
 import urllib.request
 from dataclasses import asdict, dataclass
+import tempfile
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping, Optional
+from typing import Any, BinaryIO, Iterator, Mapping, Optional
 
+from .artifacts import (
+    CONSUMER_TARGETS,
+    TARGETS,
+    ArtifactBuilder,
+    ArtifactOutput,
+    ArtifactRecord,
+    ArtifactSnapshot,
+)
 from .config import (
     InstanceContext,
     InstanceError,
     InstanceLease,
     XenoidConfig,
+    validate_image_reference,
 )
 from .daemon_client import (
-    CAMERA_MUTATION_TIMEOUT_SECONDS,
+    BOOTSTRAP_POLL_TIMEOUT_SECONDS,
+    BOOTSTRAP_WORKER_TIMEOUT_MS,
     KEYBOX_MAX_SOURCE_BYTES,
     PROXY_MAX_SOURCE_BYTES,
     DaemonClient,
 )
 from .device_identity import (
+    GOOGLE_CLEAR_PACKAGES,
+    GOOGLE_MARKER_ROOTS,
     DeviceIdentityStore,
     IdentityError,
     RegenerationJournal,
     public_identity_state,
+    stable_identity_digest,
 )
 from .google_services import (
     GOOGLE_LABEL_DATA_COMPAT,
@@ -51,31 +67,88 @@ from .google_services import (
     base_status,
     binding_matches,
     capability_model,
-    cleanup_runtime_context,
-    create_runtime_context_handle,
-    disabled_runtime_spec_fingerprint,
-    effective_google_image,
     expected_binding_identity,
     load_release_spec,
     public_binding,
     quick_validate_assets,
     resolve_google_runtime_spec,
-    staged_google_payload,
     transition_decision,
-    verify_context_copy,
 )
 from .storage import (
     CANONICAL_DATA_SIZE_BYTES,
+    DATA_IMAGE_NAME,
+    ROOTFS_IMAGE_NAME,
     StorageError,
     StorageStateStore,
     backup_image_name,
     parse_storage_result,
     public_storage_state,
     storage_rotation_target,
-    storage_transaction_id,
 )
+from .runtime_image import RuntimeImageBuilder
+from .protection import SharedProtectionManager
+from .process import run_bounded
+from .operation_lock import instance_operation_lock as _instance_operation_lock
 from .util import bounded_timeout, host_info, run, validate_release_version, which
 
+
+_DAEMON_TRANSPORT_TIMEOUT_SECONDS = 30.0
+_ROOTD_PROVISION_TIMEOUT_SECONDS = 30.0
+_BOOTSTRAP_SEQUENCE_TIMEOUT_SECONDS = 300.0
+_ROOTD_REMOTE_PATH = "/data/local/tmp/xenoid-rootd"
+_ROOTD_LEGACY_PATH = "/data/local/tmp/.netd-helper"
+_ROOTD_RUN_DIRECTORY = "/data/local/tmp/xenoid-rootd-run"
+_ROOTD_PROCESS_RECORD = f"{_ROOTD_RUN_DIRECTORY}/process.json"
+_ROOTD_PROCESS_SCHEMA = "dev.xenoid.rootd-process/v1"
+_ROOTD_ERROR_CODES = frozenset({
+    "daemon_token_unavailable",
+    "rootd_unauthorized",
+    "rootd_unavailable",
+    "rootd_resource_conflict",
+    "rootd_deploy_failed",
+})
+_DAEMON_RUNTIME_PERMISSIONS = (
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_BACKGROUND_LOCATION",
+    "android.permission.POST_NOTIFICATIONS",
+)
+_RUNTIME_SCHEMA_LABEL = "dev.xenoid.runtime_schema"
+_RUNTIME_INPUT_LABEL = "dev.xenoid.runtime_input_sha256"
+_RUNTIME_BOOT_INPUT_LABEL = "dev.xenoid.runtime_boot_input_sha256"
+_RUNTIME_BASE_IMAGE_LABEL = "dev.xenoid.runtime_base_image_id"
+_CONVERGENCE_ARTIFACT_TARGETS = tuple(
+    dict.fromkeys(
+        (
+            *CONSUMER_TARGETS["runtimeContext"],
+            *CONSUMER_TARGETS["liveDeploy"],
+        )
+    )
+)
+_CONVERGENCE_REMOTE_ARTIFACTS = {
+    "input": ("native/xenoid-input/xenoid-input", "/data/local/tmp/xenoid-input", 0o755),
+    "hide": ("native/xenoid-hide/xenoid-hide", "/data/local/tmp/xenoid-hide-helper", 0o755),
+    "profile": ("native/xenoid-profile/xenoid-profile", "/data/local/tmp/xenoid-profile-helper", 0o755),
+    "rootd": ("native/xenoid-rootd/xenoid-rootd-arm64", _ROOTD_REMOTE_PATH, 0o755),
+    "netctl": ("native/xenoid-netctl/xenoid-netctl", "/data/local/tmp/xenoid-netctl", 0o755),
+    "ssaid": ("native/xenoid-hide/xenoid-ssaid", "/data/local/tmp/xenoid-ssaid", 0o755),
+}
+_CONVERGENCE_ACCEPTANCE_CHECKS = (
+    "container",
+    "storage",
+    "identity",
+    "adb",
+    "boot",
+    "daemon",
+    "rootd",
+    "location",
+    "keybox",
+    "camera",
+    "google",
+    "proxy",
+    "protection",
+)
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 _CAMERA_UPLOAD_MIN_BYTES_PER_SECOND = 512 * 1024
 _CAMERA_UPLOAD_TIMEOUT_FLOOR_SECONDS = 600
@@ -144,8 +217,13 @@ class RuntimeManager:
         self.cfg = cfg
         self.lease = lease
         self._pending_proxy_restore: Optional[
-            tuple[str, str, bool, str, bool, bool]
+            tuple[str, bytearray, bool, str, bool, bool]
         ] = None
+        self._artifact_stages: dict[str, tempfile.TemporaryDirectory[str]] = {}
+        self._selected_runtime_image: Optional[dict[str, Any]] = None
+        self._shared_protection: Optional[SharedProtectionManager] = None
+        self._shared_protection_capability: Optional[str] = None
+        self.cancellation_event: Any = None
         self.ensure_instance_lease()
 
     def ensure_instance_lease(self) -> InstanceLease:
@@ -196,6 +274,151 @@ class RuntimeManager:
             )
         return self.lease
 
+    def legacy_token_migration_pending(self) -> bool:
+        """Observe obsolete host token entries without reading or deleting them."""
+        for name in ("daemon.token", "rootd.token"):
+            try:
+                (self.context.state_root / name).lstat()
+                return True
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+        return False
+
+    def migrate_legacy_token_state(self) -> dict[str, Any]:
+        """Unlink obsolete host token entries from one strictly owned state root."""
+        root = self.context.state_root
+        uid = os.getuid()
+        for directory, exact_mode in (
+            (root.parent.parent, None),
+            (root.parent, None),
+            (root, 0o700),
+        ):
+            try:
+                info = directory.lstat()
+                resolved = directory.resolve(strict=True)
+            except OSError as exc:
+                raise InstanceError(
+                    "legacy_token_state_invalid",
+                    "legacy token state directory is unsafe",
+                ) from exc
+            mode = stat.S_IMODE(info.st_mode)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != uid
+                or resolved != directory.absolute()
+                or exact_mode is not None
+                and mode != exact_mode
+                or exact_mode is None
+                and mode & 0o022
+            ):
+                raise InstanceError(
+                    "legacy_token_state_invalid",
+                    "legacy token state directory is unsafe",
+                )
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(root, flags)
+        except OSError as exc:
+            raise InstanceError(
+                "legacy_token_state_invalid",
+                "legacy token state directory is unsafe",
+            ) from exc
+        removed = 0
+        try:
+            opened = os.fstat(descriptor)
+            expected = root.lstat()
+            if (
+                opened.st_dev != expected.st_dev
+                or opened.st_ino != expected.st_ino
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != uid
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise InstanceError(
+                    "legacy_token_state_invalid",
+                    "legacy token state directory changed",
+                )
+            for name in ("daemon.token", "rootd.token"):
+                try:
+                    os.unlink(name, dir_fd=descriptor)
+                    removed += 1
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise InstanceError(
+                        "legacy_token_state_invalid",
+                        "legacy token entry could not be removed safely",
+                    ) from exc
+            if removed:
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return {"ok": True, "removed": removed}
+
+    def instance_operation_lock(
+        self,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> Iterator[None]:
+        """Return the one instance mutation lock used by convergence.
+
+        The executor holds this context for the complete operation.  Low-level
+        hooks deliberately do not acquire a second lock or invoke a command
+        dispatcher.
+        """
+        return _instance_operation_lock(
+            self.context.state_root,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+    def _artifact_consumer_root(
+        self,
+        consumer: str | tuple[str, ...],
+    ) -> Path:
+        key = consumer if isinstance(consumer, str) else ",".join(consumer)
+        existing = self._artifact_stages.get(key)
+        if existing is not None:
+            return Path(existing.name)
+        temporary = tempfile.TemporaryDirectory(prefix="xenoid-artifacts-")
+        destination = Path(temporary.name)
+        try:
+            builder = ArtifactBuilder(self.context.project_root)
+            snapshot = builder.snapshot(consumer)
+            builder.stage(snapshot, destination)
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            temporary.cleanup()
+            raise InstanceError(
+                "artifact_snapshot_invalid",
+                "validated artifact snapshot is unavailable",
+            ) from exc
+        self._artifact_stages[key] = temporary
+        return destination
+
+    def _artifact_output(
+        self,
+        consumer: str | tuple[str, ...],
+        relative: str,
+    ) -> Path:
+        path = self._artifact_consumer_root(consumer) / relative
+        try:
+            state = path.lstat()
+        except OSError as exc:
+            raise InstanceError(
+                "artifact_snapshot_invalid",
+                "validated artifact output is unavailable",
+            ) from exc
+        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+            raise InstanceError(
+                "artifact_snapshot_invalid",
+                "validated artifact output is invalid",
+            )
+        return path
+
     @property
     def adb_target(self) -> str:
         return f"127.0.0.1:{self.lease.host_adb_port}"
@@ -244,14 +467,353 @@ class RuntimeManager:
             require_assets=require_assets,
         )
 
-    def effective_image(self) -> str:
-        base = (
-            f"{self.cfg.runtime_image_tag}-{self.context.resource_tag}"
-            if self.cfg.auto_build_runtime_image
-            else self.cfg.image
+    def _runtime_image_builder(self) -> RuntimeImageBuilder:
+        return RuntimeImageBuilder(
+            self.context.project_root,
+            self.docker_base_cmd(),
+            self.docker_env(),
+            artifact_builder=ArtifactBuilder(self.context.project_root),
+            runner=self._run_runtime_image_command,
+            engine_lock=self._runtime_image_engine_lock,
         )
-        spec = self.google_runtime_spec("effective-image", require_assets=False)
-        return effective_google_image(base, spec)
+
+    def _run_runtime_image_command(
+        self,
+        command: tuple[str, ...],
+        *,
+        env: Mapping[str, str],
+        cwd: Optional[str],
+        input: Optional[bytes] = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        timeout = bounded_timeout(3600) or 3600
+        bounded = run_bounded(
+            command,
+            cwd=Path(cwd) if cwd is not None else self.context.project_root,
+            env=env,
+            input_bytes=input,
+            deadline=time.monotonic() + timeout,
+            project_root=self.context.project_root,
+        )
+        return subprocess.CompletedProcess(
+            command,
+            bounded.returncode
+            if bounded.returncode is not None
+            else (0 if bounded.ok else 1),
+            bounded.stdout_tail.encode("utf-8", "replace"),
+            bounded.stderr_tail.encode("utf-8", "replace"),
+        )
+
+    @contextmanager
+    def _runtime_image_engine_lock(self, lock_name: str) -> Iterator[None]:
+        if re.fullmatch(r"xenoid-runtime-image-[0-9a-f]{64}", lock_name) is None:
+            raise InstanceError(
+                "runtime_image_lock_invalid",
+                "runtime image publication lock name is invalid",
+            )
+        script = (
+            "set -eu; "
+            'p="/run/lock/$1.lock"; '
+            'if [ ! -e "$p" ]; then umask 077; : >"$p"; fi; '
+            'test ! -L "$p"; chown 0:0 "$p"; chmod 0600 "$p"; '
+            "exec flock -x \"$p\" sh -c "
+            "'( printf \"XENOID_LOCKED\\n\" ); cat >/dev/null'"
+        )
+        ssh_cmd = self.remote_docker_ssh_cmd()
+        if ssh_cmd:
+            remote_command = shlex.join(
+                [
+                    "sudo",
+                    "-n",
+                    "sh",
+                    "-c",
+                    script,
+                    "xenoid-runtime-image-lock",
+                    lock_name,
+                ]
+            )
+            command = [*ssh_cmd, remote_command]
+        elif self.should_use_colima():
+            command = [
+                "colima",
+                "ssh",
+                "--",
+                "sudo",
+                "-n",
+                "sh",
+                "-c",
+                script,
+                "xenoid-runtime-image-lock",
+                lock_name,
+            ]
+        else:
+            command = [
+                "sudo",
+                "-n",
+                "sh",
+                "-c",
+                script,
+                "xenoid-runtime-image-lock",
+                lock_name,
+            ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=self.docker_env(),
+            start_new_session=True,
+        )
+        acquired = False
+        selector = selectors.DefaultSelector()
+        try:
+            if process.stdout is None or process.stderr is None:
+                raise InstanceError(
+                    "runtime_image_lock_failed",
+                    "runtime image publication lock process is unavailable",
+                )
+            selector.register(process.stdout, selectors.EVENT_READ)
+            selector.register(process.stderr, selectors.EVENT_READ)
+            wait_seconds = bounded_timeout(120.0) or 120.0
+            deadline = time.monotonic() + max(0.001, wait_seconds)
+            diagnostic = ""
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                events = selector.select(min(remaining, 1.0))
+                for key, _ in events:
+                    line = key.fileobj.readline()
+                    if key.fileobj is process.stdout and line == "XENOID_LOCKED\n":
+                        acquired = True
+                        break
+                    if key.fileobj is process.stderr and line:
+                        diagnostic = (diagnostic + line)[-1024:]
+                if acquired:
+                    break
+                if process.poll() is not None:
+                    break
+            if not acquired and process.poll() is not None:
+                remainder = process.stdout.read(4097)
+                if len(remainder) <= 4096 and "XENOID_LOCKED\n" in remainder.splitlines(keepends=True):
+                    acquired = True
+            if not acquired:
+                raise InstanceError(
+                    "runtime_image_lock_timeout"
+                    if process.poll() is None
+                    else "runtime_image_lock_failed",
+                    "engine-host runtime image publication lock is unavailable",
+                )
+            yield
+            if process.poll() is not None:
+                raise InstanceError(
+                    "runtime_image_lock_lost",
+                    "engine-host runtime image publication lock was lost",
+                )
+        finally:
+            selector.close()
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+
+    def runtime_image_input_record(
+        self,
+        base_image: Optional[str] = None,
+        configured_tag: Optional[str] = None,
+        *,
+        spec: Optional[ReleaseSpec] = None,
+    ) -> dict[str, Any]:
+        selected_spec = (
+            self.google_runtime_spec("runtime-image-input", require_assets=True)
+            if spec is None
+            else spec
+        )
+        selected_base = validate_image_reference(
+            base_image or self.base_image_for_build()
+        )
+        selected_tag = validate_image_reference(
+            configured_tag or self.cfg.runtime_image_tag,
+            require_tag=True,
+            allow_digest=False,
+        )
+        return self._runtime_image_builder().input_record(
+            selected_base,
+            configured_tag=selected_tag,
+            google_spec=selected_spec,
+        )
+
+    def selected_runtime_image(
+        self,
+        *,
+        refresh: bool = False,
+        spec: Optional[ReleaseSpec] = None,
+    ) -> dict[str, Any]:
+        if self._selected_runtime_image is not None and not refresh:
+            return dict(self._selected_runtime_image)
+        desired = self.runtime_image_input_record(spec=spec)
+        input_sha256 = str(desired.get("inputSha256") or "")
+        record = self._runtime_image_builder().lookup(input_sha256)
+        if record is None:
+            raise InstanceError(
+                "runtime_image_required",
+                "verified content-addressed runtime image is unavailable",
+            )
+        for key in (
+            "inputSha256",
+            "bootInputSha256",
+            "derivedTag",
+            "baseImageId",
+        ):
+            if record.get(key) != desired.get(key):
+                raise InstanceError(
+                    "runtime_image_record_invalid",
+                    "runtime image record does not match current inputs",
+                )
+        image, inspect = self._inspect_docker_object(
+            "image",
+            str(record.get("derivedTag") or ""),
+        )
+        config = image.get("Config") if isinstance(image, dict) else None
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        labels = labels if isinstance(labels, dict) else {}
+        expected_labels = {
+            _RUNTIME_SCHEMA_LABEL: "1",
+            _RUNTIME_INPUT_LABEL: str(record.get("inputSha256") or ""),
+            _RUNTIME_BOOT_INPUT_LABEL: str(record.get("bootInputSha256") or ""),
+            _RUNTIME_BASE_IMAGE_LABEL: str(record.get("baseImageId") or ""),
+        }
+        if (
+            not isinstance(image, dict)
+            or not image
+            or inspect.returncode != 0
+            or str(image.get("Id") or "") != str(record.get("imageId") or "")
+            or str(image.get("Architecture") or "") not in {"arm64", "aarch64"}
+            or any(
+                labels.get(key) != value
+                for key, value in expected_labels.items()
+            )
+        ):
+            raise InstanceError(
+                "runtime_image_record_invalid",
+                "published runtime image does not match its verified record",
+            )
+        self._selected_runtime_image = dict(record)
+        return dict(record)
+
+    def ensure_runtime_image(
+        self,
+        base_image: Optional[str] = None,
+        configured_tag: Optional[str] = None,
+        *,
+        spec: Optional[ReleaseSpec] = None,
+        expected_input_sha256: Optional[str] = None,
+        expected_boot_input_sha256: Optional[str] = None,
+        deadline: Optional[float] = None,
+        cancelled: Any = None,
+    ) -> dict[str, Any]:
+        for expected in (expected_input_sha256, expected_boot_input_sha256):
+            if expected is not None and _SHA256_PATTERN.fullmatch(expected) is None:
+                return {
+                    "ok": False,
+                    "error": "convergence_state_conflict",
+                    "message": "journaled runtime image digest is invalid",
+                }
+        try:
+            selected_spec = (
+                self.google_runtime_spec(
+                    "runtime-image-build",
+                    require_assets=True,
+                )
+                if spec is None
+                else spec
+            )
+            selected_base = validate_image_reference(
+                base_image or self.base_image_for_build()
+            )
+            selected_tag = validate_image_reference(
+                configured_tag or self.cfg.runtime_image_tag,
+                require_tag=True,
+                allow_digest=False,
+            )
+            record = self._runtime_image_builder().ensure(
+                selected_base,
+                selected_tag,
+                selected_spec,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+        except (
+            GoogleServicesError,
+            InstanceError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "runtime_image_build_failed"),
+                "message": str(exc),
+            }
+        if (
+            expected_input_sha256 is not None
+            and record.get("inputSha256") != expected_input_sha256
+            or expected_boot_input_sha256 is not None
+            and record.get("bootInputSha256") != expected_boot_input_sha256
+        ):
+            return {
+                "ok": False,
+                "error": "convergence_inputs_changed",
+                "message": "runtime image inputs changed before publication",
+            }
+        if base_image is None and configured_tag is None:
+            self._selected_runtime_image = None
+            try:
+                selected = self.selected_runtime_image(
+                    refresh=True,
+                    spec=selected_spec,
+                )
+            except (
+                GoogleServicesError,
+                InstanceError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                return {
+                    "ok": False,
+                    "error": getattr(
+                        exc,
+                        "code",
+                        "runtime_image_record_invalid",
+                    ),
+                    "message": str(exc),
+                }
+            if selected.get("imageId") != record.get("imageId"):
+                return {
+                    "ok": False,
+                    "error": "runtime_image_record_invalid",
+                    "message": "published runtime image record is inconsistent",
+                }
+        return {"ok": True, **record}
+
+    def effective_image(self) -> str:
+        return str(self.selected_runtime_image()["derivedTag"])
 
     def docker_endpoint_host(self) -> str:
         """Return the Docker engine Host endpoint for cfg.docker_context, if any."""
@@ -426,55 +988,205 @@ class RuntimeManager:
         cmd.append("--local")
         return cmd
 
-    def kernel_module_status(self) -> dict[str, Any]:
-        path = "/sys/module/xenoid_kmod"
+    def shared_protection_manager(self) -> SharedProtectionManager:
+        if self._shared_protection is None:
+            self._shared_protection = SharedProtectionManager(self)
+        return self._shared_protection
+
+    @contextmanager
+    def _shared_protection_engine_lock(self) -> Iterator[None]:
+        script = r'''
+set -eu
+p=/run/lock/xenoid-shared-protection.lock
+if [ ! -e "$p" ]; then (set -C; umask 077; : >"$p") 2>/dev/null || true; fi
+[ ! -L "$p" ] && [ -f "$p" ]
+[ "$(stat -c '%u:%g:%a:%h' "$p")" = '0:0:600:1' ]
+exec flock -x "$p" sh -c '
+set -eu
+d=/run/xenoid/shared-protection-capabilities
+install -d -o root -g root -m 0700 "$d"
+[ ! -L "$d" ] && [ "$(stat -c "%u:%g:%a" "$d")" = "0:0:700" ]
+nonce=$(od -An -N32 -tx1 /dev/urandom | tr -d " \n")
+case "$nonce" in *[!0-9a-f]*|"") exit 1;; esac
+cap="$d/$nonce"
+umask 077
+(set -C; : >"$cap")
+[ ! -L "$cap" ] && [ "$(stat -c "%u:%g:%a:%h" "$cap")" = "0:0:600:1" ]
+trap "rm -f -- \"$cap\"" EXIT HUP INT TERM
+( printf "XENOID_LOCKED %s\n" "$nonce" )
+cat >/dev/null
+'
+'''
         ssh_cmd = self.remote_docker_ssh_cmd()
         if ssh_cmd:
-            cmd = [*ssh_cmd, "test", "-d", path]
+            command = [
+                *ssh_cmd,
+                shlex.join(
+                    [
+                        "sudo",
+                        "-n",
+                        "sh",
+                        "-c",
+                        script,
+                        "xenoid-shared-protection-lock",
+                    ]
+                ),
+            ]
         elif self.should_use_colima():
-            cmd = ["colima", "ssh", "--", "test", "-d", path]
+            command = [
+                "colima",
+                "ssh",
+                "--",
+                "sudo",
+                "-n",
+                "sh",
+                "-c",
+                script,
+                "xenoid-shared-protection-lock",
+            ]
+        elif self.docker_endpoint_host().startswith("tcp://"):
+            raise InstanceError(
+                "shared_protection_engine_unavailable",
+                "engine host transport cannot execute protection operations",
+            )
         else:
-            cmd = [which("test") or "test", "-d", path]
+            command = [
+                "sudo",
+                "-n",
+                "sh",
+                "-c",
+                script,
+                "xenoid-shared-protection-lock",
+            ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=self.docker_env(),
+            start_new_session=True,
+        )
+        selector = selectors.DefaultSelector()
+        capability: Optional[str] = None
+        acquired = False
         try:
-            proc = run(cmd, timeout=20, env=self.docker_env())
-        except Exception as exc:
-            return {"ok": False, "loaded": False, "command": cmd, "error": str(exc)}
-        loaded = proc.returncode == 0
-        return {
-            "ok": loaded,
-            "loaded": loaded,
-            "command": cmd,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout.strip()[-300:],
-            "stderr": proc.stderr.strip()[-300:],
+            if process.stdout is None or process.stderr is None:
+                raise InstanceError(
+                    "shared_protection_lock_failed",
+                    "engine-host protection lock process is unavailable",
+                )
+            selector.register(process.stdout, selectors.EVENT_READ)
+            selector.register(process.stderr, selectors.EVENT_READ)
+            wait_seconds = bounded_timeout(120.0) or 120.0
+            deadline = time.monotonic() + max(0.001, wait_seconds)
+            while time.monotonic() < deadline and process.poll() is None:
+                cancellation = self.cancellation_event
+                if (
+                    cancellation is not None
+                    and callable(getattr(cancellation, "is_set", None))
+                    and cancellation.is_set()
+                ):
+                    raise InstanceError(
+                        "shared_protection_cancelled",
+                        "engine-host protection operation was cancelled",
+                    )
+                events = selector.select(
+                    min(1.0, max(0.001, deadline - time.monotonic()))
+                )
+                for key, _ in events:
+                    line = key.fileobj.readline()
+                    match = re.fullmatch(
+                        r"XENOID_LOCKED ([0-9a-f]{64})\n",
+                        line,
+                    )
+                    if key.fileobj is process.stdout and match is not None:
+                        capability = match.group(1)
+                        acquired = True
+                        break
+                if acquired:
+                    break
+            if not acquired and process.poll() is not None:
+                remainder = process.stdout.read(4097)
+                if len(remainder) <= 4096:
+                    for line in remainder.splitlines(keepends=True):
+                        match = re.fullmatch(
+                            r"XENOID_LOCKED ([0-9a-f]{64})\n",
+                            line,
+                        )
+                        if match is not None:
+                            capability = match.group(1)
+                            acquired = True
+                            break
+            if not acquired:
+                raise InstanceError(
+                    "shared_protection_lock_timeout"
+                    if process.poll() is None
+                    else "shared_protection_lock_failed",
+                    "engine-host protection lock is unavailable",
+                )
+            self._shared_protection_capability = capability
+            yield
+            if process.poll() is not None:
+                raise InstanceError(
+                    "shared_protection_lock_lost",
+                    "engine-host protection lock was lost",
+                )
+        finally:
+            self._shared_protection_capability = None
+            selector.close()
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+
+    def shared_protection_status(self) -> dict[str, Any]:
+        return self.shared_protection_manager().status()
+
+    def build_shared_protection(self) -> dict[str, Any]:
+        return self.shared_protection_manager().prepare()
+
+    def unload_shared_ebpf(self, *, maintenance: bool) -> dict[str, Any]:
+        return self.shared_protection_manager().unload_ebpf(
+            maintenance=maintenance,
+        )
+
+    def smoke_shared_protection(self) -> dict[str, Any]:
+        return self.shared_protection_manager().smoke()
+
+    def kernel_module_status(self) -> dict[str, Any]:
+        status = self.shared_protection_status()
+        kernel = status.get("kernel")
+        return dict(kernel) if isinstance(kernel, Mapping) else {
+            "ok": False,
+            "loaded": False,
+            "error": status.get("error", "shared_protection_status_failed"),
         }
 
     def ebpf_status(self) -> dict[str, Any]:
-        cmd = self.ebpf_action_command("status")
-        try:
-            proc = run(cmd, timeout=60, env=self.docker_env())
-        except Exception as exc:
-            return {"ok": False, "loaded": False, "command": cmd, "error": str(exc)}
-        data: dict[str, Any] = {}
-        for line in reversed((proc.stdout or "").splitlines()):
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    parsed = json.loads(line)
-                    if isinstance(parsed, dict):
-                        data = parsed
-                except json.JSONDecodeError:
-                    pass
-                break
-        loaded = proc.returncode == 0 and data.get("loaded") is True
-        return {
-            "ok": loaded,
-            "loaded": loaded,
-            "command": cmd,
-            "returncode": proc.returncode,
-            "data": data,
-            "stdout": proc.stdout.strip()[-300:],
-            "stderr": proc.stderr.strip()[-300:],
+        status = self.shared_protection_status()
+        ebpf = status.get("ebpf")
+        return dict(ebpf) if isinstance(ebpf, Mapping) else {
+            "ok": False,
+            "loaded": False,
+            "error": status.get("error", "shared_protection_status_failed"),
         }
 
     def image_protection_status(self) -> dict[str, Any]:
@@ -581,6 +1293,19 @@ class RuntimeManager:
             for key, value in sorted(self._google_label_values().items())
             for argument in ("--label", f"{key}={value}")
         ]
+    def _runtime_image_label_args(self) -> list[str]:
+        record = self.selected_runtime_image()
+        values = {
+            _RUNTIME_SCHEMA_LABEL: "1",
+            _RUNTIME_INPUT_LABEL: str(record["inputSha256"]),
+            _RUNTIME_BOOT_INPUT_LABEL: str(record["bootInputSha256"]),
+            _RUNTIME_BASE_IMAGE_LABEL: str(record["baseImageId"]),
+        }
+        return [
+            argument
+            for key, value in sorted(values.items())
+            for argument in ("--label", f"{key}={value}")
+        ]
     def _managed_container_labels_match(self, labels: Any) -> bool:
         if not isinstance(labels, dict):
             return False
@@ -598,10 +1323,13 @@ class RuntimeManager:
         self,
         object_type: str,
         name: str,
+        *,
+        timeout: Optional[float] = None,
     ) -> tuple[Optional[dict[str, Any]], Any]:
         proc = run(
             [*self.docker_base_cmd(), object_type, "inspect", name],
             env=self.docker_env(),
+            timeout=timeout,
         )
         if proc.returncode != 0:
             return None, proc
@@ -617,26 +1345,218 @@ class RuntimeManager:
             return {}, proc
         return payload[0], proc
 
+    @staticmethod
+    def _runtime_record_seed_contract(
+        record: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        direct = record.get("daemonSeedContract")
+        if isinstance(direct, dict):
+            return dict(direct)
+        inputs = record.get("inputs")
+        nested = inputs.get("daemonSeedContract") if isinstance(inputs, dict) else None
+        return dict(nested) if isinstance(nested, dict) else None
+
+    @staticmethod
+    def _runtime_seed_incompatibility(
+        current: Mapping[str, Any],
+        desired: Mapping[str, Any],
+    ) -> Optional[str]:
+        current_seed = RuntimeManager._runtime_record_seed_contract(current)
+        desired_seed = RuntimeManager._runtime_record_seed_contract(desired)
+        if current_seed is None or desired_seed is None:
+            return "runtime_image_record_invalid"
+        for key in ("packageName", "sharedUserId", "signingLineageSha256"):
+            if current_seed.get(key) != desired_seed.get(key):
+                return "daemon_seed_contract_incompatible"
+        try:
+            current_version = int(current_seed["versionCode"])
+            desired_version = int(desired_seed["versionCode"])
+        except (KeyError, TypeError, ValueError):
+            return "runtime_image_record_invalid"
+        if desired_version < current_version:
+            return "daemon_seed_version_downgrade"
+        return None
+
+    def _daemon_live_update_matches(
+        self,
+        desired: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        seed = self._runtime_record_seed_contract(desired)
+        if seed is None:
+            return {"ok": False, "error": "runtime_image_record_invalid"}
+        package_name = str(seed.get("packageName") or "")
+        apk_sha256 = str(seed.get("apkSha256") or "")
+        try:
+            desired_version = int(seed["versionCode"])
+        except (KeyError, TypeError, ValueError):
+            desired_version = -1
+        if (
+            package_name != "dev.xenoid.daemon"
+            or re.fullmatch(r"[0-9a-f]{64}", apk_sha256) is None
+            or desired_version < 0
+        ):
+            return {"ok": False, "error": "runtime_image_record_invalid"}
+        package_path = self.adb(
+            ["shell", "pm", "path", package_name],
+            timeout=15,
+        )
+        paths = [
+            line.removeprefix("package:").strip()
+            for line in str(package_path.get("stdout") or "").splitlines()
+            if line.startswith("package:/")
+        ]
+        if package_path.get("ok") is not True or len(paths) != 1:
+            return {"ok": False, "error": "daemon_live_identity_unavailable"}
+        digest = self.docker_exec(["sha256sum", paths[0]], timeout=15)
+        digest_value = str(digest.get("stdout") or "").split(maxsplit=1)
+        if (
+            digest.get("ok") is not True
+            or not digest_value
+            or digest_value[0] != apk_sha256
+        ):
+            return {"ok": False, "error": "daemon_apk_digest_mismatch"}
+        package = self.adb(
+            ["shell", "dumpsys", "package", package_name],
+            timeout=20,
+        )
+        output = str(package.get("stdout") or "")
+        package_match = re.search(
+            rf"^\s*Package \[{re.escape(package_name)}\]",
+            output,
+            flags=re.MULTILINE,
+        )
+        version_match = re.search(r"\bversionCode=([0-9]+)\b", output)
+        shared_user = seed.get("sharedUserId")
+        if shared_user is None:
+            shared_user_match = re.search(
+                r"^\s*sharedUserId=(?!null\b)\S+",
+                output,
+                flags=re.MULTILINE,
+            ) is None
+        else:
+            shared = re.escape(str(shared_user))
+            shared_user_match = bool(
+                re.search(
+                    rf"^\s*sharedUserId={shared}\s*$",
+                    output,
+                    flags=re.MULTILINE,
+                )
+                or re.search(
+                    rf"^\s*sharedUser=.*\b{shared}(?:/|\b)",
+                    output,
+                    flags=re.MULTILINE,
+                )
+            )
+        installed_version = int(version_match.group(1)) if version_match else -1
+        ok = bool(
+            package.get("ok") is True
+            and package_match
+            and installed_version == desired_version
+            and shared_user_match
+        )
+        return {
+            "ok": ok,
+            "apkSha256": apk_sha256 if ok else None,
+            "versionCode": installed_version if installed_version >= 0 else None,
+            "packageName": package_name,
+            "sharedUserIdMatches": shared_user_match,
+            "signingLineageMatches": ok,
+            **({} if ok else {"error": "daemon_seed_contract_incompatible"}),
+        }
+
     def _container_effective_image_identity(
         self,
         container: Mapping[str, Any],
     ) -> dict[str, Any]:
-        image, inspect = self._inspect_docker_object(
-            "image",
-            self.effective_image(),
-        )
-        desired_id = (
-            str(image.get("Id") or "")
-            if isinstance(image, dict)
-            else ""
-        )
+        try:
+            desired = self.selected_runtime_image()
+        except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "runtime_image_record_invalid"),
+                "message": str(exc),
+            }
+        desired_id = str(desired.get("imageId") or "")
         container_id = str(container.get("Image") or "")
-        return {
-            "ok": bool(desired_id) and container_id == desired_id,
+        result: dict[str, Any] = {
+            "ok": False,
+            "match": "mismatch",
             "containerImageSha256": container_id or None,
             "desiredImageSha256": desired_id or None,
-            "returncode": inspect.returncode,
+            "containerInputSha256": None,
+            "desiredInputSha256": desired.get("inputSha256"),
+            "containerBootInputSha256": None,
+            "desiredBootInputSha256": desired.get("bootInputSha256"),
         }
+        if not desired_id or not container_id:
+            result["error"] = "runtime_image_record_invalid"
+            return result
+        if container_id == desired_id:
+            result.update({"ok": True, "match": "exact"})
+            return result
+        current_image, inspect = self._inspect_docker_object("image", container_id)
+        config = (
+            current_image.get("Config")
+            if isinstance(current_image, dict)
+            else None
+        )
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        labels = labels if isinstance(labels, dict) else {}
+        current_input = str(labels.get(_RUNTIME_INPUT_LABEL) or "")
+        current_boot = str(labels.get(_RUNTIME_BOOT_INPUT_LABEL) or "")
+        result.update(
+            {
+                "returncode": inspect.returncode,
+                "containerInputSha256": current_input or None,
+                "containerBootInputSha256": current_boot or None,
+            }
+        )
+        if (
+            not isinstance(current_image, dict)
+            or not current_image
+            or labels.get(_RUNTIME_SCHEMA_LABEL) != "1"
+            or re.fullmatch(r"[0-9a-f]{64}", current_input) is None
+            or re.fullmatch(r"[0-9a-f]{64}", current_boot) is None
+        ):
+            result["error"] = "runtime_image_identity_invalid"
+            return result
+        current_record = self._runtime_image_builder().lookup(current_input)
+        if current_record is None:
+            result["error"] = "runtime_image_record_invalid"
+            return result
+        expected_current_labels = current_record.get("labels")
+        if (
+            current_record.get("imageId") != container_id
+            or not isinstance(expected_current_labels, dict)
+            or any(
+                labels.get(key) != value
+                for key, value in expected_current_labels.items()
+            )
+            or str(current_image.get("Architecture") or "")
+            not in {"arm64", "aarch64"}
+        ):
+            result["error"] = "runtime_image_identity_invalid"
+            return result
+        incompatibility = self._runtime_seed_incompatibility(
+            current_record,
+            desired,
+        )
+        if incompatibility is not None:
+            result["error"] = incompatibility
+            return result
+        if current_boot != desired.get("bootInputSha256"):
+            result["error"] = "runtime_boot_input_mismatch"
+            return result
+        live = self._daemon_live_update_matches(desired)
+        result["daemonLiveIdentity"] = live
+        if live.get("ok") is not True:
+            result["error"] = live.get(
+                "error",
+                "daemon_seed_contract_incompatible",
+            )
+            return result
+        result.update({"ok": True, "match": "daemon-only"})
+        return result
 
     def docker_network_command(self) -> list[str]:
         return [
@@ -790,14 +1710,102 @@ class RuntimeManager:
         }
 
     def _engine_host_shell(self, script: str, *, timeout: int = 120) -> Any:
+        if self._shared_protection_capability is not None:
+            return self._shared_protection_engine_shell(
+                script,
+                timeout=timeout,
+            )
         ssh_cmd = self.remote_docker_ssh_cmd()
         if ssh_cmd:
-            command = [*ssh_cmd, "sudo", "-n", "sh", "-c", script]
+            command = [
+                *ssh_cmd,
+                shlex.join(["sudo", "-n", "sh", "-c", script]),
+            ]
         elif self.should_use_colima():
             command = ["colima", "ssh", "--", "sudo", "-n", "sh", "-c", script]
         else:
             command = ["sudo", "-n", "sh", "-c", script]
         return run(command, timeout=timeout, env=self.docker_env())
+
+    def _shared_protection_engine_shell(
+        self,
+        script: str,
+        *,
+        timeout: int = 120,
+    ) -> Any:
+        capability = self._shared_protection_capability
+        if (
+            not isinstance(capability, str)
+            or _SHA256_PATTERN.fullmatch(capability) is None
+        ):
+            raise InstanceError(
+                "shared_protection_lock_lost",
+                "engine-host protection capability is unavailable",
+            )
+        cap_path = (
+            "/run/xenoid/shared-protection-capabilities/" + capability
+        )
+        watchdog = (
+            'cap=$1; command=$2; parent=$PPID; target=$$; '
+            '(trap "" TERM; while kill -0 "$parent" 2>/dev/null '
+            '&& test -f "$cap"; do sleep 0.1; done; '
+            'kill -TERM -- -"$target" 2>/dev/null || true; sleep 5; '
+            'kill -KILL -- -"$target" 2>/dev/null || true) & watcher=$!; '
+            'set +e; sh -c "$command"; rc=$?; set -e; '
+            'set -e; kill -KILL "$watcher" 2>/dev/null || true; '
+            'wait "$watcher" 2>/dev/null || true; exit "$rc"'
+        )
+        remote = [
+            "sudo",
+            "-n",
+            "setsid",
+            "--wait",
+            "sh",
+            "-c",
+            watchdog,
+            "xenoid-protection",
+            cap_path,
+            script,
+        ]
+        ssh_cmd = self.remote_docker_ssh_cmd()
+        if ssh_cmd:
+            command = [*ssh_cmd, shlex.join(remote)]
+        elif self.should_use_colima():
+            command = ["colima", "ssh", "--", *remote]
+        elif self.docker_endpoint_host().startswith("tcp://"):
+            raise InstanceError(
+                "shared_protection_engine_unavailable",
+                "engine host transport cannot execute protection operations",
+            )
+        else:
+            command = remote
+        seconds = bounded_timeout(float(timeout)) or float(timeout)
+        bounded = run_bounded(
+            command,
+            cwd=self.context.project_root,
+            deadline=time.monotonic() + max(0.001, seconds),
+            env=self.docker_env(),
+            cancelled=self.cancellation_event,
+            project_root=self.context.project_root,
+        )
+        returncode = bounded.returncode
+        if returncode is None:
+            returncode = (
+                124
+                if bounded.state == "timed_out"
+                else 130
+                if bounded.state == "cancelled"
+                else 1
+            )
+        stderr = bounded.stderr_tail
+        if bounded.error_code:
+            stderr = (stderr + "\n" + bounded.error_code).strip()
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            bounded.stdout_tail,
+            stderr,
+        )
 
     @staticmethod
     def _parse_engine_meminfo(raw: str) -> Optional[dict[str, int]]:
@@ -913,7 +1921,6 @@ class RuntimeManager:
                 "error": "storage_image_invalid",
                 "message": "persistent data image is missing or invalid",
                 "returncode": proc.returncode,
-                "stderr": proc.stderr.strip()[-500:],
             }
         try:
             geometry = parse_storage_result(proc.stdout)
@@ -950,11 +1957,20 @@ class RuntimeManager:
         legacy_volume: str = "",
         backup_image: str = "",
         backup_uuid: str = "",
+        expected_rootfs_uuid: str = "",
     ) -> dict[str, Any]:
+        try:
+            runtime_image = self.selected_runtime_image()
+        except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "runtime_image_required"),
+                "message": str(exc),
+            }
         script = self.context.project_root / "scripts" / "make-rootfs-image.sh"
         command = [
             str(script),
-            self.effective_image(),
+            str(runtime_image["derivedTag"]),
             self.lease.volume_name,
             "3072",
             str(CANONICAL_DATA_SIZE_BYTES),
@@ -965,6 +1981,7 @@ class RuntimeManager:
             backup_image or "-",
             backup_uuid or "-",
             self.cfg.google_services_provider,
+            expected_rootfs_uuid or "-",
         ]
         env = self.docker_env()
         ssh_cmd = self.remote_docker_ssh_cmd()
@@ -976,9 +1993,11 @@ class RuntimeManager:
         result: dict[str, Any] = {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
-            "command": command,
-            "stdout": proc.stdout.strip()[-2000:],
-            "stderr": proc.stderr.strip()[-2000:],
+            "runtimeImage": {
+                "imageId": runtime_image["imageId"],
+                "inputSha256": runtime_image["inputSha256"],
+                "bootInputSha256": runtime_image["bootInputSha256"],
+            },
         }
         if proc.returncode != 0:
             storage_failure = 41 <= proc.returncode <= 60
@@ -1016,9 +2035,25 @@ class RuntimeManager:
             })
             return result
         try:
-            geometry = parse_storage_result(proc.stdout)
+            geometry = parse_storage_result(proc.stdout, require_rootfs=True)
         except StorageError as exc:
             return {**result, **exc.as_dict(), "ok": False}
+        try:
+            verified_runtime = self.selected_runtime_image(refresh=True)
+        except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError) as exc:
+            return {
+                **result,
+                "ok": False,
+                "error": getattr(exc, "code", "runtime_image_input_changed"),
+                "message": "runtime image identity changed during rootfs preparation",
+            }
+        if verified_runtime.get("imageId") != runtime_image.get("imageId"):
+            return {
+                **result,
+                "ok": False,
+                "error": "runtime_image_input_changed",
+                "message": "runtime image identity changed during rootfs preparation",
+            }
         result.update({
             **geometry,
             "action": action,
@@ -1030,6 +2065,9 @@ class RuntimeManager:
         expected_uuid: str,
         *,
         target_uuid: str,
+        expected_rootfs_source_sha256: str,
+        expected_rootfs_size_bytes: int,
+        expected_rootfs_uuid: str,
         target_rootfs_uuid: str,
     ) -> dict[str, Any]:
         script = self.context.project_root / "scripts" / "rotate-storage-identity.sh"
@@ -1038,6 +2076,9 @@ class RuntimeManager:
             self.lease.volume_name,
             expected_uuid,
             target_uuid,
+            expected_rootfs_uuid,
+            expected_rootfs_source_sha256,
+            str(expected_rootfs_size_bytes),
             target_rootfs_uuid,
         ]
         env = self.docker_env()
@@ -1050,9 +2091,6 @@ class RuntimeManager:
         result: dict[str, Any] = {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
-            "command": command,
-            "stdout": proc.stdout.strip()[-2000:],
-            "stderr": proc.stderr.strip()[-2000:],
         }
         if proc.returncode != 0:
             result["error"] = (
@@ -1071,7 +2109,7 @@ class RuntimeManager:
             )
             return result
         try:
-            geometry = parse_storage_result(proc.stdout)
+            geometry = parse_storage_result(proc.stdout, require_rootfs=True)
         except StorageError as exc:
             return {**result, **exc.as_dict(), "ok": False}
         rotated = any(
@@ -1080,22 +2118,165 @@ class RuntimeManager:
         result.update({**geometry, "rotated": rotated})
         return result
 
-    def rotate_storage_identity(self) -> dict[str, Any]:
-        """Rotate data/rootfs filesystem UUIDs and per-app SSAID state offline.
+    def complete_legacy_pending_storage(
+        self,
+        legacy_evidence_sha256: str,
+    ) -> dict[str, Any]:
+        """Finish only an already-recorded v1 storage transition."""
+        journal = RegenerationJournal(self.context)
+        try:
+            if journal.legacy_source_digest() != legacy_evidence_sha256:
+                raise StorageError(
+                    "device_regeneration_state_invalid",
+                    "legacy evidence digest mismatch",
+                )
+            store = StorageStateStore(self.context, self.lease)
+            state = store.load()
+            if state is None:
+                raise StorageError(
+                    "storage_not_initialized",
+                    "legacy storage state is missing",
+                )
+            if state["state"] == "committed":
+                return {"ok": True, "completed": False}
+            if (
+                state["temporaryImage"] != ""
+                or not state["rotationTargetUuid"]
+            ):
+                raise StorageError(
+                    "storage_identity_mismatch",
+                    "legacy pending storage is not a rotation window",
+                )
+            volume, _ = self._inspect_docker_object(
+                "volume",
+                self.lease.volume_name,
+            )
+            data = (
+                self._inspect_volume_image(dict(volume))
+                if isinstance(volume, Mapping)
+                else {}
+            )
+            rootfs = (
+                self._inspect_volume_image(
+                    dict(volume),
+                    image_name=ROOTFS_IMAGE_NAME,
+                )
+                if isinstance(volume, Mapping)
+                else {}
+            )
+            if (
+                data.get("ok") is not True
+                or rootfs.get("ok") is not True
+                or data.get("filesystemUuid")
+                not in {
+                    state["filesystemUuid"],
+                    state["rotationTargetUuid"],
+                }
+            ):
+                raise StorageError(
+                    "storage_identity_mismatch",
+                    "legacy storage matches neither old nor target",
+                )
+            data_uuid = str(data["filesystemUuid"])
+            rootfs_uuid = str(rootfs["filesystemUuid"])
+            migrated = self._run_storage_image_action(
+                "preserve",
+                expected_uuid=data_uuid,
+                transaction_id=str(state["transactionId"]),
+                expected_rootfs_uuid=rootfs_uuid,
+            )
+            if migrated.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": str(
+                        migrated.get("error")
+                        or "storage_v4_migration_failed"
+                    ),
+                }
+            normalized = store.pending(
+                str(state["source"]),
+                transaction_id=str(state["transactionId"]),
+                filesystem_uuid=data_uuid,
+                observed_logical_size_bytes=int(migrated["logicalSizeBytes"]),
+                observed_filesystem_size_bytes=int(
+                    migrated["filesystemSizeBytes"]
+                ),
+                host_allocated_bytes=int(migrated["allocatedBytes"]),
+                rootfs_image=ROOTFS_IMAGE_NAME,
+                rootfs_filesystem_uuid=rootfs_uuid,
+                rootfs_source_sha256=str(migrated["rootfsSourceSha256"]),
+                observed_rootfs_size_bytes=int(migrated["rootfsSizeBytes"]),
+                legacy_volume=str(state["legacyVolume"]),
+                legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
+                backup_image=str(state["backupImage"]),
+                backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
+                backup_size_bytes=int(state["backupSizeBytes"]),
+                backup_rootfs_image=str(
+                    migrated.get("backupRootfsImage") or ""
+                ),
+                backup_rootfs_filesystem_uuid=str(
+                    migrated.get("backupRootfsFilesystemUuid") or ""
+                ),
+                backup_rootfs_size_bytes=int(
+                    migrated.get("backupRootfsSizeBytes") or 0
+                ),
+                growth=True,
+            )
+            committed = store.commit(normalized, migrated)
+            committed = self._cleanup_committed_rootfs_backup(
+                store,
+                committed,
+            )
+            return {
+                "ok": True,
+                "completed": True,
+                "dataUuid": committed["filesystemUuid"],
+                "rootfsUuid": committed["rootfsFilesystemUuid"],
+            }
+        except (IdentityError, StorageError) as exc:
+            return exc.as_dict()
 
-        The owned container must be absent. One pending in-place storage
-        transaction wraps the engine-host script, which is idempotent: retry
-        after a crash adopts an already-rotated image or finishes the pending
-        rotation, then commits the observed identity. Boot-scoped values are
-        pre-seeded separately by start() on every container creation.
-        """
+
+    def rotate_storage_identity(
+        self,
+        *,
+        transaction_id: str,
+        data_target_uuid: str,
+        rootfs_target_uuid: str,
+        expected_data_uuid: str,
+        expected_rootfs_uuid: str,
+        regeneration_capability: Any = None,
+    ) -> dict[str, Any]:
+        """Converge both persistent ext4 identities to journal-pinned targets."""
         self.ensure_instance_lease()
+        journal = RegenerationJournal(self.context)
+        try:
+            regeneration = journal.load()
+            if regeneration is not None:
+                regeneration = journal.require_capability(regeneration_capability)
+                target = regeneration["target"]
+                if (
+                    transaction_id != target["storageTransactionId"]
+                    or data_target_uuid != target["dataFilesystemUuid"]
+                    or rootfs_target_uuid != target["rootfsFilesystemUuid"]
+                ):
+                    raise IdentityError(
+                        "device_regeneration_state_invalid",
+                        "storage targets do not match the regeneration journal",
+                    )
+            elif regeneration_capability is not None:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "regeneration capability has no journal",
+                )
+        except IdentityError as exc:
+            return exc.as_dict()
         container, error = self._owned_container_record()
         if container is not None:
             return {
                 "ok": False,
                 "error": "storage_rotation_requires_stop",
-                "message": "the owned Android container must be stopped before storage identity rotation",
+                "message": "the owned Android container must be absent before storage identity rotation",
             }
         if error != "instance container does not exist":
             return {
@@ -1106,13 +2287,199 @@ class RuntimeManager:
         store = StorageStateStore(self.context, self.lease)
         try:
             state = store.load()
-            if state is None or (state["state"] == "pending" and state["temporaryImage"]):
+            if (
+                isinstance(state, Mapping)
+                and state.get("state") == "pending"
+                and state.get("temporaryImage") == ""
+                and not state.get("rootfsFilesystemUuid")
+                and isinstance(regeneration, Mapping)
+                and regeneration.get("legacyEvidenceSha256") is not None
+            ):
+                volume, _ = self._inspect_docker_object(
+                    "volume",
+                    self.lease.volume_name,
+                )
+                observed_data = (
+                    self._inspect_volume_image(dict(volume))
+                    if isinstance(volume, Mapping)
+                    else {}
+                )
+                observed_rootfs = (
+                    self._inspect_volume_image(
+                        dict(volume),
+                        image_name=ROOTFS_IMAGE_NAME,
+                    )
+                    if isinstance(volume, Mapping)
+                    else {}
+                )
+                if (
+                    observed_data.get("ok") is not True
+                    or observed_rootfs.get("ok") is not True
+                    or observed_data.get("filesystemUuid")
+                    != expected_data_uuid
+                    or observed_rootfs.get("filesystemUuid")
+                    != expected_rootfs_uuid
+                ):
+                    raise StorageError(
+                        "storage_identity_mismatch",
+                        "legacy pending storage differs from its v2 snapshot",
+                    )
+                migrated = self._run_storage_image_action(
+                    "preserve",
+                    expected_uuid=expected_data_uuid,
+                    transaction_id=str(state["transactionId"]),
+                    expected_rootfs_uuid=expected_rootfs_uuid,
+                )
+                if migrated.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "error": str(
+                            migrated.get("error")
+                            or "storage_v4_migration_failed"
+                        ),
+                    }
+                migrated_backup = str(
+                    migrated.get("backupRootfsImage") or ""
+                )
+                if migrated_backup:
+                    expected_backup = (
+                        f"{ROOTFS_IMAGE_NAME}.pre-source-"
+                        f"{state['transactionId']}"
+                    )
+                    if migrated_backup != expected_backup:
+                        raise StorageError(
+                            "storage_state_invalid",
+                            "legacy rootfs backup owner is invalid",
+                        )
+                    mountpoint = (
+                        volume.get("Mountpoint")
+                        if isinstance(volume, Mapping)
+                        else None
+                    )
+                    if not isinstance(mountpoint, str):
+                        raise StorageError(
+                            "storage_image_invalid",
+                            "legacy rootfs backup path is unavailable",
+                        )
+                    backup_path = (
+                        f"{mountpoint.rstrip('/')}/{migrated_backup}"
+                    )
+                    cleanup = self._engine_host_shell(
+                        "set -eu; p="
+                        + shlex.quote(backup_path)
+                        + "; if [ ! -e \"$p\" ]; then exit 0; fi; "
+                        + "[ -f \"$p\" ] && [ ! -L \"$p\" ]; "
+                        + "[ \"$(blkid -p -s UUID -o value -- \"$p\" | tr A-F a-f)\" = "
+                        + shlex.quote(
+                            str(migrated["backupRootfsFilesystemUuid"])
+                        )
+                        + " ]; [ \"$(stat -c %s -- \"$p\")\" = "
+                        + shlex.quote(
+                            str(migrated["backupRootfsSizeBytes"])
+                        )
+                        + " ]; rm -- \"$p\"; sync -f "
+                        + shlex.quote(mountpoint)
+                    )
+                    if cleanup.returncode != 0:
+                        raise StorageError(
+                            "storage_image_invalid",
+                            "legacy rootfs backup cleanup failed",
+                        )
+                state = store.pending(
+                    str(state["source"]),
+                    transaction_id=transaction_id,
+                    filesystem_uuid=expected_data_uuid,
+                    observed_logical_size_bytes=int(
+                        migrated["logicalSizeBytes"]
+                    ),
+                    observed_filesystem_size_bytes=int(
+                        migrated["filesystemSizeBytes"]
+                    ),
+                    host_allocated_bytes=int(migrated["allocatedBytes"]),
+                    rootfs_image=ROOTFS_IMAGE_NAME,
+                    rootfs_filesystem_uuid=expected_rootfs_uuid,
+                    rootfs_source_sha256=str(
+                        migrated["rootfsSourceSha256"]
+                    ),
+                    observed_rootfs_size_bytes=int(
+                        migrated["rootfsSizeBytes"]
+                    ),
+                    legacy_volume=str(state["legacyVolume"]),
+                    legacy_filesystem_uuid=str(
+                        state["legacyFilesystemUuid"]
+                    ),
+                    backup_image=str(state["backupImage"]),
+                    backup_filesystem_uuid=str(
+                        state["backupFilesystemUuid"]
+                    ),
+                    backup_size_bytes=int(state["backupSizeBytes"]),
+                    growth=True,
+                    backup_rootfs_image="",
+                    backup_rootfs_filesystem_uuid="",
+                    backup_rootfs_size_bytes=0,
+                    rotation_target_uuid=data_target_uuid,
+                    rotation_target_rootfs_uuid=rootfs_target_uuid,
+                )
+            if (
+                isinstance(state, Mapping)
+                and state.get("state") == "committed"
+                and not state.get("rootfsFilesystemUuid")
+                and isinstance(regeneration, Mapping)
+                and regeneration.get("legacyEvidenceSha256") is not None
+            ):
+                migrated = self.ensure_instance_storage()
+                if migrated.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "error": str(
+                            migrated.get("error")
+                            or "storage_v4_migration_failed"
+                        ),
+                    }
+                state = store.load()
+                if (
+                    not isinstance(state, Mapping)
+                    or state.get("rootfsFilesystemUuid")
+                    != expected_rootfs_uuid
+                ):
+                    raise StorageError(
+                        "storage_identity_mismatch",
+                        "v3 rootfs migration changed the recorded identity",
+                    )
+            if (
+                state is None
+                or state["state"] == "pending"
+                and state["temporaryImage"]
+                or not state.get("rootfsFilesystemUuid")
+                or not state.get("rootfsSourceSha256")
+            ):
                 raise StorageError(
                     "storage_not_initialized",
-                    "instance storage is not committed",
+                    "instance data/rootfs storage is not committed",
                 )
             if state["state"] == "committed":
-                transaction_id = storage_transaction_id()
+                state = self._cleanup_committed_rootfs_backup(store, state)
+                if (
+                    state["filesystemUuid"] == data_target_uuid
+                    and state["rootfsFilesystemUuid"] == rootfs_target_uuid
+                ):
+                    state = self._cleanup_committed_rootfs_backup(store, state)
+                    return {
+                        "ok": True,
+                        "rotated": False,
+                        "filesystemUuid": data_target_uuid,
+                        "rootfsFilesystemUuid": rootfs_target_uuid,
+                        "previousFilesystemUuid": expected_data_uuid,
+                        "previousRootfsFilesystemUuid": expected_rootfs_uuid,
+                    }
+                if (
+                    state["filesystemUuid"] != expected_data_uuid
+                    or state["rootfsFilesystemUuid"] != expected_rootfs_uuid
+                ):
+                    raise StorageError(
+                        "storage_identity_mismatch",
+                        "storage matches neither regeneration before nor target",
+                    )
                 pending = store.pending(
                     str(state["source"]),
                     transaction_id=transaction_id,
@@ -1120,60 +2487,67 @@ class RuntimeManager:
                     observed_logical_size_bytes=int(state["observedLogicalSizeBytes"]),
                     observed_filesystem_size_bytes=int(state["observedFilesystemSizeBytes"]),
                     host_allocated_bytes=int(state["hostAllocatedBytes"]),
+                    rootfs_image=str(state["rootfsImage"]),
+                    rootfs_filesystem_uuid=str(state["rootfsFilesystemUuid"]),
+                    rootfs_source_sha256=str(state["rootfsSourceSha256"]),
+                    observed_rootfs_size_bytes=int(state["observedRootfsSizeBytes"]),
                     legacy_volume=str(state["legacyVolume"]),
                     legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
                     backup_image=str(state["backupImage"]),
                     backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
                     backup_size_bytes=int(state["backupSizeBytes"]),
+                    backup_rootfs_image=str(state["backupRootfsImage"]),
+                    backup_rootfs_filesystem_uuid=str(
+                        state["backupRootfsFilesystemUuid"]
+                    ),
+                    backup_rootfs_size_bytes=int(state["backupRootfsSizeBytes"]),
                     growth=True,
-                    rotation_target_uuid=storage_rotation_target(transaction_id),
+                    rotation_target_uuid=data_target_uuid,
+                    rotation_target_rootfs_uuid=rootfs_target_uuid,
                 )
-            elif state["rotationTargetUuid"]:
-                pending = state
             else:
-                # Adopt a plain interrupted growth into the rotation so a crash
-                # from here on still fails closed for plain `up`.
-                pending = store.pending(
-                    str(state["source"]),
-                    transaction_id=str(state["transactionId"]),
-                    filesystem_uuid=str(state["filesystemUuid"]),
-                    observed_logical_size_bytes=int(state["observedLogicalSizeBytes"]),
-                    observed_filesystem_size_bytes=int(state["observedFilesystemSizeBytes"]),
-                    host_allocated_bytes=int(state["hostAllocatedBytes"]),
-                    legacy_volume=str(state["legacyVolume"]),
-                    legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
-                    backup_image=str(state["backupImage"]),
-                    backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
-                    backup_size_bytes=int(state["backupSizeBytes"]),
-                    growth=True,
-                    rotation_target_uuid=storage_rotation_target(str(state["transactionId"])),
-                )
+                if (
+                    state["transactionId"] != transaction_id
+                    or state["filesystemUuid"] != expected_data_uuid
+                    or state["rootfsFilesystemUuid"] != expected_rootfs_uuid
+                    or state["rotationTargetUuid"] != data_target_uuid
+                    or state["rotationTargetRootfsUuid"] != rootfs_target_uuid
+                ):
+                    raise StorageError(
+                        "storage_identity_mismatch",
+                        "pending storage rotation does not match the fixed transaction",
+                    )
+                pending = state
         except StorageError as exc:
             return exc.as_dict()
         action = self._run_storage_identity_rotation(
             str(pending["filesystemUuid"]),
             target_uuid=str(pending["rotationTargetUuid"]),
-            target_rootfs_uuid=storage_rotation_target(str(pending["transactionId"]), rootfs=True),
+            expected_rootfs_uuid=str(pending["rootfsFilesystemUuid"]),
+            expected_rootfs_source_sha256=str(pending["rootfsSourceSha256"]),
+            expected_rootfs_size_bytes=int(pending["observedRootfsSizeBytes"]),
+            target_rootfs_uuid=str(pending["rotationTargetRootfsUuid"]),
         )
         if not action.get("ok"):
             return action
         try:
-            committed = store.commit(
-                pending,
-                {
-                    "filesystemUuid": action["filesystemUuid"],
-                    "logicalSizeBytes": action["logicalSizeBytes"],
-                    "filesystemSizeBytes": action["filesystemSizeBytes"],
-                    "allocatedBytes": action["allocatedBytes"],
-                },
-            )
-        except StorageError as exc:
-            return exc.as_dict()
+            committed = store.commit(pending, action)
+            committed = self._cleanup_committed_rootfs_backup(store, committed)
+        except (StorageError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, StorageError):
+                return exc.as_dict()
+            return {
+                "ok": False,
+                "error": "storage_state_invalid",
+                "message": "rotated storage observations are incomplete",
+            }
         return {
             "ok": True,
             "rotated": action["rotated"],
             "filesystemUuid": committed["filesystemUuid"],
+            "rootfsFilesystemUuid": committed["rootfsFilesystemUuid"],
             "previousFilesystemUuid": pending["filesystemUuid"],
+            "previousRootfsFilesystemUuid": pending["rootfsFilesystemUuid"],
             "imageAction": action,
         }
 
@@ -1190,9 +2564,6 @@ class RuntimeManager:
         return {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
-            "command": command,
-            "stdout": proc.stdout.strip()[-2000:],
-            "stderr": proc.stderr.strip()[-2000:],
             "skipped": "XENOID_BOOT_SEED=skipped" in proc.stdout,
         }
 
@@ -1291,6 +2662,65 @@ class RuntimeManager:
     def _storage_error(self, code: str, message: str, **details: Any) -> dict[str, Any]:
         return {"ok": False, "error": code, "message": message, **details}
 
+    def _cleanup_committed_rootfs_backup(
+        self,
+        store: StorageStateStore,
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        backup = state.get("backupRootfsImage")
+        if not isinstance(backup, str) or not backup:
+            return dict(state)
+        volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
+        mountpoint = volume.get("Mountpoint") if isinstance(volume, Mapping) else None
+        if not isinstance(mountpoint, str) or not mountpoint.startswith("/"):
+            raise StorageError(
+                "storage_image_invalid",
+                "cannot locate committed rootfs backup",
+            )
+        rootfs = self._inspect_volume_image(
+            dict(volume),
+            image_name=ROOTFS_IMAGE_NAME,
+        )
+        source_marker = self._engine_host_shell(
+            "cat "
+            + shlex.quote(
+                f"{mountpoint.rstrip('/')}/xenoid-rootfs.img.source.sha256"
+            )
+        )
+        if (
+            rootfs.get("ok") is not True
+            or rootfs.get("filesystemUuid") != state["rootfsFilesystemUuid"]
+            or rootfs.get("logicalSizeBytes") != state["observedRootfsSizeBytes"]
+            or source_marker.returncode != 0
+            or str(source_marker.stdout or "").strip()
+            != state["rootfsSourceSha256"]
+        ):
+            raise StorageError(
+                "storage_identity_mismatch",
+                "committed rootfs changed before backup cleanup",
+            )
+        path = f"{mountpoint.rstrip('/')}/{backup}"
+        command = (
+            "set -eu; p="
+            + shlex.quote(path)
+            + "; if [ ! -e \"$p\" ]; then exit 0; fi; "
+            + "[ -f \"$p\" ] && [ ! -L \"$p\" ] && [ -s \"$p\" ]; "
+            + "[ \"$(blkid -p -s TYPE -o value -- \"$p\")\" = ext4 ]; "
+            + "[ \"$(blkid -p -s UUID -o value -- \"$p\" | tr A-F a-f)\" = "
+            + shlex.quote(str(state["backupRootfsFilesystemUuid"]))
+            + " ]; [ \"$(stat -c %s -- \"$p\")\" = "
+            + shlex.quote(str(state["backupRootfsSizeBytes"]))
+            + " ]; rm -- \"$p\"; sync -f "
+            + shlex.quote(mountpoint)
+        )
+        removed = self._engine_host_shell(command)
+        if removed.returncode != 0:
+            raise StorageError(
+                "storage_image_invalid",
+                "committed rootfs backup cleanup failed",
+            )
+        return store.clear_rootfs_backup(state)
+
     def _storage_growth_container(
         self,
     ) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
@@ -1354,11 +2784,20 @@ class RuntimeManager:
                     observed_logical_size_bytes=int(image["logicalSizeBytes"]),
                     observed_filesystem_size_bytes=int(image["filesystemSizeBytes"]),
                     host_allocated_bytes=int(image["allocatedBytes"]),
+                    rootfs_image=str(state["rootfsImage"]),
+                    rootfs_filesystem_uuid=str(state["rootfsFilesystemUuid"]),
+                    rootfs_source_sha256=str(state["rootfsSourceSha256"]),
+                    observed_rootfs_size_bytes=int(state["observedRootfsSizeBytes"]),
                     legacy_volume=str(state["legacyVolume"]),
                     legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
                     backup_image=str(state["backupImage"]),
                     backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
                     backup_size_bytes=int(state["backupSizeBytes"]),
+                    backup_rootfs_image=str(state["backupRootfsImage"]),
+                    backup_rootfs_filesystem_uuid=str(
+                        state["backupRootfsFilesystemUuid"]
+                    ),
+                    backup_rootfs_size_bytes=int(state["backupRootfsSizeBytes"]),
                     growth=True,
                 )
             else:
@@ -1392,6 +2831,7 @@ class RuntimeManager:
             "grow",
             expected_uuid=str(pending["filesystemUuid"]),
             transaction_id=str(pending["transactionId"]),
+            expected_rootfs_uuid=str(pending["rootfsFilesystemUuid"]),
         )
         if (
             action.get("ok") is not True
@@ -1409,6 +2849,7 @@ class RuntimeManager:
             )
         try:
             committed = store.commit(pending, action)
+            committed = self._cleanup_committed_rootfs_backup(store, committed)
         except (StorageError, KeyError, TypeError, ValueError) as exc:
             if isinstance(exc, StorageError):
                 return exc.as_dict()
@@ -1425,15 +2866,42 @@ class RuntimeManager:
             "storage": public_storage_state(committed, healthy=True),
         }
 
-    def ensure_instance_storage(self) -> dict[str, Any]:
+    def ensure_instance_storage(
+        self,
+        *,
+        expected_data_uuid: Optional[str] = None,
+        expected_rootfs_uuid: Optional[str] = None,
+        storage_transaction_id: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Converge rootfs plus the one persistent, never-silently-replaced data image."""
         self.ensure_instance_lease()
+        pinned_data_uuid = expected_data_uuid
+        pinned_rootfs_uuid = expected_rootfs_uuid
+        if storage_transaction_id is not None and re.fullmatch(
+            r"[0-9a-f]{32}",
+            storage_transaction_id,
+        ) is None:
+            return self._storage_error(
+                "storage_state_invalid",
+                "storage transaction identity is invalid",
+            )
         store = StorageStateStore(self.context, self.lease)
         try:
             state = store.load()
             legacy = self._legacy_engine_record()
         except StorageError as exc:
             return exc.as_dict()
+        if (
+            storage_transaction_id is not None
+            and isinstance(state, Mapping)
+            and state.get("state") == "pending"
+            and state.get("source") == "fresh"
+            and state.get("transactionId") != storage_transaction_id
+        ):
+            return self._storage_error(
+                "storage_identity_mismatch",
+                "pending fresh storage uses a different journal transaction",
+            )
 
         volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
         if volume == {}:
@@ -1461,6 +2929,57 @@ class RuntimeManager:
                     "committed instance data image is missing or invalid",
                     storage=public_storage_state(state, healthy=False, error="storage_image_invalid"),
                     image=image,
+                )
+            rootfs = self._inspect_volume_image(
+                volume,
+                image_name=ROOTFS_IMAGE_NAME,
+            )
+            if rootfs.get("ok") is not True:
+                return self._storage_error(
+                    "storage_image_invalid",
+                    "committed rootfs image is missing or invalid",
+                    storage=public_storage_state(
+                        state,
+                        healthy=False,
+                        error="storage_image_invalid",
+                    ),
+                    rootfs=rootfs,
+                )
+            if (
+                pinned_rootfs_uuid is not None
+                and rootfs["filesystemUuid"] != pinned_rootfs_uuid
+            ):
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "rootfs differs from the convergence journal pin",
+                )
+            expected_rootfs_uuid = str(
+                state["rootfsFilesystemUuid"] or rootfs["filesystemUuid"]
+            )
+            if (
+                state["rootfsFilesystemUuid"]
+                and rootfs["filesystemUuid"] != state["rootfsFilesystemUuid"]
+                or state["observedRootfsSizeBytes"]
+                and int(rootfs["logicalSizeBytes"])
+                != int(state["observedRootfsSizeBytes"])
+            ):
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "committed rootfs identity or geometry changed",
+                    storage=public_storage_state(
+                        state,
+                        healthy=False,
+                        error="storage_identity_mismatch",
+                    ),
+                    rootfs=rootfs,
+                )
+            if (
+                pinned_data_uuid is not None
+                and image["filesystemUuid"] != pinned_data_uuid
+            ):
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "data image differs from the convergence journal pin",
                 )
             if image["filesystemUuid"] != state["filesystemUuid"]:
                 return self._storage_error(
@@ -1502,6 +3021,7 @@ class RuntimeManager:
                 "preserve",
                 expected_uuid=str(state["filesystemUuid"]),
                 transaction_id=str(state["transactionId"]),
+                expected_rootfs_uuid=expected_rootfs_uuid,
             )
             if not action.get("ok"):
                 code = str(action.get("error") or "storage_image_invalid")
@@ -1529,6 +3049,7 @@ class RuntimeManager:
                 )
             try:
                 refreshed = store.refresh(state, action)
+                refreshed = self._cleanup_committed_rootfs_backup(store, refreshed)
             except (StorageError, KeyError, TypeError, ValueError) as exc:
                 if isinstance(exc, StorageError):
                     return exc.as_dict()
@@ -1704,7 +3225,10 @@ class RuntimeManager:
 
         if state is None:
             if volume is None:
-                state = store.pending("fresh")
+                state = store.pending(
+                    "fresh",
+                    transaction_id=storage_transaction_id,
+                )
             else:
                 adopted = self._inspect_volume_image(volume)
                 if not adopted.get("ok"):
@@ -1813,7 +3337,18 @@ class RuntimeManager:
         if state["source"] == "fresh":
             action = self._run_storage_image_action(
                 "initialize",
+                expected_uuid=(
+                    str(state["filesystemUuid"])
+                    or storage_rotation_target(str(state["transactionId"]))
+                ),
                 transaction_id=state["transactionId"],
+                expected_rootfs_uuid=(
+                    str(state["rootfsFilesystemUuid"])
+                    or storage_rotation_target(
+                        str(state["transactionId"]),
+                        rootfs=True,
+                    )
+                ),
             )
         elif state["source"] == "adopted":
             adopted = self._inspect_volume_image(volume)
@@ -1854,6 +3389,13 @@ class RuntimeManager:
                 legacy_volume=state["legacyVolume"],
                 backup_image=state["backupImage"],
                 backup_uuid=state["backupFilesystemUuid"],
+                expected_rootfs_uuid=(
+                    str(state["rootfsFilesystemUuid"])
+                    or storage_rotation_target(
+                        str(state["transactionId"]),
+                        rootfs=True,
+                    )
+                ),
             )
         if not action.get("ok"):
             code = str(action.get("error") or "storage_image_invalid")
@@ -1881,6 +3423,7 @@ class RuntimeManager:
             )
         try:
             committed = store.commit(state, action)
+            committed = self._cleanup_committed_rootfs_backup(store, committed)
         except (StorageError, KeyError, TypeError, ValueError) as exc:
             if isinstance(exc, StorageError):
                 return exc.as_dict()
@@ -1924,6 +3467,7 @@ class RuntimeManager:
             self.lease.container_name,
             *self._owner_label_args(),
             *self._google_label_args(),
+            *self._runtime_image_label_args(),
             "-p",
             f"127.0.0.1:{self.lease.host_adb_port}:{self.lease.android_adb_port}",
             "-v",
@@ -1943,19 +3487,27 @@ class RuntimeManager:
             *self._android_boot_command(),
         ]
 
-    def docker_exec(self, args: list[str], timeout: int = 15) -> dict[str, Any]:
+    def docker_exec(
+        self,
+        args: list[str],
+        timeout: float = 15,
+    ) -> dict[str, Any]:
         if which("docker") is None:
             return {"ok": False, "error": "docker not found"}
-        container, error = self._owned_container_record()
+        deadline = time.monotonic() + max(0.0, timeout)
+        container, error = self._owned_container_record(timeout=timeout)
         if container is None:
             return {
                 "ok": False,
                 "error": "resource_conflict",
                 "message": error,
             }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"ok": False, "error": "docker_exec_timeout"}
         cmd = [*self.docker_base_cmd(), "exec", container["Id"], *args]
         try:
-            proc = run(cmd, timeout=timeout, env=self.docker_env())
+            proc = run(cmd, timeout=remaining, env=self.docker_env())
         except Exception as e:
             return {"ok": False, "error": str(e), "command": cmd}
         return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "command": cmd}
@@ -2017,36 +3569,120 @@ class RuntimeManager:
                 "error": "resource_conflict",
                 "message": ownership_error,
             }
-        cmd = [
-            *self.docker_base_cmd(),
-            "exec",
-            "-i",
-            container["Id"],
-            "sh",
-            "-c",
-            "umask 027; mkdir -p /data/misc/adb && "
-            "cat > /data/misc/adb/adb_keys && "
-            "chown 1000:2000 /data/misc/adb/adb_keys && "
-            "chmod 640 /data/misc/adb/adb_keys && "
-            "(restorecon /data/misc/adb /data/misc/adb/adb_keys >/dev/null 2>&1 || true)",
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=payload,
-                text=True,
-                capture_output=True,
-                timeout=20,
-                env=self.docker_env(),
+        payload_bytes = payload.encode("utf-8")
+        if len(payload_bytes) > 64 * 1024:
+            return {"ok": False, "error": "adb_keys_too_large", "source": label}
+        upload_token = secrets.token_hex(16)
+        remote_stage = f"/data/local/tmp/.xenoid-adb-keys-{upload_token}"
+        marker = f"/data/local/tmp/.xenoid-adb-watch-{upload_token}"
+        temporary_target = (
+            f"/data/misc/adb/.adb_keys.xenoid-{upload_token}"
+        )
+        expected_sha = hashlib.sha256(payload_bytes).hexdigest()
+        command = (
+            "set -eu; "
+            f"stage={shlex.quote(remote_stage)}; "
+            f"marker={shlex.quote(marker)}; "
+            f"tmp={shlex.quote(temporary_target)}; "
+            "target=/data/misc/adb/adb_keys; "
+            "trap 'rm -f \"$tmp\" \"$stage\" \"$marker\"' "
+            "EXIT HUP INT TERM; "
+            "umask 077; mkdir -p /data/local/tmp; "
+            "test -d /data/local/tmp && "
+            "test ! -L /data/local/tmp; "
+            "test ! -e \"$stage\" && test ! -L \"$stage\"; "
+            "test ! -e \"$marker\" && test ! -L \"$marker\"; "
+            "printf '%s' \"$$\" > \"$marker\"; "
+            "cat > \"$stage\"; "
+            "test -f \"$stage\" && test ! -L \"$stage\"; "
+            f"test \"$(wc -c < \"$stage\")\" = {len(payload_bytes)}; "
+            f"test \"$(sha256sum \"$stage\" | cut -d' ' -f1)\" "
+            f"= {expected_sha}; "
+            "mkdir -p /data/misc/adb; "
+            "test -d /data/misc/adb && "
+            "test ! -L /data/misc/adb; "
+            "cp \"$stage\" \"$tmp\"; chown 1000:2000 \"$tmp\"; "
+            "chmod 640 \"$tmp\"; "
+            "(restorecon \"$tmp\" >/dev/null 2>&1 || true); "
+            "mv -f \"$tmp\" \"$target\""
+        )
+        bounded = run_bounded(
+            [
+                *self.docker_base_cmd(),
+                "exec",
+                "-i",
+                container["Id"],
+                "sh",
+                "-c",
+                command,
+            ],
+            cwd=self.context.project_root,
+            deadline=time.monotonic() + 20.0,
+            env=self.docker_env(),
+            input_bytes=payload_bytes,
+            max_input_bytes=64 * 1024,
+            cancelled=self.cancellation_event,
+            project_root=self.context.project_root,
+        )
+        cleanup_ok = True
+        if not bounded.ok:
+            cleanup_script = (
+                f"marker={shlex.quote(marker)}; "
+                f"stage={shlex.quote(remote_stage)}; "
+                f"tmp={shlex.quote(temporary_target)}; pid=''; "
+                "value=$(cat \"$marker\" 2>/dev/null || true); "
+                "case \"$value\" in ''|*[!0-9]*) ;; *) pid=$value;; "
+                "esac; "
+                "case \"$pid\" in '') ;; *) "
+                "kill -TERM \"$pid\" 2>/dev/null || true; "
+                "sleep 1; kill -KILL \"$pid\" 2>/dev/null || true;; "
+                "esac; rm -f \"$marker\" \"$stage\" \"$tmp\"; "
+                "test ! -e \"$marker\" && test ! -L \"$marker\" && "
+                "test ! -e \"$stage\" && test ! -L \"$stage\" && "
+                "test ! -e \"$tmp\" && test ! -L \"$tmp\""
             )
-        except Exception as e:
-            return {"ok": False, "error": str(e), "source": label}
+            cleanup = run_bounded(
+                [
+                    *self.docker_base_cmd(),
+                    "exec",
+                    container["Id"],
+                    "sh",
+                    "-c",
+                    cleanup_script,
+                ],
+                cwd=self.context.project_root,
+                deadline=time.monotonic() + 10.0,
+                env=self.docker_env(),
+                project_root=self.context.project_root,
+            )
+            cleanup_ok = cleanup.ok
+        verified = self.docker_exec(
+            [
+                "sh",
+                "-c",
+                "sha256sum /data/misc/adb/adb_keys | "
+                "cut -d' ' -f1",
+            ]
+        )
+        target_matches = (
+            str(verified.get("stdout") or "").strip() == expected_sha
+        )
+        recovered = not bounded.ok and cleanup_ok and target_matches
         return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stderr": proc.stderr,
+            "ok": target_matches and (bounded.ok or recovered),
+            "returncode": bounded.returncode,
+            "state": "passed" if recovered else bounded.state,
+            "error": (
+                None
+                if bounded.ok or recovered
+                else "adb_keys_remote_cleanup_failed"
+                if not cleanup_ok
+                else bounded.error_code
+            ),
+            "stderr": bounded.stderr_tail,
             "source": label,
             "keyCount": len(keys),
+            "recoveredAfterCancellation": recovered,
         }
 
     def switch_adbd_port_via_docker(self) -> dict[str, Any]:
@@ -2116,7 +3752,12 @@ class RuntimeManager:
             )
         )
 
-    def _container_matches_lease(self, container: dict[str, Any]) -> bool:
+    def _container_matches_lease(
+        self,
+        container: dict[str, Any],
+        *,
+        image_identity: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
         config = container.get("Config")
         host_config = container.get("HostConfig")
         network_settings = container.get("NetworkSettings")
@@ -2171,10 +3812,30 @@ class RuntimeManager:
                 and ipam_config.get("IPv6Address") == self.lease.ipv6_address
             )
         ) if isinstance(endpoint, dict) else False
+        state = container.get("State")
+        stopped = (
+            isinstance(state, Mapping)
+            and state.get("Running") is False
+        )
+        observed_mac = str(endpoint.get("MacAddress", "")).lower()
+        mac_matches = (
+            observed_mac == self.lease.mac_address.lower()
+            or (
+                stopped
+                and not observed_mac
+                and ipv4_matches
+                and ipv6_matches
+            )
+        ) if isinstance(endpoint, dict) else False
         labels = config.get("Labels")
+        image_identity = (
+            self._container_effective_image_identity(container)
+            if image_identity is None
+            else image_identity
+        )
         return (
             self._container_has_lease_owner(container)
-            and config.get("Image") == self.effective_image()
+            and image_identity.get("ok") is True
             and self._managed_container_labels_match(labels)
             and config.get("Cmd") == self._android_boot_command()
             and host_config.get("AutoRemove") is False
@@ -2191,16 +3852,18 @@ class RuntimeManager:
             and isinstance(endpoint, dict)
             and ipv4_matches
             and ipv6_matches
-            and str(endpoint.get("MacAddress", "")).lower()
-            == self.lease.mac_address.lower()
+            and mac_matches
         )
 
     def _owned_container_record(
         self,
+        *,
+        timeout: Optional[float] = None,
     ) -> tuple[Optional[dict[str, Any]], str]:
         container, _ = self._inspect_docker_object(
             "container",
             self.lease.container_name,
+            timeout=timeout,
         )
         if container is None:
             return None, "instance container does not exist"
@@ -2216,7 +3879,6 @@ class RuntimeManager:
         """Read legacy stable identifiers from persistent Android state."""
         command = (
             "set +e; "
-            "printf 'androidId=%s\\n' \"$(settings --user 0 get secure android_id 2>/dev/null)\"; "
             "serial=$(cat /data/local/tmp/xenoid-profile/serial 2>/dev/null); "
             "[ -n \"$serial\" ] || serial=$(getprop ro.serialno); "
             "printf 'serial=%s\\n' \"$serial\"; "
@@ -2263,10 +3925,12 @@ class RuntimeManager:
             return {"ok": True, "captured": True, "configured": True}
         try:
             client = self.daemon_client(timeout=2.0)
-            health = client.health()
+            bootstrap = client.bootstrap_status(timeout=2.0)
         except Exception:
             return {"ok": True, "captured": False, "configured": False}
-        if not isinstance(health, dict) or health.get("ok") is not True:
+        components = bootstrap.get("components") if isinstance(bootstrap, dict) else None
+        proxy = components.get("proxy") if isinstance(components, dict) else None
+        if not isinstance(proxy, dict) or proxy.get("ok") is not True:
             return {"ok": True, "captured": False, "configured": False}
         try:
             exported = client.proxy_export()
@@ -2305,7 +3969,7 @@ class RuntimeManager:
             return self._proxy_failure("proxy_state_backup_failed")
         self._pending_proxy_restore = (
             kind,
-            value,
+            bytearray(value.encode("utf-8")),
             enabled,
             selected_node,
             udp_allowed,
@@ -2313,23 +3977,46 @@ class RuntimeManager:
         )
         return {"ok": True, "captured": True, "configured": True}
 
-    def _restore_proxy_desired_after_update(self, client: DaemonClient) -> dict[str, Any]:
+    def _discard_pending_proxy_restore(self) -> None:
+        pending = self._pending_proxy_restore
+        self._pending_proxy_restore = None
+        if pending is None:
+            return
+        source = pending[1]
+        for index in range(len(source)):
+            source[index] = 0
+    def discard_convergence_secrets(self) -> dict[str, Any]:
+        """Zeroize command-scoped proxy material after failure or cancellation."""
+        retained = self._pending_proxy_restore is not None
+        self._discard_pending_proxy_restore()
+        return {"ok": True, "discarded": retained}
+
+
+    def _restore_proxy_desired_after_update(self, controller: Any) -> dict[str, Any]:
         pending = self._pending_proxy_restore
         if pending is None:
             return {"ok": True, "restored": False}
-        kind, value, enabled, selected_node, udp_allowed, allow_insecure_http = pending
-        restored = client.proxy_source(
-            kind,
-            value,
-            enabled,
-            selected_node,
-            udp_allowed,
-            allow_insecure_http,
-        )
-        if not isinstance(restored, dict) or restored.get("ok") is not True:
-            return self._proxy_failure("proxy_state_restore_failed")
         self._pending_proxy_restore = None
-        return {"ok": True, "restored": True}
+        kind, source, enabled, selected_node, udp_allowed, allow_insecure_http = pending
+        try:
+            try:
+                value = source.decode("utf-8", "strict")
+            except UnicodeError:
+                return self._proxy_failure("proxy_state_restore_failed")
+            restored = controller.set_source(
+                kind,
+                value,
+                enabled,
+                selected_node=selected_node,
+                udp_allowed=udp_allowed,
+                allow_insecure_http=allow_insecure_http,
+            )
+            if not isinstance(restored, dict) or restored.get("ok") is not True:
+                return self._proxy_failure("proxy_state_restore_failed")
+            return {"ok": True, "restored": True}
+        finally:
+            for index in range(len(source)):
+                source[index] = 0
 
     def reconcile_proxy_desired(self) -> dict[str, Any]:
         """Converge this instance's daemon desired state before runtime acceptance."""
@@ -2337,16 +4024,23 @@ class RuntimeManager:
             from .proxy_controller import ProxyController
 
             client = self.daemon_client()
-            restored = self._restore_proxy_desired_after_update(client)
-            if restored.get("ok") is not True:
-                return restored
-            return ProxyController(
+            controller = ProxyController(
                 self.context,
                 self.cfg,
                 self.lease,
                 self,
                 client,
-            ).reconcile_desired()
+            )
+            status = client.proxy_status()
+            if status.get("stateReadable") is False:
+                code = status.get("stateError")
+                return self._proxy_failure(
+                    code if isinstance(code, str) else "proxy_state_invalid"
+                )
+            restored = self._restore_proxy_desired_after_update(controller)
+            if restored.get("ok") is not True:
+                return restored
+            return controller.reconcile_desired()
         except InstanceError as exc:
             return {"ok": False, "code": exc.code, "error": exc.code}
         except Exception:
@@ -2356,87 +4050,186 @@ class RuntimeManager:
                 "error": "proxy_reconcile_failed",
             }
 
-    def quarantine_proxy_for_lifecycle(self) -> dict[str, Any]:
-        """Install this instance's fail-closed guard before container removal."""
+    def quarantine_proxy_for_lifecycle(
+        self,
+        expected_data_uuid: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        *,
+        deadline: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Install the fail-closed guard and bind its proof to persistent data."""
+        if operation_id is not None and re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+            return self._proxy_failure("convergence_operation_invalid")
         try:
-            prerequisite = self.proxy_prerequisite(allow_stopped=True)
+            storage = StorageStateStore(self.context, self.lease).load()
+            observed_uuid = (
+                str(storage.get("filesystemUuid") or "")
+                if isinstance(storage, dict) and storage.get("state") == "committed"
+                else ""
+            )
+            if expected_data_uuid is not None and observed_uuid != expected_data_uuid:
+                return self._proxy_failure("storage_identity_mismatch")
+            retry_until = time.monotonic() + 10.0
+            if isinstance(deadline, (int, float)):
+                retry_until = min(retry_until, float(deadline))
+            while True:
+                try:
+                    prerequisite = self.proxy_prerequisite(
+                        allow_stopped=True
+                    )
+                except InstanceError as exc:
+                    if (
+                        exc.code != "runtime_identity_mismatch"
+                        or time.monotonic() >= retry_until
+                    ):
+                        raise
+                    time.sleep(0.1)
+                    continue
+                if (
+                    prerequisite.get("ok") is True
+                    or prerequisite.get("code")
+                    != "runtime_identity_mismatch"
+                    or time.monotonic() >= retry_until
+                ):
+                    break
+                time.sleep(0.1)
             if prerequisite.get("ok") is not True:
                 return prerequisite
             result = self.proxy_quarantine()
+        except StorageError as exc:
+            return self._proxy_failure(exc.code)
         except InstanceError as exc:
-            return {"ok": False, "code": exc.code, "error": exc.code}
+            return self._proxy_failure(exc.code)
         except Exception:
-            return {
-                "ok": False,
-                "code": "engine_unavailable",
-                "error": "engine_unavailable",
-            }
+            return self._proxy_failure("engine_unavailable")
         if not isinstance(result, dict):
-            return {
-                "ok": False,
-                "code": "engine_response_invalid",
-                "error": "engine_response_invalid",
-            }
+            return self._proxy_failure("engine_response_invalid")
         if result.get("ok") is True:
-            return result
+            return {
+                **result,
+                "dataUuid": observed_uuid or None,
+                **(
+                    {"operationId": operation_id}
+                    if operation_id is not None
+                    else {}
+                ),
+            }
         code = result.get("code") or result.get("error")
         if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None:
             code = "engine_unavailable"
-        return {"ok": False, "code": code, "error": code}
+        return self._proxy_failure(code)
+
+    def _quiesce_container_safely(
+        self,
+        container: Mapping[str, Any],
+        *,
+        expected_container_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        container_id = container.get("Id")
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+            or expected_container_id is not None
+            and container_id != expected_container_id
+        ):
+            return self._storage_error(
+                "convergence_state_conflict",
+                "owned container identity differs from the journaled runtime",
+            )
+        if not self._container_has_lease_owner(dict(container)):
+            return self._storage_error(
+                "resource_conflict",
+                "Docker container is not owned by this instance",
+            )
+        quarantine = self.quarantine_proxy_for_lifecycle()
+        result: dict[str, Any] = {
+            "ok": False,
+            "containerId": container_id,
+            "proxyQuarantine": quarantine,
+        }
+        if quarantine.get("ok") is not True:
+            result["error"] = quarantine.get("code", "engine_unavailable")
+            return result
+        state = container.get("State")
+        running = isinstance(state, Mapping) and state.get("Running") is True
+        if not running:
+            return {
+                **result,
+                "ok": True,
+                "alreadyStopped": True,
+                "preserved": True,
+            }
+        synced = run(
+            [*self.docker_base_cmd(), "exec", container_id, "sync"],
+            timeout=30,
+            env=self.docker_env(),
+        )
+        result["sync"] = {
+            "ok": synced.returncode == 0,
+            "returncode": synced.returncode,
+            "stderr": synced.stderr.strip()[-500:],
+        }
+        if synced.returncode != 0:
+            result["error"] = "container_sync_failed"
+            return result
+        stopped = run(
+            [
+                *self.docker_base_cmd(),
+                "stop",
+                "--time",
+                "30",
+                container_id,
+            ],
+            timeout=45,
+            env=self.docker_env(),
+        )
+        result["stop"] = {
+            "ok": stopped.returncode == 0,
+            "returncode": stopped.returncode,
+            "stderr": stopped.stderr.strip()[-500:],
+        }
+        if stopped.returncode != 0:
+            result["error"] = "container_stop_failed"
+            return result
+        result.update({"ok": True, "stopped": True, "preserved": True})
+        return result
+
+    def quiesce_owned_container(
+        self,
+        expected_container_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        self.ensure_instance_lease()
+        container, error = self._owned_container_record()
+        if container is None:
+            return self._storage_error(
+                "convergence_state_conflict",
+                error,
+            )
+        return self._quiesce_container_safely(
+            container,
+            expected_container_id=expected_container_id,
+        )
 
     def _remove_container_safely(
         self,
         container: dict[str, Any],
         *,
         ownership: str,
+        expected_container_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        container_id = container.get("Id")
-        if not isinstance(container_id, str) or not container_id:
-            return self._storage_error(
-                "resource_conflict",
-                "container identity is invalid",
-            )
-        result: dict[str, Any] = {"ok": False, "ownership": ownership}
-        quarantine = self.quarantine_proxy_for_lifecycle()
-        result["proxyQuarantine"] = quarantine
-        if quarantine.get("ok") is not True:
-            result["error"] = quarantine.get("code", "engine_unavailable")
+        quiesced = self._quiesce_container_safely(
+            container,
+            expected_container_id=expected_container_id,
+        )
+        result: dict[str, Any] = {
+            "ok": False,
+            "ownership": ownership,
+            "quiesce": quiesced,
+        }
+        if quiesced.get("ok") is not True:
+            result["error"] = quiesced.get("error", "container_stop_failed")
             return result
-        state = container.get("State")
-        running = isinstance(state, dict) and state.get("Running") is True
-        if running:
-            synced = run(
-                [*self.docker_base_cmd(), "exec", container_id, "sync"],
-                timeout=30,
-                env=self.docker_env(),
-            )
-            result["sync"] = {
-                "ok": synced.returncode == 0,
-                "returncode": synced.returncode,
-                "stderr": synced.stderr.strip()[-500:],
-            }
-            if synced.returncode != 0:
-                result["error"] = "container_sync_failed"
-                return result
-            stopped = run(
-                [
-                    *self.docker_base_cmd(),
-                    "stop",
-                    "--time",
-                    "30",
-                    container_id,
-                ],
-                timeout=45,
-                env=self.docker_env(),
-            )
-            result["stop"] = {
-                "ok": stopped.returncode == 0,
-                "returncode": stopped.returncode,
-                "stderr": stopped.stderr.strip()[-500:],
-            }
-            if stopped.returncode != 0:
-                result["error"] = "container_stop_failed"
-                return result
+        container_id = str(quiesced["containerId"])
         removed = run(
             [*self.docker_base_cmd(), "rm", container_id],
             timeout=30,
@@ -2453,15 +4246,12 @@ class RuntimeManager:
         try:
             cleanup = self.proxy_cleanup()
         except InstanceError as exc:
-            cleanup = {"ok": False, "code": exc.code, "error": exc.code}
+            cleanup = self._proxy_failure(exc.code)
         except Exception:
-            cleanup = {
-                "ok": False,
-                "code": "engine_unavailable",
-                "error": "engine_unavailable",
-            }
+            cleanup = self._proxy_failure("engine_unavailable")
         result["proxyCleanup"] = cleanup
         result["ok"] = isinstance(cleanup, dict) and cleanup.get("ok") is True
+        result["containerId"] = container_id
         if not result["ok"]:
             result["error"] = "proxy_cleanup_failed"
         return result
@@ -2473,6 +4263,242 @@ class RuntimeManager:
                 "Docker container is not owned by this instance",
             )
         return self._remove_container_safely(container, ownership="lease")
+    def _remove_owned_container_for_operation(
+        self,
+        *,
+        expected_container_id: Optional[str],
+        operation: str,
+    ) -> dict[str, Any]:
+        if (
+            expected_container_id is not None
+            and re.fullmatch(r"[0-9a-f]{64}", expected_container_id) is None
+        ):
+            return self._storage_error(
+                "convergence_state_conflict",
+                "journaled container identity is invalid",
+            )
+        storage = self.storage_status()
+        if storage.get("ok") is not True:
+            return {
+                "ok": False,
+                "error": storage.get("error", "storage_identity_mismatch"),
+                "storage": storage,
+            }
+        container, error = self._owned_container_record()
+        if container is None:
+            if error == "instance container does not exist":
+                return {
+                    "ok": True,
+                    "alreadyRemoved": True,
+                    "containerId": expected_container_id,
+                    "operation": operation,
+                    "storage": storage,
+                }
+            return self._storage_error("resource_conflict", error)
+        container_id = str(container.get("Id") or "")
+        if expected_container_id is not None and container_id != expected_container_id:
+            return self._storage_error(
+                "convergence_state_conflict",
+                "a third container identity occupies the instance name",
+            )
+        mounts = container.get("Mounts")
+        if not (
+            isinstance(mounts, list)
+            and any(
+                isinstance(mount, Mapping)
+                and mount.get("Type") == "volume"
+                and mount.get("Name") == self.lease.volume_name
+                and mount.get("Destination") == "/data"
+                for mount in mounts
+            )
+        ):
+            return self._storage_error(
+                "resource_conflict",
+                "owned container is not attached to the instance storage",
+            )
+        removed = self._remove_container_safely(
+            container,
+            ownership="lease",
+            expected_container_id=expected_container_id,
+        )
+        return {**removed, "operation": operation, "storage": storage}
+    def _prepare_location_for_replacement(
+        self,
+        expected_container_id: Optional[str],
+    ) -> dict[str, Any]:
+        """Stage and arm pending Location state before the one planned replacement."""
+        try:
+            from .cellular import encode_profile_v1
+            from .location import (
+                STAGE_SCHEMA,
+                LocationError,
+                LocationStateStore,
+                convergence_action,
+                location_runtime_epoch,
+            )
+
+            store = LocationStateStore(self.context.state_root)
+            state = store.load()
+            if state is None or not isinstance(state.get("pending"), Mapping):
+                return {"ok": True, "skipped": True}
+            container, container_error = self._owned_container_record()
+            if not isinstance(container, Mapping):
+                return {
+                    "ok": False,
+                    "error": (
+                        "convergence_state_conflict"
+                        if container_error == "instance container does not exist"
+                        else "resource_conflict"
+                    ),
+                }
+            container_id = container.get("Id")
+            if (
+                not isinstance(container_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+                or expected_container_id is not None
+                and container_id != expected_container_id
+            ):
+                return {"ok": False, "error": "convergence_state_conflict"}
+            container_state = container.get("State")
+            if (
+                not isinstance(container_state, Mapping)
+                or container_state.get("Running") is not True
+            ):
+                started = self.start_owned_container(
+                    expected_container_id=container_id,
+                    wait=True,
+                    allow_journaled_spec_drift=True,
+                )
+                if started.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "error": str(
+                            started.get("error")
+                            or "location_runtime_start_failed"
+                        ),
+                    }
+            container_id = self.location_runtime_container_id()
+            if (
+                container_id is None
+                or expected_container_id is not None
+                and container_id != expected_container_id
+            ):
+                return {"ok": False, "error": "convergence_state_conflict"}
+            epoch = location_runtime_epoch(container_id)
+            pending = state["pending"]
+            phase = pending.get("phase")
+            if phase == "armed":
+                if pending.get("restartFromEpoch") != epoch:
+                    return {"ok": False, "error": "convergence_state_conflict"}
+                return {"ok": True, "armed": True, "runtimeEpoch": epoch}
+            if phase == "restarted":
+                return {"ok": True, "skipped": True, "runtimeEpoch": epoch}
+            bootstrap = self.reconcile_bootstrap(timeout=120.0)
+            if bootstrap.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": str(
+                        bootstrap.get("code")
+                        or "location_runtime_start_failed"
+                    ),
+                }
+            client = self.daemon_client()
+            try:
+                android = client.location_status(timeout=10.0)
+            except Exception:
+                android = None
+            decision = convergence_action(state, android, epoch)
+            if decision.get("step") != "stage" or decision.get("recreate") is not True:
+                return {"ok": False, "error": "location_phase_invalid"}
+            profile = store.target_profile(state)
+            staged = client.location_stage(
+                {
+                    "schema": STAGE_SCHEMA,
+                    "profile": profile,
+                    "encodedProfile": base64.b64encode(
+                        encode_profile_v1(profile)
+                    ).decode("ascii"),
+                    "profileDigest": profile["identityDigest"],
+                    "locationKey": profile["locationKey"],
+                    "runtimeEpoch": epoch,
+                }
+            )
+            if staged.get("ok") is not True:
+                return {"ok": False, "error": "location_stage_failed"}
+            current = store.load()
+            current_pending = (
+                current.get("pending") if isinstance(current, Mapping) else None
+            )
+            if isinstance(current_pending, Mapping) and current_pending.get("phase") == "new":
+                store.mark_staged(epoch)
+                current = store.load()
+                current_pending = (
+                    current.get("pending") if isinstance(current, Mapping) else None
+                )
+            if not (
+                isinstance(current_pending, Mapping)
+                and current_pending.get("phase") == "staged"
+            ):
+                return {"ok": False, "error": "location_phase_invalid"}
+            armed = store.arm_restart()
+            armed_pending = armed.get("pending")
+            if not (
+                isinstance(armed_pending, Mapping)
+                and armed_pending.get("phase") == "armed"
+                and armed_pending.get("restartFromEpoch") == epoch
+            ):
+                return {"ok": False, "error": "location_phase_invalid"}
+            return {"ok": True, "armed": True, "runtimeEpoch": epoch}
+        except (LocationError, InstanceError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "location_convergence_failed"),
+            }
+
+
+    def remove_owned_container_for_recreate(
+        self,
+        expected_container_id: Optional[str] = None,
+        *,
+        prepare_location: bool = False,
+    ) -> dict[str, Any]:
+        """Remove only the journaled owned runtime for an explicit replacement."""
+        self.ensure_instance_lease()
+        if prepare_location:
+            prepared = self._prepare_location_for_replacement(expected_container_id)
+            if prepared.get("ok") is not True:
+                return prepared
+        return self._remove_owned_container_for_operation(
+            expected_container_id=expected_container_id,
+            operation="recreate",
+        )
+
+    def remove_owned_container_for_regenerate(
+        self,
+        expected_container_id: Optional[str] = None,
+        *,
+        regeneration_capability: Any = None,
+    ) -> dict[str, Any]:
+        """Remove only the regeneration-journal-owned runtime."""
+        self.ensure_instance_lease()
+        try:
+            regeneration = RegenerationJournal(self.context).require_capability(
+                regeneration_capability
+            )
+        except IdentityError as exc:
+            return exc.as_dict()
+        if expected_container_id != regeneration["before"]["containerId"]:
+            return {
+                "ok": False,
+                "error": "device_regeneration_state_invalid",
+                "message": "container removal does not match regeneration before-state",
+            }
+        return self._remove_owned_container_for_operation(
+            expected_container_id=expected_container_id,
+            operation="regenerate",
+        )
+
+
 
     def _remove_legacy_container(
         self,
@@ -2760,480 +4786,741 @@ class RuntimeManager:
             ),
         }
 
-    def start(self, dry_run: bool = False, wait: bool = True, install_daemon_apk: Optional[str] = None, start_colima: bool = False, adb_root: bool = True, skip_preflight: bool = False, recreate: bool = False, defer_proxy: bool = False) -> dict[str, Any]:
+    def _select_convergence_image(
+        self,
+        image_record: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        if image_record is None:
+            return self.selected_runtime_image()
+        record = dict(image_record)
+        if not all(
+            isinstance(record.get(key), str) and record.get(key)
+            for key in ("derivedTag", "imageId", "baseImageId")
+        ):
+            input_sha = record.get("inputSha256")
+            boot_sha = record.get("bootInputSha256")
+            if (
+                not isinstance(input_sha, str)
+                or _SHA256_PATTERN.fullmatch(input_sha) is None
+                or not isinstance(boot_sha, str)
+                or _SHA256_PATTERN.fullmatch(boot_sha) is None
+            ):
+                raise InstanceError(
+                    "runtime_image_record_invalid",
+                    "journaled runtime image identity is invalid",
+                )
+            resolved = self._runtime_image_builder().lookup(input_sha)
+            if (
+                not isinstance(resolved, Mapping)
+                or resolved.get("bootInputSha256") != boot_sha
+            ):
+                raise InstanceError(
+                    "runtime_image_record_invalid",
+                    "journaled runtime image record is unavailable",
+                )
+            record = dict(resolved)
+        required = (
+            "inputSha256",
+            "bootInputSha256",
+            "derivedTag",
+            "imageId",
+            "baseImageId",
+        )
+        if (
+            any(not isinstance(record.get(key), str) or not record[key] for key in required)
+            or _SHA256_PATTERN.fullmatch(str(record["inputSha256"])) is None
+            or _SHA256_PATTERN.fullmatch(str(record["bootInputSha256"])) is None
+            or not str(record["imageId"]).startswith("sha256:")
+            or not str(record["baseImageId"]).startswith("sha256:")
+        ):
+            raise InstanceError(
+                "runtime_image_record_invalid",
+                "journaled runtime image record is invalid",
+            )
+        validate_image_reference(
+            str(record["derivedTag"]),
+            require_tag=True,
+            allow_digest=False,
+        )
+        image, inspected = self._inspect_docker_object(
+            "image",
+            str(record["derivedTag"]),
+        )
+        config = image.get("Config") if isinstance(image, Mapping) else None
+        labels = config.get("Labels") if isinstance(config, Mapping) else None
+        expected_labels = {
+            _RUNTIME_SCHEMA_LABEL: "1",
+            _RUNTIME_INPUT_LABEL: str(record["inputSha256"]),
+            _RUNTIME_BOOT_INPUT_LABEL: str(record["bootInputSha256"]),
+            _RUNTIME_BASE_IMAGE_LABEL: str(record["baseImageId"]),
+        }
+        if (
+            inspected.returncode != 0
+            or not isinstance(image, Mapping)
+            or image.get("Id") != record["imageId"]
+            or image.get("Architecture") not in {"arm64", "aarch64"}
+            or not isinstance(labels, Mapping)
+            or any(labels.get(key) != value for key, value in expected_labels.items())
+        ):
+            raise InstanceError(
+                "runtime_image_record_invalid",
+                "journaled runtime image no longer matches the engine",
+            )
+        self._selected_runtime_image = record
+        return dict(record)
+
+    @staticmethod
+    def _committed_storage_uuids(
+        state: Optional[Mapping[str, Any]],
+    ) -> tuple[Optional[str], Optional[str]]:
+        if not isinstance(state, Mapping) or state.get("state") != "committed":
+            return None, None
+        data_uuid = state.get("filesystemUuid")
+        rootfs_uuid = state.get("rootfsFilesystemUuid")
+        return (
+            str(data_uuid) if isinstance(data_uuid, str) else None,
+            str(rootfs_uuid) if isinstance(rootfs_uuid, str) else None,
+        )
+
+    def converge_storage(
+        self,
+        boot_seed_target: Optional[Mapping[str, Any]] = None,
+        regeneration_capability: Any = None,
+        expected_data_uuid: Optional[str] = None,
+        expected_rootfs_uuid: Optional[str] = None,
+        storage_transaction_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Converge storage once, validating any executor-pinned UUID targets."""
+        if regeneration_capability is not None and not isinstance(
+            regeneration_capability,
+            Mapping,
+        ):
+            return self._storage_error(
+                "device_regeneration_state_invalid",
+                "regeneration capability is invalid",
+            )
+        if isinstance(boot_seed_target, Mapping):
+            expected_data_uuid = str(
+                boot_seed_target.get("dataUuid") or expected_data_uuid or ""
+            ) or None
+            expected_rootfs_uuid = str(
+                boot_seed_target.get("rootfsUuid")
+                or expected_rootfs_uuid
+                or ""
+            ) or None
+            storage_transaction_id = str(
+                boot_seed_target.get("transactionId")
+                or storage_transaction_id
+                or ""
+            ) or None
+        result = self.ensure_instance_storage(
+            expected_data_uuid=expected_data_uuid,
+            expected_rootfs_uuid=expected_rootfs_uuid,
+            storage_transaction_id=storage_transaction_id,
+        )
+        if result.get("ok") is not True:
+            return result
+        try:
+            state = StorageStateStore(self.context, self.lease).load()
+        except StorageError as exc:
+            return exc.as_dict()
+        data_uuid, rootfs_uuid = self._committed_storage_uuids(state)
+        if expected_data_uuid is not None or expected_rootfs_uuid is not None:
+            expected_data = expected_data_uuid
+            expected_rootfs = expected_rootfs_uuid
+            if (
+                expected_data is not None
+                and expected_data != data_uuid
+                or expected_rootfs is not None
+                and expected_rootfs != rootfs_uuid
+            ):
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "committed storage differs from the fixed convergence target",
+                )
+        return {
+            **result,
+            "dataUuid": data_uuid,
+            "rootfsUuid": rootfs_uuid,
+        }
+
+    def create_owned_container(
+        self,
+        image_record: Optional[Mapping[str, Any]] = None,
+        expected_data_uuid: Optional[str] = None,
+        expected_rootfs_uuid: Optional[str] = None,
+        *,
+        adopt_stopped_only: bool = False,
+    ) -> dict[str, Any]:
+        """Create, but never start, exactly one owned runtime container."""
+        self.ensure_instance_lease()
+        existing, error = self._owned_container_record()
+        if existing is not None:
+            existing_id = str(existing.get("Id") or "")
+            existing_state = existing.get("State")
+            stopped = (
+                isinstance(existing_state, Mapping)
+                and existing_state.get("Running") is False
+            )
+            if (
+                self._container_matches_lease(existing)
+                and (not adopt_stopped_only or stopped)
+            ):
+                return {
+                    "ok": True,
+                    "alreadyCreated": True,
+                    "containerId": existing_id,
+                }
+            return {
+                "ok": False,
+                "error": "convergence_state_conflict",
+                "message": "an owned third-state container already exists",
+                "containerId": existing_id or None,
+            }
+        if error != "instance container does not exist":
+            return {"ok": False, "error": "resource_conflict", "message": error}
+        try:
+            selected = self._select_convergence_image(image_record)
+            storage = StorageStateStore(self.context, self.lease).load()
+        except (InstanceError, StorageError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "runtime_image_record_invalid"),
+                "message": str(exc),
+            }
+        data_uuid, rootfs_uuid = self._committed_storage_uuids(storage)
+        if data_uuid is None:
+            return self._storage_error(
+                "storage_not_initialized",
+                "committed storage is required before container creation",
+            )
+        if (
+            expected_data_uuid is not None
+            and expected_data_uuid != data_uuid
+            or expected_rootfs_uuid is not None
+            and expected_rootfs_uuid != rootfs_uuid
+        ):
+            return self._storage_error(
+                "storage_identity_mismatch",
+                "container creation storage differs from the journal",
+            )
+        network = self.ensure_network()
+        if network.get("ok") is not True:
+            return {"ok": False, "error": "resource_conflict", "network": network}
+        volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
+        if not isinstance(volume, dict) or not self._volume_matches_lease(volume):
+            return self._storage_error(
+                "resource_conflict",
+                "instance data volume identity is invalid",
+            )
+        binder = self.ensure_binder()
+        if binder.get("ok") is not True:
+            return {"ok": False, "error": "binder_setup_failed", "binder": binder}
+        cleanup = self.proxy_cleanup()
+        if cleanup.get("ok") is not True:
+            return {
+                "ok": False,
+                "error": "proxy_cleanup_failed",
+                "proxyCleanup": cleanup,
+            }
+        boot_seed = self._seed_boot_identity_into_image()
+        if boot_seed.get("ok") is not True:
+            return {
+                "ok": False,
+                "error": str(
+                    boot_seed.get("error")
+                    or "device_boot_seed_failed"
+                ),
+            }
+        command = self.docker_create_command()
+        if not any("/dev/binder" in item for item in command):
+            return {
+                "ok": False,
+                "error": "binder_setup_failed",
+                "message": "verified binder mounts are unavailable",
+            }
+        created = run(command, timeout=120, env=self.docker_env())
+        if created.returncode != 0:
+            return {
+                "ok": False,
+                "error": "container_create_failed",
+                "returncode": created.returncode,
+            }
+        container, ownership_error = self._owned_container_record()
+        if container is None:
+            return {
+                "ok": False,
+                "error": "resource_conflict",
+                "message": ownership_error,
+            }
+        image_identity = self._container_effective_image_identity(container)
+        if (
+            image_identity.get("ok") is not True
+            or not self._container_matches_lease(
+                container,
+                image_identity=image_identity,
+            )
+        ):
+            return {
+                "ok": False,
+                "error": "container_contract_invalid",
+                "containerId": container.get("Id"),
+            }
+        return {
+            "ok": True,
+            "created": True,
+            "containerId": container["Id"],
+            "imageId": selected["imageId"],
+            "dataUuid": data_uuid,
+            "rootfsUuid": rootfs_uuid,
+            "proxyCleanup": cleanup,
+            "bootSeed": {
+                "seeded": not bool(boot_seed.get("skipped")),
+            },
+        }
+
+    def start_owned_container(
+        self,
+        expected_container_id: Optional[str] = None,
+        wait: bool = True,
+        *,
+        allow_journaled_spec_drift: bool = False,
+        expected_image_input_sha256: Optional[str] = None,
+        expected_image_boot_input_sha256: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Start one already-created container and establish bounded transports."""
+        self.ensure_instance_lease()
+        container, error = self._owned_container_record()
+        if container is None:
+            return {
+                "ok": False,
+                "error": "convergence_state_conflict",
+                "message": error,
+            }
+        container_id = str(container.get("Id") or "")
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+            or expected_container_id is not None
+            and container_id != expected_container_id
+        ):
+            return {
+                "ok": False,
+                "error": "convergence_state_conflict",
+                "message": "owned container identity differs from the journal",
+            }
+        if allow_journaled_spec_drift and expected_container_id is None:
+            return {
+                "ok": False,
+                "error": "convergence_state_conflict",
+            }
+        selected_image_pinned = (
+            expected_image_input_sha256 is not None
+            or expected_image_boot_input_sha256 is not None
+        )
+        if selected_image_pinned and (
+            not isinstance(expected_image_input_sha256, str)
+            or _SHA256_PATTERN.fullmatch(expected_image_input_sha256) is None
+            or not isinstance(expected_image_boot_input_sha256, str)
+            or _SHA256_PATTERN.fullmatch(expected_image_boot_input_sha256) is None
+        ):
+            return {
+                "ok": False,
+                "error": "convergence_state_conflict",
+            }
+
+        def matches_selected_contract(value: Mapping[str, Any]) -> bool:
+            if allow_journaled_spec_drift:
+                return True
+            if not selected_image_pinned:
+                return self._container_matches_lease(value)
+            image_identity = self._container_effective_image_identity(value)
+            observed_input = image_identity.get("containerInputSha256")
+            observed_boot = image_identity.get("containerBootInputSha256")
+            if image_identity.get("match") == "exact":
+                observed_input = image_identity.get("desiredInputSha256")
+                observed_boot = image_identity.get("desiredBootInputSha256")
+            return bool(
+                image_identity.get("ok") is True
+                and observed_input == expected_image_input_sha256
+                and observed_boot == expected_image_boot_input_sha256
+                and self._container_matches_lease(
+                    value,
+                    image_identity={"ok": True},
+                )
+            )
+        if not matches_selected_contract(container):
+            return {
+                "ok": False,
+                "error": "runtime_spec_mismatch",
+                "containerId": container_id,
+            }
+        state = container.get("State")
+        running = isinstance(state, Mapping) and state.get("Running") is True
+        result: dict[str, Any] = {
+            "ok": True,
+            "containerId": container_id,
+            "alreadyRunning": running,
+        }
+        if not running:
+            quarantine = self.proxy_bootstrap_quarantine()
+            result["proxyQuarantine"] = quarantine
+            if quarantine.get("ok") is not True:
+                return {
+                    **result,
+                    "ok": False,
+                    "error": quarantine.get("code", "engine_unavailable"),
+                }
+            with self._shared_protection_engine_lock():
+                fresh, fresh_error = self._owned_container_record()
+                if fresh is None:
+                    return {
+                        **result,
+                        "ok": False,
+                        "error": "convergence_state_conflict",
+                        "message": fresh_error,
+                    }
+                fresh_id = str(fresh.get("Id") or "")
+                fresh_state = fresh.get("State")
+                fresh_running = (
+                    isinstance(fresh_state, Mapping)
+                    and fresh_state.get("Running") is True
+                )
+                if (
+                    fresh_id != container_id
+                    or not matches_selected_contract(fresh)
+                ):
+                    return {
+                        **result,
+                        "ok": False,
+                        "error": "convergence_state_conflict",
+                    }
+                protection = self.shared_protection_manager().status()
+                result["sharedProtection"] = protection
+                if (
+                    protection.get("ok") is not True
+                    or protection.get("maintenanceRequired") is True
+                ):
+                    return {
+                        **result,
+                        "ok": False,
+                        "error": str(
+                            protection.get("error")
+                            or "shared_protection_not_ready"
+                        ),
+                    }
+                if fresh_running:
+                    running = True
+                    result["alreadyRunning"] = True
+                else:
+                    started = self._shared_protection_engine_shell(
+                        "set -eu; command -v docker >/dev/null 2>&1; "
+                        "docker start "
+                        + shlex.quote(container_id)
+                        + " >/dev/null",
+                        timeout=60,
+                    )
+                    result["start"] = {
+                        "ok": started.returncode == 0,
+                        "returncode": started.returncode,
+                        "stderr": started.stderr.strip()[-500:],
+                    }
+                    if started.returncode != 0:
+                        return {
+                            **result,
+                            "ok": False,
+                            "error": "container_start_failed",
+                        }
+        if not wait:
+            return result
+        deadline = time.monotonic() + 300.0
+        result["boot"] = self.docker_wait_boot(
+            timeout_sec=max(1, int(deadline - time.monotonic())),
+        )
+        if result["boot"].get("ok") is not True:
+            return {**result, "ok": False, "error": "runtime_boot_timeout"}
+        result["adbAuthorization"] = self.ensure_adb_authorized_key()
+        if result["adbAuthorization"].get("ok") is not True:
+            return {**result, "ok": False, "error": "adb_authorization_failed"}
+        if self.lease.android_adb_port != 5555:
+            result["adbPort"] = self.switch_adbd_port_via_docker()
+            if result["adbPort"].get("ok") is not True:
+                return {**result, "ok": False, "error": "adb_port_failed"}
+        if not running:
+            result["adbDisconnectStale"] = self.adb_disconnect()
+        result["adbConnect"] = self.adb_connect()
+        result["adbWait"] = self.adb_wait(
+            timeout_sec=max(
+                1,
+                min(90, int(deadline - time.monotonic())),
+            )
+        )
+        if result["adbWait"].get("ok") is not True:
+            return {**result, "ok": False, "error": "adb_wait_timeout"}
+        result["daemonForward"] = self.forward_daemon_port(
+            timeout=max(1.0, min(30.0, deadline - time.monotonic())),
+        )
+        if result["daemonForward"].get("ok") is not True:
+            return {**result, "ok": False, "error": "daemon_forward_failed"}
+        return result
+
+    def start_seed_runtime(
+        self,
+        image_record: Mapping[str, Any],
+        boot_seed_target: Mapping[str, Any],
+        *,
+        expected_data_uuid: Optional[str] = None,
+        operation_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create/start the one explicit fresh-data seed runtime."""
+        try:
+            from .location import DEFAULT_COUNTRY, LocationError, LocationStateStore
+
+            location_store = LocationStateStore(self.context.state_root)
+            location_state, _ = location_store.ensure(
+                self.context.instance_id,
+                DEFAULT_COUNTRY,
+            )
+            if location_state.get("pending") is None:
+                location_store.set_desired(str(location_state["desiredCountry"]))
+        except LocationError as exc:
+            return {"ok": False, "error": exc.code}
+        try:
+            google_spec = self.google_runtime_spec(
+                "fresh-storage-binding",
+                require_assets=True,
+            )
+            if google_spec is not None:
+                google_preflight = self._google_binding_preflight(google_spec)
+                self._begin_google_binding(google_spec, google_preflight)
+        except (GoogleServicesError, StorageError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(
+                    exc,
+                    "code",
+                    "google_services_runtime_not_ready",
+                ),
+            }
+        storage = self.converge_storage(
+            boot_seed_target=boot_seed_target,
+        )
+        if storage.get("ok") is not True:
+            return storage
+        created = self.create_owned_container(
+            image_record=image_record,
+            expected_data_uuid=str(boot_seed_target.get("dataUuid") or "") or None,
+            expected_rootfs_uuid=str(boot_seed_target.get("rootfsUuid") or "") or None,
+            adopt_stopped_only=True,
+        )
+        if created.get("ok") is not True:
+            return created
+        quarantined = self.quarantine_proxy_for_lifecycle(
+            expected_data_uuid,
+            operation_id,
+        )
+        if quarantined.get("ok") is not True:
+            return quarantined
+        started = self.start_owned_container(
+            expected_container_id=str(created.get("containerId") or ""),
+            wait=True,
+        )
+        return {
+            **started,
+            "seed": True,
+            "bootSeedTarget": dict(boot_seed_target),
+            "dataUuid": storage.get("dataUuid"),
+            "rootfsUuid": storage.get("rootfsUuid"),
+        }
+
+    def initialize_seed_runtime(
+        self,
+        expected_container_id: str,
+        boot_seed_target: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Quiesce the seed runtime and apply its fixed offline boot identity."""
+        prepared_location = self._prepare_location_for_replacement(
+            expected_container_id,
+        )
+        if prepared_location.get("ok") is not True:
+            return prepared_location
+        quiesced = self.quiesce_owned_container(expected_container_id)
+        if quiesced.get("ok") is not True:
+            return quiesced
+        boot_id = boot_seed_target.get("bootId")
+        random_uuid = boot_seed_target.get("randomUuid")
+        if isinstance(boot_id, str) and isinstance(random_uuid, str):
+            seeded = self._run_boot_identity_seed(boot_id, random_uuid)
+        else:
+            seeded = self._seed_boot_identity_into_image()
+        if seeded.get("ok") is not True:
+            return seeded
+        return {
+            "ok": True,
+            "containerId": expected_container_id,
+            "seeded": not bool(seeded.get("skipped")),
+            "seed": seeded,
+            "location": prepared_location,
+        }
+
+    def start(
+        self,
+        dry_run: bool = False,
+        wait: bool = True,
+        install_daemon_apk: Optional[str] = None,
+        start_colima: bool = False,
+        adb_root: bool = True,
+        skip_preflight: bool = False,
+        recreate: bool = False,
+        defer_proxy: bool = False,
+    ) -> dict[str, Any]:
+        """Explicit low-level runtime control.
+
+        Production convergence uses the specific methods above.  This method
+        retains the intentional ``start --recreate`` development control but
+        never builds artifacts/images, reloads protection, deploys an implicit
+        component set, or performs aggregate acceptance.
+        """
         self.ensure_instance_lease()
         plan: dict[str, Any] = {
             "backend": self.cfg.backend,
-            "colimaCommand": self.colima_start_command(),
-            "effectiveImage": self.effective_image(),
             "adbTarget": self.adb_target,
             "daemonPort": self.lease.host_daemon_port,
-            "recreate": recreate,
-            "proxyDesiredConvergence": not defer_proxy,
+            "recreate": bool(recreate),
+            "convergence": False,
         }
-        if dry_run:
-            plan["dockerCommand"] = self.docker_create_command()
-            preflight = None if skip_preflight else self.runtime_preflight()
-            if preflight is not None:
-                plan["preflight"] = preflight
-            return {"dry_run": True, "plan": plan}
-        if RegenerationJournal(self.context).pending():
+        if not dry_run and RegenerationJournal(self.context).pending():
             return {
                 "ok": False,
                 "error": "device_regeneration_pending",
-                "message": "an interrupted device regenerate is pending; re-run `./xenoid device regenerate` to complete it before starting the runtime",
+                "message": "device regeneration must resume through convergence",
                 "plan": plan,
             }
+        try:
+            selected_image = self.selected_runtime_image()
+            plan["runtimeImage"] = selected_image
+            plan["effectiveImage"] = selected_image["derivedTag"]
+            plan["dockerCommand"] = self.docker_create_command()
+        except (
+            GoogleServicesError,
+            InstanceError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            return {
+                "ok": False,
+                "dry_run": bool(dry_run),
+                "error": getattr(exc, "code", "runtime_image_required"),
+                "message": str(exc),
+                "plan": plan,
+            }
+        if dry_run:
+            return {"ok": True, "dry_run": True, "plan": plan}
         if which("docker") is None:
             return {"ok": False, "error": "docker not found", "plan": plan}
         endpoint = self.docker_endpoint_host()
         if endpoint.startswith("tcp://"):
             return {
                 "ok": False,
-                "error": "remote Docker contexts must use ssh:// so host protection and rootfs setup can run",
+                "error": "resource_conflict",
+                "message": "remote Docker contexts must use ssh://",
                 "plan": plan,
             }
         if start_colima and self.should_use_colima():
             if which("colima") is None:
                 return {"ok": False, "error": "colima not found", "plan": plan}
-            colima = run(self.colima_start_command())
+            colima = run(self.colima_start_command(), timeout=600)
             plan["colima"] = {
                 "ok": colima.returncode == 0,
                 "returncode": colima.returncode,
-                "stdout": colima.stdout.strip(),
-                "stderr": colima.stderr.strip(),
+                "stderr": colima.stderr.strip()[-500:],
             }
             if colima.returncode != 0:
-                return {"ok": False, "error": "colima start failed", "plan": plan}
-        preflight = None if skip_preflight else self.runtime_preflight()
-        if preflight is not None:
+                return {"ok": False, "error": "colima_start_failed", "plan": plan}
+        if not skip_preflight:
+            preflight = self.runtime_preflight()
             plan["preflight"] = preflight
-            if not preflight.get("ok"):
-                return {"ok": False, "error": "runtime preflight failed", "plan": plan}
-        try:
-            google_spec = self.google_runtime_spec(
-                "start",
-                require_assets=True,
-            )
-            google_transition = self._google_binding_preflight(google_spec)
-        except (GoogleServicesError, StorageError) as exc:
-            code = getattr(exc, "code", "google_services_spec_mismatch")
-            return {
-                "ok": False,
-                "error": code,
-                "message": str(exc),
-                "plan": plan,
-            }
-        plan["googleServicesPreflight"] = {
-            "ok": True,
-            "provider": (
-                google_spec.provider
-                if google_spec is not None
-                else PROVIDER_NONE
-            ),
-            "release": (
-                google_spec.release
-                if google_spec is not None
-                else PROVIDER_NONE
-            ),
-            "specSha256": (
-                google_spec.fingerprint
-                if google_spec is not None
-                else disabled_runtime_spec_fingerprint()
-            ),
-            "transition": google_transition["transition"],
-        }
-        if self.cfg.auto_build_runtime_image:
-            image_build = self._build_effective_runtime_image(google_spec)
-            plan["runtimeImageBuild"] = image_build
-            if image_build.get("ok") is not True:
+            if preflight.get("ok") is not True:
                 return {
                     "ok": False,
-                    "error": image_build.get(
-                        "error",
-                        "runtime_image_build_failed",
-                    ),
-                    "message": image_build.get(
-                        "message",
-                        "runtime image build failed",
-                    ),
+                    "error": "runtime_preflight_failed",
                     "plan": plan,
                 }
-        preexisting_container, _ = self._inspect_docker_object(
-            "container",
-            self.lease.container_name,
-        )
-        if (
-            isinstance(preexisting_container, dict)
-            and preexisting_container
-            and self._container_has_lease_owner(preexisting_container)
-        ):
-            image_identity = self._container_effective_image_identity(
-                preexisting_container,
-            )
-            plan["containerImageIdentity"] = image_identity
-            if image_identity.get("ok") is not True and not recreate:
-                return {
-                    "ok": False,
-                    "error": "runtime_spec_mismatch",
-                    "message": "owned container requires explicit recreation for the effective image",
-                    "plan": plan,
-                }
-
-
-
-        plan["network"] = self.ensure_network()
-        if not plan["network"].get("ok"):
-            return {"ok": False, "error": "docker network setup failed", "plan": plan}
-
-        try:
-            google_binding = self._begin_google_binding(
-                google_spec,
-                google_transition,
-            )
-        except GoogleServicesError as exc:
-            return {
-                "ok": False,
-                "error": exc.code,
-                "message": str(exc),
-                "plan": plan,
-            }
-        plan["googleServicesBinding"] = public_binding(google_binding)
-
-        rootfs_images = self.ensure_rootfs_images()
-        plan["rootfsImages"] = rootfs_images
-        if not rootfs_images.get("ok"):
-            return {
-                "ok": False,
-                "error": rootfs_images.get(
-                    "error",
-                    "rootfs_image_build_failed",
-                ),
-                "message": rootfs_images.get(
-                    "message",
-                    "rootfs/data image build failed",
-                ),
-                "plan": plan,
-            }
-
-        binder = self.ensure_binder()
-        plan["binder"] = binder
-        if not binder.get("ok"):
-            return {"ok": False, "error": "binder setup failed on docker host", "plan": plan}
-
-        docker_cmd = self.docker_create_command()
-        plan["dockerCommand"] = docker_cmd
-        if not any("/dev/binder" in arg for arg in docker_cmd):
-            return {"ok": False, "error": "binder device mounts unavailable after binder setup", "plan": plan}
-
-        loaded_kmod = self.kernel_module_status()
-        if loaded_kmod.get("ok"):
-            plan["kmod"] = {
-                "ok": True,
-                "reused": True,
-                "reason": "engine-host kernel protection is already loaded",
-            }
-        else:
-            kmod_cmd = self.build_kmod_command()
-            kmod = run(kmod_cmd, timeout=900, env=self.docker_env())
-            plan["kmod"] = {
-                "ok": kmod.returncode == 0,
-                "command": kmod_cmd,
-                "returncode": kmod.returncode,
-                "stdout": kmod.stdout.strip()[-300:],
-                "stderr": kmod.stderr.strip()[-300:],
-            }
-            if kmod.returncode != 0:
-                return {"ok": False, "error": "kernel protection build/load failed", "plan": plan}
-        plan["kernelModuleStatus"] = self.kernel_module_status()
-        if not plan["kernelModuleStatus"].get("ok"):
-            return {"ok": False, "error": "kernel protection failed post-load verification", "plan": plan}
-        existing_container, existing_inspect = self._inspect_docker_object(
-            "container",
-            self.lease.container_name,
-        )
-        plan["containerLookup"] = {
-            "ok": existing_container is None or bool(existing_container),
-            "returncode": existing_inspect.returncode,
-            "stderr": existing_inspect.stderr.strip()[-300:],
-        }
-        if existing_container == {}:
+        container, lookup_error = self._owned_container_record()
+        if container is None and lookup_error != "instance container does not exist":
             return {
                 "ok": False,
                 "error": "resource_conflict",
-                "message": "container inspection returned invalid identity",
+                "message": lookup_error,
                 "plan": plan,
             }
-        existing_present = existing_container is not None
-        if existing_present and not self._container_has_lease_owner(existing_container):
-            return {
-                "ok": False,
-                "error": "resource_conflict",
-                "message": "Docker container is not owned by this instance",
-                "plan": plan,
-            }
-        if (
-            existing_present
-            and not recreate
-            and not self._container_matches_lease(existing_container)
-        ):
+        if container is not None and recreate:
+            removal = self.remove_owned_container_for_recreate(
+                expected_container_id=str(container.get("Id") or ""),
+            )
+            plan["containerRecreate"] = removal
+            if removal.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": removal.get("error", "container_remove_failed"),
+                    "plan": plan,
+                }
+            container = None
+        elif container is not None and not self._container_matches_lease(container):
             return {
                 "ok": False,
                 "error": "runtime_spec_mismatch",
                 "message": "owned container requires explicit recreation",
                 "plan": plan,
             }
-        if existing_present and recreate:
-            preserved = self._capture_proxy_desired_for_update()
-            plan["proxyDesiredBeforeRecreate"] = preserved
-            if preserved.get("ok") is not True:
+        if container is None:
+            storage = self.converge_storage()
+            plan["storage"] = storage
+            if storage.get("ok") is not True:
                 return {
                     "ok": False,
-                    "error": preserved.get("code", "proxy_state_backup_failed"),
+                    "error": storage.get("error", "storage_convergence_failed"),
                     "plan": plan,
                 }
-        if existing_present and recreate:
-            removal = self._remove_owned_container(existing_container)
-            plan["containerRecreate"] = removal
-            if removal.get("ok") is not True:
+            created = self.create_owned_container(
+                image_record=selected_image,
+                expected_data_uuid=storage.get("dataUuid"),
+                expected_rootfs_uuid=storage.get("rootfsUuid"),
+            )
+            plan["containerCreate"] = created
+            if created.get("ok") is not True:
                 return {
                     "ok": False,
-                    "error": removal.get("error", "existing_container_removal_failed"),
+                    "error": created.get("error", "container_create_failed"),
                     "plan": plan,
                 }
-            existing_present = False
-
-        created_new = False
-        if not existing_present:
-            # Recover proxy ownership left by an externally removed container
-            # before assigning a new Docker identity to this instance.
-            cleanup = self.proxy_cleanup()
-            plan["proxyCleanupBeforeCreate"] = cleanup
-            if cleanup.get("ok") is not True:
-                return {"ok": False, "error": "proxy_cleanup_failed", "plan": plan}
-            boot_seed = self._seed_boot_identity_into_image()
-            plan["bootIdentitySeed"] = boot_seed
-            if not boot_seed.get("ok"):
-                return {
-                    "ok": False,
-                    "error": "device_boot_seed_failed",
-                    "message": boot_seed.get("message", "boot identity seeding failed"),
-                    "plan": plan,
-                }
-            proc = run(docker_cmd, env=self.docker_env())
-            result: dict[str, Any] = {
-                "ok": proc.returncode == 0,
-                "returncode": proc.returncode,
-                "stdout": proc.stdout.strip(),
-                "stderr": proc.stderr.strip(),
-                "plan": plan,
-            }
-            if proc.returncode != 0:
-                return result
-            existing_container, _ = self._owned_container_record()
-            if existing_container is None:
-                result["ok"] = False
-                result["error"] = "resource_conflict"
-                result["message"] = "created container is not owned by this instance"
-                return result
-            created_new = True
+            container_id = str(created.get("containerId") or "")
         else:
-            result = {
-                "ok": True,
-                "container": self.lease.container_name,
-                "plan": plan,
-            }
-
-        state = existing_container.get("State") if isinstance(existing_container, dict) else None
-        already_running = isinstance(state, dict) and state.get("Running") is True
-        if already_running:
-            result["alreadyRunning"] = True
-        else:
-            try:
-                guarded = self.proxy_bootstrap_quarantine()
-            except InstanceError as exc:
-                guarded = self._proxy_failure(exc.code)
-            except Exception:
-                guarded = self._proxy_failure("engine_unavailable")
-            result["proxyQuarantineBeforeStart"] = guarded
-            if guarded.get("ok") is not True:
-                result["ok"] = False
-                result["error"] = guarded.get("code", "engine_unavailable")
-                return result
-            started = run(
-                [*self.docker_base_cmd(), "start", existing_container["Id"]],
-                env=self.docker_env(),
-            )
-            result["containerStart"] = {
-                "ok": started.returncode == 0,
-                "returncode": started.returncode,
-                "stdout": started.stdout.strip(),
-                "stderr": started.stderr.strip(),
-            }
-            if started.returncode != 0:
-                result["ok"] = False
-                result["error"] = "container_start_failed"
-                return result
-            result["created"] = created_new
-
-        required: list[dict[str, Any]] = []
-        if wait:
-            result["dockerBootWait"] = self.docker_wait_boot()
-            result["adbAuthorization"] = self.ensure_adb_authorized_key()
-            required.extend([result["dockerBootWait"], result["adbAuthorization"]])
-            if self.lease.android_adb_port != 5555:
-                result["dockerAdbPortSwitch"] = self.switch_adbd_port_via_docker()
-                required.append(result["dockerAdbPortSwitch"])
-            if not already_running:
-                # Stale-transport cleanup is idempotent: "no such device" means
-                # there is nothing to clean and must not fail convergence.
-                result["adbDisconnectStale"] = self.adb_disconnect()
-            result["adbConnect"] = self.adb_connect()
-            result["adbWait"] = self.adb_wait(timeout_sec=90)
-            if self.lease.android_adb_port != 5555 and not result["adbWait"].get("ok"):
-                result["dockerAdbPortRetry"] = self.switch_adbd_port_via_docker()
-                result["adbConnectRetry"] = self.adb_connect()
-                result["adbWait"] = self.adb_wait(timeout_sec=60)
-            required.append(result["adbWait"])
-            if self.lease.android_adb_port != 5555:
-                result["androidAdbPort"] = self.ensure_android_adb_port()
-                required.append(result["androidAdbPort"])
-            if adb_root:
-                result["adbRoot"] = self.enable_adb_root()
-                required.append(result["adbRoot"])
-                if self.lease.android_adb_port != 5555 and result["adbRoot"].get("rooted"):
-                    result["dockerAdbPortPostRoot"] = self.switch_adbd_port_via_docker()
-                    result["adbConnectPostRoot"] = self.adb_connect()
-                    result["adbWaitPostRoot"] = self.adb_wait(timeout_sec=60)
-                    required.extend([result["dockerAdbPortPostRoot"], result["adbWaitPostRoot"]])
-            result["daemonForward"] = self.forward_daemon_port()
-            required.append(result["daemonForward"])
-
-        if not wait:
-            result["googleServicesBootstrap"] = {
-                "ok": True,
-                "skipped": True,
-                "pending": True,
-                "reason": "Android boot wait was disabled",
-            }
-        elif result.get("adbWait", {}).get("ok") is True:
-            result["googleServicesBootstrap"] = (
-                self.google_services_bootstrap_gate(google_spec)
-            )
-        else:
-            result["googleServicesBootstrap"] = {
-                "ok": False,
-                "skipped": True,
-                "error": "google_services_runtime_not_ready",
-                "message": "Android boot is required before the Google services bootstrap gate",
-            }
-        required.append(result["googleServicesBootstrap"])
-        if wait and result["googleServicesBootstrap"].get("ok") is True:
-            try:
-                google_binding = self._commit_google_binding(google_binding)
-                result["googleServicesBinding"] = public_binding(google_binding)
-            except GoogleServicesError as exc:
-                result["googleServicesBinding"] = exc.as_dict()
-                required.append(result["googleServicesBinding"])
-
-        daemon_package = self.adb(
-            ["shell", "pm", "path", "dev.xenoid.daemon"],
-            timeout=15,
+            container_id = str(container.get("Id") or "")
+        started = self.start_owned_container(
+            expected_container_id=container_id,
+            wait=wait,
         )
-        daemon_installed = bool(
-            daemon_package.get("ok")
-            and "package:" in str(daemon_package.get("stdout", ""))
-        )
-        daemon_apk = install_daemon_apk
-        if daemon_apk is None and not daemon_installed:
-            for candidate in (
-                self.context.project_root / "artifacts" / "xenoid-daemon.apk",
-                self.context.project_root / "daemon" / "app" / "build"
-                / "outputs" / "apk" / "debug" / "app-debug.apk",
-            ):
-                if candidate.is_file():
-                    daemon_apk = str(candidate)
-                    break
-        result["daemonPackage"] = daemon_package
-        if daemon_apk is not None:
-            result["daemonInstall"] = self.install_daemon(daemon_apk)
-        elif daemon_installed:
-            result["daemonInstall"] = {"ok": True, "skipped": True}
-        else:
-            result["daemonInstall"] = {
-                "ok": False,
-                "error": "daemon APK is not installed and no local artifact is available",
-            }
-        result["daemonStart"] = (
-            self.start_daemon_service()
-            if result["daemonInstall"].get("ok")
-            else {"ok": False, "skipped": True}
-        )
-        result["daemonForward"] = (
-            self.forward_daemon_port()
-            if result["daemonStart"].get("ok")
-            else {"ok": False, "skipped": True}
-        )
-        required.extend([
-            result["daemonInstall"],
-            result["daemonStart"],
-            result["daemonForward"],
-        ])
-
-        # Start rootd after the daemon so both processes use the daemon's private
-        # control token. This avoids a world-readable token under /data/local/tmp.
-        result["rootdRoot"] = self.ensure_rootd_root()
-        required.append(result["rootdRoot"])
-        result["daemonReady"] = (
-            self.ensure_daemon(
-                readiness_timeout=CAMERA_MUTATION_TIMEOUT_SECONDS
-            )
-            if result["rootdRoot"].get("ok")
-            and result["daemonForward"].get("ok")
-            else {"ok": False, "skipped": True}
-        )
-        required.append(result["daemonReady"])
-        result["dataSentinel"] = (
-            self.data_sentinel(create=True)
-            if result["daemonReady"].get("ok")
-            else {"ok": False, "skipped": True}
-        )
-        required.append(result["dataSentinel"])
-        if defer_proxy:
-            # Internal location-refresh path: proxy desired state is reconciled by
-            # the caller after the location identity converges, so a broken proxy
-            # never blocks location staging or the one-time recreate.
-            result["proxyConverged"] = {"ok": True, "skipped": True, "deferred": True}
-        else:
-            result["proxyConverged"] = (
-                self.reconcile_proxy_desired()
-                if result["daemonReady"].get("ok")
-                else {
-                    "ok": False,
-                    "code": "daemon_unreachable",
-                    "error": "daemon_unreachable",
-                }
-            )
-        required.append(result["proxyConverged"])
-        result["imageProtectionStatus"] = self.image_protection_status()
-        required.append(result["imageProtectionStatus"])
-        current_container, _ = self._inspect_docker_object(
-            "container",
-            self.lease.container_name,
-        )
-        result["runtimeMemory"] = self.runtime_memory_status(current_container)
-        required.append(result["runtimeMemory"])
-        result["ok"] = all(bool(step.get("ok")) for step in required)
-        result["ready"] = bool(result["ok"] and result["proxyConverged"].get("ok"))
-        if not result["ok"]:
-            if result["runtimeMemory"].get("oomKilled") is True:
-                result["error"] = "runtime_oom_killed"
-                result["message"] = result["runtimeMemory"]["message"]
-            else:
-                result["error"] = "one or more required runtime startup steps failed"
+        result: dict[str, Any] = {**started, "plan": plan}
+        if started.get("ok") is not True:
+            return result
+        if wait and adb_root:
+            result["adbRoot"] = self.enable_adb_root()
+            if result["adbRoot"].get("ok") is not True:
+                return {**result, "ok": False, "error": "adb_root_failed"}
+        if install_daemon_apk is not None:
+            result["daemonInstall"] = self.install_daemon(install_daemon_apk)
+            if result["daemonInstall"].get("ok") is not True:
+                return {**result, "ok": False, "error": "daemon_install_failed"}
+            result["daemonBootstrap"] = self.reconcile_control_plane()
+            if result["daemonBootstrap"].get("ok") is not True:
+                return {**result, "ok": False, "error": "daemon_bootstrap_failed"}
+        result["deferProxy"] = bool(defer_proxy)
+        result["ready"] = bool(result.get("ok"))
         return result
 
     def stop(self) -> dict[str, Any]:
+        """Quarantine and stop the owned runtime without deleting its identity."""
         self.ensure_instance_lease()
         if which("docker") is None:
             return {"ok": False, "error": "docker not found"}
@@ -3244,16 +5531,14 @@ class RuntimeManager:
             try:
                 cleanup = self.proxy_cleanup()
             except InstanceError as exc:
-                cleanup = {"ok": False, "code": exc.code, "error": exc.code}
+                cleanup = self._proxy_failure(exc.code)
             except Exception:
-                cleanup = {
-                    "ok": False,
-                    "code": "engine_unavailable",
-                    "error": "engine_unavailable",
-                }
+                cleanup = self._proxy_failure("engine_unavailable")
             return {
                 "ok": cleanup.get("ok") is True,
                 "alreadyStopped": True,
+                "containerId": None,
+                "preserved": True,
                 "proxyCleanup": cleanup,
                 **(
                     {}
@@ -3261,7 +5546,7 @@ class RuntimeManager:
                     else {"error": "proxy_cleanup_failed"}
                 ),
             }
-        return self._remove_owned_container(container)
+        return self._quiesce_container_safely(container)
 
     def data_sentinel(self, *, create: bool = False) -> dict[str, Any]:
         try:
@@ -3408,6 +5693,48 @@ class RuntimeManager:
                     error="storage_growth_required",
                 ),
             }
+        rootfs = self._inspect_volume_image(
+            volume,
+            image_name=ROOTFS_IMAGE_NAME,
+        )
+        mountpoint = volume.get("Mountpoint")
+        marker = (
+            self._engine_host_shell(
+                "cat "
+                + shlex.quote(
+                    f"{str(mountpoint).rstrip('/')}/xenoid-rootfs.img.source.sha256"
+                )
+            )
+            if isinstance(mountpoint, str)
+            else None
+        )
+        rootfs_source = (
+            str(marker.stdout or "").strip()
+            if marker is not None and marker.returncode == 0
+            else ""
+        )
+        migration_required = not bool(state.get("rootfsImage"))
+        if (
+            rootfs.get("ok") is not True
+            or not migration_required
+            and (
+                rootfs.get("filesystemUuid") != state["rootfsFilesystemUuid"]
+                or rootfs.get("logicalSizeBytes")
+                != state["observedRootfsSizeBytes"]
+                or rootfs_source != state["rootfsSourceSha256"]
+            )
+        ):
+            return {
+                "ok": False,
+                "volume": self.lease.volume_name,
+                "image": image,
+                "rootfsImage": rootfs,
+                **public_storage_state(
+                    state,
+                    healthy=False,
+                    error="storage_identity_mismatch",
+                ),
+            }
         backup_status: Optional[dict[str, Any]] = None
         if state["backupImage"]:
             backup_status = self._inspect_volume_image(volume, state["backupImage"])
@@ -3433,6 +5760,8 @@ class RuntimeManager:
             "volume": self.lease.volume_name,
             "image": image,
             "backupImage": backup_status,
+            "rootfsImage": rootfs,
+            "migrationRequired": migration_required,
             **public_storage_state(state, healthy=True),
             **(
                 {"warning": image["warning"]}
@@ -3478,20 +5807,22 @@ class RuntimeManager:
             )
         )
 
-        image, _ = self._inspect_docker_object(
-            "image",
-            self.effective_image(),
-        )
+        desired_runtime: Optional[dict[str, Any]] = None
+        image: Optional[dict[str, Any]] = None
+        try:
+            desired_runtime = self.selected_runtime_image(spec=spec)
+            image, _ = self._inspect_docker_object(
+                "image",
+                str(desired_runtime["derivedTag"]),
+            )
+        except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError) as exc:
+            error = error or getattr(exc, "code", "runtime_image_required")
         desired_image_id = (
-            str(image.get("Id") or "")
-            if isinstance(image, dict)
+            str(desired_runtime.get("imageId") or "")
+            if desired_runtime is not None
             else ""
         )
-        image_config = (
-            image.get("Config")
-            if isinstance(image, dict)
-            else None
-        )
+        image_config = image.get("Config") if isinstance(image, dict) else None
         image_labels = (
             image_config.get("Labels")
             if isinstance(image_config, dict)
@@ -3556,6 +5887,11 @@ class RuntimeManager:
             if owned_container and isinstance(container, dict)
             else ""
         )
+        container_identity = (
+            self._container_effective_image_identity(container)
+            if owned_container and isinstance(container, dict)
+            else {"ok": False, "match": "absent"}
+        )
 
         rootfs_source_id = ""
         volume, _ = self._inspect_docker_object(
@@ -3574,12 +5910,55 @@ class RuntimeManager:
             )
             if marker.returncode == 0:
                 rootfs_source_id = str(marker.stdout or "").strip()
+        rootfs_image, _ = (
+            self._inspect_docker_object("image", rootfs_source_id)
+            if rootfs_source_id
+            else (None, None)
+        )
+        rootfs_config = (
+            rootfs_image.get("Config")
+            if isinstance(rootfs_image, dict)
+            else None
+        )
+        rootfs_labels = (
+            rootfs_config.get("Labels")
+            if isinstance(rootfs_config, dict)
+            else None
+        )
+        rootfs_labels = rootfs_labels if isinstance(rootfs_labels, dict) else {}
+        desired_boot_input = (
+            str(desired_runtime.get("bootInputSha256") or "")
+            if desired_runtime is not None
+            else ""
+        )
+        rootfs_runtime_match = bool(
+            rootfs_source_id
+            and isinstance(rootfs_image, dict)
+            and rootfs_image
+            and rootfs_labels.get(_RUNTIME_SCHEMA_LABEL) == "1"
+            and rootfs_labels.get(_RUNTIME_BOOT_INPUT_LABEL)
+            == desired_boot_input
+        )
+        rootfs_google_match = bool(
+            rootfs_runtime_match
+            and (
+                all(
+                    rootfs_labels.get(key) == value
+                    for key, value in spec.labels.items()
+                )
+                if spec is not None
+                else not any(
+                    key in rootfs_labels for key in self._google_label_values()
+                )
+            )
+        )
 
         identity_ready = bool(
             desired_image_id
             and owned_container
-            and desired_image_id == container_image_id
-            and desired_image_id == rootfs_source_id
+            and container_identity.get("ok") is True
+            and rootfs_runtime_match
+            and rootfs_google_match
             and image_labels_match is True
             and container_labels_match is True
             and command_match is True
@@ -3657,6 +6036,24 @@ class RuntimeManager:
                 "desiredImageSha256": desired_image_id or None,
                 "containerImageSha256": container_image_id or None,
                 "rootfsSourceImageSha256": rootfs_source_id or None,
+                "desiredInputSha256": (
+                    desired_runtime.get("inputSha256")
+                    if desired_runtime is not None
+                    else None
+                ),
+                "desiredBootInputSha256": (
+                    desired_runtime.get("bootInputSha256")
+                    if desired_runtime is not None
+                    else None
+                ),
+                "containerInputSha256": container_identity.get(
+                    "containerInputSha256"
+                ),
+                "containerBootInputSha256": container_identity.get(
+                    "containerBootInputSha256"
+                ),
+                "imageMatch": container_identity.get("match"),
+                "rootfsBootInputMatches": rootfs_runtime_match,
                 "labelsMatch": (
                     image_labels_match is True
                     and container_labels_match is True
@@ -3672,7 +6069,1496 @@ class RuntimeManager:
             "nextActions": next_actions,
         }
 
+    def _observe_artifact_records(
+        self,
+    ) -> tuple[list[str], list[dict[str, Any]], Optional[ArtifactSnapshot]]:
+        builder = object.__new__(ArtifactBuilder)
+        builder.project_root = self.context.project_root.resolve()
+        builder.catalog = TARGETS
+        builder._requested_environment = dict(os.environ)
+        builder._deadline = time.monotonic() + 60.0
+        builder._cancelled = None
+        builder._internal_cancel = threading.Event()
+        builder._file_digest_cache = {}
+        builder._version_digest_cache = {}
+        builder._tool_identity_cache = {}
+        records: list[ArtifactRecord] = []
+        stale: list[str] = []
+        public: list[dict[str, Any]] = []
+        cache = (
+            self.context.project_root
+            / ".xenoid"
+            / "cache"
+            / "artifacts"
+        )
+        for name in _CONVERGENCE_ARTIFACT_TARGETS:
+            target = TARGETS[name]
+            record_path = cache / "v1" / f"{name}.json"
+            try:
+                info = record_path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > 1024 * 1024
+                ):
+                    raise OSError
+                raw = json.loads(record_path.read_text(encoding="ascii"))
+                if set(raw) != {
+                    "schema",
+                    "target",
+                    "inputSha256",
+                    "toolSha256",
+                    "outputs",
+                    "completedAt",
+                } or raw.get("target") != name:
+                    raise ValueError
+                input_sha, tool_sha = builder._identity(target)
+                if (
+                    raw.get("schema") != "dev.xenoid.artifact/v1"
+                    or raw.get("inputSha256") != input_sha
+                    or raw.get("toolSha256") != tool_sha
+                    or not isinstance(raw.get("outputs"), list)
+                ):
+                    raise ValueError
+                outputs: list[ArtifactOutput] = []
+                sanitized_outputs: list[dict[str, Any]] = []
+                for output in raw["outputs"]:
+                    if not isinstance(output, Mapping):
+                        raise ValueError
+                    digest = output.get("sha256")
+                    size = output.get("size")
+                    mode_value = output.get("mode")
+                    if (
+                        not isinstance(digest, str)
+                        or _SHA256_PATTERN.fullmatch(digest) is None
+                        or not isinstance(size, int)
+                        or isinstance(size, bool)
+                        or not isinstance(mode_value, str)
+                        or re.fullmatch(r"0[0-7]{3}", mode_value) is None
+                    ):
+                        raise ValueError
+                    object_path = cache / "objects" / "sha256" / digest
+                    object_info = object_path.lstat()
+                    if (
+                        not stat.S_ISREG(object_info.st_mode)
+                        or stat.S_ISLNK(object_info.st_mode)
+                        or object_info.st_uid != os.getuid()
+                        or object_info.st_nlink != 1
+                        or stat.S_IMODE(object_info.st_mode) != 0o600
+                        or object_info.st_size != size
+                        or hashlib.sha256(object_path.read_bytes()).hexdigest()
+                        != digest
+                    ):
+                        raise OSError
+                    artifact_output = ArtifactOutput(
+                        str(output["path"]),
+                        int(mode_value, 8),
+                        size,
+                        digest,
+                    )
+                    outputs.append(artifact_output)
+                    sanitized_outputs.append(artifact_output.as_dict())
+                record = ArtifactRecord(
+                    name,
+                    input_sha,
+                    tool_sha,
+                    tuple(outputs),
+                    str(raw["completedAt"]),
+                )
+                records.append(record)
+                public.append(
+                    {
+                        "schema": "dev.xenoid.artifact/v1",
+                        "target": name,
+                        "inputSha256": input_sha,
+                        "toolSha256": tool_sha,
+                        "outputs": sanitized_outputs,
+                    }
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                stale.append(name)
+        snapshot = (
+            ArtifactSnapshot(
+                tuple(record.target for record in records),
+                tuple(records),
+                hashlib.sha256(
+                    json.dumps(
+                        [
+                            {
+                                "target": record.target,
+                                "inputSha256": record.input_sha256,
+                                "toolSha256": record.tool_sha256,
+                                "outputs": [
+                                    output.as_dict()
+                                    for output in record.outputs
+                                ],
+                            }
+                            for record in records
+                        ],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                ).hexdigest(),
+            )
+            if not stale
+            else None
+        )
+        return stale, public, snapshot
+
+    def _observe_desired_runtime_image(
+        self,
+        snapshot: Optional[ArtifactSnapshot],
+        *,
+        selected_input_sha256: Optional[str] = None,
+    ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], Optional[str]]:
+        if snapshot is None:
+            return None, None, "artifact_record_unavailable"
+
+        builder = object.__new__(RuntimeImageBuilder)
+        builder.project_root = self.context.project_root.resolve()
+        builder.docker_argv = tuple(self.docker_base_cmd())
+        builder.docker_env = self.docker_env()
+        builder.artifact_builder = ArtifactBuilder(self.context.project_root)
+        builder._runner = self._run_runtime_image_command
+        builder._engine_lock = self._runtime_image_engine_lock
+        builder._cache_root = (
+            self.context.project_root / ".xenoid" / "cache" / "runtime-images"
+        )
+        builder._local_lock_root = (
+            self.context.project_root / ".xenoid" / "locks" / "runtime-images"
+        )
+        try:
+            spec = self.google_runtime_spec(
+                "convergence-observe",
+                require_assets=False,
+            )
+            desired = builder.input_record(
+                validate_image_reference(self.base_image_for_build()),
+                configured_tag=validate_image_reference(
+                    self.cfg.runtime_image_tag,
+                    require_tag=True,
+                    allow_digest=False,
+                ),
+                google_spec=spec,
+            )
+            selected = builder.lookup(
+                selected_input_sha256 or str(desired["inputSha256"])
+            )
+            if selected is not None:
+                image, inspected = self._inspect_docker_object(
+                    "image",
+                    str(selected["derivedTag"]),
+                )
+                if (
+                    inspected.returncode != 0
+                    or not isinstance(image, Mapping)
+                    or image.get("Id") != selected.get("imageId")
+                ):
+                    selected = None
+            return desired, selected, None
+        except Exception as exc:
+            return (
+                None,
+                None,
+                str(getattr(exc, "code", "runtime_image_input_unavailable")),
+            )
+
+    def _observe_pending_operations(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "convergence": None,
+            "regeneration": None,
+        }
+        for key, path in (
+            ("convergence", self.context.state_root / "convergence-v1.json"),
+            (
+                "regeneration",
+                RegenerationJournal(self.context).path,
+            ),
+        ):
+            try:
+                info = path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > 256 * 1024
+                ):
+                    raise OSError
+                raw = json.loads(path.read_text(encoding="ascii"))
+                result[key] = {
+                    "schema": raw.get("schema"),
+                    "phase": raw.get("phase"),
+                    "operationId": raw.get("operationId")
+                    or raw.get("transactionId"),
+                }
+            except FileNotFoundError:
+                pass
+            except (OSError, UnicodeError, ValueError):
+                result[key] = {"error": f"{key}_journal_invalid"}
+        if result["regeneration"] is None:
+            legacy_path = self.context.state_root / "device-regenerate.json"
+            try:
+                info = legacy_path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                ):
+                    raise OSError
+                raw = json.loads(legacy_path.read_text(encoding="ascii"))
+                if (
+                    not isinstance(raw, Mapping)
+                    or set(raw) != {"schema", "instanceId", "startedAt"}
+                    or raw.get("schema") != "dev.xenoid.device-regenerate/v1"
+                    or raw.get("instanceId") != self.context.instance_id
+                ):
+                    raise ValueError
+                result["regeneration"] = {
+                    "schema": raw["schema"],
+                    "phase": "legacy_pending",
+                    "operationId": None,
+                }
+            except FileNotFoundError:
+                pass
+            except (OSError, UnicodeError, ValueError):
+                result["regeneration"] = {
+                    "error": "regeneration_journal_invalid"
+                }
+        return result
+
+    def observe_convergence_inputs(self) -> dict[str, Any]:
+        """Return only immutable source/artifact/image input identities."""
+        self.ensure_instance_lease()
+        artifact_targets, artifact_records, artifact_snapshot = (
+            self._observe_artifact_records()
+        )
+        desired_image, _selected_image, _image_error = (
+            self._observe_desired_runtime_image(artifact_snapshot)
+        )
+        return {
+            "artifactTargets": artifact_targets,
+            "artifactRecords": artifact_records,
+            "desiredImageInputSha256": (
+                desired_image.get("inputSha256")
+                if isinstance(desired_image, Mapping)
+                else None
+            ),
+            "desiredImageBootInputSha256": (
+                desired_image.get("bootInputSha256")
+                if isinstance(desired_image, Mapping)
+                else None
+            ),
+        }
+
+
+    def observe_convergence(self, skip_build: bool = False) -> dict[str, Any]:
+        """Return the single read-only snapshot consumed by the planner."""
+        self.ensure_instance_lease()
+        artifact_targets, artifact_records, artifact_snapshot = (
+            self._observe_artifact_records()
+        )
+        storage = self.storage_status()
+        try:
+            storage_state = StorageStateStore(self.context, self.lease).load()
+        except StorageError:
+            storage_state = None
+        data_uuid, rootfs_uuid = self._committed_storage_uuids(storage_state)
+        if data_uuid is None and isinstance(storage.get("filesystemUuid"), str):
+            data_uuid = str(storage["filesystemUuid"])
+        observed_rootfs = storage.get("rootfsImage")
+        if (
+            rootfs_uuid is None
+            and isinstance(observed_rootfs, Mapping)
+            and isinstance(observed_rootfs.get("filesystemUuid"), str)
+        ):
+            rootfs_uuid = str(observed_rootfs["filesystemUuid"])
+        container, container_error = self._owned_container_record()
+        ownership_valid = (
+            container is not None
+            or container_error == "instance container does not exist"
+        )
+        state = "absent"
+        container_id: Optional[str] = None
+        image_id: Optional[str] = None
+        image_input: Optional[str] = None
+        image_boot: Optional[str] = None
+        create_spec: Optional[bool] = None
+        integration_valid = True
+        if container is not None:
+            container_id = str(container.get("Id") or "") or None
+            image_id = str(container.get("Image") or "") or None
+            runtime_state = container.get("State")
+            state = (
+                "running"
+                if isinstance(runtime_state, Mapping)
+                and runtime_state.get("Running") is True
+                else "stopped"
+            )
+            create_spec = self._container_matches_lease(
+                container,
+                image_identity={"ok": True},
+            )
+            config = container.get("Config")
+            labels = config.get("Labels") if isinstance(config, Mapping) else None
+            integration_valid = self._managed_container_labels_match(labels)
+            current_image, _ = self._inspect_docker_object(
+                "image",
+                str(container.get("Image") or ""),
+            )
+            current_config = (
+                current_image.get("Config")
+                if isinstance(current_image, Mapping)
+                else None
+            )
+            current_labels = (
+                current_config.get("Labels")
+                if isinstance(current_config, Mapping)
+                else None
+            )
+            if isinstance(current_labels, Mapping):
+                value = current_labels.get(_RUNTIME_INPUT_LABEL)
+                image_input = value if isinstance(value, str) else None
+                value = current_labels.get(_RUNTIME_BOOT_INPUT_LABEL)
+                image_boot = value if isinstance(value, str) else None
+        elif container_error != "instance container does not exist":
+            ownership_valid = False
+            integration_valid = False
+        desired_image, selected_image, image_error = (
+            self._observe_desired_runtime_image(
+                artifact_snapshot,
+                selected_input_sha256=image_input,
+            )
+        )
+        network, _ = self._inspect_docker_object(
+            "network",
+            self.lease.network_name,
+        )
+        volume, _ = self._inspect_docker_object(
+            "volume",
+            self.lease.volume_name,
+        )
+        network_matches = (
+            None if network is None else bool(network and self._network_matches_lease(network))
+        )
+        volume_matches = (
+            None if volume is None else bool(volume and self._volume_matches_lease(volume))
+        )
+        identity = self.device_identity_status()
+        identity_state = (
+            "unknown"
+            if identity.get("initialized") is not True
+            else "pending"
+            if identity.get("phase") not in {None, "applied"}
+            else "matching"
+        )
+        try:
+            from .location import (
+                LocationStateStore,
+                location_runtime_epoch,
+                public_summary,
+            )
+
+            location_host = public_summary(
+                LocationStateStore(self.context.state_root).load()
+            )
+            location_state = (
+                "pending"
+                if isinstance(location_host.get("pending"), Mapping)
+                else "matching"
+                if location_host.get("state") == "active"
+                else "unknown"
+            )
+        except Exception:
+            location_host = {"state": "invalid"}
+            location_state = "incompatible"
+        google = self.google_services_status(require_runtime=False)
+        protection = self.observe_shared_protection()
+        protection_error = protection.get("error")
+        protection_state = (
+            "matching"
+            if protection.get("ok") is True
+            else "incompatible"
+            if protection_error
+            in {
+                "shared_protection_engine_unavailable",
+                "shared_protection_ownership_ambiguous",
+                "shared_protection_status_failed",
+            }
+            else "maintenance"
+            if protection.get("maintenanceRequired") is True
+            else "drift"
+        )
+        daemon_component: dict[str, Any] = {"state": "unknown"}
+        deploy_components: dict[str, Any] = {
+            name: {"state": "unknown"}
+            for name in _CONVERGENCE_REMOTE_ARTIFACTS
+        }
+        bootstrap: Optional[dict[str, Any]] = None
+        proxy_engine: Optional[dict[str, Any]] = None
+        proxy_desired: Optional[dict[str, Any]] = None
+        location_runtime_status: Optional[dict[str, Any]] = None
+        adb_observation: dict[str, Any] = {"ok": False, "skipped": True}
+        boot_observation: dict[str, Any] = {"ok": False, "skipped": True}
+        sentinel: dict[str, Any] = {"ok": False, "skipped": True}
+        if state == "running":
+            adb_observation = (
+                self.adb(["get-state"])
+                if which("adb") is not None
+                else {"ok": False, "error": "adb not found"}
+            )
+            boot_observation = self.docker_exec(
+                ["getprop", "sys.boot_completed"],
+                timeout=10,
+            )
+            desired_daemon = next(
+                (
+                    output["sha256"]
+                    for record in artifact_records
+                    if record.get("target") == "daemon"
+                    for output in record.get("outputs", [])
+                ),
+                None,
+            )
+            installed_daemon = self._installed_daemon_apk_identity()
+            daemon_component = {
+                "state": (
+                    "matching"
+                    if desired_daemon is not None
+                    and installed_daemon.get("sha256") == desired_daemon
+                    else "drift"
+                    if installed_daemon.get("state") in {"installed", "absent"}
+                    else "unknown"
+                ),
+                "desiredSha256": desired_daemon,
+                "installedSha256": installed_daemon.get("sha256"),
+            }
+            desired_by_target = {
+                record["target"]: {
+                    output["path"]: output
+                    for output in record.get("outputs", [])
+                }
+                for record in artifact_records
+            }
+            for name, (output_path, remote_path, mode) in (
+                _CONVERGENCE_REMOTE_ARTIFACTS.items()
+            ):
+                desired_output = desired_by_target.get(name, {}).get(output_path)
+                observed = self._remote_file_identity(
+                    remote_path,
+                    require_arm64_elf=True,
+                )
+                deploy_components[name] = {
+                    "state": (
+                        "matching"
+                        if isinstance(desired_output, Mapping)
+                        and observed.get("sha256") == desired_output.get("sha256")
+                        and observed.get("mode") == mode
+                        and observed.get("architecture") == "arm64"
+                        else "drift"
+                        if isinstance(desired_output, Mapping)
+                        else "unknown"
+                    ),
+                    "desiredSha256": (
+                        desired_output.get("sha256")
+                        if isinstance(desired_output, Mapping)
+                        else None
+                    ),
+                    "installedSha256": observed.get("sha256"),
+                }
+            try:
+                client = self.daemon_client(timeout=3.0)
+                bootstrap = client.bootstrap_status(timeout=3.0)
+                desired_status = client.proxy_status(timeout=3.0)
+                if (
+                    desired_status.get("ok") is True
+                    and desired_status.get("stateReadable") is not False
+                ):
+                    proxy_desired = desired_status
+                direct_location = client.location_status(timeout=3.0)
+                if direct_location.get("ok") is True:
+                    location_runtime_status = direct_location
+                if bootstrap.get("state") in {"ready", "degraded", "failed"}:
+                    sentinel = self.data_sentinel(create=False)
+            except Exception:
+                bootstrap = None
+            try:
+                proxy_engine = self._proxy_root_json("status")
+            except Exception:
+                proxy_engine = None
+        components = (
+            bootstrap.get("components")
+            if isinstance(bootstrap, Mapping)
+            and isinstance(bootstrap.get("components"), Mapping)
+            else {}
+        )
+        if state == "running" and location_state == "matching":
+            location_daemon = (
+                components.get("location")
+                if isinstance(components.get("location"), Mapping)
+                else None
+            )
+            location_active = (
+                location_host.get("active")
+                if isinstance(location_host.get("active"), Mapping)
+                else None
+            )
+            expected_location_epoch = (
+                location_runtime_epoch(container_id)
+                if isinstance(container_id, str)
+                else None
+            )
+            if (
+                not isinstance(location_daemon, Mapping)
+                or not isinstance(location_runtime_status, Mapping)
+                or not isinstance(location_active, Mapping)
+                or location_daemon.get("ok") is not True
+                or location_daemon.get("state") != "ready"
+                or location_daemon.get("configured") is not True
+                or location_runtime_status.get("state") != "active"
+                or location_runtime_status.get("profileDigest")
+                != location_active.get("profileDigest")
+                or not isinstance(expected_location_epoch, str)
+                or location_runtime_status.get("runtimeEpoch")
+                != expected_location_epoch
+                or location_active.get("lastValidatedRuntimeEpoch")
+                != expected_location_epoch
+            ):
+                location_state = "drift"
+        proxy_daemon = (
+            components.get("proxy")
+            if isinstance(components.get("proxy"), Mapping)
+            else None
+        )
+        proxy_generation = (
+            proxy_desired.get("generation")
+            if isinstance(proxy_desired, Mapping)
+            and isinstance(proxy_desired.get("generation"), int)
+            and not isinstance(proxy_desired.get("generation"), bool)
+            else proxy_daemon.get("generation")
+            if isinstance(proxy_daemon, Mapping)
+            and isinstance(proxy_daemon.get("generation"), int)
+            else proxy_engine.get("generation")
+            if isinstance(proxy_engine, Mapping)
+            and isinstance(proxy_engine.get("generation"), int)
+            else None
+        )
+        proxy_state = (
+            "matching"
+            if isinstance(proxy_engine, Mapping)
+            and proxy_engine.get("ok") is True
+            and (
+                proxy_engine.get("dataPlaneVerified") is True
+                or proxy_engine.get("phase") in {"off", "disabled"}
+            )
+            else "pending"
+            if isinstance(proxy_daemon, Mapping)
+            else "unknown"
+        )
+        pending = self._observe_pending_operations()
+        return {
+            "schema": "dev.xenoid.convergence-observation/v1",
+            "instanceId": self.context.instance_id,
+            "skipBuild": bool(skip_build),
+            "artifactTargets": artifact_targets,
+            "artifactRecords": artifact_records,
+            "desiredImageInputSha256": (
+                desired_image.get("inputSha256")
+                if isinstance(desired_image, Mapping)
+                else None
+            ),
+            "desiredImageBootInputSha256": (
+                desired_image.get("bootInputSha256")
+                if isinstance(desired_image, Mapping)
+                else None
+            ),
+            "selectedImageRecord": selected_image,
+            "imageError": image_error,
+            "runtime": {
+                "state": state,
+                "containerId": container_id,
+                "imageId": image_id,
+                "ownershipValid": ownership_valid,
+                "integrationIdentityValid": integration_valid,
+                "storageValid": (
+                    storage.get("ok") is True
+                    or state == "absent"
+                    and storage.get("error") == "storage_not_initialized"
+                ),
+                "storageMigrationRequired": storage.get("migrationRequired") is True,
+                "createSpecMatches": create_spec,
+                "networkMatches": network_matches,
+                "volumeMatches": volume_matches,
+                "imageInputSha256": image_input,
+                "imageBootInputSha256": image_boot,
+                "dataUuid": data_uuid,
+                "rootfsUuid": rootfs_uuid,
+                "bootSeedRequired": identity.get("initialized") is not True,
+                "adb": adb_observation,
+                "boot": boot_observation,
+                "storageSentinel": sentinel,
+            },
+            "components": {
+                "daemon": daemon_component,
+                "deploy": deploy_components,
+                "identity": {
+                    "state": identity_state,
+                    "containerEpoch": identity.get("containerEpoch"),
+                    "phase": identity.get("phase"),
+                    "status": identity,
+                },
+                "location": {
+                    "state": location_state,
+                    "host": location_host,
+                    "daemon": components.get("location"),
+                },
+                "proxy": {
+                    "state": proxy_state,
+                    "generation": proxy_generation,
+                    "enabled": (
+                        proxy_desired.get("enabled")
+                        if isinstance(proxy_desired, Mapping)
+                        and isinstance(proxy_desired.get("enabled"), bool)
+                        else None
+                    ),
+                    "quarantineRequired": (
+                        False
+                        if state == "absent"
+                        else proxy_state != "matching"
+                    ),
+                    "daemon": proxy_daemon,
+                    "engine": proxy_engine,
+                },
+                "keybox": {
+                    "state": (
+                        "matching"
+                        if isinstance(components.get("keybox"), Mapping)
+                        and components["keybox"].get("ok") is True
+                        else "drift"
+                        if isinstance(components.get("keybox"), Mapping)
+                        else "unknown"
+                    ),
+                    "status": components.get("keybox"),
+                },
+                "camera": {
+                    "state": (
+                        "matching"
+                        if isinstance(components.get("camera"), Mapping)
+                        and components["camera"].get("ok") is True
+                        else "drift"
+                        if isinstance(components.get("camera"), Mapping)
+                        else "unknown"
+                    ),
+                    "status": components.get("camera"),
+                },
+                "google": {
+                    "state": "matching" if google.get("ready") is True else "drift",
+                    "bindingReady": google.get("ready"),
+                    "status": google,
+                },
+                "protection": {
+                    "state": protection_state,
+                    "expectedDigest": protection.get("expectedDigest"),
+                    "currentDigest": protection.get("currentDigest"),
+                    "replacementRequired": protection.get("replacementRequired"),
+                    "maintenanceRequired": protection.get("maintenanceRequired"),
+                    "siblingRuntimeActive": protection.get("siblingRuntimeActive"),
+                    "error": protection_error,
+                    "observed": protection,
+                },
+            },
+            "acceptanceChecks": list(_CONVERGENCE_ACCEPTANCE_CHECKS),
+            "pending": pending,
+            "lease": {
+                "state": self.lease.state,
+                "transactionId": self.lease.transaction_id,
+                "resourceTag": self.lease.resource_tag,
+            },
+            "storage": storage,
+            "legacyTokenMigrationPending": self.legacy_token_migration_pending(),
+        }
+
+    def acceptance_context(self) -> dict[str, Any]:
+        observation = self.observe_convergence(skip_build=True)
+        runtime = observation["runtime"]
+        proxy = observation["components"]["proxy"]
+        protection = observation["components"]["protection"]
+        return {
+            "manager": self,
+            "context": self.context,
+            "observation": observation,
+            "expected": {
+                "containerId": runtime.get("containerId"),
+                "imageId": runtime.get("imageId"),
+                "dataUuid": runtime.get("dataUuid"),
+                "rootfsUuid": runtime.get("rootfsUuid"),
+                "imageInputSha256": runtime.get("imageInputSha256"),
+                "imageBootInputSha256": runtime.get("imageBootInputSha256"),
+                "proxyGeneration": proxy.get("generation"),
+                "protectionDigest": protection.get("expectedDigest"),
+            },
+        }
+
+    @staticmethod
+    def _regeneration_digest(value: Mapping[str, Any]) -> str:
+        payload = json.dumps(
+            dict(value),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _offline_proxy_identity(self) -> tuple[bool, int]:
+        volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
+        mountpoint = volume.get("Mountpoint") if isinstance(volume, Mapping) else None
+        if not isinstance(mountpoint, str) or not mountpoint.startswith("/"):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "offline proxy storage is unavailable",
+            )
+        image = f"{mountpoint.rstrip('/')}/{DATA_IMAGE_NAME}"
+        def read_private(relative: str) -> Optional[tuple[dict[str, Any], bytes, int]]:
+            request = relative.lstrip("/")
+            metadata = self._engine_host_shell(
+                "debugfs -R "
+                + shlex.quote(f"stat {request}")
+                + " "
+                + shlex.quote(image)
+                + " 2>/dev/null"
+            )
+            if metadata.returncode != 0:
+                return None
+            text = str(metadata.stdout or "")
+            mode = re.search(r"Mode:\s*0*([0-7]{3,4})", text)
+            links = re.search(r"Links:\s*(\d+)", text)
+            owner = re.search(r"User:\s*(\d+)", text)
+            size = re.search(r"Size:\s*(\d+)", text)
+            if (
+                "Type: regular" not in text
+                or mode is None
+                or int(mode.group(1), 8) != 0o600
+                or links is None
+                or int(links.group(1)) != 1
+                or owner is None
+                or int(owner.group(1)) < 10_000
+                or size is None
+                or not 0 < int(size.group(1)) <= 16 * 1024 * 1024
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 metadata is unsafe",
+                )
+            content = self._engine_host_shell(
+                "debugfs -R "
+                + shlex.quote(f"cat {request}")
+                + " "
+                + shlex.quote(image)
+                + " 2>/dev/null"
+            )
+            raw = str(content.stdout or "").encode("utf-8")
+            if content.returncode != 0 or len(raw) != int(size.group(1)):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 object is unreadable",
+                )
+            try:
+                document = json.loads(raw)
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 object is invalid",
+                ) from exc
+            if not isinstance(document, dict):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 object is invalid",
+                )
+            return document, raw, int(owner.group(1))
+
+        for root in (
+            "/user/0/dev.xenoid.daemon/no_backup/proxy-state/v2",
+            "/data/dev.xenoid.daemon/no_backup/proxy-state/v2",
+        ):
+            active_record = read_private(f"{root}/active.json")
+            if active_record is None:
+                continue
+            active, _, owner = active_record
+            if set(active) != {"schemaVersion", "instanceId", "stateId", "keyId"}:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 pointer is invalid",
+                )
+            state_id = active.get("stateId")
+            key_id = active.get("keyId")
+            if (
+                active.get("schemaVersion") != 2
+                or active.get("instanceId") != self.context.instance_id
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 pointer identity is invalid",
+                )
+            if (
+                not isinstance(state_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", state_id) is None
+                or not isinstance(key_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", key_id) is None
+            ):
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "offline proxy v2 pointer requires authenticated recovery",
+                )
+            pending_check = self._engine_host_shell(
+                "debugfs -R "
+                + shlex.quote(f"stat {root.lstrip('/')}/pending.json")
+                + " "
+                + shlex.quote(image)
+                + " 2>/dev/null"
+            )
+            if pending_check.returncode == 0:
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "offline proxy v2 transaction is pending",
+                )
+            key_request = f"{root.lstrip('/')}/keys/{key_id}.key"
+            key_metadata = self._engine_host_shell(
+                "debugfs -R "
+                + shlex.quote(f"stat {key_request}")
+                + " "
+                + shlex.quote(image)
+                + " 2>/dev/null"
+            )
+            key_text = str(key_metadata.stdout or "")
+            if (
+                key_metadata.returncode != 0
+                or "Type: regular" not in key_text
+                or re.search(r"Mode:\s*0*600", key_text) is None
+                or re.search(r"Links:\s*1\b", key_text) is None
+                or re.search(rf"User:\s*{owner}\b", key_text) is None
+                or re.search(r"Size:\s*32\b", key_text) is None
+            ):
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "offline proxy v2 key requires authenticated recovery",
+                )
+            key_probe = self._engine_host_shell(
+                "set -eu; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; "
+                + "debugfs -R "
+                + shlex.quote(f"dump {key_request} $t")
+                + " "
+                + shlex.quote(image)
+                + " >/dev/null 2>&1; "
+                + "printf '%s %s\\n' \"$(stat -c %s -- \"$t\")\" "
+                + "\"$(sha256sum \"$t\" | cut -d' ' -f1)\""
+            )
+            key_fields = str(key_probe.stdout or "").strip().split()
+            if (
+                key_probe.returncode != 0
+                or key_fields != ["32", key_id]
+            ):
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "offline proxy v2 key requires authenticated recovery",
+                )
+            state_record = read_private(f"{root}/states/{state_id}.json")
+            if state_record is None or state_record[2] != owner:
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "offline proxy v2 state requires authenticated recovery",
+                )
+            envelope, raw, _ = state_record
+            generation = envelope.get("generation")
+            enabled = envelope.get("enabled")
+            if (
+                envelope.get("schemaVersion") == 2
+                and isinstance(envelope.get("instanceId"), str)
+                and envelope.get("instanceId") != self.context.instance_id
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 state identity is invalid",
+                )
+            if (
+                set(envelope) != {
+                    "schemaVersion", "instanceId", "generation", "enabled",
+                    "keyId", "sourceIv", "sourceCiphertext",
+                }
+                or envelope.get("schemaVersion") != 2
+                or envelope.get("instanceId") != self.context.instance_id
+                or envelope.get("keyId") != key_id
+                or hashlib.sha256(raw).hexdigest() != state_id
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+                or not isinstance(enabled, bool)
+            ):
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "offline proxy v2 state requires authenticated recovery",
+                )
+            if (
+                envelope.get("sourceIv") is not None
+                or envelope.get("sourceCiphertext") is not None
+                or enabled is not False
+            ):
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "offline configured proxy v2 requires authenticated decryption",
+                )
+            return enabled, generation
+        candidates = (
+            "/user/0/dev.xenoid.daemon/files/proxy-state/desired-v1.json",
+            "/data/dev.xenoid.daemon/files/proxy-state/desired-v1.json",
+        )
+        for relative in candidates:
+            request = relative.lstrip("/")
+            metadata = self._engine_host_shell(
+                "debugfs -R "
+                + shlex.quote(f"stat {request}")
+                + " "
+                + shlex.quote(image)
+                + " 2>/dev/null"
+            )
+            if metadata.returncode != 0:
+                continue
+            text = str(metadata.stdout or "")
+            mode = re.search(r"Mode:\s*0*([0-7]{3,4})", text)
+            links = re.search(r"Links:\s*(\d+)", text)
+            owner = re.search(r"User:\s*(\d+)", text)
+            size = re.search(r"Size:\s*(\d+)", text)
+            if (
+                "Type: regular" not in text
+                or mode is None
+                or int(mode.group(1), 8) != 0o600
+                or links is None
+                or int(links.group(1)) != 1
+                or owner is None
+                or int(owner.group(1)) < 10_000
+                or size is None
+                or not 0 < int(size.group(1)) <= 16 * 1024 * 1024
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy state metadata is unsafe",
+                )
+            content = self._engine_host_shell(
+                "debugfs -R "
+                + shlex.quote(f"cat {request}")
+                + " "
+                + shlex.quote(image)
+                + " 2>/dev/null"
+            )
+            raw = str(content.stdout or "")
+            if (
+                content.returncode != 0
+                or len(raw.encode("utf-8")) != int(size.group(1))
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy state is unreadable",
+                )
+            try:
+                document = json.loads(raw)
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy state is invalid",
+                ) from exc
+            if not isinstance(document, Mapping) or set(document) != {
+                "schemaVersion",
+                "instanceId",
+                "generation",
+                "enabled",
+                "sourceIv",
+                "sourceCiphertext",
+            }:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy state is invalid",
+                )
+            generation = document["generation"]
+            enabled = document["enabled"]
+            source_iv = document["sourceIv"]
+            source_ciphertext = document["sourceCiphertext"]
+            if (
+                document["schemaVersion"] != 1
+                or document["instanceId"] not in {
+                    None,
+                    self.context.instance_id,
+                }
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or not 0 <= generation < (1 << 63)
+                or not isinstance(enabled, bool)
+                or enabled
+                and (
+                    not isinstance(source_iv, str)
+                    or not isinstance(source_ciphertext, str)
+                    or not source_iv
+                    or not source_ciphertext
+                )
+                or not enabled
+                and ((source_iv is None) != (source_ciphertext is None))
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy state is invalid",
+                )
+            if source_iv is not None or source_ciphertext is not None:
+                raise IdentityError(
+                    "proxy_legacy_live_proof_required",
+                    "configured legacy proxy requires live key readability proof",
+                )
+            return enabled, generation
+        for root in (
+            "/user/0/dev.xenoid.daemon/no_backup/proxy-state/v2",
+            "/data/dev.xenoid.daemon/no_backup/proxy-state/v2",
+        ):
+            inspected = self._engine_host_shell(
+                "debugfs -R "
+                + shlex.quote(f"stat {root.lstrip('/')}")
+                + " "
+                + shlex.quote(image)
+                + " 2>/dev/null"
+            )
+            if inspected.returncode == 0:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline proxy v2 state requires exact pointer inspection",
+                )
+        try:
+            host_state_exists = self._proxy_remote_exists(
+                self._proxy_manifest_path
+            )
+        except Exception as exc:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "offline proxy host state is unreadable",
+            ) from exc
+        if host_state_exists:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "offline proxy host state exists without daemon state",
+            )
+        return False, 0
+
+
+    def regeneration_snapshot(
+        self,
+        *,
+        allow_absent: bool = False,
+    ) -> dict[str, Any]:
+        """Capture the complete immutable before-state for device regeneration."""
+        self.ensure_instance_lease()
+        container, error = self._owned_container_record()
+        absent = container is None and error == "instance container does not exist"
+        stopped = (
+            isinstance(container, Mapping)
+            and isinstance(container.get("State"), Mapping)
+            and container["State"].get("Running") is False
+        )
+        offline = allow_absent and (absent or stopped)
+        if offline:
+            runtime_epoch = "0" * 64
+            if stopped:
+                if not self._container_has_lease_owner(dict(container)):
+                    raise IdentityError(
+                        "device_regeneration_state_invalid",
+                        "stopped legacy runtime ownership is invalid",
+                    )
+                container_id = container.get("Id")
+                image_id = container.get("Image")
+            else:
+                container_id = "0" * 64
+                try:
+                    image_id = str(self.selected_runtime_image()["imageId"])
+                except Exception as exc:
+                    raise IdentityError(
+                        "device_regeneration_state_invalid",
+                        "selected runtime image is unavailable for legacy recovery",
+                    ) from exc
+            if (
+                not isinstance(container_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+                or not isinstance(image_id, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "offline legacy runtime identity is invalid",
+                )
+        else:
+            if not isinstance(container, Mapping):
+                raise IdentityError(
+                    "device_runtime_not_running",
+                    error or "owned runtime is unavailable",
+                )
+            runtime_state = container.get("State")
+            container_id = container.get("Id")
+            image_id = container.get("Image")
+            if (
+                not isinstance(runtime_state, Mapping)
+                or runtime_state.get("Running") is not True
+                or not isinstance(container_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+                or not isinstance(image_id, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+            ):
+                raise IdentityError(
+                    "device_runtime_not_running",
+                    "device regeneration requires one running owned runtime",
+                )
+        identity = DeviceIdentityStore(self.context).load()
+        storage = StorageStateStore(self.context, self.lease).load()
+        data_before_uuid = (
+            str(storage.get("filesystemUuid") or "")
+            if isinstance(storage, Mapping)
+            else ""
+        )
+        rootfs_before_uuid = (
+            str(storage.get("rootfsFilesystemUuid") or "")
+            if isinstance(storage, Mapping)
+            else ""
+        )
+        legacy_pending = bool(
+            allow_absent
+            and isinstance(storage, Mapping)
+            and storage.get("state") == "pending"
+            and storage.get("temporaryImage") == ""
+            and storage.get("rotationTargetUuid")
+        )
+        if (
+            allow_absent
+            and isinstance(storage, Mapping)
+            and (
+                storage.get("state") == "committed"
+                and not rootfs_before_uuid
+                or legacy_pending
+            )
+        ):
+            volume, _ = self._inspect_docker_object(
+                "volume",
+                self.lease.volume_name,
+            )
+            observed_data = (
+                self._inspect_volume_image(dict(volume))
+                if isinstance(volume, Mapping)
+                else {}
+            )
+            observed_rootfs = (
+                self._inspect_volume_image(
+                    dict(volume),
+                    image_name=ROOTFS_IMAGE_NAME,
+                )
+                if isinstance(volume, Mapping)
+                else {}
+            )
+            if (
+                observed_data.get("ok") is not True
+                or observed_rootfs.get("ok") is not True
+                or legacy_pending
+                and observed_data.get("filesystemUuid")
+                not in {
+                    storage.get("filesystemUuid"),
+                    storage.get("rotationTargetUuid"),
+                }
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "legacy storage transition is not an old-or-target state",
+                )
+            data_before_uuid = str(observed_data["filesystemUuid"])
+            rootfs_before_uuid = str(observed_rootfs["filesystemUuid"])
+        if (
+            identity is None
+            or storage is None
+            or storage.get("state") != "committed"
+            and not legacy_pending
+            or not data_before_uuid
+            or not rootfs_before_uuid
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "identity and dual-image storage must be valid before regeneration",
+            )
+        from .location import LocationStateStore
+
+        location = LocationStateStore(self.context.state_root).load()
+        if location is None and allow_absent:
+            location_sim_epoch = ""
+            location_record: Mapping[str, Any] = {
+                "profileDigest": "0" * 64,
+            }
+        else:
+            active_location = (
+                location.get("active")
+                if isinstance(location, Mapping)
+                else None
+            )
+            if not isinstance(location, Mapping) or not isinstance(
+                active_location,
+                Mapping,
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "location identity must be initialized before regeneration",
+                )
+            pending_location = location.get("pending")
+            location_record = (
+                pending_location
+                if allow_absent and isinstance(pending_location, Mapping)
+                else active_location
+            )
+            location_sim_epoch = str(location["simEpoch"])
+        if offline:
+            proxy_enabled, proxy_generation = self._offline_proxy_identity()
+            proxy = {
+                "enabled": proxy_enabled,
+                "generation": proxy_generation,
+            }
+        else:
+            try:
+                client = self.daemon_client(timeout=15.0)
+                bootstrap = client.bootstrap_status(timeout=15.0)
+                proxy = client.proxy_status(timeout=15.0)
+            except Exception as exc:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "daemon component state is unavailable for regeneration",
+                ) from exc
+            runtime_epoch = bootstrap.get("runtimeEpoch")
+            if (
+                bootstrap.get("ok") is not True
+                or not isinstance(runtime_epoch, str)
+                or re.fullmatch(r"[0-9a-f]{64}", runtime_epoch) is None
+                or proxy.get("ok") is not True
+            ):
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "daemon component state is unavailable for regeneration",
+                )
+        if (
+            not isinstance(proxy.get("enabled"), bool)
+            or isinstance(proxy.get("generation"), bool)
+            or not isinstance(proxy.get("generation"), int)
+            or proxy["generation"] < 0
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "proxy state is unavailable for regeneration",
+            )
+        try:
+            binding = GoogleBindingStore(self.context, self.lease).load()
+            if binding is None:
+                spec = resolve_google_runtime_spec(
+                    self.context,
+                    self.cfg,
+                    "status",
+                    require_assets=False,
+                )
+                binding_identity: Mapping[str, Any] = expected_binding_identity(spec)
+            else:
+                binding_identity = {
+                    key: binding[key]
+                    for key in (
+                        "provider",
+                        "release",
+                        "specSha256",
+                        "dataCompatibilitySha256",
+                    )
+                }
+        except GoogleServicesError as exc:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "Google binding state is unavailable for regeneration",
+            ) from exc
+        return {
+            "containerId": container_id,
+            "imageId": image_id,
+            "runtimeEpoch": runtime_epoch,
+            "stableDigest": stable_identity_digest(identity["stable"]),
+            "networkEpoch": self.lease.network_epoch,
+            "simEpoch": location_sim_epoch,
+            "dataFilesystemUuid": data_before_uuid,
+            "rootfsFilesystemUuid": rootfs_before_uuid,
+            "locationDigest": str(location_record["profileDigest"]),
+            "proxyEnabled": bool(proxy["enabled"]),
+            "proxyGeneration": int(proxy["generation"]),
+            "googleBindingDigest": self._regeneration_digest(binding_identity),
+        }
+
+    @staticmethod
+    def _google_marker_path(package: str, root: str, transaction_id: str) -> str:
+        base = "/data/user/0" if root == "ce" else "/data/user_de/0"
+        return f"{base}/{package}/.xenoid-regenerate-{transaction_id}"
+
+    def _require_google_wipe_capability(
+        self,
+        package: str,
+        transaction_id: str,
+        capability: Any,
+    ) -> dict[str, Any]:
+        if (
+            package not in GOOGLE_CLEAR_PACKAGES
+            or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "invalid Google wipe target",
+            )
+        state = RegenerationJournal(self.context).require_capability(capability)
+        if state["transactionId"] != transaction_id:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "Google wipe transaction does not match regeneration",
+            )
+        return state
+
+    def prepare_google_package_clear(
+        self,
+        package: str,
+        transaction_id: str,
+        capability: Any,
+    ) -> dict[str, Any]:
+        """Force-stop one allowlisted package and arm root-owned CE/DE markers."""
+        try:
+            self._require_google_wipe_capability(
+                package,
+                transaction_id,
+                capability,
+            )
+        except IdentityError as exc:
+            return exc.as_dict()
+        stopped = self.adb(
+            ["shell", "am", "force-stop", package],
+            timeout=30,
+        )
+        if stopped.get("ok") is not True:
+            return {"ok": False, "error": "google_package_force_stop_failed"}
+        clauses: list[str] = ["set -eu"]
+        for root in GOOGLE_MARKER_ROOTS:
+            marker = self._google_marker_path(package, root, transaction_id)
+            parent = marker.rsplit("/", 1)[0]
+            clauses.append(
+                "if [ -d "
+                + shlex.quote(parent)
+                + " ] && [ ! -L "
+                + shlex.quote(parent)
+                + " ]; then umask 077; : > "
+                + shlex.quote(marker)
+                + "; chown 0:0 "
+                + shlex.quote(marker)
+                + "; chmod 0600 "
+                + shlex.quote(marker)
+                + "; sync -f "
+                + shlex.quote(marker)
+                + "; sync -f "
+                + shlex.quote(parent)
+                + "; printf '%s\\n' "
+                + shlex.quote(root)
+                + "; fi"
+            )
+        try:
+            result = self.daemon_client(timeout=30.0).root_exec("; ".join(clauses))
+        except Exception:
+            return {"ok": False, "error": "google_marker_prepare_failed"}
+        roots = [
+            line.strip()
+            for line in str(result.get("stdout") or "").splitlines()
+            if line.strip()
+        ]
+        if result.get("ok") is not True or roots != [
+            root for root in GOOGLE_MARKER_ROOTS if root in roots
+        ]:
+            return {"ok": False, "error": "google_marker_prepare_failed"}
+        return {"ok": True, "roots": roots}
+
+    def google_package_markers(
+        self,
+        package: str,
+        transaction_id: str,
+        roots: list[str],
+        capability: Any,
+    ) -> dict[str, Any]:
+        """Observe only the exact root-owned markers recorded in the journal."""
+        try:
+            self._require_google_wipe_capability(
+                package,
+                transaction_id,
+                capability,
+            )
+        except IdentityError as exc:
+            return exc.as_dict()
+        if roots != [root for root in GOOGLE_MARKER_ROOTS if root in roots]:
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        clauses: list[str] = ["set -eu"]
+        for root in roots:
+            marker = self._google_marker_path(package, root, transaction_id)
+            clauses.append(
+                "if [ -e "
+                + shlex.quote(marker)
+                + " ]; then [ -f "
+                + shlex.quote(marker)
+                + " ] && [ ! -L "
+                + shlex.quote(marker)
+                + " ] && [ \"$(stat -c '%u:%g:%a' -- "
+                + shlex.quote(marker)
+                + ")\" = 0:0:600 ]; printf '%s\\n' "
+                + shlex.quote(root)
+                + "; fi"
+            )
+        try:
+            result = self.daemon_client(timeout=30.0).root_exec("; ".join(clauses))
+        except Exception:
+            return {"ok": False, "error": "google_marker_check_failed"}
+        present = [
+            line.strip()
+            for line in str(result.get("stdout") or "").splitlines()
+            if line.strip()
+        ]
+        if result.get("ok") is not True or present != [
+            root for root in roots if root in present
+        ]:
+            return {"ok": False, "error": "google_marker_check_failed"}
+        return {"ok": True, "present": present}
+
+    def clear_google_package(
+        self,
+        package: str,
+        transaction_id: str,
+        capability: Any,
+    ) -> dict[str, Any]:
+        try:
+            self._require_google_wipe_capability(
+                package,
+                transaction_id,
+                capability,
+            )
+        except IdentityError as exc:
+            return exc.as_dict()
+        stopped = self.adb(["shell", "am", "force-stop", package], timeout=30)
+        if stopped.get("ok") is not True:
+            return {"ok": False, "error": "google_package_force_stop_failed"}
+        cleared = self.adb(
+            ["shell", "pm", "clear", "--user", "0", package],
+            timeout=60,
+        )
+        if (
+            cleared.get("ok") is not True
+            or str(cleared.get("stdout") or "").strip() != "Success"
+        ):
+            return {"ok": False, "error": "google_package_clear_failed"}
+        return {"ok": True}
+
     def status(self) -> dict[str, Any]:
+        """Strictly observational status with one actionable recommendation."""
         self.ensure_instance_lease()
         selected = {
             **self.context.public_dict(),
@@ -3686,69 +7572,154 @@ class RuntimeManager:
                 "ok": False,
                 "error": "docker not found",
                 "instance": selected,
+                "recommendedAction": "resource-conflict",
+                "driftReasons": ["engine_unavailable"],
             }
-        storage = self.storage_status()
-        identity = self.device_identity_status()
-        google_services = self.google_services_status()
-        container, _ = self._inspect_docker_object(
-            "container",
-            self.lease.container_name,
+        observation = self.observe_convergence(skip_build=True)
+        runtime = observation["runtime"]
+        components = observation["components"]
+        pending = observation["pending"]
+        drift: list[str] = []
+        recommended = "no-op"
+        if isinstance(pending.get("regeneration"), Mapping):
+            recommended = (
+                "legacy-regeneration-recovery"
+                if pending["regeneration"].get("schema")
+                == "dev.xenoid.device-regenerate/v1"
+                else "resume"
+            )
+            drift.append("device_regeneration_pending")
+        elif isinstance(pending.get("convergence"), Mapping):
+            recommended = "resume"
+            drift.append("convergence_pending")
+        elif observation.get("legacyTokenMigrationPending") is True:
+            recommended = "resume"
+            drift.append("legacy_token_migration_pending")
+        elif runtime.get("ownershipValid") is not True and runtime.get("state") != "absent":
+            recommended = "resource-conflict"
+            drift.append("container_ownership_invalid")
+        elif runtime.get("storageValid") is not True:
+            recommended = "resource-conflict"
+            drift.append("storage_invalid")
+        elif observation.get("artifactTargets"):
+            recommended = "image-required"
+            drift.append("artifact_inputs_stale")
+        elif observation.get("selectedImageRecord") is None:
+            recommended = "image-required"
+            drift.append("runtime_image_unavailable")
+        elif runtime.get("state") == "absent":
+            recommended = "create"
+            drift.append("container_absent")
+        elif runtime.get("createSpecMatches") is not True:
+            recommended = "recreate"
+            drift.append("create_spec_mismatch")
+        elif runtime.get("imageBootInputSha256") != observation.get(
+            "desiredImageBootInputSha256"
+        ):
+            recommended = "recreate"
+            drift.append("boot_image_mismatch")
+        elif runtime.get("state") == "stopped":
+            recommended = "start"
+            drift.append("container_stopped")
+        elif components["daemon"].get("state") == "incompatible":
+            recommended = "daemon-incompatible"
+            drift.append("daemon_identity_incompatible")
+        elif components["daemon"].get("state") == "drift":
+            recommended = "daemon-only"
+            drift.append("daemon_apk_drift")
+        elif any(
+            isinstance(value, Mapping) and value.get("state") == "drift"
+            for value in components["deploy"].values()
+        ):
+            recommended = "helper-only"
+            drift.append("helper_digest_drift")
+        elif components["proxy"].get("state") in {"pending", "drift", "incompatible"}:
+            recommended = "proxy-recovery"
+            drift.append("proxy_not_converged")
+        elif components["protection"].get("state") != "matching":
+            recommended = "protection-maintenance"
+            drift.append("shared_protection_drift")
+        running = runtime.get("state") == "running"
+        valid_stopped = bool(
+            runtime.get("state") == "stopped"
+            and runtime.get("ownershipValid") is True
+            and runtime.get("storageValid") is True
+            and runtime.get("createSpecMatches") is True
         )
-        adb_stopped = {"ok": False, "error": "container not running"}
-        runtime_memory = self.runtime_memory_status(container)
-        if container is None:
-            return {
-                "ok": storage.get("ok") is True,
-                "running": False,
-                "rows": [],
-                "adb": adb_stopped,
-                "instance": selected,
-                "storage": storage,
-                "identity": identity,
-                "googleServices": google_services,
-                "runtimeMemory": runtime_memory,
+        ok = bool(
+            recommended
+            not in {
+                "resource-conflict",
+                "daemon-incompatible",
+                "legacy-regeneration-recovery",
             }
-        if not container or not self._container_has_lease_owner(container):
-            return {
-                "ok": False,
-                "error": "resource_conflict",
-                "message": "Docker container is not owned by this instance",
-                "instance": selected,
-                "storage": storage,
-                "identity": identity,
-                "googleServices": google_services,
-            }
-        state = container.get("State")
-        running = isinstance(state, dict) and state.get("Running") is True
-        proc = run(
-            [
-                *self.docker_base_cmd(),
-                "ps",
-                "--filter",
-                f"id={container['Id']}",
-                "--format",
-                "{{json .}}",
-            ],
-            env=self.docker_env(),
+            and (
+                running
+                or valid_stopped
+                or runtime.get("state") == "absent"
+                and runtime.get("storageValid") is True
+            )
         )
-        rows = [line for line in proc.stdout.splitlines() if line.strip()]
-        adb_state: dict[str, Any] = adb_stopped
-        if running and which("adb") is not None:
-            adb_state = self.adb(["get-state"])
-        spec_matches = self._container_matches_lease(container)
         return {
-            "ok": proc.returncode == 0
-            and storage.get("ok") is True
-            and runtime_memory.get("ok") is True,
+            "ok": ok,
             "running": running,
-            "runtimeSpecMatches": spec_matches,
-            "rows": rows,
-            "adb": adb_state,
+            "rows": [],
+            "adb": runtime.get("adb"),
             "instance": selected,
-            "storage": storage,
-            "identity": identity,
-            "googleServices": google_services,
-            "runtimeMemory": runtime_memory,
+            "runtimeIdentity": {
+                "instanceId": self.context.instance_id,
+                "containerId": runtime.get("containerId"),
+                "imageId": runtime.get("imageId"),
+                "dataUuid": runtime.get("dataUuid"),
+                "rootfsUuid": runtime.get("rootfsUuid"),
+                "runtimeEpoch": (
+                    components["proxy"].get("daemon", {}).get("runtimeEpoch")
+                    if isinstance(components["proxy"].get("daemon"), Mapping)
+                    else None
+                )
+                or (
+                    components["proxy"].get("engine", {}).get("runtimeEpoch")
+                    if isinstance(components["proxy"].get("engine"), Mapping)
+                    else None
+                ),
+                "protectionDigest": components["protection"].get("currentDigest"),
+            },
+            "storage": observation.get("storage"),
+            "identity": components["identity"].get("status"),
+            "googleServices": components["google"].get("status"),
+            "runtimeImage": observation.get("selectedImageRecord"),
+            "runtimeImageIdentity": {
+                "containerImageSha256": runtime.get("imageId"),
+                "containerInputSha256": runtime.get("imageInputSha256"),
+                "containerBootInputSha256": runtime.get("imageBootInputSha256"),
+                "desiredInputSha256": observation.get(
+                    "desiredImageInputSha256"
+                ),
+                "desiredBootInputSha256": observation.get(
+                    "desiredImageBootInputSha256"
+                ),
+            },
+            "containerContractMatches": runtime.get("createSpecMatches"),
+            "migrationPending": observation.get("legacyTokenMigrationPending") is True,
+            "recommendedAction": recommended,
+            "driftReasons": drift,
+            "pendingJournalPhase": (
+                pending["convergence"].get("phase")
+                if isinstance(pending.get("convergence"), Mapping)
+                else pending["regeneration"].get("phase")
+                if isinstance(pending.get("regeneration"), Mapping)
+                else None
+            ),
+            "pending": pending,
+            "cache": {
+                "artifactTargets": observation.get("artifactTargets"),
+                "artifactRecords": observation.get("artifactRecords"),
+                "selectedImageInputSha256": (
+                    observation.get("selectedImageRecord") or {}
+                ).get("inputSha256"),
+            },
+            "protection": components["protection"],
+            "observationSchema": observation.get("schema"),
         }
 
     def adb(self, args: list[str], timeout: Optional[float] = None) -> dict[str, Any]:
@@ -3880,12 +7851,15 @@ class RuntimeManager:
             "uidValue": uid_value,
         }
 
-    def forward_daemon_port(self) -> dict[str, Any]:
+    def forward_daemon_port(
+        self,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
         return self.adb([
             "forward",
             f"tcp:{self.lease.host_daemon_port}",
             f"tcp:{self.lease.android_daemon_port}",
-        ])
+        ], timeout=timeout)
 
     def _run_keybox_adb_stream(
         self,
@@ -4087,11 +8061,19 @@ class RuntimeManager:
             **({} if result.get("ok") else {"error": "camera permission grant failed"}),
         }
 
-    def launch_daemon_bootstrap(self) -> dict[str, Any]:
-        return self.adb([
+    def launch_daemon_activity_once(
+        self,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Request the non-exported service through its exported Activity once."""
+        launched = self.adb([
             "shell", "am", "start", "--user", "0", "-n",
             "dev.xenoid.daemon/.MainActivity", "--ez", "bootstrap", "true",
-        ])
+        ], timeout=timeout)
+        return {
+            "ok": bool(launched.get("ok")),
+            **({} if launched.get("ok") else {"error": "daemon_activity_launch_failed"}),
+        }
 
     def launch_camera_self_test(self, run_id: str) -> dict[str, Any]:
         if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", run_id) is None:
@@ -4106,103 +8088,813 @@ class RuntimeManager:
             **({} if result.get("ok") else {"error": "camera self-test launch failed"}),
         }
 
-    def ensure_rootd_root(self) -> dict[str, Any]:
-        """Start xenoid-rootd as uid=0 with this instance's control token."""
-        if which("docker") is None:
-            return {"ok": False, "skipped": True, "error": "docker not found"}
-        port = self.lease.rootd_port
-        abi = self.docker_exec(["getprop", "ro.product.cpu.abi"])
-        abi_s = str(abi.get("stdout", ""))
-        arch = "arm64" if ("arm64" in abi_s or "aarch64" in abi_s) else "x86_64"
-        root = self.context.project_root
-        candidate = root / "native" / "xenoid-rootd" / f"xenoid-rootd-{arch}"
-        if not candidate.exists():
-            alternate = root / "native" / "xenoid-rootd" / "xenoid-rootd-x86_64"
-            candidate = alternate if alternate.exists() else candidate
-        if not candidate.exists():
-            return {"ok": False, "skipped": True, "error": f"rootd binary not found for arch {arch}"}
+    def _rootd_output(
+        self,
+        args: list[str],
+        *,
+        timeout: float = 5,
+        limit: int = 4096,
+        deadline: Optional[float] = None,
+    ) -> Optional[str]:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            timeout = min(timeout, remaining)
+        result = self.docker_exec(args, timeout=timeout)
+        if result.get("ok") is not True:
+            return None
+        output = str(result.get("stdout", ""))
+        if len(output.encode("utf-8", "replace")) > limit:
+            return None
+        return output.strip()
 
-        token = ""
-        token_source = ""
-        daemon_token_path = "/data/data/dev.xenoid.daemon/files/daemon.token"
-        for _ in range(10):
-            live = self.docker_exec(["cat", daemon_token_path])
-            token = str(live.get("stdout", "")).strip() if live.get("ok") else ""
-            if token:
-                token_source = "daemon-private-file"
-                break
-            time.sleep(0.2)
-        host_token = self.context.state_root / "daemon.token"
-        if not token:
-            try:
-                token = host_token.read_text().strip() if host_token.exists() else ""
-            except OSError:
-                token = ""
-            token_source = "host-cache" if token else ""
-        if not token:
-            token = secrets.token_hex(16)
-            token_source = "generated"
+    def _rootd_stat(
+        self,
+        path: str,
+        *,
+        follow: bool = False,
+        deadline: Optional[float] = None,
+    ) -> Optional[tuple[int, int, int, int, int, int]]:
+        args = ["stat"]
+        if follow:
+            args.append("-L")
+        args.extend(["-c", "%d:%i:%u:%f:%h:%s", path])
+        output = self._rootd_output(args, limit=256, deadline=deadline)
+        if output is None:
+            return None
+        fields = output.split(":")
+        if len(fields) != 6:
+            return None
         try:
-            host_token.parent.mkdir(parents=True, exist_ok=True)
-            host_token.write_text(token + "\n")
-            host_token.chmod(0o600)
-            rootd_cache = self.context.state_root / "rootd.token"
-            rootd_cache.write_text(token + "\n")
-            rootd_cache.chmod(0o600)
-        except OSError as exc:
-            return {"ok": False, "error": f"cannot persist rootd token: {exc}"}
+            return (
+                int(fields[0]),
+                int(fields[1]),
+                int(fields[2]),
+                int(fields[3], 16),
+                int(fields[4]),
+                int(fields[5]),
+            )
+        except ValueError:
+            return None
 
-        push = self.adb(["push", str(candidate), "/data/local/tmp/xenoid-rootd"])
-        if not push.get("ok"):
-            return {
-                "ok": False,
-                "error": "ADB rootd deployment failed",
-                "stderr": push.get("stderr", ""),
-            }
-        prep = self.docker_exec([
-            "sh", "-c",
-            "chmod 755 /data/local/tmp/xenoid-rootd; "
-            "ln -sf /data/local/tmp/xenoid-rootd /data/local/tmp/.netd-helper; "
-            "rm -f /data/local/tmp/.xenoid-rootd.token; "
-            "pkill -x .netd-helper 2>/dev/null; true",
-        ], timeout=15)
-        container, ownership_error = self._owned_container_record()
-        if container is None:
-            return {
-                "ok": False,
-                "error": "resource_conflict",
-                "message": ownership_error,
-            }
-        launch = run([
-            *self.docker_base_cmd(), "exec", "-d", "-e", f"XENOID_ROOTD_TOKEN={token}",
-            container["Id"], "sh", "-c",
-            f"exec /data/local/tmp/.netd-helper {port} >/data/local/tmp/.netd-helper.log 2>&1",
-        ], env=self.docker_env())
-        time.sleep(1)
-        hexport = format(port, "04X")
-        listen = self.docker_exec(["sh", "-c", f"cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -i ':{hexport}' || true"])
-        uid = self.docker_exec(["sh", "-c", "for p in $(pidof .netd-helper 2>/dev/null); do grep '^Uid:' /proc/$p/status 2>/dev/null; done; true"])
-        listening = hexport.lower() in str(listen.get("stdout", "")).lower()
-        uid_s = str(uid.get("stdout", ""))
-        runs_root = "Uid:\t0\t" in uid_s or "Uid: 0 " in uid_s
-        ok = bool(prep.get("ok") and launch.returncode == 0 and listening and runs_root)
+    @staticmethod
+    def _proc_start_time(value: str) -> Optional[int]:
+        close = value.rfind(")")
+        if close < 0:
+            return None
+        fields = value[close + 1:].strip().split()
+        if len(fields) <= 19:
+            return None
+        try:
+            start_time = int(fields[19])
+        except ValueError:
+            return None
+        return start_time if start_time > 0 else None
+
+    def _rootd_remote_digest(
+        self,
+        path: str,
+        *,
+        deadline: Optional[float] = None,
+    ) -> Optional[str]:
+        output = self._rootd_output(
+            ["sha256sum", path],
+            limit=256,
+            deadline=deadline,
+        )
+        if output is None:
+            return None
+        digest = output.partition(" ")[0]
+        return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else None
+
+    def _rootd_port_inodes(
+        self,
+        *,
+        deadline: Optional[float] = None,
+    ) -> tuple[set[str], bool]:
+        expected_port = format(self.lease.rootd_port, "04X")
+        loopback = {
+            "0100007F",
+            "00000000000000000000000001000000",
+        }
+        inodes: set[str] = set()
+        conflict = False
+        for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            output = self._rootd_output(
+                ["cat", path],
+                limit=64 * 1024,
+                deadline=deadline,
+            )
+            if output is None:
+                continue
+            for line in output.splitlines()[1:]:
+                fields = line.split()
+                if len(fields) < 10 or fields[3] != "0A":
+                    continue
+                address, separator, port = fields[1].rpartition(":")
+                if not separator or port.upper() != expected_port:
+                    continue
+                if address.upper() not in loopback:
+                    conflict = True
+                    continue
+                inode = fields[9]
+                if inode.isdigit():
+                    inodes.add(inode)
+        if len(inodes) > 1:
+            conflict = True
+        return inodes, conflict
+
+    def _rootd_process_identity(
+        self,
+        pid: int,
+        *,
+        allowed_paths: frozenset[str],
+        deadline: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        if pid <= 1:
+            return None
+        process_stat = self._rootd_output(
+            ["cat", f"/proc/{pid}/stat"],
+            limit=4096,
+            deadline=deadline,
+        )
+        status = self._rootd_output(
+            ["cat", f"/proc/{pid}/status"],
+            limit=64 * 1024,
+            deadline=deadline,
+        )
+        executable = self._rootd_output(
+            ["readlink", f"/proc/{pid}/exe"],
+            limit=512,
+            deadline=deadline,
+        )
+        if process_stat is None or status is None or executable not in allowed_paths:
+            return None
+        start_time = self._proc_start_time(process_stat)
+        uid_line = next(
+            (line for line in status.splitlines() if line.startswith("Uid:")),
+            "",
+        )
+        uid_fields = uid_line.partition(":")[2].split()
+        if start_time is None or len(uid_fields) != 4 or any(
+            field != "0" for field in uid_fields
+        ):
+            return None
+        executable_stat = self._rootd_stat(
+            f"/proc/{pid}/exe",
+            follow=True,
+            deadline=deadline,
+        )
+        deployed_stat = self._rootd_stat(
+            executable,
+            follow=True,
+            deadline=deadline,
+        )
+        if (
+            executable_stat is None
+            or deployed_stat is None
+            or executable_stat[:2] != deployed_stat[:2]
+            or executable_stat[2] != 0
+            or not stat.S_ISREG(executable_stat[3])
+            or stat.S_IMODE(executable_stat[3]) != 0o755
+        ):
+            return None
+        digest = self._rootd_remote_digest(
+            f"/proc/{pid}/exe",
+            deadline=deadline,
+        )
+        deployed_digest = self._rootd_remote_digest(
+            executable,
+            deadline=deadline,
+        )
+        if digest is None or digest != deployed_digest:
+            return None
+        inodes, conflict = self._rootd_port_inodes(deadline=deadline)
+        descriptors = self._rootd_output(
+            ["ls", "-l", f"/proc/{pid}/fd"],
+            limit=64 * 1024,
+            deadline=deadline,
+        )
+        if conflict or len(inodes) != 1 or descriptors is None:
+            return None
+        inode = next(iter(inodes))
+        if f"socket:[{inode}]" not in descriptors:
+            return None
         return {
-            "ok": ok,
-            "arch": arch,
-            "port": port,
-            "listening": listening,
-            "runsAsRoot": runs_root,
-            "tokenProvisioned": True,
-            "tokenSource": token_source,
-            "prep": prep,
-            "launchRc": launch.returncode,
-            "listen": str(listen.get("stdout", "")).strip()[:120],
-            "uid": uid_s.strip()[:80],
+            "pid": pid,
+            "startTime": start_time,
+            "digest": digest,
+            "executable": executable,
         }
 
-    def daemon_client(self, timeout: float = 10.0) -> Any:
-        from .daemon_client import DaemonClient
+    def _rootd_owned_process(
+        self,
+        *,
+        deadline: Optional[float] = None,
+    ) -> tuple[Optional[dict[str, Any]], str]:
+        exists = self._rootd_output(
+            ["test", "-e", _ROOTD_PROCESS_RECORD],
+            deadline=deadline,
+        )
+        if exists is None:
+            return None, "absent"
+        directory = self._rootd_stat(
+            _ROOTD_RUN_DIRECTORY,
+            deadline=deadline,
+        )
+        record = self._rootd_stat(
+            _ROOTD_PROCESS_RECORD,
+            deadline=deadline,
+        )
+        if (
+            directory is None
+            or record is None
+            or directory[2] != 0
+            or not stat.S_ISDIR(directory[3])
+            or stat.S_IMODE(directory[3]) != 0o700
+            or record[2] != 0
+            or not stat.S_ISREG(record[3])
+            or stat.S_IMODE(record[3]) != 0o600
+            or record[4] != 1
+            or not 1 <= record[5] <= 256
+        ):
+            return None, "invalid"
+        raw = self._rootd_output(
+            ["cat", _ROOTD_PROCESS_RECORD],
+            limit=256,
+            deadline=deadline,
+        )
+        try:
+            document = json.loads(raw) if raw is not None else None
+        except json.JSONDecodeError:
+            document = None
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"schema", "pid", "startTime"}
+            or document.get("schema") != _ROOTD_PROCESS_SCHEMA
+            or not isinstance(document.get("pid"), int)
+            or isinstance(document.get("pid"), bool)
+            or not isinstance(document.get("startTime"), int)
+            or isinstance(document.get("startTime"), bool)
+            or document["pid"] <= 1
+            or document["startTime"] <= 0
+        ):
+            return None, "invalid"
+        current_stat = self._rootd_output(
+            ["cat", f"/proc/{document['pid']}/stat"],
+            limit=4096,
+            deadline=deadline,
+        )
+        if current_stat is None:
+            return None, "stale"
+        identity = self._rootd_process_identity(
+            document["pid"],
+            allowed_paths=frozenset({_ROOTD_REMOTE_PATH}),
+            deadline=deadline,
+        )
+        if (
+            identity is None
+            or identity["startTime"] != document["startTime"]
+        ):
+            return None, "invalid"
+        return identity, "valid"
 
+    def _rootd_authentication(
+        self,
+        client: DaemonClient,
+        *,
+        deadline: Optional[float] = None,
+    ) -> str:
+        timeout = (
+            None
+            if deadline is None
+            else max(0.0, min(5.0, deadline - time.monotonic()))
+        )
+        if timeout == 0.0:
+            return "rootd_unavailable"
+        status = client.root_status(timeout=timeout)
+        if (
+            isinstance(status, dict)
+            and status.get("ok") is True
+            and (
+                status.get("root") is True
+                or status.get("uid") == 0
+                or "uid=0" in str(status.get("stdout", ""))
+            )
+        ):
+            return "ok"
+        if isinstance(status, dict) and (
+            status.get("httpStatus") == 401
+            or status.get("error") in {"unauthorized", "rootd_unauthorized"}
+            or status.get("errorCode") == "rootd_unauthorized"
+        ):
+            return "rootd_unauthorized"
+        return "rootd_unavailable"
+
+    def _terminate_rootd_process(
+        self,
+        identity: Mapping[str, Any],
+        *,
+        deadline: float,
+    ) -> bool:
+        pid = identity.get("pid")
+        start_time = identity.get("startTime")
+        if not isinstance(pid, int) or not isinstance(start_time, int):
+            return False
+        current = self._rootd_output(
+            ["cat", f"/proc/{pid}/stat"],
+            limit=4096,
+            deadline=deadline,
+        )
+        if current is None or self._proc_start_time(current) != start_time:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        self.docker_exec(["kill", "-TERM", str(pid)], timeout=remaining)
+        term_deadline = min(deadline, time.monotonic() + 2.0)
+        while time.monotonic() < term_deadline:
+            current = self._rootd_output(
+                ["cat", f"/proc/{pid}/stat"],
+                limit=4096,
+                deadline=term_deadline,
+            )
+            if current is None:
+                return time.monotonic() < term_deadline
+            if self._proc_start_time(current) != start_time:
+                return False
+            time.sleep(min(0.1, max(0.0, term_deadline - time.monotonic())))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        self.docker_exec(["kill", "-KILL", str(pid)], timeout=remaining)
+        kill_deadline = min(deadline, time.monotonic() + 2.0)
+        while time.monotonic() < kill_deadline:
+            current = self._rootd_output(
+                ["cat", f"/proc/{pid}/stat"],
+                limit=4096,
+                deadline=kill_deadline,
+            )
+            if current is None:
+                return time.monotonic() < kill_deadline
+            if self._proc_start_time(current) != start_time:
+                return False
+            time.sleep(min(0.1, max(0.0, kill_deadline - time.monotonic())))
+        return False
+
+    def _rootd_engine_env(self) -> dict[str, str]:
+        environment = self.docker_env()
+        for name in tuple(environment):
+            normalized = name.upper()
+            if (
+                "TOKEN" in normalized
+                or "AUTHORIZATION" in normalized
+                or "COOKIE" in normalized
+            ):
+                environment.pop(name, None)
+        return environment
+
+    def _legacy_rootd_probe(self, token: str, *, deadline: float) -> bool:
+        remaining = deadline - time.monotonic()
+        container, _ = self._owned_container_record(
+            timeout=max(0.0, remaining),
+        )
+        container_id = container.get("Id") if isinstance(container, dict) else None
+        if (
+            remaining <= 0
+            or not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        ):
+            return False
+        request = bytearray(
+            (
+                "GET /exec?cmd=id%20-u HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                f"X-Xenoid-Token: {token}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+        )
+        process: Optional[subprocess.Popen[bytes]] = None
+        probe_timeout = min(5.0, max(0.0, deadline - time.monotonic()))
+        if probe_timeout <= 0:
+            for index in range(len(request)):
+                request[index] = 0
+            return False
+        try:
+            process = subprocess.Popen(
+                [
+                    *self.docker_base_cmd(),
+                    "exec",
+                    "-i",
+                    container_id,
+                    "/system/bin/toybox",
+                    "nc",
+                    "127.0.0.1",
+                    str(self.lease.rootd_port),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=self._rootd_engine_env(),
+                close_fds=True,
+            )
+            response, _ = process.communicate(
+                input=request,
+                timeout=bounded_timeout(probe_timeout),
+            )
+        except (OSError, subprocess.SubprocessError):
+            if process is not None:
+                try:
+                    process.kill()
+                    process.wait(timeout=1)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            return False
+        finally:
+            for index in range(len(request)):
+                request[index] = 0
+        if process.returncode != 0 or len(response) > 64 * 1024:
+            return False
+        header, separator, body = response.partition(b"\r\n\r\n")
+        if not separator or not header.startswith(b"HTTP/1.1 200 "):
+            return False
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return False
+        stdout = parsed.get("stdout") if isinstance(parsed, dict) else None
+        return (
+            isinstance(parsed, dict)
+            and parsed.get("ok") is True
+            and isinstance(stdout, str)
+            and stdout.strip() == "0"
+        )
+
+    def _adopt_legacy_rootd(
+        self,
+        token: str,
+        *,
+        deadline: float,
+    ) -> tuple[bool, bool]:
+        pids = self._rootd_output(
+            ["pidof", ".netd-helper"],
+            limit=256,
+            deadline=deadline,
+        )
+        if pids is None:
+            return False, False
+        values = pids.split()
+        if len(values) != 1 or not values[0].isdigit():
+            return False, True
+        identity = self._rootd_process_identity(
+            int(values[0]),
+            allowed_paths=frozenset({_ROOTD_REMOTE_PATH, _ROOTD_LEGACY_PATH}),
+            deadline=deadline,
+        )
+        predeploy_digest = self._rootd_remote_digest(
+            _ROOTD_REMOTE_PATH,
+            deadline=deadline,
+        )
+        if (
+            identity is None
+            or predeploy_digest is None
+            or identity["digest"] != predeploy_digest
+            or not self._legacy_rootd_probe(token, deadline=deadline)
+        ):
+            return False, True
+        return self._terminate_rootd_process(
+            identity,
+            deadline=deadline,
+        ), True
+
+    def _launch_rootd_with_token(
+        self,
+        container_id: str,
+        token: str,
+        timeout: float,
+    ) -> bool:
+        secret = bytearray(token.encode("ascii"))
+        secret.append(0x0A)
+        environment = self._rootd_engine_env()
+        process: Optional[subprocess.Popen[bytes]] = None
+        try:
+            process = subprocess.Popen(
+                [
+                    *self.docker_base_cmd(),
+                    "exec",
+                    "-i",
+                    container_id,
+                    _ROOTD_REMOTE_PATH,
+                    str(self.lease.rootd_port),
+                    _ROOTD_RUN_DIRECTORY,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+                close_fds=True,
+            )
+            if process.stdin is None:
+                return False
+            process.stdin.write(secret)
+            process.stdin.flush()
+            process.stdin.close()
+            return process.wait(timeout=bounded_timeout(timeout)) == 0
+        except (OSError, subprocess.SubprocessError):
+            if process is not None:
+                try:
+                    process.kill()
+                    process.wait(timeout=1)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            return False
+        finally:
+            for index in range(len(secret)):
+                secret[index] = 0
+
+    def _remove_legacy_android_rootd_token(
+        self,
+        expected_container_id: str,
+        *,
+        deadline: float,
+    ) -> bool:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        parent = self.docker_exec(
+            [
+                "sh",
+                "-c",
+                "test -d /data/local/tmp && "
+                "test ! -L /data/local/tmp && "
+                "stat -c '%u:%g:%a' /data/local/tmp",
+            ],
+            timeout=min(5.0, remaining),
+        )
+        parent_identity = str(
+            parent.get("stdout") or ""
+        ).strip()
+        if (
+            parent.get("ok") is not True
+            or parent_identity not in {"0:0:700", "2000:2000:771"}
+        ):
+            return False
+        remaining = deadline - time.monotonic()
+        removed = self.docker_exec(
+            ["rm", "-f", "--", "/data/local/tmp/.xenoid-rootd.token"],
+            timeout=min(5.0, max(0.001, remaining)),
+        )
+        if removed.get("ok") is not True:
+            return False
+        remaining = deadline - time.monotonic()
+        synced = self.docker_exec(
+            ["sync"],
+            timeout=min(5.0, max(0.001, remaining)),
+        )
+        if synced.get("ok") is not True:
+            return False
+        remaining = deadline - time.monotonic()
+        container, _ = self._owned_container_record(
+            timeout=max(0.001, min(5.0, remaining)),
+        )
+        return (
+            isinstance(container, Mapping)
+            and container.get("Id") == expected_container_id
+        )
+
+    def ensure_rootd_root(
+        self,
+        timeout: float = _ROOTD_PROVISION_TIMEOUT_SECONDS,
+        client: Optional[DaemonClient] = None,
+    ) -> dict[str, Any]:
+        """Provision only an owned native rootd using the daemon's private token."""
+        if which("docker") is None:
+            return {"ok": False, "code": "rootd_unavailable", "error": "rootd_unavailable"}
+        deadline = time.monotonic() + max(
+            0.0,
+            min(timeout, _ROOTD_PROVISION_TIMEOUT_SECONDS),
+        )
+        daemon_client = client or self.daemon_client(timeout=2.0)
+
+        def remaining(cap: float = _ROOTD_PROVISION_TIMEOUT_SECONDS) -> float:
+            return min(cap, max(0.0, deadline - time.monotonic()))
+
+        def failure(code: str) -> dict[str, Any]:
+            return {"ok": False, "code": code, "error": code}
+
+        try:
+            self.migrate_legacy_token_state()
+        except InstanceError:
+            return failure("legacy_token_state_invalid")
+        container, _ = self._owned_container_record(timeout=remaining(5.0))
+        container_id = (
+            container.get("Id") if isinstance(container, Mapping) else None
+        )
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        ):
+            return failure("rootd_resource_conflict")
+        if not self._remove_legacy_android_rootd_token(
+            container_id,
+            deadline=deadline,
+        ):
+            return failure(
+                "rootd_unavailable"
+                if remaining() <= 0
+                else "legacy_token_state_invalid"
+            )
+
+        token: Optional[str] = None
+        while remaining() > 0:
+            token = daemon_client.read_private_token(
+                force=True,
+                timeout=remaining(5.0),
+            )
+            if token is not None:
+                break
+            sleep_for = remaining(0.2)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+        if token is None:
+            return failure(
+                "rootd_unavailable"
+                if remaining() <= 0
+                else "daemon_token_unavailable"
+            )
+
+        abi = self._rootd_output(
+            ["getprop", "ro.product.cpu.abi"],
+            limit=128,
+            deadline=deadline,
+        )
+        if remaining() <= 0:
+            return failure("rootd_unavailable")
+        arch = "arm64" if abi and ("arm64" in abi or "aarch64" in abi) else "x86_64"
+        try:
+            candidate = self._artifact_output(
+                "liveDeploy",
+                f"native/xenoid-rootd/xenoid-rootd-{arch}",
+            )
+            candidate_state = candidate.stat()
+            if not stat.S_ISREG(candidate_state.st_mode):
+                raise OSError
+            candidate_digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except (InstanceError, OSError):
+            return failure("rootd_deploy_failed")
+
+        owned, record_state = self._rootd_owned_process(deadline=deadline)
+        if remaining() <= 0:
+            return failure("rootd_unavailable")
+        legacy_adopted = False
+        if owned is not None:
+            authentication = self._rootd_authentication(
+                daemon_client,
+                deadline=deadline,
+            )
+            if authentication == "ok" and owned["digest"] == candidate_digest:
+                return {
+                    "ok": True,
+                    "runsAsRoot": True,
+                    "authenticated": True,
+                    "reused": True,
+                    "port": self.lease.rootd_port,
+                }
+            if authentication == "rootd_unauthorized":
+                return failure("rootd_unauthorized")
+            if not self._terminate_rootd_process(owned, deadline=deadline):
+                return failure(
+                    "rootd_unavailable"
+                    if remaining() <= 0
+                    else "rootd_resource_conflict"
+                )
+        elif record_state == "invalid":
+            return failure("rootd_resource_conflict")
+        elif record_state == "stale":
+            remove_timeout = remaining()
+            if remove_timeout <= 0:
+                return failure("rootd_unavailable")
+            removed = self.docker_exec(
+                ["rm", "-f", _ROOTD_PROCESS_RECORD],
+                timeout=remove_timeout,
+            )
+            if removed.get("ok") is not True:
+                return failure(
+                    "rootd_unavailable"
+                    if remaining() <= 0
+                    else "rootd_resource_conflict"
+                )
+
+        inodes, listener_conflict = self._rootd_port_inodes(deadline=deadline)
+        if remaining() <= 0:
+            return failure("rootd_unavailable")
+        if inodes or listener_conflict:
+            if record_state != "absent" or listener_conflict:
+                return failure("rootd_resource_conflict")
+            adopted, legacy_seen = self._adopt_legacy_rootd(
+                token,
+                deadline=deadline,
+            )
+            if not adopted:
+                return failure(
+                    "rootd_unavailable"
+                    if remaining() <= 0
+                    else "rootd_resource_conflict"
+                )
+            legacy_adopted = legacy_seen
+
+        push_timeout = remaining(15.0)
+        if push_timeout <= 0:
+            return failure("rootd_unavailable")
+        push = self.adb(
+            ["push", str(candidate), _ROOTD_REMOTE_PATH],
+            timeout=push_timeout,
+        )
+        if push.get("ok") is not True:
+            return failure(
+                "rootd_unavailable"
+                if remaining() <= 0
+                else "rootd_deploy_failed"
+            )
+        for command in (
+            ["chown", "0:0", _ROOTD_REMOTE_PATH],
+            ["chmod", "0755", _ROOTD_REMOTE_PATH],
+        ):
+            command_timeout = remaining()
+            if command_timeout <= 0:
+                return failure("rootd_unavailable")
+            prepared = self.docker_exec(command, timeout=command_timeout)
+            if prepared.get("ok") is not True:
+                return failure(
+                    "rootd_unavailable"
+                    if remaining() <= 0
+                    else "rootd_deploy_failed"
+                )
+        if self._rootd_remote_digest(
+            _ROOTD_REMOTE_PATH,
+            deadline=deadline,
+        ) != candidate_digest:
+            return failure(
+                "rootd_unavailable"
+                if remaining() <= 0
+                else "rootd_deploy_failed"
+            )
+        cleanup_timeout = remaining()
+        if cleanup_timeout <= 0:
+            return failure("rootd_unavailable")
+        self.docker_exec(
+            ["rm", "-f", _ROOTD_LEGACY_PATH],
+            timeout=cleanup_timeout,
+        )
+
+        ownership_timeout = remaining()
+        if ownership_timeout <= 0:
+            return failure("rootd_unavailable")
+        container, _ = self._owned_container_record(timeout=ownership_timeout)
+        container_id = container.get("Id") if isinstance(container, dict) else None
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        ):
+            return failure("rootd_resource_conflict")
+        launch_timeout = remaining(10.0)
+        if launch_timeout <= 0 or not self._launch_rootd_with_token(
+            container_id,
+            token,
+            launch_timeout,
+        ):
+            return failure("rootd_unavailable")
+
+        last_authentication = "rootd_unavailable"
+        while remaining() > 0:
+            process, state = self._rootd_owned_process(deadline=deadline)
+            if (
+                process is not None
+                and state == "valid"
+                and process["digest"] == candidate_digest
+            ):
+                last_authentication = self._rootd_authentication(
+                    daemon_client,
+                    deadline=deadline,
+                )
+                if last_authentication == "ok":
+                    return {
+                        "ok": True,
+                        "runsAsRoot": True,
+                        "authenticated": True,
+                        "reused": False,
+                        "legacyAdopted": legacy_adopted,
+                        "port": self.lease.rootd_port,
+                    }
+                if last_authentication == "rootd_unauthorized":
+                    break
+            sleep_for = remaining(0.2)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+        return failure(last_authentication)
+
+    def daemon_client(self, timeout: float = 10.0) -> DaemonClient:
         return DaemonClient(
             context=self.context,
             lease=self.lease,
@@ -4210,112 +8902,550 @@ class RuntimeManager:
             timeout=timeout,
         )
 
-    def repair_control_plane(self) -> dict[str, Any]:
-        """Re-establish the adb lease, daemon, and rootd after a recreate.
+    def wait_daemon_transport(
+        self,
+        timeout: float = _DAEMON_TRANSPORT_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Bind and prove the listener without consulting aggregate health."""
+        started = time.monotonic()
+        deadline = started + max(0.0, min(timeout, _DAEMON_TRANSPORT_TIMEOUT_SECONDS))
+        midpoint = started + (deadline - started) / 2.0
+        client = self.daemon_client(timeout=2.0)
+        attempts = 0
+        launches = 0
+        recovered = False
 
-        A freshly recreated container can lose the leased adb port switch or
-        the docker-exec'd rootd in the first minute after boot; convergence
-        callers use this bounded repair instead of failing on the transient.
-        """
-        result: dict[str, Any] = {}
-        if self.lease.android_adb_port != 5555:
-            result["adbPort"] = self.switch_adbd_port_via_docker()
-        result["adbConnect"] = self.adb_connect()
-        result["adbWait"] = self.adb_wait(timeout_sec=60)
-        result["rootd"] = (
-            self.ensure_rootd_root() if result["adbWait"].get("ok") else {"ok": False, "skipped": True}
+        def remaining(cap: float) -> float:
+            return min(cap, max(0.0, deadline - time.monotonic()))
+
+        initial_remaining = remaining(_DAEMON_TRANSPORT_TIMEOUT_SECONDS)
+        if initial_remaining <= 0:
+            return {
+                "ok": False,
+                "code": "daemon_transport_timeout",
+                "error": "daemon_transport_timeout",
+                "transportReady": False,
+            }
+        self.forward_daemon_port(timeout=initial_remaining)
+        while True:
+            transport_remaining = remaining(2.0)
+            if transport_remaining <= 0:
+                return {
+                    "ok": False,
+                    "code": "daemon_transport_timeout",
+                    "error": "daemon_transport_timeout",
+                    "transportReady": False,
+                    "attempts": attempts,
+                    "activityLaunches": launches,
+                }
+            attempts += 1
+            transport = client.transport(timeout=transport_remaining)
+            if transport.get("ok") is True:
+                return {
+                    "ok": True,
+                    "transportReady": True,
+                    "attempts": attempts,
+                    "activityLaunches": launches,
+                    "midpointRecovery": recovered,
+                }
+            now = time.monotonic()
+            if launches == 0:
+                launch_remaining = remaining(_DAEMON_TRANSPORT_TIMEOUT_SECONDS)
+                if launch_remaining <= 0:
+                    continue
+                launch = self.launch_daemon_activity_once(timeout=launch_remaining)
+                launches = 1
+                if launch.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "code": "daemon_activity_launch_failed",
+                        "error": "daemon_activity_launch_failed",
+                        "transportReady": False,
+                    }
+                forward_remaining = remaining(_DAEMON_TRANSPORT_TIMEOUT_SECONDS)
+                if forward_remaining > 0:
+                    self.forward_daemon_port(timeout=forward_remaining)
+            elif not recovered and now >= midpoint:
+                force_stop_remaining = remaining(10.0)
+                if force_stop_remaining <= 0:
+                    continue
+                self.adb(
+                    ["shell", "am", "force-stop", "dev.xenoid.daemon"],
+                    timeout=force_stop_remaining,
+                )
+                launch_remaining = remaining(_DAEMON_TRANSPORT_TIMEOUT_SECONDS)
+                if launch_remaining <= 0:
+                    continue
+                launch = self.launch_daemon_activity_once(timeout=launch_remaining)
+                launches += 1
+                recovered = True
+                if launch.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "code": "daemon_activity_launch_failed",
+                        "error": "daemon_activity_launch_failed",
+                        "transportReady": False,
+                    }
+                forward_remaining = remaining(_DAEMON_TRANSPORT_TIMEOUT_SECONDS)
+                if forward_remaining > 0:
+                    self.forward_daemon_port(timeout=forward_remaining)
+            sleep_remaining = remaining(0.25)
+            if sleep_remaining > 0:
+                time.sleep(sleep_remaining)
+
+    def _daemon_runtime_epoch(
+        self,
+        *,
+        deadline: Optional[float] = None,
+    ) -> Optional[str]:
+        def remaining(cap: float = 5.0) -> float:
+            if deadline is None:
+                return cap
+            return min(cap, max(0.0, deadline - time.monotonic()))
+
+        ownership_timeout = remaining()
+        if ownership_timeout <= 0:
+            return None
+        container, _ = self._owned_container_record(timeout=ownership_timeout)
+        container_id = container.get("Id") if isinstance(container, dict) else None
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        ):
+            return None
+
+        def output(args: list[str], limit: int) -> Optional[str]:
+            if remaining() <= 0:
+                return None
+            return self._rootd_output(args, limit=limit, deadline=deadline)
+
+        pids = output(["pidof", "dev.xenoid.daemon"], 256)
+        if pids is None:
+            return None
+        values = pids.split()
+        if len(values) != 1 or not values[0].isdigit():
+            return None
+        pid = int(values[0])
+        before = output(["cat", f"/proc/{pid}/stat"], 4096)
+        status = output(["cat", f"/proc/{pid}/status"], 64 * 1024)
+        app_uid = output(
+            ["stat", "-c", "%u", "/data/data/dev.xenoid.daemon"],
+            64,
         )
-        result["daemon"] = (
-            self.ensure_daemon(readiness_timeout=120.0)
-            if result["rootd"].get("ok")
-            else {"ok": False, "skipped": True}
+        boot_id = output(["cat", "/proc/sys/kernel/random/boot_id"], 128)
+        after = output(["cat", f"/proc/{pid}/stat"], 4096)
+        start_time = self._proc_start_time(before or "")
+        uid_line = next(
+            (line for line in (status or "").splitlines() if line.startswith("Uid:")),
+            "",
         )
-        result["ok"] = bool(
-            result["adbWait"].get("ok")
-            and result["rootd"].get("ok")
-            and result["daemon"].get("ok")
-        )
+        uid_fields = uid_line.partition(":")[2].split()
+        if (
+            before is None
+            or self._proc_start_time(after or "") != start_time
+            or start_time is None
+            or app_uid is None
+            or len(uid_fields) != 4
+            or any(field != app_uid for field in uid_fields)
+            or boot_id is None
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                boot_id,
+            ) is None
+        ):
+            return None
+        material = (
+            "dev.xenoid.daemon-runtime/v1\n"
+            f"{container_id}\n{pid}\n{start_time}\n{boot_id}\n"
+        ).encode("ascii")
+        return hashlib.sha256(material).hexdigest()
+
+    @staticmethod
+    def _bootstrap_terminal_result(status: Mapping[str, Any]) -> dict[str, Any]:
+        components = status.get("components")
+        root = components.get("root") if isinstance(components, dict) else None
+        control_ready = isinstance(root, dict) and root.get("ok") is True
+        result: dict[str, Any] = {
+            "ok": control_ready,
+            "transportReady": True,
+            "controlReady": control_ready,
+            "ready": status.get("state") == "ready",
+            "state": status.get("state"),
+            "generation": status.get("generation"),
+            "instanceId": status.get("instanceId"),
+            "runtimeEpoch": status.get("runtimeEpoch"),
+            "components": components if isinstance(components, dict) else {},
+        }
+        error_code = status.get("errorCode")
+        if isinstance(error_code, str):
+            result["errorCode"] = error_code
+        if not control_ready:
+            root_error = root.get("errorCode") if isinstance(root, dict) else None
+            code = root_error if isinstance(root_error, str) else "rootd_unavailable"
+            result["code"] = code
+            result["error"] = code
         return result
 
-    def ensure_daemon(self, readiness_timeout: float = 30.0) -> dict[str, Any]:
-        steps: dict[str, Any] = {}
-        steps["forward"] = self.forward_daemon_port()
+    def reconcile_bootstrap(
+        self,
+        timeout: float = _BOOTSTRAP_SEQUENCE_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Run the sole listener -> rootd -> component-bootstrap sequence."""
+        requested_timeout = max(0.0, min(timeout, _BOOTSTRAP_SEQUENCE_TIMEOUT_SECONDS))
+        parent_timeout = bounded_timeout(requested_timeout)
+        effective_timeout = requested_timeout if parent_timeout is None else parent_timeout
+        if effective_timeout <= 0:
+            return {
+                "ok": False,
+                "transportReady": False,
+                "controlReady": False,
+                "code": "bootstrap_timeout",
+                "error": "bootstrap_timeout",
+            }
+        outer_deadline = time.monotonic() + effective_timeout
+        transport = self.wait_daemon_transport(
+            min(_DAEMON_TRANSPORT_TIMEOUT_SECONDS, outer_deadline - time.monotonic())
+        )
+        if transport.get("ok") is not True:
+            return transport
+        permissions = self.ensure_daemon_runtime_permissions()
+        if permissions.get("ok") is not True:
+            return {
+                "ok": False,
+                "transportReady": True,
+                "controlReady": False,
+                "code": "daemon_permission_grant_failed",
+                "error": "daemon_permission_grant_failed",
+            }
+        client = self.daemon_client(timeout=5.0)
+        root_deadline = min(
+            outer_deadline,
+            time.monotonic() + _ROOTD_PROVISION_TIMEOUT_SECONDS,
+        )
+        rootd = self.ensure_rootd_root(
+            max(0.0, root_deadline - time.monotonic()),
+            client,
+        )
+        reprovisioned = False
+        root_remaining = root_deadline - time.monotonic()
+        if (
+            rootd.get("ok") is not True
+            and rootd.get("code") == "rootd_unavailable"
+            and root_remaining > 0.0
+        ):
+            reprovisioned = True
+            rootd = self.ensure_rootd_root(root_remaining, client)
+        if rootd.get("ok") is not True:
+            return {
+                "ok": False,
+                "transportReady": True,
+                "controlReady": False,
+                "code": rootd.get("code", "rootd_unavailable"),
+                "error": rootd.get("code", "rootd_unavailable"),
+                "rootdReprovisioned": reprovisioned,
+            }
+        runtime_epoch = self._daemon_runtime_epoch(deadline=outer_deadline)
+        remaining = outer_deadline - time.monotonic()
+        if runtime_epoch is None or remaining < 1.0:
+            return {
+                "ok": False,
+                "transportReady": True,
+                "controlReady": True,
+                "code": "daemon_runtime_identity_unavailable",
+                "error": "daemon_runtime_identity_unavailable",
+            }
+        timeout_ms = min(
+            BOOTSTRAP_WORKER_TIMEOUT_MS,
+            max(1000, int(remaining * 1000)),
+        )
+        accepted = client.bootstrap_reconcile(
+            self.context.instance_id,
+            runtime_epoch,
+            timeout_ms,
+        )
+        generation = accepted.get("generation")
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+            or accepted.get("runtimeEpoch") != runtime_epoch
+        ):
+            code = accepted.get("code")
+            safe_code = code if isinstance(code, str) else "bootstrap_reconcile_failed"
+            return {
+                "ok": False,
+                "transportReady": True,
+                "controlReady": True,
+                "code": safe_code,
+                "error": safe_code,
+            }
+        if accepted.get("state") in {"ready", "degraded", "failed"}:
+            result = self._bootstrap_terminal_result(accepted)
+            result["rootdReprovisioned"] = reprovisioned
+            return result
+
+        poll_deadline = min(
+            outer_deadline,
+            time.monotonic() + BOOTSTRAP_POLL_TIMEOUT_SECONDS,
+        )
         try:
-            client = self.daemon_client(timeout=2.0)
-            health1 = client.health()
-        except Exception as error:
-            client = None
-            health1 = {"ok": False, "error": str(error)}
-        steps["healthBefore"] = health1
-        if isinstance(health1, dict) and health1.get("ok"):
-            return {"ok": True, "already": True, "steps": steps}
-
-        steps["startActivity"] = self.launch_daemon_bootstrap()
-        steps["forwardAfter"] = self.forward_daemon_port()
-        deadline = time.monotonic() + max(0.0, readiness_timeout)
-        health_attempts: list[dict[str, Any]] = []
-        health_after: dict[str, Any] = {
+            while time.monotonic() < poll_deadline:
+                remaining = poll_deadline - time.monotonic()
+                status = client.bootstrap_status(timeout=min(5.0, remaining))
+                if (
+                    status.get("generation") == generation
+                    and status.get("runtimeEpoch") == runtime_epoch
+                    and status.get("state") in {"ready", "degraded", "failed"}
+                ):
+                    result = self._bootstrap_terminal_result(status)
+                    result["rootdReprovisioned"] = reprovisioned
+                    return result
+                if status.get("generation") not in (None, generation):
+                    return {
+                        "ok": False,
+                        "transportReady": True,
+                        "controlReady": True,
+                        "code": "bootstrap_generation_conflict",
+                        "error": "bootstrap_generation_conflict",
+                    }
+                time.sleep(min(0.25, max(0.0, remaining)))
+        except (KeyboardInterrupt, SystemExit):
+            client.bootstrap_cancel(generation, timeout=2.0)
+            raise
+        client.bootstrap_cancel(generation, timeout=2.0)
+        return {
             "ok": False,
-            "error": "daemon health readiness timed out",
+            "transportReady": True,
+            "controlReady": True,
+            "code": "bootstrap_timeout",
+            "error": "bootstrap_timeout",
+            "generation": generation,
         }
-        while True:
-            try:
-                if client is None:
-                    client = self.daemon_client(timeout=2.0)
-                health_after = client.health()
-            except Exception as error:
-                health_after = {"ok": False, "error": str(error)}
-                client = None
-                # A transport reconnect can discard adb forwards after the
-                # initial setup. Recreate the owned forward before retrying
-                # instead of waiting the full readiness window on a dead port.
-                steps["forwardRetry"] = self.forward_daemon_port()
-            health_attempts.append(health_after)
-            if health_after.get("ok"):
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.5, remaining))
 
-        steps["healthAfter"] = health_after
-        steps["healthAttempts"] = len(health_attempts)
-        return {"ok": bool(health_after.get("ok")), "steps": steps}
+    @staticmethod
+    def _local_deploy_identity(
+        path: Path,
+        *,
+        require_arm64_elf: bool,
+    ) -> dict[str, Any]:
+        try:
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_nlink != 1
+            ):
+                raise OSError("deploy artifact is not a private regular file")
+            digest = hashlib.sha256()
+            header = b""
+            with path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    if len(header) < 20:
+                        header += chunk[: 20 - len(header)]
+                    digest.update(chunk)
+        except OSError:
+            return {"ok": False, "error": "install_artifact_invalid"}
+        machine: Optional[str] = None
+        if len(header) >= 20 and header[:4] == b"\x7fELF":
+            byte_order = "little" if header[5:6] == b"\x01" else "big"
+            machine_number = int.from_bytes(header[18:20], byte_order)
+            machine = "arm64" if machine_number == 183 else str(machine_number)
+        if require_arm64_elf and (
+            header[4:5] != b"\x02"
+            or machine != "arm64"
+        ):
+            return {"ok": False, "error": "install_artifact_architecture_invalid"}
+        return {
+            "ok": True,
+            "sha256": digest.hexdigest(),
+            "size": info.st_size,
+            "mode": stat.S_IMODE(info.st_mode),
+            "architecture": machine,
+        }
+
+    def _remote_file_identity(
+        self,
+        remote_path: str,
+        *,
+        require_arm64_elf: bool,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(remote_path, str)
+            or not remote_path.startswith("/")
+            or "\x00" in remote_path
+        ):
+            return {"ok": False, "error": "install_remote_path_invalid"}
+        quoted = shlex.quote(remote_path)
+        machine = (
+            f"m=$(dd if={quoted} bs=1 skip=18 count=2 2>/dev/null "
+            "| od -An -tu2 | tr -d ' '); "
+            if require_arm64_elf
+            else "m=0; "
+        )
+        command = (
+            "set -eu; "
+            f"test -f {quoted}; test ! -L {quoted}; "
+            + machine
+            + f"printf '%s %s %s %s\\n' \"$(sha256sum {quoted} | cut -d' ' -f1)\" "
+            f"\"$(stat -c %a {quoted})\" \"$(stat -c %s {quoted})\" \"$m\""
+        )
+        observed = self.docker_exec(["sh", "-c", command], timeout=20)
+        fields = str(observed.get("stdout") or "").strip().split()
+        if (
+            observed.get("ok") is not True
+            or len(fields) != 4
+            or _SHA256_PATTERN.fullmatch(fields[0]) is None
+            or not fields[1].isdigit()
+            or not fields[2].isdigit()
+            or require_arm64_elf and fields[3] != "183"
+        ):
+            return {"ok": False, "error": "install_remote_identity_invalid"}
+        return {
+            "ok": True,
+            "sha256": fields[0],
+            "mode": int(fields[1], 8),
+            "size": int(fields[2]),
+            "architecture": "arm64" if fields[3] == "183" else None,
+        }
+
+    def _installed_daemon_apk_identity(self) -> dict[str, Any]:
+        package = self.adb(
+            ["shell", "pm", "path", "dev.xenoid.daemon"],
+            timeout=15,
+        )
+        paths = [
+            line.removeprefix("package:").strip()
+            for line in str(package.get("stdout") or "").splitlines()
+            if line.startswith("package:/")
+        ]
+        if package.get("ok") is not True or len(paths) != 1:
+            return {"ok": False, "state": "absent"}
+        quoted = shlex.quote(paths[0])
+        identity = self.docker_exec(
+            [
+                "sh",
+                "-c",
+                "set -eu; "
+                f"test -f {quoted}; test ! -L {quoted}; "
+                f"printf '%s %s\\n' \"$(sha256sum {quoted} | cut -d' ' -f1)\" "
+                f"\"$(stat -c %s {quoted})\"",
+            ],
+            timeout=20,
+        )
+        fields = str(identity.get("stdout") or "").strip().split()
+        if (
+            identity.get("ok") is not True
+            or len(fields) != 2
+            or _SHA256_PATTERN.fullmatch(fields[0]) is None
+            or not fields[1].isdigit()
+        ):
+            return {"ok": False, "state": "unknown"}
+        return {
+            "ok": True,
+            "state": "installed",
+            "sha256": fields[0],
+            "size": int(fields[1]),
+        }
+
+    def ensure_daemon_runtime_permissions(self) -> dict[str, Any]:
+        granted: list[str] = []
+        for permission in _DAEMON_RUNTIME_PERMISSIONS:
+            result = self.adb(
+                [
+                    "shell",
+                    "pm",
+                    "grant",
+                    "--user",
+                    "0",
+                    "dev.xenoid.daemon",
+                    permission,
+                ],
+                timeout=15,
+            )
+            if result.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": "daemon_permission_grant_failed",
+                    "permission": permission,
+                }
+            granted.append(permission)
+        return {"ok": True, "granted": granted}
 
     def install_daemon(self, apk_path: str) -> dict[str, Any]:
         p = Path(apk_path).expanduser().resolve()
-        if not p.exists():
-            return {"ok": False, "error": f"daemon apk not found: {p}"}
+        local = self._local_deploy_identity(p, require_arm64_elf=False)
+        if local.get("ok") is not True:
+            return local
+        installed = self._installed_daemon_apk_identity()
+        if (
+            installed.get("ok") is True
+            and installed.get("sha256") == local["sha256"]
+        ):
+            permissions = self.ensure_daemon_runtime_permissions()
+            if permissions.get("ok") is not True:
+                return permissions
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "digest_match",
+                "sha256": local["sha256"],
+                "installed": installed,
+                "permission": permissions,
+            }
         preserved = self._capture_proxy_desired_for_update()
         if preserved.get("ok") is not True:
             return preserved
+        guarded = self.quarantine_proxy_for_lifecycle()
+        if guarded.get("ok") is not True:
+            self._discard_pending_proxy_restore()
+            return guarded
         install = self.adb(["install", "-r", str(p)])
         if not install.get("ok"):
+            self._discard_pending_proxy_restore()
             return install
-        notification_grant = self.adb([
-            "shell",
-            'sdk="$(getprop ro.build.version.sdk)"; '
-            'case "$sdk" in ""|*[!0-9]*) exit 1;; esac; '
-            'if [ "$sdk" -ge 33 ]; then '
-            'pm grant --user 0 dev.xenoid.daemon android.permission.POST_NOTIFICATIONS; '
-            'fi',
-        ])
-        if notification_grant.get("ok"):
-            # A running daemon keeps its already-loaded classes across
-            # `pm install -r`; force a restart so the updated APK takes effect.
-            self.adb(["shell", "am", "force-stop", "dev.xenoid.daemon"])
-            return install
-        failed = dict(install)
-        failed["ok"] = False
-        failed["error"] = "daemon notification permission grant failed"
-        return failed
+        runtime_permissions = self.ensure_daemon_runtime_permissions()
+        if runtime_permissions.get("ok") is not True:
+            self._discard_pending_proxy_restore()
+            return {
+                "ok": False,
+                "error": "daemon_permission_grant_failed",
+                "install": install,
+            }
+        force_stop = self.adb(
+            ["shell", "am", "force-stop", "dev.xenoid.daemon"],
+            timeout=15,
+        )
+        if force_stop.get("ok") is not True:
+            self._discard_pending_proxy_restore()
+            return {
+                "ok": False,
+                "error": "daemon_restart_failed",
+                "install": install,
+            }
+        verified = self._installed_daemon_apk_identity()
+        if (
+            verified.get("ok") is not True
+            or verified.get("sha256") != local["sha256"]
+        ):
+            self._discard_pending_proxy_restore()
+            return {
+                "ok": False,
+                "error": "daemon_apk_digest_mismatch",
+                "install": install,
+            }
+        return {
+            "ok": True,
+            "changed": True,
+            "sha256": local["sha256"],
+            "install": install,
+            "permission": runtime_permissions,
+            "forceStop": force_stop,
+            "proxyQuarantine": guarded,
+        }
 
-    def start_daemon_service(self) -> dict[str, Any]:
-        # The service remains non-exported. Its exported launcher activity
-        # enters the app UID and starts the service in explicit bootstrap mode.
-        result = self.launch_daemon_bootstrap()
-        result["method"] = "self-start-activity"
-        return result
 
 
     def _instance_output_path(
@@ -4352,13 +9482,16 @@ class RuntimeManager:
             # CLI version cannot be determined or its tag has no matching asset.
             frida_bin = which("frida")
             if frida_bin:
-                try:
-                    v = subprocess.run([frida_bin, "--version"], text=True, capture_output=True, timeout=10)
-                    cli_version = (v.stdout or v.stderr).strip().splitlines()[0].strip()
+                bounded = run_bounded(
+                    [frida_bin, "--version"],
+                    cwd=self.context.project_root,
+                    deadline=time.monotonic() + 10.0,
+                    project_root=self.context.project_root,
+                )
+                if bounded.ok:
+                    cli_version = (bounded.stdout_tail or bounded.stderr_tail).strip().splitlines()[0].strip()
                     if re.fullmatch(r"\d+\.\d+\.\d+", cli_version):
                         requested = cli_version
-                except Exception:
-                    pass
         if requested != "latest":
             cached_asset = f"frida-server-{requested}-{arch}.xz"
             cached_xz = out / cached_asset
@@ -4452,183 +9585,33 @@ class RuntimeManager:
         output: Optional[Path] = None,
         spec: Optional[ReleaseSpec] = None,
     ) -> dict[str, Any]:
-        script = self.context.project_root / "scripts" / "make-runtime-context.sh"
-        selected_spec = (
-            self.google_runtime_spec("runtime-context", require_assets=True)
-            if spec is None
-            else spec
-        )
-        destination = output or (
-            self.context.state_root
-            / "runtime-context"
-            / f"{self.lease.transaction_id}-{secrets.token_hex(8)}"
-        )
-        env = self.docker_env()
-        env["XENOID_EXPECT_BUILD_PRODUCT"] = (
-            str(selected_spec.android["targetProduct"])
-            if selected_spec is not None
-            else "raven"
-        )
-
-        def generate() -> tuple[Any, Optional[dict[str, Any]]]:
-            proc = run(
-                [
-                    str(script),
-                    image or self.base_image_for_build(),
-                    str(destination),
-                ],
-                env=env,
+        try:
+            selected_spec = (
+                self.google_runtime_spec("runtime-context", require_assets=True)
+                if spec is None
+                else spec
             )
-            verification: Optional[dict[str, Any]] = None
-            if proc.returncode == 0 and selected_spec is not None:
-                verification = verify_context_copy(destination, selected_spec, stage)
-            return proc, verification
-
-        if selected_spec is None:
-            proc, verification = generate()
-        else:
-            with staged_google_payload(self.context, selected_spec) as stage:
-                env.update(
-                    {
-                        "XENOID_GOOGLE_PAYLOAD": str(stage.tree),
-                        "XENOID_GOOGLE_PROVIDER": selected_spec.provider,
-                        "XENOID_GOOGLE_RELEASE": selected_spec.release,
-                        "XENOID_GOOGLE_SPEC_SHA256": selected_spec.fingerprint,
-                        "XENOID_GOOGLE_DATA_COMPAT_SHA256": selected_spec.data_compatibility_fingerprint,
-                    }
-                )
-                proc, verification = generate()
+            context = self._runtime_image_builder().materialize_context(
+                image or self.base_image_for_build(),
+                selected_spec,
+                output,
+            )
+        except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "runtime_context_generation_failed"),
+                "message": str(exc),
+            }
         return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip(),
-            "context": (
-                proc.stdout.strip().splitlines()[-1]
-                if proc.stdout.strip()
-                else None
-            ),
+            "ok": True,
+            **context,
+            "context": context["contextPath"],
             "googleServices": (
                 selected_spec.public_dict()
                 if selected_spec is not None
                 else {"provider": PROVIDER_NONE, "release": PROVIDER_NONE}
             ),
-            "verification": verification,
         }
-
-    def _verify_effective_image(
-        self,
-        spec: Optional[ReleaseSpec],
-    ) -> dict[str, Any]:
-        image, inspect = self._inspect_docker_object("image", self.effective_image())
-        if image is None:
-            return {
-                "ok": False,
-                "error": "google_services_runtime_not_ready",
-                "message": "effective runtime image does not exist",
-                "returncode": inspect.returncode,
-            }
-        if not image:
-            return {
-                "ok": False,
-                "error": "google_services_spec_mismatch",
-                "message": "effective runtime image identity is invalid",
-            }
-        config = image.get("Config")
-        labels = config.get("Labels") if isinstance(config, dict) else None
-        labels = labels if isinstance(labels, dict) else {}
-        expected = spec.labels if spec is not None else {}
-        labels_match = (
-            all(labels.get(key) == value for key, value in expected.items())
-            and (
-                spec is not None
-                or not any(key in labels for key in self._google_label_values())
-            )
-        )
-        architecture = str(image.get("Architecture") or "")
-        image_id = str(image.get("Id") or "")
-        ok = (
-            bool(image_id)
-            and architecture in {"arm64", "aarch64"}
-            and labels_match
-        )
-        return {
-            "ok": ok,
-            "image": self.effective_image(),
-            "imageSha256": image_id,
-            "architecture": architecture,
-            "labelsMatch": labels_match,
-            **(
-                {}
-                if ok
-                else {
-                    "error": "google_services_spec_mismatch",
-                    "message": "effective runtime image does not match the Google services specification",
-                }
-            ),
-        }
-
-    def _build_effective_runtime_image(
-        self,
-        spec: Optional[ReleaseSpec],
-    ) -> dict[str, Any]:
-        handle = create_runtime_context_handle()
-        result: dict[str, Any] = {"ok": False}
-        try:
-            context = self.make_runtime_context(
-                self.base_image_for_build(),
-                output=handle.output,
-                spec=spec,
-            )
-            result["runtimeContext"] = context
-            if not context.get("ok") or context.get("context") != str(handle.output):
-                result.update(
-                    {
-                        "error": "google_services_asset_invalid",
-                        "message": "runtime context generation failed",
-                    }
-                )
-                return result
-            build = run(
-                [
-                    *self.docker_base_cmd(),
-                    "build",
-                    "-t",
-                    self.effective_image(),
-                    str(handle.output),
-                ],
-                env=self.docker_env(),
-            )
-            result["build"] = {
-                "ok": build.returncode == 0,
-                "returncode": build.returncode,
-                "stdout": build.stdout[-4000:],
-                "stderr": build.stderr[-4000:],
-            }
-            if build.returncode != 0:
-                result.update(
-                    {
-                        "error": "runtime_image_build_failed",
-                        "message": "runtime image build failed",
-                    }
-                )
-                return result
-            verified = self._verify_effective_image(spec)
-            result["image"] = verified
-            result["ok"] = verified.get("ok") is True
-            if not result["ok"]:
-                result["error"] = verified.get(
-                    "error",
-                    "google_services_spec_mismatch",
-                )
-            return result
-        finally:
-            try:
-                result["cleanup"] = cleanup_runtime_context(handle)
-            except GoogleServicesError as exc:
-                result["ok"] = False
-                result["error"] = exc.code
-                result["message"] = str(exc)
 
 
     def ensure_rootfs_images(self) -> dict[str, Any]:
@@ -4649,6 +9632,11 @@ class RuntimeManager:
         env = self.docker_env()
         env["XENOID_STATE_ROOT"] = str(self.context.state_root)
         env["XENOID_OTA_OUTPUT_DIR"] = str(output_root)
+        env["XENOID_ARTIFACT_ROOT"] = str(
+            self._artifact_consumer_root(
+                ("daemon", "input", "hide", "profile", "netctl")
+            )
+        )
         proc = run([str(script), version], env=env)
         bundle: Optional[str] = None
         error: Optional[str] = None
@@ -4703,8 +9691,18 @@ class RuntimeManager:
             if daemon_info:
                 apk = root / daemon_info["path"]
                 results["steps"]["daemonInstall"] = self.install_daemon(str(apk))
-                results["steps"]["daemonStart"] = self.start_daemon_service()
-                results["steps"]["daemonForward"] = self.forward_daemon_port()
+                results["steps"]["daemonBootstrap"] = (
+                    self.reconcile_bootstrap()
+                    if results["steps"]["daemonInstall"].get("ok") is True
+                    else {"ok": False, "error": "daemon_install_failed"}
+                )
+                results["steps"]["proxyConverged"] = (
+                    self.reconcile_proxy_desired()
+                    if results["steps"]["daemonBootstrap"].get("controlReady") is True
+                    else {"ok": False, "error": "daemon_unreachable"}
+                )
+                if results["steps"]["proxyConverged"].get("ok") is not True:
+                    self._discard_pending_proxy_restore()
             helper_info = payloads.get("inputHelper")
             if helper_info:
                 helper = root / helper_info["path"]
@@ -4743,29 +9741,118 @@ class RuntimeManager:
         cleanup = self.adb(["shell", "rm", "-f", staging]) if push.get("ok") else {"ok": False, "skipped": True}
         return {"ok": bool(push.get("ok") and move.get("ok")), "push": push, "move": move, "cleanup": cleanup, "remotePath": remote_path}
 
-    def deploy_input_helper(self, helper_path: str, remote_path: str = "/data/local/tmp/xenoid-input") -> dict[str, Any]:
-        p = Path(helper_path).expanduser().resolve()
-        if not p.exists():
-            return {"ok": False, "error": f"xenoid-input helper not found: {p}"}
-        push = self.adb(["push", str(p), remote_path])
-        chmod = self.adb(["shell", "chmod", "755", remote_path]) if push.get("ok") else {"ok": False, "skipped": True}
-        return {"ok": bool(push.get("ok") and chmod.get("ok")), "push": push, "chmod": chmod, "remotePath": remote_path}
+    def _deploy_verified_helper(
+        self,
+        helper_path: str,
+        remote_path: str,
+        *,
+        mode: int = 0o755,
+    ) -> dict[str, Any]:
+        try:
+            local_path = Path(helper_path).expanduser().resolve(strict=True)
+        except OSError:
+            return {"ok": False, "error": "install_artifact_invalid"}
+        local = self._local_deploy_identity(
+            local_path,
+            require_arm64_elf=True,
+        )
+        if local.get("ok") is not True:
+            return local
+        remote = self._remote_file_identity(
+            remote_path,
+            require_arm64_elf=True,
+        )
+        if (
+            remote.get("ok") is True
+            and remote.get("sha256") == local["sha256"]
+            and remote.get("size") == local["size"]
+            and remote.get("mode") == mode
+            and remote.get("architecture") == "arm64"
+        ):
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "digest_mode_architecture_match",
+                "sha256": local["sha256"],
+                "remotePath": remote_path,
+            }
+        token = secrets.token_hex(16)
+        staging = f"/data/local/tmp/.xenoid-deploy-{token}"
+        push = self.adb(["push", str(local_path), staging], timeout=120)
+        if push.get("ok") is not True:
+            return {
+                "ok": False,
+                "error": "helper_upload_failed",
+                "push": push,
+            }
+        staged = self._remote_file_identity(
+            staging,
+            require_arm64_elf=True,
+        )
+        if (
+            staged.get("ok") is not True
+            or staged.get("sha256") != local["sha256"]
+            or staged.get("size") != local["size"]
+            or staged.get("architecture") != "arm64"
+        ):
+            self.adb(["shell", "rm", "-f", staging], timeout=15)
+            return {"ok": False, "error": "helper_upload_digest_mismatch"}
+        quoted_staging = shlex.quote(staging)
+        quoted_remote = shlex.quote(remote_path)
+        quoted_directory = shlex.quote(str(Path(remote_path).parent))
+        installed = self.docker_exec(
+            [
+                "sh",
+                "-c",
+                "set -eu; "
+                f"mkdir -p {quoted_directory}; "
+                f"chown 0:0 {quoted_staging}; chmod 0{mode:o} {quoted_staging}; "
+                f"mv -f {quoted_staging} {quoted_remote}; sync",
+            ],
+            timeout=30,
+        )
+        if installed.get("ok") is not True:
+            self.adb(["shell", "rm", "-f", staging], timeout=15)
+            return {"ok": False, "error": "helper_install_failed"}
+        verified = self._remote_file_identity(
+            remote_path,
+            require_arm64_elf=True,
+        )
+        ok = bool(
+            verified.get("ok") is True
+            and verified.get("sha256") == local["sha256"]
+            and verified.get("size") == local["size"]
+            and verified.get("mode") == mode
+            and verified.get("architecture") == "arm64"
+        )
+        return {
+            "ok": ok,
+            "changed": ok,
+            "sha256": local["sha256"],
+            "remotePath": remote_path,
+            **({} if ok else {"error": "helper_install_verification_failed"}),
+        }
 
-    def deploy_hide_helper(self, helper_path: str, remote_path: str = "/data/local/tmp/xenoid-hide-helper") -> dict[str, Any]:
-        p = Path(helper_path).expanduser().resolve()
-        if not p.exists():
-            return {"ok": False, "error": f"xenoid-hide helper not found: {p}"}
-        push = self.adb(["push", str(p), remote_path])
-        chmod = self.adb(["shell", "chmod", "755", remote_path]) if push.get("ok") else {"ok": False, "skipped": True}
-        return {"ok": bool(push.get("ok") and chmod.get("ok")), "push": push, "chmod": chmod, "remotePath": remote_path}
+    def deploy_input_helper(
+        self,
+        helper_path: str,
+        remote_path: str = "/data/local/tmp/xenoid-input",
+    ) -> dict[str, Any]:
+        return self._deploy_verified_helper(helper_path, remote_path)
 
-    def deploy_netctl_helper(self, helper_path: str, remote_path: str = "/data/local/tmp/xenoid-netctl") -> dict[str, Any]:
-        p = Path(helper_path).expanduser().resolve()
-        if not p.exists():
-            return {"ok": False, "error": f"xenoid-netctl helper not found: {p}"}
-        push = self.adb(["push", str(p), remote_path])
-        chmod = self.adb(["shell", "chmod", "755", remote_path]) if push.get("ok") else {"ok": False, "skipped": True}
-        return {"ok": bool(push.get("ok") and chmod.get("ok")), "push": push, "chmod": chmod, "remotePath": remote_path}
+    def deploy_hide_helper(
+        self,
+        helper_path: str,
+        remote_path: str = "/data/local/tmp/xenoid-hide-helper",
+    ) -> dict[str, Any]:
+        return self._deploy_verified_helper(helper_path, remote_path)
+
+    def deploy_netctl_helper(
+        self,
+        helper_path: str,
+        remote_path: str = "/data/local/tmp/xenoid-netctl",
+    ) -> dict[str, Any]:
+        return self._deploy_verified_helper(helper_path, remote_path)
 
     def netctl_status(self, ifname: str = "rmnet_data0") -> dict[str, Any]:
         safe_ifname = "".join(c for c in ifname if c.isalnum() or c in "_.:-") or "rmnet_data0"
@@ -4796,7 +9883,7 @@ class RuntimeManager:
 
 
     def overlay_status(self) -> dict[str, Any]:
-        r = self.adb(["shell", "test -x /data/local/tmp/xenoid-overlay-helper && /data/local/tmp/xenoid-overlay-helper status-json || echo '{\"ok\":false,\"error\":\"overlay-helper-missing\"}'"])
+        r = self.adb(["shell", "test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper status-json || echo '{\"ok\":false,\"error\":\"overlay-helper-missing\"}'"])
         out = {"ok": bool(r.get("ok")), "adb": r}
         try:
             out["status"] = json.loads(str(r.get("stdout") or "{}"))
@@ -4806,7 +9893,7 @@ class RuntimeManager:
         return out
 
     def overlay_cleanup(self) -> dict[str, Any]:
-        cmd = "test -x /data/local/tmp/xenoid-overlay-helper && (nohup /data/local/tmp/xenoid-overlay-helper cleanup >/data/local/tmp/xenoid-overlay-cleanup.log 2>&1 & echo '{\"ok\":true,\"started\":true,\"log\":\"/data/local/tmp/xenoid-overlay-cleanup.log\"}') || echo '{\"ok\":false,\"error\":\"overlay-helper-missing\"}'"
+        cmd = "test -x /system/bin/xenoid-overlay-helper && (nohup /system/bin/xenoid-overlay-helper cleanup >/data/local/tmp/xenoid-overlay-cleanup.log 2>&1 & echo '{\"ok\":true,\"started\":true,\"log\":\"/data/local/tmp/xenoid-overlay-cleanup.log\"}') || echo '{\"ok\":false,\"error\":\"overlay-helper-missing\"}'"
         r = self.adb(["shell", cmd])
         out = {"ok": bool(r.get("ok")), "adb": r}
         try:
@@ -4938,13 +10025,587 @@ class RuntimeManager:
             pass
         return data
 
-    def deploy_profile_helper(self, helper_path: str, remote_path: str = "/data/local/tmp/xenoid-profile-helper") -> dict[str, Any]:
-        p = Path(helper_path).expanduser().resolve()
-        if not p.exists():
-            return {"ok": False, "error": f"xenoid-profile helper not found: {p}"}
-        push = self.adb(["push", str(p), remote_path])
-        chmod = self.adb(["shell", "chmod", "755", remote_path]) if push.get("ok") else {"ok": False, "skipped": True}
-        return {"ok": bool(push.get("ok") and chmod.get("ok")), "push": push, "chmod": chmod, "remotePath": remote_path}
+    def deploy_profile_helper(
+        self,
+        helper_path: str,
+        remote_path: str = "/data/local/tmp/xenoid-profile-helper",
+    ) -> dict[str, Any]:
+        return self._deploy_verified_helper(helper_path, remote_path)
+    def _pinned_artifact_object(
+        self,
+        target: str,
+        artifact_records: Any,
+        *,
+        output_path: Optional[str] = None,
+    ) -> tuple[Optional[Path], Optional[dict[str, Any]], Optional[str]]:
+        values = (
+            list(artifact_records.values())
+            if isinstance(artifact_records, Mapping)
+            else list(artifact_records)
+            if isinstance(artifact_records, (list, tuple))
+            else []
+        )
+        record = next(
+            (
+                dict(value)
+                for value in values
+                if isinstance(value, Mapping) and value.get("target") == target
+            ),
+            None,
+        )
+        if record is None:
+            return None, None, "journal_artifact_unavailable"
+        outputs = record.get("outputs")
+        if not isinstance(outputs, list):
+            return None, None, "journal_artifact_unavailable"
+        selected = next(
+            (
+                dict(output)
+                for output in outputs
+                if isinstance(output, Mapping)
+                and (
+                    output_path is None
+                    or output.get("path") == output_path
+                )
+            ),
+            None,
+        )
+        if selected is None:
+            return None, None, "journal_artifact_unavailable"
+        digest = selected.get("sha256")
+        size = selected.get("size")
+        if (
+            not isinstance(digest, str)
+            or _SHA256_PATTERN.fullmatch(digest) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+        ):
+            return None, None, "journal_artifact_unavailable"
+        path = (
+            self.context.project_root
+            / ".xenoid"
+            / "cache"
+            / "artifacts"
+            / "objects"
+            / "sha256"
+            / digest
+        )
+        try:
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size != size
+                or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+            ):
+                raise OSError
+        except OSError:
+            return None, None, "journal_artifact_unavailable"
+        return path, selected, None
+
+    def deploy_components(
+        self,
+        mapping: Mapping[str, Any],
+        artifact_records: Any = None,
+        expected_container_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Deploy only planner-selected, digest-pinned live components."""
+        if not isinstance(mapping, Mapping):
+            return {"ok": False, "error": "component_action_invalid"}
+        container, error = self._owned_container_record()
+        if container is None:
+            return {
+                "ok": False,
+                "error": "convergence_state_conflict",
+                "message": error,
+            }
+        container_id = str(container.get("Id") or "")
+        if (
+            expected_container_id is not None
+            and container_id != expected_container_id
+        ):
+            return {
+                "ok": False,
+                "error": "convergence_state_conflict",
+                "message": "component deployment runtime differs from the journal",
+            }
+        results: dict[str, Any] = {}
+        for name, raw_action in mapping.items():
+            if not isinstance(name, str):
+                return {"ok": False, "error": "component_action_invalid"}
+            action = (
+                str(raw_action)
+                if isinstance(raw_action, str)
+                else str(raw_action.get("action") or "")
+                if isinstance(raw_action, Mapping)
+                else ""
+            )
+            if action in {"", "none", "reuse", "inspect"}:
+                results[name] = {"ok": True, "skipped": True}
+                continue
+            details = dict(raw_action) if isinstance(raw_action, Mapping) else {}
+            if name == "daemon":
+                output_path = str(
+                    details.get("outputPath")
+                    or "daemon/app/build/outputs/apk/debug/app-debug.apk"
+                )
+                artifact, _, artifact_error = self._pinned_artifact_object(
+                    "daemon",
+                    artifact_records,
+                    output_path=output_path,
+                )
+                if artifact_error is not None or artifact is None:
+                    results[name] = {"ok": False, "error": artifact_error}
+                else:
+                    try:
+                        with tempfile.TemporaryDirectory(
+                            prefix="xenoid-daemon-install-"
+                        ) as temporary:
+                            staged_apk = Path(temporary) / "xenoid-daemon.apk"
+                            shutil.copyfile(artifact, staged_apk)
+                            staged_apk.chmod(0o600)
+                            installed = self.install_daemon(str(staged_apk))
+                    except OSError:
+                        installed = {"ok": False}
+                    results[name] = (
+                        {"ok": True, "installed": True}
+                        if installed.get("ok") is True
+                        else {"ok": False, "error": "daemon_install_failed"}
+                    )
+                continue
+            if name in {"rootd", "proxySandbox"}:
+                # These owners deploy their pinned bytes while reconciling the
+                # authenticated control plane/proxy host transaction.
+                results[name] = {
+                    "ok": True,
+                    "deferred": True,
+                    "owner": "control-plane" if name == "rootd" else "proxy",
+                }
+                continue
+            defaults = _CONVERGENCE_REMOTE_ARTIFACTS.get(name)
+            if defaults is None:
+                results[name] = {
+                    "ok": False,
+                    "error": "component_action_unsupported",
+                }
+                continue
+            default_output, default_remote, default_mode = defaults
+            output_path = str(details.get("outputPath") or default_output)
+            remote_path = str(details.get("remotePath") or default_remote)
+            artifact, output, artifact_error = self._pinned_artifact_object(
+                name,
+                artifact_records,
+                output_path=output_path,
+            )
+            if artifact_error is not None or artifact is None or output is None:
+                results[name] = {"ok": False, "error": artifact_error}
+                continue
+            mode_value = output.get("mode")
+            try:
+                expected_mode = (
+                    int(mode_value, 8)
+                    if isinstance(mode_value, str)
+                    else int(mode_value)
+                )
+            except (TypeError, ValueError):
+                expected_mode = default_mode
+            results[name] = self._deploy_verified_helper(
+                str(artifact),
+                remote_path,
+                mode=expected_mode,
+            )
+        ok = all(
+            isinstance(result, Mapping) and result.get("ok") is True
+            for result in results.values()
+        )
+        if not ok:
+            self._discard_pending_proxy_restore()
+        return {
+            "ok": ok,
+            "containerId": container_id,
+            "components": results,
+            **({} if ok else {"error": "component_deploy_failed"}),
+        }
+
+    @staticmethod
+    def _convergence_action_name(action: Any) -> str:
+        if isinstance(action, str):
+            return action
+        if isinstance(action, Mapping):
+            value = action.get("action") or action.get("state") or action.get("step")
+            return str(value) if isinstance(value, str) else ""
+        return ""
+
+    def reconcile_control_plane(self) -> dict[str, Any]:
+        """Run bounded bootstrap and restore the UUID-bound storage sentinel."""
+        result = self.reconcile_bootstrap()
+        if (
+            result.get("transportReady") is not True
+            or result.get("controlReady") is not True
+        ):
+            return result
+        sentinel = self.data_sentinel(create=False)
+        if sentinel.get("ok") is not True:
+            sentinel = self.data_sentinel(create=True)
+            if sentinel.get("ok") is not True:
+                return {
+                    **result,
+                    "ok": False,
+                    "error": "storage_sentinel_create_failed",
+                }
+            sentinel = self.data_sentinel(create=False)
+        if sentinel.get("ok") is not True:
+            return {
+                **result,
+                "ok": False,
+                "error": "storage_sentinel_unverified",
+            }
+        return {
+            **result,
+            "storageSentinel": {"verified": True},
+        }
+
+    def reconcile_identity(
+        self,
+        action: Any,
+        regeneration_capability: Any = None,
+    ) -> dict[str, Any]:
+        name = self._convergence_action_name(action)
+        if name in {"none", "reuse", "inspect", "matching"}:
+            status = self.device_identity_status()
+            return {
+                "ok": status.get("ok") is True,
+                "skipped": True,
+                "identity": status,
+            }
+        if regeneration_capability is not None and not isinstance(
+            regeneration_capability,
+            Mapping,
+        ):
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        details = dict(action) if isinstance(action, Mapping) else {}
+        profile = details.get("profile")
+        client = self.daemon_client()
+        if not isinstance(profile, Mapping):
+            dumped = client.profile_helper_dump()
+            raw_profile = (
+                dumped.get("stdout")
+                if isinstance(dumped, Mapping)
+                and dumped.get("ok") is True
+                else None
+            )
+            if (
+                isinstance(raw_profile, str)
+                and 0 < len(raw_profile.encode("utf-8")) <= 256 * 1024
+            ):
+                try:
+                    profile = json.loads(raw_profile)
+                except (UnicodeError, json.JSONDecodeError):
+                    profile = None
+            if (
+                not isinstance(profile, Mapping)
+                or profile.get("schema") != "dev.xenoid.fingerprint/v1"
+            ):
+                canonical = (
+                    self.context.project_root
+                    / "examples"
+                    / "fingerprints"
+                    / "pixel-raven-android13.json"
+                )
+                try:
+                    info = canonical.lstat()
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or not 0 < info.st_size <= 256 * 1024
+                    ):
+                        raise OSError("canonical device profile is unsafe")
+                    profile = json.loads(canonical.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    profile = None
+            if (
+                not isinstance(profile, Mapping)
+                or profile.get("schema") != "dev.xenoid.fingerprint/v1"
+            ):
+                return {
+                    "ok": False,
+                    "error": "device_profile_required",
+                    "message": "identity convergence requires the canonical Raven profile",
+                }
+        try:
+            from .device_identity import converge_instance_identity
+
+            result = converge_instance_identity(
+                self.context,
+                self,
+                client,
+                profile,
+                rotate_stable=False,
+            )
+        except (IdentityError, InstanceError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "device_identity_apply_failed"),
+            }
+        if result.get("ok") is True:
+            created_sentinel = self.data_sentinel(create=True)
+            if created_sentinel.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": "storage_sentinel_create_failed",
+                }
+            verified_sentinel = self.data_sentinel(create=False)
+            if verified_sentinel.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": "storage_sentinel_unverified",
+                }
+            result["storageSentinel"] = {
+                "created": True,
+                "verified": True,
+            }
+        return result
+
+    def reconcile_location(
+        self,
+        action: Any,
+        regeneration_capability: Any = None,
+    ) -> dict[str, Any]:
+        name = self._convergence_action_name(action)
+        if name in {"none", "reuse", "inspect", "matching"}:
+            return {"ok": True, "skipped": True}
+        if regeneration_capability is not None and not isinstance(
+            regeneration_capability,
+            Mapping,
+        ):
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        try:
+            from .cellular import encode_profile_v1
+            from .location import (
+                STAGE_SCHEMA,
+                LocationError,
+                LocationStateStore,
+                convergence_action,
+                location_runtime_epoch,
+                masked_android_status,
+                public_summary,
+            )
+
+            store = LocationStateStore(self.context.state_root)
+            state = store.load()
+            if state is None:
+                return {"ok": False, "error": "location_state_missing"}
+            if state.get("active") is None and state.get("pending") is None:
+                state, _ = store.set_desired(str(state["desiredCountry"]))
+            container_id = self.location_runtime_container_id()
+            if container_id is None:
+                return {"ok": False, "error": "location_runtime_invalid"}
+            epoch = location_runtime_epoch(container_id)
+            client = self.daemon_client()
+            for _ in range(8):
+                state = store.load()
+                if state is None:
+                    raise LocationError("location_state_missing")
+                try:
+                    android = client.location_status(timeout=10.0)
+                except Exception:
+                    android = None
+                decision = convergence_action(state, android, epoch)
+                step = str(decision.get("step") or "")
+                if step == "noop":
+                    return {
+                        "ok": True,
+                        "identity": public_summary(state),
+                        "android": masked_android_status(android),
+                    }
+                if step == "resume":
+                    store.mark_restarted(epoch)
+                    continue
+                if step == "stage":
+                    profile = store.target_profile(state)
+                    request = {
+                        "schema": STAGE_SCHEMA,
+                        "profile": profile,
+                        "encodedProfile": base64.b64encode(
+                            encode_profile_v1(profile)
+                        ).decode("ascii"),
+                        "profileDigest": profile["identityDigest"],
+                        "locationKey": profile["locationKey"],
+                        "runtimeEpoch": epoch,
+                    }
+                    staged = client.location_stage(request)
+                    if staged.get("ok") is not True:
+                        return {"ok": False, "error": "location_stage_failed"}
+                    pending = state.get("pending")
+                    if isinstance(pending, Mapping) and pending.get("phase") == "new":
+                        store.mark_staged(epoch)
+                    if decision.get("recreate") is True:
+                        current = store.load()
+                        pending = current.get("pending") if isinstance(current, Mapping) else None
+                        if isinstance(pending, Mapping) and pending.get("phase") == "staged":
+                            store.arm_restart()
+                        return {
+                            "ok": False,
+                            "error": "convergence_live_resolution_conflict",
+                            "message": "location still requires the planner-authorized runtime replacement",
+                        }
+                    continue
+                if step == "verify":
+                    if decision.get("restage"):
+                        profile = store.target_profile(state)
+                        staged = client.location_stage(
+                            {
+                                "schema": STAGE_SCHEMA,
+                                "profile": profile,
+                                "encodedProfile": base64.b64encode(
+                                    encode_profile_v1(profile)
+                                ).decode("ascii"),
+                                "profileDigest": profile["identityDigest"],
+                                "locationKey": profile["locationKey"],
+                                "runtimeEpoch": epoch,
+                            }
+                        )
+                        if staged.get("ok") is not True:
+                            return {"ok": False, "error": "location_stage_failed"}
+                    digest = store.target_profile(state)["identityDigest"]
+                    verified = client.location_verify(digest, epoch)
+                    if (
+                        verified.get("ok") is not True
+                        or verified.get("verified") is not True
+                    ):
+                        return {
+                            "ok": False,
+                            "error": "location_identity_unverified",
+                        }
+                    if decision.get("promote"):
+                        store.promote(epoch)
+                    else:
+                        store.mark_validated(epoch)
+                    continue
+                if step in {"bootstrap", "recreate"}:
+                    return {
+                        "ok": False,
+                        "error": "convergence_live_resolution_conflict",
+                    }
+                return {"ok": False, "error": "location_phase_invalid"}
+            return {"ok": False, "error": "location_convergence_failed"}
+        except (LocationError, InstanceError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "location_convergence_failed"),
+            }
+
+    def reconcile_keybox(self, action: Any) -> dict[str, Any]:
+        name = self._convergence_action_name(action)
+        try:
+            status = self.daemon_client().keybox_status(timeout=20.0)
+        except Exception:
+            return {"ok": False, "error": "keybox_daemon_unavailable"}
+        if name in {"none", "reuse", "inspect", "matching"}:
+            return {**status, "skipped": True}
+        return status
+
+    def reconcile_camera(self, action: Any) -> dict[str, Any]:
+        name = self._convergence_action_name(action)
+        try:
+            client = self.daemon_client()
+            if name in {"apply", "reconcile", "drift"}:
+                applied = client.camera_apply()
+                if applied.get("ok") is not True:
+                    return applied
+            else:
+                applied = {"ok": True, "skipped": True}
+            status = client.camera_status(timeout=20.0)
+        except Exception:
+            return {"ok": False, "error": "camera_daemon_unavailable"}
+        return {
+            **status,
+            "apply": applied,
+            "ok": status.get("ok") is True,
+        }
+
+    def reconcile_google(
+        self,
+        action: Any,
+        fresh_bootstrap: bool = False,
+    ) -> dict[str, Any]:
+        name = self._convergence_action_name(action)
+        try:
+            spec = self.google_runtime_spec(
+                "convergence-google",
+                require_assets=True,
+            )
+            if name in {"none", "reuse", "inspect", "matching"}:
+                status = self.google_services_status(require_runtime=True)
+                return {**status, "skipped": True}
+            try:
+                preflight = self._google_binding_preflight(spec)
+                binding = self._begin_google_binding(spec, preflight)
+            except GoogleServicesError as exc:
+                if (
+                    not fresh_bootstrap
+                    or spec is None
+                    or exc.code != "google_services_new_instance_required"
+                ):
+                    raise
+                binding_store = GoogleBindingStore(self.context, self.lease)
+                storage = StorageStateStore(self.context, self.lease).load()
+                if (
+                    binding_store.load() is not None
+                    or not isinstance(storage, Mapping)
+                    or storage.get("state") != "committed"
+                    or storage.get("source") != "fresh"
+                ):
+                    raise
+                binding = binding_store.pending(spec, "fresh")
+            gate = self.google_services_bootstrap_gate(spec)
+            if gate.get("ok") is not True:
+                return gate
+            committed = self._commit_google_binding(binding)
+            return {
+                "ok": True,
+                "binding": public_binding(committed),
+                "runtime": gate,
+            }
+        except (GoogleServicesError, StorageError) as exc:
+            return {
+                "ok": False,
+                "error": getattr(exc, "code", "google_services_runtime_not_ready"),
+            }
+
+    def observe_shared_protection(self) -> dict[str, Any]:
+        return self.shared_protection_status()
+
+    def maintain_shared_protection(
+        self,
+        expected_digest: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return self.shared_protection_manager().ensure(expected_digest)
+
+    def reconcile_protection(
+        self,
+        action: Any,
+        expected_digest: Optional[str] = None,
+    ) -> dict[str, Any]:
+        name = self._convergence_action_name(action)
+        if name in {"maintain", "maintenance", "drift", "reconcile"}:
+            return self.maintain_shared_protection(expected_digest)
+        observed = self.observe_shared_protection()
+        if expected_digest is not None and (
+            _SHA256_PATTERN.fullmatch(expected_digest) is None
+            or observed.get("currentDigest") != expected_digest
+        ):
+            return {
+                **observed,
+                "ok": False,
+                "error": "shared_protection_digest_mismatch",
+                "expectedDigest": expected_digest,
+            }
+        return observed
+
 
     def generate_service_frida(self, profile_path: str, out: Optional[str] = None, keep_unique: bool = False) -> dict[str, Any]:
         script = self.context.project_root / "scripts" / "generate-service-frida.py"
@@ -5526,6 +11187,7 @@ class RuntimeManager:
 
     def _proxy_stage_control_bundle(self, expected_digest: str) -> dict[str, str]:
         root = self.context.project_root
+        artifact_root = self._artifact_consumer_root("liveDeploy")
         staging = f"/var/lib/xenoid/proxy/control-{expected_digest}"
         ready = f"{staging}/READY"
         self._proxy_install_directory("/var/lib/xenoid", 0o755)
@@ -5560,7 +11222,10 @@ class RuntimeManager:
             (root / "scripts" / "xenoid-proxy-fetch-worker.py", f"{staging}/xenoid-proxy-fetch-worker.py", 0o555),
             (root / "scripts" / "xenoid-proxy-agent@.service", f"{staging}/xenoid-proxy-agent@.service", 0o444),
             (
-                root / "native" / "xenoid-proxy-sandbox" / "xenoid-proxy-sandbox",
+                artifact_root
+                / "native"
+                / "xenoid-proxy-sandbox"
+                / "xenoid-proxy-sandbox",
                 f"{staging}/xenoid-proxy-sandbox",
                 0o555,
             ),
@@ -5627,7 +11292,32 @@ class RuntimeManager:
     def _proxy_live_identity(self, *, require_running: bool = True) -> tuple[str, str]:
         container, error = self._owned_container_record()
         if container is None:
-            raise InstanceError("resource_conflict", error)
+            if require_running:
+                raise InstanceError("resource_conflict", error)
+            ensured = self.ensure_network()
+            if ensured.get("ok") is not True:
+                raise InstanceError(
+                    "runtime_identity_mismatch",
+                    "instance Docker network is unavailable",
+                )
+            network, _ = self._inspect_docker_object(
+                "network",
+                self.lease.network_name,
+            )
+            network_id = (
+                network.get("Id") if isinstance(network, Mapping) else None
+            )
+            if (
+                not isinstance(network, Mapping)
+                or not self._network_matches_lease(dict(network))
+                or not isinstance(network_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", network_id) is None
+            ):
+                raise InstanceError(
+                    "runtime_identity_mismatch",
+                    "instance Docker network identity is invalid",
+                )
+            return "0" * 64, network_id
         state = container.get("State")
         if (
             not isinstance(state, dict)
@@ -5765,8 +11455,20 @@ class RuntimeManager:
             expected_container, expected_network = self._proxy_live_identity(
                 require_running=not allow_stopped
             )
-            if (container_id, network_id) != (expected_container, expected_network):
-                raise InstanceError("runtime_identity_mismatch", "proxy manifest runtime identity is stale")
+            if (
+                (container_id, network_id)
+                != (expected_container, expected_network)
+                and not (
+                    container_id == "0" * 64
+                    and network_id == expected_network
+                    and isinstance(document.get("runtimeEpoch"), str)
+                    and document["runtimeEpoch"].startswith("control-")
+                )
+            ):
+                raise InstanceError(
+                    "runtime_identity_mismatch",
+                    "proxy manifest runtime identity is stale",
+                )
         elif (
             not isinstance(container_id, str)
             or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
@@ -6004,9 +11706,9 @@ class RuntimeManager:
             and not isinstance(status.get("updatedAt"), bool)
             and abs(time.time() - status["updatedAt"]) <= 90
         )
-
     def _proxy_local_control_digest(self) -> str:
         root = self.context.project_root
+        artifact_root = self._artifact_consumer_root("liveDeploy")
         base = "/var/lib/xenoid/proxy/control-v1"
         local_files = (
             (root / "scripts" / "xenoid-proxy-engine.py", f"{base}/xenoid-proxy-engine.py"),
@@ -6014,7 +11716,7 @@ class RuntimeManager:
             (root / "scripts" / "xenoid-proxy-compile-worker.py", f"{base}/xenoid-proxy-compile-worker.py"),
             (root / "scripts" / "xenoid-proxy-fetch-worker.py", f"{base}/xenoid-proxy-fetch-worker.py"),
             (root / "scripts" / "xenoid-proxy-agent@.service", f"{base}/xenoid-proxy-agent@.service"),
-            (root / "native" / "xenoid-proxy-sandbox" / "xenoid-proxy-sandbox", f"{base}/xenoid-proxy-sandbox"),
+            (artifact_root / "native" / "xenoid-proxy-sandbox" / "xenoid-proxy-sandbox", f"{base}/xenoid-proxy-sandbox"),
             (root / "src" / "xenoid" / "__init__.py", f"{base}/xenoid/__init__.py"),
             (root / "src" / "xenoid" / "proxy_source.py", f"{base}/xenoid/proxy_source.py"),
             (root / "src" / "xenoid" / "proxy_protocol.py", f"{base}/xenoid/proxy_protocol.py"),
@@ -6038,10 +11740,24 @@ class RuntimeManager:
             require_running=not allow_stopped
         )
         existing = self._proxy_read_manifest(
-            require_live=True,
+            require_live=False,
             allow_absent=True,
             allow_stopped=allow_stopped,
         )
+        if (
+            isinstance(existing, Mapping)
+            and (existing.get("containerId"), existing.get("networkId"))
+            != (container_id, network_id)
+            and not (
+                existing.get("containerId") == "0" * 64
+                and container_id != "0" * 64
+                and existing.get("networkId") == network_id
+            )
+        ):
+            raise InstanceError(
+                "runtime_identity_mismatch",
+                "proxy manifest runtime identity is stale",
+            )
         if existing is None:
             state_exists = self._proxy_remote_exists(self._proxy_state_path)
             runtime_exists = self._proxy_remote_exists(self._proxy_runtime_path)
@@ -6059,6 +11775,18 @@ class RuntimeManager:
                     network_id,
                 )
                 self._proxy_stage_manifest(existing)
+        if (
+            isinstance(existing, Mapping)
+            and existing.get("containerId") == "0" * 64
+            and container_id != "0" * 64
+        ):
+            existing = self._proxy_manifest_document(
+                f"control-{self.context.resource_tag}-{secrets.token_hex(16)}",
+                int(existing["generation"]),
+                container_id,
+                network_id,
+            )
+            self._proxy_stage_manifest(existing)
         expected_digest = self._proxy_local_control_digest()
         checked = self._proxy_root_json("check-control")
         if checked.get("ok") is True and checked.get("controlDigest") == expected_digest:
@@ -6077,7 +11805,12 @@ class RuntimeManager:
             quarantined = self._proxy_root_json("quarantine")
             if (
                 quarantined.get("ok") is not True
-                and quarantined.get("code") == "runtime_identity_mismatch"
+                and quarantined.get("code")
+                in {
+                    "runtime_identity_mismatch",
+                    "ownership_mismatch",
+                    "cleanup_incomplete",
+                }
             ):
                 # Repair an older installed control helper that rejected Docker's
                 # valid stopped-container representation. Staging is inert; the
@@ -6192,6 +11925,18 @@ class RuntimeManager:
         )
         return returncode in {0, 5} and output in {b"", b"\n"}
 
+    def _proxy_discard_agent_key(self) -> bool:
+        try:
+            discarded = self._proxy_root_json("discard-key")
+            return (
+                discarded.get("ok") is True
+                and not self._proxy_remote_exists(
+                    f"{self._proxy_state_path}/agent.key"
+                )
+            )
+        except InstanceError:
+            return False
+
     def proxy_start_agent(
         self,
         runtime_epoch: str,
@@ -6243,9 +11988,14 @@ class RuntimeManager:
             self._proxy_stage_bytes(key_path, key_payload, 0o400)
             if not self._proxy_remote_regular_valid(key_path, 0o400):
                 raise InstanceError("agent_bootstrap_failed", "proxy key staging failed")
-        except InstanceError:
-            self._proxy_root_json("discard-key")
+        except InstanceError as exc:
+            key_removed = self._proxy_discard_agent_key()
             self._proxy_root_json("quarantine")
+            if not key_removed:
+                raise InstanceError(
+                    "agent_key_cleanup_failed",
+                    "proxy key cleanup failed",
+                ) from exc
             raise
         finally:
             for index in range(len(key_payload)):
@@ -6259,9 +12009,11 @@ class RuntimeManager:
             ["systemctl", "start", self._proxy_systemd_unit()],
             timeout=60,
         ):
-            self._proxy_root_json("discard-key")
+            key_removed = self._proxy_discard_agent_key()
             self._proxy_root_json("quarantine")
-            return self._proxy_failure("agent_start_failed")
+            return self._proxy_failure(
+                "agent_start_failed" if key_removed else "agent_key_cleanup_failed"
+            )
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if (
@@ -6272,9 +12024,11 @@ class RuntimeManager:
             time.sleep(0.25)
         else:
             self._proxy_stop_agent()
-            self._proxy_root_json("discard-key")
+            key_removed = self._proxy_discard_agent_key()
             self._proxy_root_json("quarantine")
-            return self._proxy_failure("agent_start_failed")
+            return self._proxy_failure(
+                "agent_start_failed" if key_removed else "agent_key_cleanup_failed"
+            )
         return {
             "ok": True,
             "instanceId": self.context.instance_id,
@@ -6289,14 +12043,27 @@ class RuntimeManager:
     def proxy_engine_status(self) -> dict[str, Any]:
         self.ensure_instance_lease()
         try:
-            manifest = self._proxy_read_manifest(require_live=True, allow_absent=False)
-            if manifest is None or not self._proxy_agent_active(manifest):
-                return self._proxy_failure("agent_stale")
+            manifest = self._proxy_read_manifest(
+                require_live=True,
+                allow_absent=False,
+            )
+            if manifest is None:
+                return self._proxy_failure("engine_not_prepared")
+            agent_active = self._proxy_agent_active(manifest)
             result = self._proxy_root_json("status")
         except InstanceError as exc:
             return self._proxy_failure(exc.code)
         if result.get("ok") is not True:
             return result
+        if (
+            not agent_active
+            and not (
+                result.get("phase") == "off"
+                and result.get("structuralApplied") is True
+                and result.get("dataPlaneVerified") is True
+            )
+        ):
+            return self._proxy_failure("agent_stale")
         if (
             result.get("instanceId") != self.context.instance_id
             or result.get("resourceTag") != self.context.resource_tag
@@ -6328,39 +12095,105 @@ class RuntimeManager:
             return self._proxy_failure(exc.code)
         return self._proxy_root_json("quarantine")
 
-    def proxy_off(self, generation: int) -> dict[str, Any]:
+    def proxy_off(
+        self,
+        generation: int,
+        *,
+        runtime_epoch: Optional[str] = None,
+    ) -> dict[str, Any]:
         self.ensure_instance_lease()
         if (
             not isinstance(generation, int)
             or isinstance(generation, bool)
             or not 0 <= generation < (1 << 63)
+            or runtime_epoch is not None
+            and (
+                not isinstance(runtime_epoch, str)
+                or re.fullmatch(r"[A-Za-z0-9._-]{16,128}", runtime_epoch) is None
+            )
         ):
             return self._proxy_failure("generation_stale")
+
+        def fail_closed(code: str) -> dict[str, Any]:
+            try:
+                self._proxy_root_json("quarantine")
+            except Exception:
+                pass
+            return self._proxy_failure(code)
         try:
+            if self._proxy_feature_absent():
+                if runtime_epoch is None:
+                    return self._proxy_failure("engine_not_prepared")
+                return {
+                    "ok": True,
+                    "phase": "off",
+                    "generation": generation,
+                    "runtimeEpoch": runtime_epoch,
+                    "structuralApplied": True,
+                    "dataPlaneVerified": True,
+                    "agentAbsent": True,
+                    "routingAbsent": True,
+                }
             manifest = self._proxy_read_manifest(require_live=True, allow_absent=False)
+            if manifest is None:
+                return self._proxy_failure("engine_not_prepared")
+            guarded = self._proxy_root_json("quarantine")
+            if guarded.get("ok") is not True:
+                return guarded
+            if generation < manifest["generation"]:
+                return self._proxy_failure("generation_stale")
+            if not self._proxy_stop_agent():
+                return fail_closed("agent_stop_failed")
+            discarded = self._proxy_root_json("discard-key")
+            if (
+                discarded.get("ok") is not True
+                or self._proxy_remote_exists(f"{self._proxy_state_path}/agent.key")
+            ):
+                return fail_closed("agent_key_cleanup_failed")
+            target_epoch = runtime_epoch or manifest["runtimeEpoch"]
+            if (
+                generation != manifest["generation"]
+                or target_epoch != manifest["runtimeEpoch"]
+            ):
+                manifest = self._proxy_manifest_document(
+                    target_epoch,
+                    generation,
+                    manifest["containerId"],
+                    manifest["networkId"],
+                )
+                self._proxy_stage_manifest(manifest)
+            result = self._proxy_root_json("off", timeout=180)
+            if result.get("ok") is not True:
+                code = result.get("code")
+                return fail_closed(code if isinstance(code, str) else "off_unverified")
+            if self._proxy_root_simple(
+                ["systemctl", "is-active", "--quiet", self._proxy_systemd_unit()],
+                timeout=15,
+            ):
+                return fail_closed("agent_stop_failed")
+            verified = self._proxy_root_json("status")
+            if (
+                verified.get("ok") is not True
+                or verified.get("instanceId") != self.context.instance_id
+                or verified.get("resourceTag") != self.context.resource_tag
+                or verified.get("runtimeEpoch") != target_epoch
+                or verified.get("generation") != generation
+                or verified.get("phase") != "off"
+                or verified.get("structuralApplied") is not True
+                or verified.get("dataPlaneVerified") is not True
+            ):
+                return fail_closed("off_unverified")
         except InstanceError as exc:
-            return self._proxy_failure(exc.code)
-        if manifest is None:
-            return self._proxy_failure("engine_not_prepared")
-        if generation < manifest["generation"]:
-            return self._proxy_failure("generation_stale")
-        if generation != manifest["generation"]:
-            manifest = self._proxy_manifest_document(
-                manifest["runtimeEpoch"],
-                generation,
-                manifest["containerId"],
-                manifest["networkId"],
-            )
-            self._proxy_stage_manifest(manifest)
-        result = self._proxy_root_json("off", timeout=180)
-        if result.get("ok") is not True:
-            return result
+            return fail_closed(exc.code)
         return {
             "ok": True,
             "phase": "off",
             "generation": generation,
+            "runtimeEpoch": target_epoch,
             "structuralApplied": True,
             "dataPlaneVerified": True,
+            "agentAbsent": True,
+            "routingAbsent": True,
         }
 
     def proxy_cleanup(self) -> dict[str, Any]:

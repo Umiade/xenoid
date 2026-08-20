@@ -5,24 +5,27 @@
 # transaction in private instance state; this script is idempotent so an
 # interrupted rotation converges on retry.
 #
-# Usage: rotate-storage-identity.sh VOLUME EXPECTED_DATA_UUID TARGET_DATA_UUID TARGET_ROOTFS_UUID
-# The DATA image accepts only the EXPECTED→TARGET transition (or an
-# already-TARGET resume); any other observed data UUID is a hard identity
-# mismatch so a replaced image is never silently adopted. The ROOTFS image has
-# no expected-old reference: any valid ext4 rootfs is only normalized to the
-# target UUID (rotation, not replacement detection — rootfs content
-# authenticity is a separate concern).
+# Usage: rotate-storage-identity.sh VOLUME EXPECTED_DATA_UUID TARGET_DATA_UUID EXPECTED_ROOTFS_UUID EXPECTED_ROOTFS_SOURCE_SHA256 EXPECTED_ROOTFS_SIZE TARGET_ROOTFS_UUID
+# Each image accepts only its recorded EXPECTED→TARGET transition (or an
+# already-TARGET resume). Any third identity, source, geometry, missing image,
+# geometry mismatch fails closed.
 # Requires: docker, e2fsprogs (blkid/tune2fs/e2fsck/debugfs) on the Docker
 # engine host. The owned Android container must be absent.
 set -euo pipefail
 VOLUME="${1:-}"
 EXPECTED_UUID="${2:-}"
 TARGET_UUID="${3:-}"
-TARGET_ROOTFS_UUID="${4:-}"
+EXPECTED_ROOTFS_UUID="${4:-}"
+EXPECTED_ROOTFS_SOURCE_SHA256="${5:-}"
+EXPECTED_ROOTFS_SIZE="${6:-}"
+TARGET_ROOTFS_UUID="${7:-}"
 [[ "$VOLUME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || { echo "invalid volume" >&2; exit 2; }
 UUID36_RE='^[0-9a-fA-F-]{36}$'
 [[ "$EXPECTED_UUID" =~ $UUID36_RE ]] || { echo "invalid expected data UUID" >&2; exit 2; }
 [[ "$TARGET_UUID" =~ $UUID36_RE ]] || { echo "invalid target data UUID" >&2; exit 2; }
+[[ "$EXPECTED_ROOTFS_UUID" =~ $UUID36_RE ]] || { echo "invalid expected rootfs UUID" >&2; exit 2; }
+[[ "$EXPECTED_ROOTFS_SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid expected rootfs source" >&2; exit 2; }
+[[ "$EXPECTED_ROOTFS_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "invalid expected rootfs size" >&2; exit 2; }
 [[ "$TARGET_ROOTFS_UUID" =~ $UUID36_RE ]] || { echo "invalid target rootfs UUID" >&2; exit 2; }
 DOCKER=(docker)
 if [[ -n "${XENOID_DOCKER_CONTEXT:-}" ]]; then
@@ -54,6 +57,9 @@ data='$VOL_PATH/xenoid-data.img'
 rootfs='$VOL_PATH/xenoid-rootfs.img'
 expected='$EXPECTED_UUID'
 target='$TARGET_UUID'
+expected_rootfs='$EXPECTED_ROOTFS_UUID'
+expected_rootfs_source='$EXPECTED_ROOTFS_SOURCE_SHA256'
+expected_rootfs_size='$EXPECTED_ROOTFS_SIZE'
 target_rootfs='$TARGET_ROOTFS_UUID'
 
 lower_uuid() { printf '%s' "\$1" | tr 'A-F' 'a-f'; }
@@ -82,8 +88,30 @@ fsck_image() {
 
 expected="\$(lower_uuid "\$expected")"
 target="\$(lower_uuid "\$target")"
+expected_rootfs="\$(lower_uuid "\$expected_rootfs")"
 target_rootfs="\$(lower_uuid "\$target_rootfs")"
 current="\$(image_uuid "\$data")"
+[ "\$current" = "\$expected" ] || [ "\$current" = "\$target" ] ||
+  { echo 'persistent data image UUID matches neither the pending expectation nor the rotation target' >&2; exit 42; }
+[ "\$(logical_size "\$data")" = 128000000000 ] &&
+  [ "\$(filesystem_size "\$data")" = 128000000000 ] ||
+  { echo 'persistent data geometry mismatch' >&2; exit 58; }
+[ -f "\$rootfs" ] && [ ! -L "\$rootfs" ] && [ -s "\$rootfs" ] &&
+  [ "\$(blkid -p -s TYPE -o value -- "\$rootfs" 2>/dev/null)" = ext4 ] ||
+  { echo 'persistent rootfs image missing or invalid' >&2; exit 41; }
+rootfs_current="\$(image_uuid "\$rootfs")"
+[ "\$rootfs_current" = "\$expected_rootfs" ] ||
+  [ "\$rootfs_current" = "\$target_rootfs" ] ||
+  { echo 'persistent rootfs image UUID matches neither the pending expectation nor the rotation target' >&2; exit 42; }
+source_marker='$VOL_PATH/xenoid-rootfs.img.source.sha256'
+[ -f "\$source_marker" ] && [ ! -L "\$source_marker" ] &&
+  [ "\$(stat -c %u -- "\$source_marker")" = 0 ] ||
+  { echo 'persistent rootfs source marker is unsafe' >&2; exit 41; }
+[ "\$(cat "\$source_marker")" = "\$expected_rootfs_source" ] ||
+  { echo 'persistent rootfs source marker mismatch' >&2; exit 41; }
+[ "\$(logical_size "\$rootfs")" = "\$expected_rootfs_size" ] &&
+  [ "\$(filesystem_size "\$rootfs")" = "\$expected_rootfs_size" ] ||
+  { echo 'persistent rootfs geometry mismatch' >&2; exit 58; }
 rotated=0
 fsck_image "\$data"
 if [ "\$current" = "\$expected" ]; then
@@ -115,16 +143,22 @@ remove_data_file 'system/users/0/settings_ssaid.xml'
 remove_data_file 'local/tmp/runtime-state/storage-sentinel.v1'
 sync -f "\$data"
 
-if [ -f "\$rootfs" ] && [ ! -L "\$rootfs" ] &&
-  [ "\$(blkid -p -s TYPE -o value -- "\$rootfs" 2>/dev/null)" = ext4 ]; then
-  fsck_image "\$rootfs"
+fsck_image "\$rootfs"
+if [ "\$rootfs_current" = "\$expected_rootfs" ]; then
+  tune2fs -U "\$target_rootfs" "\$rootfs" >/dev/null ||
+    { echo 'rootfs image UUID rotation failed' >&2; exit 60; }
+  sync -f "\$rootfs"
   rootfs_current="\$(image_uuid "\$rootfs")"
-  if [ "\$rootfs_current" != "\$target_rootfs" ]; then
-    tune2fs -U "\$target_rootfs" "\$rootfs" >/dev/null ||
-      { echo 'rootfs image UUID rotation failed' >&2; exit 60; }
-    sync -f "\$rootfs"
-  fi
+  [ "\$rootfs_current" = "\$target_rootfs" ] ||
+    { echo 'rootfs image UUID rotation verification failed' >&2; exit 60; }
+  rotated=1
+[ "\$(logical_size "\$data")" = 128000000000 ] &&
+  [ "\$(filesystem_size "\$data")" = 128000000000 ] ||
+  { echo 'rotated data geometry mismatch' >&2; exit 58; }
 fi
+[ "\$(logical_size "\$rootfs")" = "\$expected_rootfs_size" ] &&
+  [ "\$(filesystem_size "\$rootfs")" = "\$expected_rootfs_size" ] ||
+  { echo 'rotated rootfs geometry mismatch' >&2; exit 58; }
 
 logical="\$(logical_size "\$data")"
 filesystem="\$(filesystem_size "\$data")"
@@ -138,6 +172,9 @@ printf 'XENOID_DATA_ALLOCATED_SIZE=%s\n' "\$allocated"
 printf 'XENOID_DATA_BACKING_TOTAL=%s\n' "\$1"
 printf 'XENOID_DATA_BACKING_AVAILABLE=%s\n' "\$2"
 printf 'XENOID_DATA_ROTATED=%s\n' "\$rotated"
+printf 'XENOID_ROOTFS_UUID=%s\n' "\$rootfs_current"
+printf 'XENOID_ROOTFS_SOURCE_SHA256=%s\n' "\$(cat '$VOL_PATH/xenoid-rootfs.img.source.sha256')"
+printf 'XENOID_ROOTFS_LOGICAL_SIZE=%s\n' "\$(logical_size "\$rootfs")"
 EOF
 )"
 echo "OK storage identity rotated for $VOLUME"

@@ -9,8 +9,8 @@ final class HideManager {
                 "test -x /data/local/tmp/xenoid-hide-helper && " +
                 "/data/local/tmp/xenoid-hide-helper status");
         Map<String,Object> overlayStatus = RootHelper.exec(
-                "test -x /data/local/tmp/xenoid-overlay-helper && " +
-                "/data/local/tmp/xenoid-overlay-helper status-json");
+                "test -x /system/bin/xenoid-overlay-helper && " +
+                "/system/bin/xenoid-overlay-helper status-json");
         Map<String,Object> propertyStatus = RootHelper.exec(
                 "test \"$(getprop ro.boot.verifiedbootstate)\" = green && " +
                 "test \"$(getprop ro.boot.flash.locked)\" = 1 && " +
@@ -78,15 +78,15 @@ final class HideManager {
                 "/data/local/tmp/xenoid-hide-helper apply /data/local/tmp/xenoid-hide/policy.json",
                 true);
         addAction(actions, failures, "overlay",
-                "test -x /data/local/tmp/xenoid-overlay-helper && " +
-                "/data/local/tmp/xenoid-overlay-helper apply " +
+                "test -x /system/bin/xenoid-overlay-helper && " +
+                "/system/bin/xenoid-overlay-helper apply " +
                 ">/data/local/tmp/xenoid-overlay.log 2>&1",
                 true);
         addAction(actions, failures, "native-verification",
                 "/data/local/tmp/xenoid-hide-helper status",
                 true);
         addAction(actions, failures, "overlay-verification",
-                "/data/local/tmp/xenoid-overlay-helper status-json",
+                "/system/bin/xenoid-overlay-helper status-json",
                 true);
 
         out.put("actions", actions);

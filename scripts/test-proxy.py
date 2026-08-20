@@ -6,7 +6,9 @@ all mutable state remains inside a fresh temporary project and client state root
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import importlib.util
 import json
 import stat
 import sys
@@ -17,13 +19,12 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-
-from xenoid import config
-from xenoid import backend
+from xenoid import backend, cli, config, location
 
 
 ID_A = "10000000-0000-4000-8000-000000000001"
@@ -167,12 +168,23 @@ def context_config_state_and_tag() -> None:
         require(cfg.instance_name == context.instance_name and cfg.instance_id == context.instance_id)
         require(config.load_config(context) == cfg)
         require((context.state_root / "allocation.json").is_file())
+        location_state = location.LocationStateStore(context.state_root).load()
+        require(location_state is not None)
+        require(location_state["instanceId"] == ID_A)
+        require(location_state["desiredCountry"] == location.DEFAULT_COUNTRY)
+        require(location_state["active"] is None)
+        require(
+            isinstance(location_state["pending"], dict)
+            and location_state["pending"]["country"] == location.DEFAULT_COUNTRY
+            and location_state["pending"]["phase"] == "new"
+        )
         require((roots.state / "registry.json").is_file())
         for directory in (context.config_path.parent, context.state_root, roots.state):
             require(stat.S_IMODE(directory.stat().st_mode) == 0o700)
         for private_file in (
             context.config_path,
             context.state_root / "allocation.json",
+            context.state_root / location.STATE_FILENAME,
             roots.state / "registry.json",
         ):
             require(stat.S_IMODE(private_file.stat().st_mode) == 0o600)
@@ -183,8 +195,13 @@ def network_epoch_rotation() -> None:
     with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
         context, _, lease = initialize(roots, "phone-a")
         require(lease.network_epoch == "")
-        rotated = config.rotate_instance_network(context)
-        require(rotated.network_epoch != "")
+        first_target = "11" * 16
+        rotated = config.rotate_instance_network(
+            context,
+            target_epoch=first_target,
+            expected_epoch="",
+        )
+        require(rotated.network_epoch == first_target)
         require(rotated.mac_address != lease.mac_address)
         require(
             (rotated.slot, rotated.ipv4_address, rotated.ipv6_address)
@@ -197,10 +214,29 @@ def network_epoch_rotation() -> None:
         first_octet = int(rotated.mac_address.split(":", 1)[0], 16)
         require(first_octet & 0x03 == 0x02)
         require(resolve(roots, "phone-a")[2] == rotated)
-        again = config.rotate_instance_network(context)
-        require(again.network_epoch != rotated.network_epoch)
+        retried = config.rotate_instance_network(
+            context,
+            target_epoch=first_target,
+            expected_epoch="",
+        )
+        require(retried == rotated)
+        second_target = "22" * 16
+        again = config.rotate_instance_network(
+            context,
+            target_epoch=second_target,
+            expected_epoch=first_target,
+        )
+        require(again.network_epoch == second_target)
         require(again.mac_address != rotated.mac_address)
         require(resolve(roots, "phone-a")[2] == again)
+        require_error(
+            "device_regeneration_state_invalid",
+            lambda: config.rotate_instance_network(
+                context,
+                target_epoch=first_target,
+                expected_epoch="",
+            ),
+        )
 
 
 def _crash_rotation_at_write(target_write: int) -> Callable[[Any, Any, int], Any]:
@@ -246,7 +282,11 @@ def network_epoch_rotation_crash_before_allocation() -> None:
             config, "_atomic_json", side_effect=_crash_rotation_at_write(2)
         ):
             try:
-                config.rotate_instance_network(context)
+                config.rotate_instance_network(
+                    context,
+                    target_epoch="33" * 16,
+                    expected_epoch="",
+                )
             except RuntimeError:
                 pass
             else:
@@ -262,7 +302,11 @@ def network_epoch_rotation_crash_before_commit() -> None:
             config, "_atomic_json", side_effect=_crash_rotation_at_write(3)
         ):
             try:
-                config.rotate_instance_network(context)
+                config.rotate_instance_network(
+                    context,
+                    target_epoch="44" * 16,
+                    expected_epoch="",
+                )
             except RuntimeError:
                 pass
             else:
@@ -274,7 +318,11 @@ def network_epoch_rotation_crash_before_commit() -> None:
 def network_epoch_rotation_rejects_tampered_pending() -> None:
     with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
         context, _, lease = initialize(roots, "phone-a")
-        config.rotate_instance_network(context)
+        config.rotate_instance_network(
+            context,
+            target_epoch="55" * 16,
+            expected_epoch="",
+        )
         registry_path = roots.state / "registry.json"
         registry = json.loads(registry_path.read_text())
         forged = config._lease_for_slot("phone-a", ID_A, 1, TX_A)
@@ -593,14 +641,17 @@ def daemon_proxy_desired_survives_update() -> None:
     with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
         context, cfg, lease = initialize(roots, "phone-a")
         manager = backend.RuntimeManager(context, cfg, lease)
-        source_value = "socks5://user:secret@proxy.example:1080"
+        source_value = "socks5" + "://user:secret@proxy.example:1080"
         restored_calls: list[tuple[Any, ...]] = []
 
         class Client:
             @staticmethod
-            def health() -> dict[str, Any]:
-                return {"ok": True}
-
+            def bootstrap_status(timeout: float = 2.0) -> dict[str, Any]:
+                require(timeout == 2.0)
+                return {
+                    "ok": True,
+                    "components": {"proxy": {"ok": True}},
+                }
             @staticmethod
             def proxy_export() -> dict[str, Any]:
                 return {
@@ -616,9 +667,27 @@ def daemon_proxy_desired_survives_update() -> None:
                     },
                 }
 
+        class Controller:
             @staticmethod
-            def proxy_source(*args: Any) -> dict[str, Any]:
-                restored_calls.append(args)
+            def set_source(
+                kind: str,
+                value: str,
+                enabled: bool,
+                *,
+                selected_node: str,
+                udp_allowed: bool,
+                allow_insecure_http: bool,
+            ) -> dict[str, Any]:
+                restored_calls.append(
+                    (
+                        kind,
+                        value,
+                        enabled,
+                        selected_node,
+                        udp_allowed,
+                        allow_insecure_http,
+                    )
+                )
                 return {"ok": True}
 
         client = Client()
@@ -626,13 +695,213 @@ def daemon_proxy_desired_survives_update() -> None:
             captured = manager._capture_proxy_desired_for_update()
         require(captured == {"ok": True, "captured": True, "configured": True})
         require(source_value not in json.dumps(captured))
-        restored = manager._restore_proxy_desired_after_update(client)
+        restored = manager._restore_proxy_desired_after_update(Controller())
         require(restored == {"ok": True, "restored": True})
         require(
             restored_calls
             == [("endpoint", source_value, True, "", True, False)]
         )
         require(manager._pending_proxy_restore is None)
+
+@contract_case("proxyAgentKeyIsOneShot")
+def proxy_agent_key_is_one_shot() -> None:
+    staged: list[bytearray] = []
+    root_actions: list[str] = []
+
+    class Runtime(backend.RuntimeManager):
+        def __init__(self) -> None:
+            self.context = SimpleNamespace(
+                instance_id=ID_A,
+                resource_tag="fixturetag",
+            )
+
+        def ensure_instance_lease(self) -> None:
+            return None
+
+        def _proxy_live_identity(self) -> tuple[str, str]:
+            return ("container-id", "network-id")
+
+        def _proxy_manifest_document(
+            self,
+            runtime_epoch: str,
+            generation: int,
+            _container_id: str,
+            _network_id: str,
+        ) -> dict[str, Any]:
+            return {
+                "runtimeEpoch": runtime_epoch,
+                "generation": generation,
+            }
+
+        def proxy_prerequisite(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"ok": True}
+
+        def proxy_prepare_asset(self, _asset: Any) -> dict[str, Any]:
+            return {"ok": True}
+
+        def _proxy_read_manifest(self, **_kwargs: Any) -> None:
+            return None
+
+        def _proxy_root_json(self, action: str, **_kwargs: Any) -> dict[str, Any]:
+            root_actions.append(action)
+            return {"ok": True}
+
+        def _proxy_stop_agent(self) -> bool:
+            return True
+
+        def _proxy_stage_manifest(self, _manifest: dict[str, Any]) -> None:
+            return None
+
+        def _proxy_stage_bytes(
+            self, _path: str, payload: bytearray, _mode: int
+        ) -> None:
+            staged.append(payload)
+
+        def _proxy_remote_regular_valid(self, _path: str, _mode: int) -> bool:
+            return True
+
+        def _proxy_root_process(
+            self, _command: list[str], **_kwargs: Any
+        ) -> tuple[int, bytes]:
+            return (0, b"")
+
+        def _proxy_root_simple(self, _command: list[str], **_kwargs: Any) -> bool:
+            return True
+
+        def _proxy_remote_exists(self, path: str) -> bool:
+            require(path.endswith("/agent.key"))
+            return False
+
+        def _proxy_agent_active(self, _manifest: dict[str, Any]) -> bool:
+            return True
+
+    encoded = base64.b64encode(b"k" * 32).decode("ascii")
+    result = Runtime().proxy_start_agent(
+        runtime_epoch="v1-fixturetag-" + "1" * 32,
+        generation=7,
+        master_key=encoded,
+        agent_token=encoded,
+        enabled=False,
+    )
+    require(result["ok"] is True and result["generation"] == 7)
+    require(len(staged) == 1 and staged[0] and not any(staged[0]))
+    require(root_actions == ["quarantine", "off"])
+    require(encoded not in json.dumps(result, sort_keys=True))
+
+
+@contract_case("proxyAgentConsumesKeyOnce")
+def proxy_agent_consumes_key_once() -> None:
+    module_path = ROOT / "scripts" / "xenoid-proxy-agent.py"
+    spec = importlib.util.spec_from_file_location(
+        "xenoid_proxy_agent_contract",
+        module_path,
+    )
+    require(spec is not None and spec.loader is not None)
+    agent = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = agent
+    spec.loader.exec_module(agent)
+
+    encoded = base64.b64encode(b"s" * 32).decode("ascii")
+    payload = json.dumps(
+        {"masterKey": encoded, "agentToken": encoded},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    with tempfile.TemporaryDirectory(prefix="xenoid-agent-key-") as directory:
+        key_path = Path(directory) / "agent.key"
+        key_path.write_bytes(payload)
+        key_path.chmod(0o400)
+        real_fstat = agent.os.fstat
+
+        def root_owned_stat(descriptor: int) -> SimpleNamespace:
+            info = real_fstat(descriptor)
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_uid=0,
+                st_gid=0,
+                st_nlink=info.st_nlink,
+                st_size=info.st_size,
+            )
+
+        with mock.patch.object(agent.os, "fstat", side_effect=root_owned_stat):
+            master, token = agent._read_channel_secret(
+                {"paths": {"key": str(key_path)}}
+            )
+        try:
+            require(bytes(master) == b"s" * 32)
+            require(bytes(token) == encoded.encode("ascii"))
+            require(not key_path.exists())
+        finally:
+            for value in (master, token):
+                for index in range(len(value)):
+                    value[index] = 0
+
+@contract_case("proxyDiscardCliIsExplicit")
+def proxy_discard_cli_is_explicit() -> None:
+    ordinary = cli.build_parser().parse_args(["proxy", "clear"])
+    recovery = cli.build_parser().parse_args(
+        ["proxy", "clear", "--discard-unreadable-state"]
+    )
+    require(ordinary.discard_unreadable_state is False)
+    require(recovery.discard_unreadable_state is True)
+
+
+@contract_case("legacyRegenerationRestartCliIsExplicit")
+def legacy_regeneration_restart_cli_is_explicit() -> None:
+    ordinary = cli.build_parser().parse_args(["device", "regenerate"])
+    require(ordinary.restart_legacy_transaction is False)
+    recovery = cli.build_parser().parse_args(
+        ["device", "regenerate", "--restart-legacy-transaction"]
+    )
+    require(recovery.restart_legacy_transaction is True)
+
+@contract_case("legacyProxyRecoveryRequiresBoundCliJournal")
+def legacy_proxy_recovery_requires_bound_cli_journal() -> None:
+    digest = "ab" * 32
+    bound = {
+        "operationId": digest[:32],
+        "regenerationTransactionId": "cd" * 16,
+        "completed": ["planned", "quarantined"],
+    }
+    args = SimpleNamespace(
+        context=SimpleNamespace(instance_id=ID_A),
+        discard_unreadable_state=False,
+    )
+    with mock.patch.object(cli, "RegenerationJournal") as journal_type, \
+         mock.patch.object(cli, "ConvergenceExecutor") as executor_type, \
+         mock.patch.object(cli, "runtime", return_value=object()):
+        journal_type.return_value.legacy_source_digest.return_value = digest
+        executor_type.return_value.journal.load.return_value = bound
+        require(cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_set"))
+        args.discard_unreadable_state = True
+        require(cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_clear"))
+        args.discard_unreadable_state = False
+        require(not cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_clear"))
+        executor_type.return_value.journal.load.return_value = {
+            **bound,
+            "operationId": "ef" * 16,
+        }
+        require(not cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_set"))
+
+    error = cli.IdentityError(
+        "device_regeneration_legacy_pending",
+        "legacy regeneration requires recovery",
+    )
+    with mock.patch.object(cli, "RegenerationJournal") as journal_type:
+        journal_type.return_value.load.side_effect = error
+        journal_type.return_value.legacy_source_digest.side_effect = error
+        try:
+            cli._reject_unrelated_regeneration_mutation(
+                SimpleNamespace(
+                    context=args.context,
+                    func=SimpleNamespace(__name__="cmd_proxy_clear"),
+                    discard_unreadable_state=False,
+                )
+            )
+        except cli.IdentityError as exc:
+            require(exc.code == "device_regeneration_legacy_pending")
+        else:
+            raise ContractFailure
 
 
 def main() -> int:

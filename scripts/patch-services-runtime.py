@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
 import tempfile
 import zipfile
+
+from xenoid_archive import canonicalize_zip, publish_file_atomic, run_apktool
 
 EXPECTED_INPUT_SHA256 = "c90ba95645f1b4685d1c0740b03a8d2dd06d98604ab8962b061c7b35cc366498"
 
@@ -114,8 +113,6 @@ APP_DATA_REPLACEMENT = """    .line 396
 """
 
 
-def run(command: list[str]) -> None:
-    subprocess.run(command, check=True)
 
 
 def main() -> int:
@@ -130,14 +127,13 @@ def main() -> int:
             f"SHA256 mismatch for {source}: expected {EXPECTED_INPUT_SHA256}, got {actual_hash}"
         )
 
-    apktool = os.environ.get("APKTOOL") or shutil.which("apktool")
-    if not apktool:
-        raise SystemExit("apktool is required to patch services.jar")
-
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="xenoid-services-") as temporary:
-        decoded = Path(temporary) / "decoded"
-        run([apktool, "d", "-f", "-o", str(decoded), str(source)])
+        work = Path(temporary)
+        decoded = work / "decoded"
+        staged = work / "services.apktool.jar"
+        canonical = work / "services.canonical.jar"
+        run_apktool(["d", "-f", "-o", str(decoded), str(source)])
         ownership_smali = decoded / "smali_classes2/com/android/server/pm/ComputerEngine.smali"
         ownership_text = ownership_smali.read_text()
         ownership_occurrences = ownership_text.count(ORIGINAL)
@@ -157,11 +153,18 @@ def main() -> int:
         data_smali.write_text(
             data_text.replace(APP_DATA_ORIGINAL, APP_DATA_REPLACEMENT, 1)
         )
-        run([apktool, "b", "-o", str(output), str(decoded)])
-
-    with zipfile.ZipFile(output) as archive:
-        if "classes2.dex" not in archive.namelist():
-            raise SystemExit(f"patched services jar has no classes2.dex: {output}")
+        run_apktool(["b", "-f", "-o", str(staged), str(decoded)])
+        canonicalize_zip(staged, canonical)
+        with zipfile.ZipFile(canonical) as archive:
+            if archive.namelist().count("classes2.dex") != 1:
+                raise SystemExit("patched_services_dex_layout_mismatch")
+            dex = archive.read("classes2.dex")
+        if (
+            b"getIsolatedOwner" not in dex
+            or b"Failed to restorecon /data/" not in dex
+        ):
+            raise SystemExit("patched_services_verification_failed")
+        publish_file_atomic(canonical, output)
     print(f"patched runtime PackageManager contracts in {output}")
     return 0
 
