@@ -141,6 +141,8 @@ epoch = int(os.environ["SOURCE_DATE_EPOCH"], 10)
 allowed_files = {
     ".gitignore",
     "AGENTS.md",
+    "LICENSE",
+    "NOTICE",
     "README.md",
     "README_CN.md",
     "pyproject.toml",
@@ -152,6 +154,7 @@ allowed_files = {
 allowed_prefixes = (
     ".githooks/",
     ".github/",
+    "LICENSES/",
     "daemon/",
     "data/",
     "docs/",

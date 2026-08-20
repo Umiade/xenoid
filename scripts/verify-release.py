@@ -24,6 +24,10 @@ _MAX_TEXT_BYTES = 8 * 1024 * 1024
 _MAX_OTA_BYTES = 512 * 1024 * 1024
 _MAX_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
 _REQUIRED = {
+    "LICENSE",
+    "NOTICE",
+    "LICENSES/Apache-2.0.txt",
+    "LICENSES/GPL-2.0-only.txt",
     "README.md",
     "README_CN.md",
     "RUNBOOK.md",

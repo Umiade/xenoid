@@ -2,8 +2,12 @@
 name = "xenoid"
 version = "0.1.0"
 description = "Xenoid Android runtime orchestration for Apple Silicon macOS and Linux ARM"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.9"
 dependencies = []
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
 
 [project.scripts]
 xenoid = "xenoid.cli:main"

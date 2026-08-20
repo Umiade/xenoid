@@ -1,0 +1,32 @@
+Xenoid Licensing Notice
+=======================
+
+Copyright (C) 2026 Xenoid contributors.
+
+Unless a file or directory carries a more specific notice, Xenoid original
+source code is licensed under the GNU General Public License, version 3 or (at
+your option) any later version (GPL-3.0-or-later). See LICENSE.
+Canonical texts for path-specific licenses are included under LICENSES/.
+
+More-specific and third-party terms take precedence for their covered material:
+
+- native/xenoid-kmod/xenoid_kmod.c and
+  native/xenoid-ebpf/xenoid_pathhide.bpf.c are GPL-2.0-only kernel-facing
+  programs.
+- Android Open Source Project interface definitions and other files retaining
+  Apache License 2.0 headers remain Apache-2.0.
+- native/xenoid-keymint derives from TEESimulator. Its GPL-covered material,
+  including rust/teesim-km, remains under the applicable GPL-3.0 terms; the
+  crate declares GPL-3.0-or-later.
+- data/cellular is governed by the notices collected in
+  data/cellular/LICENSES.txt.
+- The optional mihomo proxy engine identified by
+  scripts/proxy-engine-assets.json is GPL-3.0-only and is not relicensed by
+  Xenoid.
+- redroid images, Frida, MindTheGapps, Google applications, operator-supplied
+  keyboxes, and other externally obtained assets remain under their respective
+  upstream terms. Imported proprietary assets are not part of the Xenoid source
+  or release archive.
+
+Redistributors must preserve the applicable source notices and satisfy every
+license covering the components they convey.

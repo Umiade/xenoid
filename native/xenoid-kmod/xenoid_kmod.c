@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // xenoid_kmod.c — Xenoid kernel module: bottom-layer environment virtualization.
 //
 // v1 scope (per P2 decision):

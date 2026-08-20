@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // xenoid_pathhide.bpf.c — host-side path-hide for unprivileged apps (uid>=10000).
 // Policy mirrors native/xenoid-kmod path_hidden (marker subset).
 #include "vmlinux.h"

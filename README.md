@@ -1,321 +1,148 @@
 # Xenoid
 
-[Chinese version](README_CN.md)
+[Chinese Version](README_CN.md)
 
-Xenoid orchestrates an Android cloud-phone runtime on Apple Silicon macOS and Linux ARM hosts. It is based on 64-bit redroid Android 13 and provides one control surface for startup, device profiles, a transparent global proxy, environment hiding, controlled root, Frida, eBPF, automation, OTA, CLI, and MCP operations.
+Xenoid is a controlled Android 13 ARM64 runtime for mobile security work on Apple Silicon macOS and Linux ARM64. It turns redroid into a persistent Raven-class device with one production entrypoint:
 
-The production path is:
+```bash
+./xenoid up
+```
 
-- **macOS:** an ARM64 Colima VM with the Docker CLI;
-- **Linux ARM / ARM ECS:** native Docker with binderfs;
-- **Android:** the redroid 13 `64only` image;
-- **control plane:** the `xenoid` CLI, `xenoid-mcp`, and the Android daemon;
-- **privilege boundary:** the daemon issues short-lived tokens that rootd validates before execution; no persistent application-visible `su` path is exposed;
-- **environment shaping:** rootfs/data images, mount namespaces, overlays, property-area changes, kmod/eBPF, the zygote shim, and framework/HAL patches work together.
+A successful `up` means the runtime, daemon, device profile, protection, storage, and configured services are ready. Partial readiness is failure. Unsupported hosts, ambiguous ownership, and stale artifacts are rejected rather than guessed through.
 
-## Quick start
+## Capabilities
+
+- Persistent Android 13 `arm64-v8a` instances backed by redroid `64only`.
+- Idempotent, resumable convergence with content-addressed artifacts and runtime images.
+- Coherent Pixel 6 Pro (`raven`) identity across framework, property, HAL, procfs, sysfs, filesystem, cellular, and raw-syscall surfaces.
+- Independent country, locale, timezone, SIM, carrier, APN, and LTE-cell profiles.
+- Fail-closed global proxying for SOCKS5, HTTP(S), Clash, URI lists, and subscriptions.
+- Token-gated root operations without an application-visible `su` path.
+- KeyMint/keybox, camera media injection, sensor, radio, input, application, automation, OTA, Frida, and MCP controls.
+- Engine-scoped kmod/eBPF protection shared safely across multiple instances.
+- Optional, locally imported MindTheGapps runtime. Play Integrity and Google device certification are not claimed.
+
+Frida is an explicit inspection capability. It is never part of normal production startup. Credentials, proxy sources, keyboxes, imported Google binaries, captures, and runtime state remain local and untracked.
+
+## Requirements
 
 ### Apple Silicon macOS
 
-Requirements: Apple Silicon, macOS, Homebrew, Python 3.9 or newer, and at least 8 GB of allocatable memory.
+- Apple Silicon Mac
+- macOS with Homebrew
+- Python 3.9 or newer
+- At least 8 GiB allocatable memory
 
-Clone this repository as `xenoid`, then:
+### Linux ARM64
+
+- Ubuntu 22.04 or 24.04 ARM64
+- Docker Engine
+- Root or sudo access
+- A kernel with `binder_linux`/binderfs support
+
+Xenoid supports one production architecture: an ARM64 host running Android 13 `64only`. x86 and 32-bit Android are not compatibility targets.
+
+## Quick Start
+
+### macOS
 
 ```bash
-cd xenoid
 ./xenoid install-runtime
+./xenoid init --config examples/config-macos-colima.json
 ./xenoid up
 ./xenoid view
 ```
 
-`install-runtime` installs and validates the macOS host toolchain, prepares Colima and binderfs, and initializes the `default` instance from `examples/config-macos-colima.json` when no instance exists. It does not start Android.
-
-`up` is the user-facing startup command. It builds and starts the complete runtime, deploys the daemon and native helpers, applies the device profile and hiding policy, loads eBPF, and finishes with the same live-runtime validation used by `doctor --require-runtime`. If startup fails, `up` collects the standalone doctor report before returning the original failure.
-
-No separate `doctor` command is required before or after a normal startup.
-
-### Linux ARM / ARM ECS
-
-Requirements: Ubuntu 22.04 or 24.04 ARM64, Python 3.9 or newer, Docker Engine, root or sudo access, and a kernel that can load `binder_linux`. Source builds also require JDK 17, Android SDK platform 35, Android build-tools 35.0.0, and Android NDK 27.2.12479018 or a compatible newer NDK.
-
-Clone this repository as `xenoid`, then:
+### Linux ARM64
 
 ```bash
-cd xenoid
 sudo ./scripts/setup-linux-binderfs.sh
 ./xenoid init --config examples/config-linux-arm.json
 ./xenoid up
 ```
 
-A remote Docker context can be selected before startup:
+Run `init` once per instance. Later calls to `up` reuse healthy artifacts, images, storage, and containers.
 
-```bash
-./xenoid config set --backend linux-docker --docker-context CONTEXT_NAME
-./xenoid up
-```
+## Common Operations
 
-Linux hosts must expose binderfs devices to redroid. ARM64 hosts must use the `64only` redroid image; an x86_64 image is not a substitute.
-
-### Instance lifecycle and data persistence
-
-Each Xenoid instance is a logical device with three persistent components:
-
-1. **Instance config** at `.xenoid/instances/<name>/config.json` (project root);
-2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
-3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a sparse ext4 backing image (`xenoid-data.img`) that is bind-mounted as the container's `/data`.
-
-`stop`, repeated `up`, container recreate, and `colima stop/start` preserve the data volume. `colima delete`, external volume deletion/prune, or loss of the host instance state will cause Xenoid to fail hard on next startup rather than silently create an empty disk.
-
-Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
-
-The backing image stays ext4 to preserve the established grow/recovery contract. The unprivileged Android Raven view is f2fs: profile data, mount tables, the userdata by-name alias, libc `statfs`/`fstatfs`, and direct raw syscalls all report the Raven filesystem contract. Privileged maintenance commands continue to observe the real backing filesystem.
-
-### Multi-instance operation
-
-Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Linux ARM). Each instance gets a unique container, volume, network, MAC, IPv4/IPv6, host ADB/daemon port, and proxy routing table from the operator registry.
-
-```bash
-# Initialize two instances from the platform template
-./xenoid --instance phone-a init --config examples/config-macos-colima.json
-./xenoid --instance phone-b init --from phone-a
-
-# Start both (shared protection is engine-host scoped; first up loads it)
-./xenoid --instance phone-a up
-./xenoid --instance phone-b up
-
-# Per-instance status and ADB
-./xenoid --instance phone-a status
-./xenoid --instance phone-b adb shell getprop ro.product.model
-
-# Stop one instance without affecting the other
-./xenoid --instance phone-a stop
-```
-
-Device identity (Android ID, serial, IMEI/IMEISV) is generated once per instance and persisted in `~/.xenoid/instances/<UUID>/device-identity.json`. Boot-scoped values (`boot_id`, `random_uuid`) rotate on container recreation. Explicit rotation via `device apply --keep-unique` or `device set` updates the same host state so the next `up` does not revert identity. `./xenoid device regenerate` goes further: it rotates the stable identifiers, the lease network epoch (container MAC), the boot-scoped values, the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country) on a live instance — and on GMS instances clears the Google services apps so the app-readable advertising ID regenerates — then recreates the container and re-converges through the standard `up` pipeline, making the instance present as a brand-new same-model device while preserving user data and the location country/carrier.
-
-The "equivalent to a unique real device" acceptance scope is Android user/data/keystore/account-facing state and instance identity/lifecycle. Xenoid does not simulate physical telephony, SMS, or hardware sensors that the host does not provide.
-
-## Diagnostics
-
-`doctor` is the standalone diagnostic and evidence command. It is not part of the normal user command sequence because `up` already uses the same checks internally.
-
-Run a non-invasive host and runtime diagnosis:
-
-```bash
-./xenoid doctor
-```
-
-Require a live Android runtime:
-
-```bash
-./xenoid doctor --require-runtime
-```
-
-Run builds, OTA checks, runtime-context checks, hook-surface checks, and the complete live-runtime smoke path:
-
-```bash
-./xenoid doctor --full --require-runtime
-```
-
-Save the JSON report:
-
-```bash
-./xenoid doctor --out /tmp/xenoid-doctor.json
-```
-
-Important report fields:
-
-- `ok`: every check requested by this invocation passed;
-- `complete`: a real Android runtime is online and all executed checks passed;
-- `runtimeAvailable`: the runtime container is running;
-- `checks`: concise per-section results;
-- `sections`: auditable detailed evidence;
-- `nextActions`: recovery commands for failures.
-
-The default doctor does not start Android or inject Frida. If Android is offline, host checks can pass while `complete` remains `false` and `nextActions` recommends `./xenoid up`.
-
-## Lifecycle
+### Runtime
 
 ```bash
 ./xenoid up
+./xenoid up --dry-run
+./xenoid up --skip-build
 ./xenoid status
+./xenoid doctor --require-runtime
 ./xenoid logs
 ./xenoid view
 ./xenoid stop
-```
-
-Common operations:
-
-```bash
-# Show the complete convergence plan without changing the runtime.
-./xenoid up --dry-run
-
-# Use prebuilt release artifacts instead of rebuilding them.
-./xenoid up --skip-build
-
-# Run an ADB command directly.
 ./xenoid adb shell getprop ro.product.model
 ```
 
-## Location identity
+`--dry-run` is observational. `--skip-build` still validates source, tools, artifact records, outputs, and image identity; stale or missing work fails instead of compiling.
 
-The device location is an explicit, proxy-independent identity: country, system locale, timezone, single USIM, carrier, APN, and the registered LTE cell all come from one persistent per-instance profile. A fresh instance defaults to Singapore on the first `./xenoid up`; later runs keep the selected country.
+### Instances
 
 ```bash
-# List supported countries (no runtime access; AU DE GB HK JP SG US).
-./xenoid location list
+./xenoid instance list
+./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-a up
+./xenoid --instance phone-a status
+```
 
-# Show the masked host and Android location state.
-./xenoid location status
+Without `--instance`, Xenoid selects `default`.
+
+### Device and Location Identity
+
+```bash
+./xenoid location list
+./xenoid location set US
 ./xenoid location status --check
 
-# Select a country and converge the identity.
-./xenoid location set US
+./xenoid device collect --out /tmp/device-profile.json
+./xenoid device apply examples/fingerprints/pixel-raven-android13.json
+./xenoid device regenerate
 ```
 
-Re-selecting the current country is a no-op. Switching countries recreates the owned Android container exactly once; hardware identifiers (IMEI, serial, Android ID, MAC/IP lease) do not change, and switching back to a previously used country restores that country's SIM, phone number, and cell identity within the same SIM epoch; `device regenerate` rotates the SIM epoch (a fresh SIM for the current country). A `./xenoid location set` that rotates the country performs its own container recreate; run `./xenoid up` afterwards to re-validate the complete production state. Phone numbers are stable synthetic identities shaped from pinned libphonenumber country metadata; they are not real assigned numbers and carry no voice/SMS service. The global proxy never reads or changes this identity, and proxy mutations never restart the runtime.
+`device regenerate` rotates device, network, SIM, boot, storage, and application identity targets while preserving user data and installed applications.
 
-## Global proxy
-
-Configure the saved proxy source in the Android Xenoid settings screen or through the host CLI. Source values and credentials never belong in command arguments:
+### Global Proxy
 
 ```bash
-# SOCKS5, HTTP, or HTTPS endpoint; input is read without terminal echo.
 ./xenoid proxy set --prompt
+./xenoid proxy on
+./xenoid proxy status --check
+./xenoid proxy off
 
-# A direct HTTP endpoint cannot relay UDP.
-./xenoid proxy set --prompt --no-udp
-
-# Clash YAML/JSON, URI lists, and base64 URI subscriptions.
 chmod 600 /path/to/proxy-source
 ./xenoid proxy import /path/to/proxy-source
-
-# Online configuration URL; HTTPS is required by default.
-./xenoid proxy subscribe --prompt
 ```
 
-The compiler accepts SOCKS5, HTTP/HTTPS, Shadowsocks, ShadowsocksR, Trojan, VMess, VLESS, Hysteria 1/2, TUIC, AnyTLS, Mieru, and Snell nodes. Clash `proxy-providers` are fetched and merged; unsupported rules, listeners, groups, and provider settings are discarded rather than passed through to the engine.
+Secrets do not belong in command arguments. Proxy failure retains quarantine instead of silently exposing direct egress.
 
-Manage the active source and inspect redacted readiness evidence:
-
-```bash
-./xenoid proxy status --check
-./xenoid proxy list
-./xenoid proxy select NAME
-./xenoid proxy off
-./xenoid proxy on
-./xenoid proxy export --out /path/to/private-backup
-./xenoid proxy clear
-```
-
-Proxying is global by default. The Docker engine host transparently captures the Android container's IPv4/IPv6 DNS, TCP, and permitted UDP flows before they leave the bridge, so Java clients, native libraries, and raw sockets use the same path without Android proxy properties, a VPN transport, or a TUN device in the Android network namespace. Activation is fail-closed: traffic remains quarantined until an instance/runtime-bound ordinary-app check proves the requested data plane. `./xenoid up` restores and validates the saved desired state.
-
-
-## Root
-
-Root access is provided through the daemon and token-gated rootd; users do not need an Android root shell.
+### Root, Applications, Camera, and Inspection
 
 ```bash
-./xenoid daemon health
 ./xenoid root status
 ./xenoid root exec id
-./xenoid root exec 'cat /proc/version'
-```
 
-The production rootfs contains no persistent application-visible `su` path. The CLI and MCP share the same privilege boundary.
+./xenoid app install /path/to/app.apk
+./xenoid app launch com.example.app/.MainActivity
+./xenoid input tap 540 1800
 
-## Camera media
-
-Xenoid's Android settings screen and host CLI can configure a photo, a video, or both as the source for the two ordinary Camera2 devices:
-
-```bash
-./xenoid camera status
-./xenoid camera set photo FILE
-./xenoid camera set video FILE
-./xenoid camera mode naturalized
-./xenoid camera mode faithful
-./xenoid camera clear photo
-./xenoid camera clear all
-./xenoid camera apply
+./xenoid camera set photo /path/to/image.png
 ./xenoid camera status --check
-```
 
-`naturalized` adds subtle frame-to-frame sensor variation; `faithful` preserves decoded source pixels apart from required scaling and camera transforms. Imports are validated and copied into private Android storage: the original host path and filename are not retained or returned. Saved camera state survives daemon and runtime restarts, while changes take effect on the next camera open.
-
-`up` republishes the saved source state and completes an ordinary-app YUV/JPEG capture through both cameras. A source-free runtime is valid and uses the built-in fallback scene. The runtime also publishes coherent framework camcorder profiles, so the stock Android Camera app can open, capture photos, and record H.264 video without a configured source.
-
-## Frida
-
-Frida is an explicit analysis capability, not part of production startup. `up` stops and removes stale frida-server processes and temporary payloads.
-
-```bash
 python -m pip install frida-tools
 ./xenoid frida install
 ./xenoid frida start
-./xenoid frida status
 ./xenoid frida load-script com.example.app frida/scripts/xenoid-default.js --spawn
 ./xenoid frida stop
 ```
 
-`frida install` matches the installed host `frida-tools` version, downloads the corresponding `android-arm64` server, and deploys it through daemon/rootd. An existing server binary can also be deployed directly:
+### Optional Google Services
 
-```bash
-./xenoid frida deploy /path/to/frida-server
-./xenoid frida deploy-scripts
-```
-
-Frida is appropriate for dynamic app-process analysis and app-layer hooks. Filesystem, mount, Binder, HAL, and kernel-visible surfaces are handled at system layers.
-
-## Device profiles
-
-Collect the current profile:
-
-```bash
-./xenoid device collect --out /tmp/device-profile.json
-```
-
-Apply the canonical Android 13 Pixel 6 Pro (`raven`) profile and regenerate unique identifiers:
-
-```bash
-./xenoid device apply examples/fingerprints/pixel-raven-android13.json
-```
-
-Apply the profile's explicit unique identifiers without generating replacement values:
-
-```bash
-./xenoid device apply examples/fingerprints/pixel-raven-android13.json --keep-unique
-```
-
-Rotate every per-device uniqueness factor on a running instance and re-converge it as a brand-new same-model device:
-
-```bash
-./xenoid device regenerate
-```
-
-`device regenerate` rotates the stable identifiers (Android ID, serial, IMEI/IMEISV with the pinned raven TAC), the lease network epoch (container MAC), the boot-scoped values (`boot_id`, `random_uuid`), the data/rootfs filesystem UUIDs, the per-app SSAID store, and the SIM identity (new IMSI/ICCID/MSISDN/cell for the same country), then recreates the container and re-runs the standard `up` convergence and validation; on GMS instances it also clears the Google services apps so the app-readable advertising ID regenerates (this removes Google account sign-in state, so signing in again is required). User data, installed apps, keystore state, and the location country/carrier are preserved (new phone, new SIM, restored data). `--skip-build` and `--dry-run` behave like their `up` counterparts. An interrupted regenerate is journaled: `start`/`up` fail closed with `device_regeneration_pending` until `device regenerate` is re-run to completion.
-
-Generate app-layer and service-layer Frida profiles:
-
-```bash
-./xenoid device generate-frida examples/fingerprints/pixel-raven-android13.json --out /tmp/device-profile.js
-./xenoid device generate-service-frida examples/fingerprints/pixel-raven-android13.json --out /tmp/service-profile.js
-```
-
-The production profile is Google Pixel 6 Pro model `G8V0U`, build `TP1A.221005.002`/`9012097`, shipping API 31, with a 1440 x 3120 60/120 Hz display, 12 GiB device memory view, and sparse 128,000,000,000-byte UFS 3.1 data image. Android-facing `/proc/partitions`, `/proc/diskstats`, `/dev/block/sda`, `/dev/block/platform/14700000.ufs/by-name/userdata`, block sysfs, f2fs mount records, and raw filesystem magic derive from the same profile contract. Its `provenance` object distinguishes Google/AOSP facts from community-derived sensor and camera geometry.
-
-`device apply` synchronizes daemon profile state, SettingsProvider, property-area state, native HAL inputs, and reboot-persistent data. PackageManager advertises only camera and sensor capabilities implemented by the runtime; NFC, UWB, fingerprint/UDFPS, true NR, full/manual/RAW camera, HiFi sensor, and head-tracker claims remain absent. After changing profiles, cold-start the target application and recollect the complete profile; one `getprop` value is not sufficient evidence.
-
-Set the KeyMint attestation keybox (Android 13 ARM64):
-
-```bash
-./xenoid device keybox set /secure/local/keybox.xml
-./xenoid device keybox status
-./xenoid device keybox clear
-```
-
-## Optional Google Play runtime
-
-Google Mobile Services is disabled by default. Xenoid supports one explicit Android 13 ARM64 release: `MindTheGapps-13.0.0-arm64-20231025_200931`. Obtain the official ZIP and its `release.x509.pem` sidecar from the [upstream GitHub release](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931), then configure a fresh instance:
+Import is local-only and must happen before the instance has Android data:
 
 ```bash
 ./xenoid --instance play init --config examples/config-macos-colima.json
@@ -327,146 +154,42 @@ Google Mobile Services is disabled by default. Xenoid supports one explicit Andr
 ./xenoid --instance play google-services status --require-runtime
 ```
 
-The import is local-only and verifies the pinned release certificate, archive signature, exact archive inventory, every member digest, APK signer lineage, package/version inventory, and native ABI before accepting the payload. Xenoid does not download, redistribute, or include Google binaries in source, release, or OTA bundles. The Google choice is immutable after Android data exists; enable or disable it only on a fresh instance. Google account login remains an operator action. Play Integrity and device certification are separate Google-controlled capabilities and are not claimed by this integration.
+Xenoid verifies the pinned release, archive inventory, member digests, package versions, signer histories, and ABI before accepting it. Google binaries are not downloaded implicitly or included in Xenoid releases.
 
-## Applications, input, and automation
-
-```bash
-./xenoid app install /path/to/app.apk
-./xenoid app launch com.example.app/.MainActivity
-./xenoid app uninstall com.example.app
-
-./xenoid input tap 540 1800
-./xenoid input swipe 540 1600 540 400 500
-
-./xenoid automation plan examples/automation/ordered-task.js
-./xenoid automation run examples/automation/ordered-task.js
-```
-
-Low-level input uses the `/dev/uinput` helper through the daemon. Automation supports ordered actions and host-side execution. Use each subcommand's `--help` output as the authoritative parameter reference.
-
-## Network identity
-
-```bash
-./xenoid netctl status --ifname rmnet_data0
-./xenoid netctl set-mac 02:00:00:00:00:01 --ifname rmnet_data0
-```
-
-A coherent network profile includes interfaces, routes, namespaces, MAC addresses, and framework-visible values; changing one property is insufficient.
-
-## OTA
-
-```bash
-./xenoid ota make --version 0.1.0
-./xenoid ota install-bundle dist/ota/xenoid-0.1.0.tar.gz
-./xenoid ota check
-./xenoid ota apply
-```
-
-An OTA bundle contains the daemon and native runtime helpers plus manifest/hash metadata. Frida server and scripts remain separate, explicit analysis installs.
-
-## MCP
-
-Generate a stdio MCP configuration:
+### MCP, Build, and Verification
 
 ```bash
 ./xenoid mcp-config
-```
-
-Or start the server directly:
-
-```bash
 ./xenoid-mcp
-```
 
-Representative tools include:
-
-- `xenoid_doctor` with `full` and `requireRuntime`;
-- `xenoid_up_plan` for a non-mutating full-startup plan;
-- `xenoid_up` for the canonical full production convergence path;
-- `xenoid_stop` and `xenoid_status` for runtime lifecycle control;
-- `xenoid_google_services_status`, `xenoid_google_services_enable`, and `xenoid_google_services_disable`;
-- `xenoid_root_status` and `xenoid_root_exec`;
-- `xenoid_frida_install` and `xenoid_frida_load_script`;
-- `xenoid_device_collect` and `xenoid_device_apply`;
-- `xenoid_automation_run` and `xenoid_input_tap`.
-
-MCP does not bypass daemon tokens, backend constraints, or runtime preconditions. Before granting an agent mutating tools, define the target runtime, package, and permitted operation scope.
-
-See [`docs/mcp-tools.md`](docs/mcp-tools.md) for the complete tool contract.
-
-### Remote multi-instance service
-
-`xenoid-service` exposes every initialized instance in one fixed Xenoid project
-through authenticated MCP 2026-07-28 Streamable HTTP. It requires an explicit
-instance on every instance tool, re-resolves instance state per request,
-serializes mutations per instance, and presents a scope-filtered remote catalog
-that excludes unrestricted host paths, builds, deployment, and host scripts.
-
-```bash
-./xenoid-service token create \
-  --name operator --all-instances --scope read --scope control
-./xenoid-service serve --bind 127.0.0.1 --port 8765
-```
-
-Loopback plus SSH/VPN or a trusted TLS/OAuth gateway is the recommended
-deployment. Non-loopback cleartext is rejected by default; temporary trusted-
-network testing requires the explicit `--allow-insecure-http` opt-in and an
-exact Host allowlist. A reverse-proxy deployment keeps the service listener on loopback. See
-[`docs/remote-service.md`](docs/remote-service.md) for macOS LaunchAgent, Linux
-ARM64 systemd, TLS, token scopes, and MCP client configuration.
-
-## Configuration
-
-```bash
-./xenoid config show
-./xenoid config set --backend colima-docker
-./xenoid init --backend colima-docker
-```
-
-Configuration examples:
-
-- `examples/config-macos-colima.json`
-- `examples/config-linux-arm.json`
-
-Local configuration is stored in `.xenoid/config.json`. Never commit credentials, tokens, private image addresses, or workstation-specific absolute paths.
-
-## Build and release
-
-```bash
 ./xenoid build all
+./scripts/verify.sh --fresh
 ./xenoid package-release --version 0.1.0
 ./xenoid verify-release dist/release/xenoid-0.1.0.tar.gz
 ```
 
-Build individual components:
+Detailed contracts:
 
-```bash
-./xenoid build daemon
-./xenoid build input
-./xenoid build profile
-./xenoid build netctl
-```
+- [Architecture](docs/architecture.md)
+- [Operations](docs/operations.md)
+- [Build and release](docs/build.md)
+- [MCP tools](docs/mcp-tools.md)
+- [Remote service](docs/remote-service.md)
 
-Release bundles contain the CLI, MCP server, non-proprietary runtime assets, daemon APK, native helpers, configuration examples, public Google release metadata, skill files, `doctor.json`, and a SHA-256 manifest. They never contain an imported Google ZIP, certificate, or expanded payload.
+Use each command's `--help` output as the authoritative parameter reference.
 
-## Roadmap
+## License
 
-- [ ] Add a programmable host eBPF hook interface for trusted operators: user-owned CO-RE programs, isolated lifecycle and event streams, atomic replacement, rollback, and optional startup restoration without replacing Xenoid's built-in runtime protections.
-
-## Architecture and detailed documentation
-
-- [`docs/architecture.md`](docs/architecture.md): architecture and trust boundaries;
-- [`docs/operations.md`](docs/operations.md): runtime, troubleshooting, and release operations;
-- [`docs/profile-and-hiding.md`](docs/profile-and-hiding.md): device profiles and environment hiding;
-- [`docs/build.md`](docs/build.md): build artifacts and dependencies;
-- [`docs/mcp-tools.md`](docs/mcp-tools.md): MCP tool parameters;
-- [`docs/remote-service.md`](docs/remote-service.md): remote multi-instance deployment and security.
+Xenoid original source is licensed under `GPL-3.0-or-later`. More-specific and third-party terms are listed in [NOTICE](NOTICE) and remain controlling for their covered material.
 
 ## Acknowledgments
 
-Xenoid builds on the work of these projects:
+Xenoid stands on upstream work. Credit belongs where it was earned:
 
-- [redroid](https://github.com/remote-android/redroid-doc): the remote Android container runtime Xenoid's Android 13 images are based on;
-- [MindTheGapps](https://gitlab.com/MindTheGapps/vendor_gapps): the optional Google Play services runtime;
-- [TEESimulator](https://github.com/JingMatrix/TEESimulator): the KeyMint simulation approach, router, and in-process reference KeyMint TA (`GPL-3.0-or-later`) that the Xenoid KeyMint HAL service derives from.
+- [Android Open Source Project](https://source.android.com/)
+- [redroid](https://github.com/remote-android/redroid-doc)
+- [MindTheGapps](https://gitlab.com/MindTheGapps/vendor_gapps)
+- [TEESimulator](https://github.com/JingMatrix/TEESimulator)
+- [Frida](https://frida.re/)
+
+Third-party components remain under their respective licenses.
