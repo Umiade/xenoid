@@ -409,6 +409,13 @@ if command -v "${DOCKER[0]}" >/dev/null 2>&1; then
     "${DOCKER[@]}" cp "$_cid:/system/framework/services.jar" "$OUT/payload/services.jar" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/framework/telephony-common.jar" "$OUT/payload/telephony-common.base.jar" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/vendor/lib64/libpuresoftkeymasterdevice.so" "$OUT/payload/libpuresoftkeymasterdevice.so" >/dev/null || _required_extract_ok=0
+    if [[ "$GOOGLE_PROVIDER" == "microg" ]]; then
+      # The microG product policy is pinned against this exact base image's
+      # framework resources and requires the AOSP location provider library.
+      "${DOCKER[@]}" cp "$_cid:/system/framework/framework-res.apk" "$OUT/.policy-framework-res.apk" >/dev/null || _required_extract_ok=0
+      "${DOCKER[@]}" cp "$_cid:/system/framework/com.android.location.provider.jar" "$OUT/.policy-location-provider.probe" >/dev/null || _required_extract_ok=0
+      rm -f "$OUT/.policy-location-provider.probe"
+    fi
     if "${DOCKER[@]}" rm "$_cid" >/dev/null 2>&1; then
       _cid=""
     fi
@@ -428,9 +435,50 @@ if command -v "${DOCKER[0]}" >/dev/null 2>&1; then
     python3 "$ROOT/scripts/patch-runtime-libselinux.py" "$OUT/payload/libselinux.so"
     python3 "$ROOT/scripts/patch-telephony-legacy-lte-band.py"       "$OUT/payload/telephony-common.base.jar" "$OUT/payload/telephony-common.jar"
     rm -f "$OUT/payload/telephony-common.base.jar"
+    _services_provider="none"
+    if [[ "$GOOGLE_PROVIDER" == "microg" ]]; then
+      _services_provider="microg"
+    elif [[ -n "$GOOGLE_PROVIDER" && "$GOOGLE_PROVIDER" != "none" ]]; then
+      echo "unsupported Google services provider for services.jar policy: $GOOGLE_PROVIDER" >&2
+      exit 1
+    fi
     python3 "$ROOT/scripts/patch-services-runtime.py" \
-      "$OUT/payload/services.jar" "$OUT/payload/services.runtime.jar"
+      "$OUT/payload/services.jar" "$OUT/payload/services.runtime.jar" \
+      --google-provider "$_services_provider"
     mv "$OUT/payload/services.runtime.jar" "$OUT/payload/services.jar"
+    if [[ "$GOOGLE_PROVIDER" == "microg" ]]; then
+      # Stage the pinned canonical microG product policy into the Google
+      # services payload, after the third-party APKs and before Xenoid files.
+      _aapt2="${ANDROID_SDK_ROOT:-}/build-tools/35.0.0/aapt2"
+      if [[ ! -x "$_aapt2" ]]; then
+        _aapt2="$(command -v aapt2 || true)"
+      fi
+      [[ -n "$_aapt2" && -x "$_aapt2" ]] || {
+        echo "aapt2 35.0.0 is required for the microG product policy" >&2
+        exit 1
+      }
+      python3 "$ROOT/scripts/generate-microg-product-policy.py" \
+        --project-root "$ROOT" \
+        --framework-res "$OUT/.policy-framework-res.apk" \
+        --aapt2 "$_aapt2" \
+        --output-dir "$OUT/payload/google-services" \
+        --manifest "$OUT/.policy-manifest.json" || {
+        echo "microG product policy generation failed" >&2
+        exit 1
+      }
+      python3 - "$OUT/.policy-manifest.json" <<'PY3'
+import json
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    manifest = json.load(stream)
+if set(manifest) != {"schema", "inputs", "outputs"} or manifest["schema"] != "dev.xenoid.microg-product-policy/v1":
+    raise SystemExit("microG product policy manifest is not canonical")
+if len(manifest["outputs"]) != 4:
+    raise SystemExit("microG product policy outputs are incomplete")
+PY3
+      rm -f "$OUT/.policy-framework-res.apk" "$OUT/.policy-manifest.json"
+    fi
     python3 - \
       "$OUT/payload/gralloc.base.redroid.so" \
       "$OUT/payload/hwcomposer.redroid.so" \
@@ -758,9 +806,13 @@ path = Path(sys.argv[1])
 provider, release, spec_sha256, data_compat_sha256 = sys.argv[2:6]
 values = (provider, release, spec_sha256, data_compat_sha256)
 google_enabled = any(values)
+valid_pair = (
+    provider == "microg" and release.startswith("microg-0.3.15.250932-")
+) or (
+    provider == "mindthegapps" and release.startswith("MindTheGapps-13.0.0-arm64-")
+)
 if google_enabled and (
-    provider != "mindthegapps"
-    or not release.startswith("MindTheGapps-13.0.0-arm64-")
+    not valid_pair
     or any(len(value) == 0 for value in values)
     or len(spec_sha256) != 64
     or len(data_compat_sha256) != 64

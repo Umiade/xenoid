@@ -25,7 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 import sys
 sys.path.insert(0, str(ROOT / "src"))
 
-from xenoid import convergence  # noqa: E402
+from xenoid import convergence, live_observe  # noqa: E402
+from xenoid.google_services import capability_model  # noqa: E402
+from xenoid.backend import RuntimeManager  # noqa: E402
+from xenoid.google_services import GoogleServicesError  # noqa: E402
 
 
 INSTANCE_ID = "10000000-0000-4000-8000-000000000001"
@@ -43,6 +46,47 @@ OBSERVATION_DIGEST = "4" * 64
 PROTECTION_DIGEST = "5" * 64
 PROTECTION_ENGINE_ID = "7" * 64
 ARTIFACT_DIGEST = "6" * 64
+MICROG_PLAY_RELEASE = (
+    "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0"
+)
+GOOGLE_STATUS_KEYS = {
+    "schema",
+    "ok",
+    "provider",
+    "release",
+    "configured",
+    "state",
+    "hostReady",
+    "runtimeRequired",
+    "runtimeChecked",
+    "ready",
+    "skipped",
+    "implementation",
+    "signatureModel",
+    "storeImplementation",
+    "specSha256",
+    "dataCompatibilitySha256",
+    "binding",
+    "runtimeIdentity",
+    "factoryComponents",
+    "effectiveComponents",
+    "live",
+    "requiredCapabilities",
+    "capabilities",
+    "error",
+    "nextActions",
+}
+GOOGLE_LIVE_CHECKS = {
+    "components",
+    "signaturePolicy",
+    "productPolicy",
+    "accountAuthenticator",
+    "boundBroker",
+    "fcmRegistrar",
+    "fusedProvider",
+    "playStoreLauncher",
+    "processStability",
+}
 PLAN_KEYS = {
     "schema",
     "resolution",
@@ -142,6 +186,111 @@ def require(value: bool, message: str) -> None:
         raise ContractFailure(message)
 
 
+def microg_google_status() -> dict[str, Any]:
+    digest = "9" * 64
+    components = (
+        (
+            "gmsCore",
+            "com.google.android.gms",
+            "/system/product/priv-app/GmsCore/GmsCore.apk",
+            250932030,
+        ),
+        (
+            "gsfProxy",
+            "com.google.android.gsf",
+            "/system/product/priv-app/GsfProxy/GsfProxy.apk",
+            8,
+        ),
+        (
+            "playStoreSeed",
+            "com.android.vending",
+            "/system/product/priv-app/Phonesky/Phonesky.apk",
+            83041710,
+        ),
+    )
+    model = capability_model("microg", "ready")
+    return {
+        "schema": "dev.xenoid.google-services-status/v2",
+        "ok": True,
+        "provider": "microg",
+        "release": MICROG_PLAY_RELEASE,
+        "configured": True,
+        "state": "ready",
+        "hostReady": True,
+        "runtimeRequired": True,
+        "runtimeChecked": True,
+        "ready": True,
+        "skipped": False,
+        "implementation": "microg",
+        "signatureModel": "restricted-spoofing",
+        "storeImplementation": "google-play",
+        "specSha256": digest,
+        "dataCompatibilitySha256": digest,
+        "binding": {
+            "provider": "microg",
+            "release": MICROG_PLAY_RELEASE,
+            "specSha256": digest,
+            "dataCompatibilitySha256": digest,
+            "state": "committed",
+            "source": "fresh",
+            "inferred": False,
+        },
+        "runtimeIdentity": {
+            "desiredImageSha256": IMAGE_ID,
+            "containerImageSha256": IMAGE_ID,
+            "rootfsSourceImageSha256": IMAGE_ID,
+            "desiredInputSha256": INPUT_DIGEST,
+            "desiredBootInputSha256": BOOT_DIGEST,
+            "containerInputSha256": INPUT_DIGEST,
+            "containerBootInputSha256": BOOT_DIGEST,
+            "imageMatch": "matching",
+            "rootfsBootInputMatches": True,
+            "labelsMatch": True,
+            "commandMatch": True,
+            "skipped": False,
+        },
+        "factoryComponents": {
+            name: {
+                "package": package,
+                "path": path,
+                "versionCode": version,
+                "sha256": digest,
+                "signingCertificateHistorySha256": [digest],
+                "privileged": True,
+            }
+            for name, package, path, version in components
+        },
+        "effectiveComponents": {
+            name: {
+                "package": package,
+                "codePath": path,
+                "versionCode": version,
+                "versionName": str(version),
+                "signerSha256": digest,
+                "enabled": True,
+                "system": True,
+                "privileged": True,
+                "updatedSystemApp": False,
+                "processState": (
+                    "stable" if name == "gmsCore" else "dormant"
+                ),
+            }
+            for name, package, path, version in components
+        },
+        "live": {
+            "ok": True,
+            "checks": {
+                name: {"ok": True, "code": None}
+                for name in GOOGLE_LIVE_CHECKS
+            },
+            "error": None,
+        },
+        **model,
+        "error": None,
+        "nextActions": [],
+    }
+
+
 def selected_image() -> dict[str, Any]:
     return {
         "schema": "dev.xenoid.runtime-image/v1",
@@ -212,7 +361,10 @@ def healthy_snapshot() -> dict[str, Any]:
             },
             "keybox": {"state": "matching"},
             "camera": {"state": "matching"},
-            "google": {"state": "matching"},
+            "google": {
+                "state": "matching",
+                "status": microg_google_status(),
+            },
             "protection": {
                 "state": "matching",
                 "expectedDigest": PROTECTION_DIGEST,
@@ -623,6 +775,243 @@ def expect_error(function: Callable[[], Any], code: str | None = None) -> Any:
             require(exc.code == code, f"expected {code}, got {exc.code}")
         return exc
     raise ContractFailure("expected ConvergenceError")
+
+
+@case("googleStatusV2AndBindingAcceptance")
+def google_status_v2_and_binding_acceptance() -> None:
+    status = microg_google_status()
+    require(set(status) == GOOGLE_STATUS_KEYS, "Google status v2 top-level keys drifted")
+    require(
+        status["schema"] == "dev.xenoid.google-services-status/v2"
+        and status["provider"] == "microg"
+        and status["release"] == MICROG_PLAY_RELEASE
+        and status["implementation"] == "microg"
+        and status["signatureModel"] == "restricted-spoofing"
+        and status["storeImplementation"] == "google-play",
+        "Google status v2 identity literals drifted",
+    )
+    require(
+        set(status["runtimeIdentity"])
+        == {
+            "desiredImageSha256",
+            "containerImageSha256",
+            "rootfsSourceImageSha256",
+            "desiredInputSha256",
+            "desiredBootInputSha256",
+            "containerInputSha256",
+            "containerBootInputSha256",
+            "imageMatch",
+            "rootfsBootInputMatches",
+            "labelsMatch",
+            "commandMatch",
+            "skipped",
+        },
+        "Google runtime identity field set drifted",
+    )
+    require(
+        set(status["factoryComponents"])
+        == {"gmsCore", "gsfProxy", "playStoreSeed"}
+        and all(
+            set(item)
+            == {
+                "package",
+                "path",
+                "versionCode",
+                "sha256",
+                "signingCertificateHistorySha256",
+                "privileged",
+            }
+            for item in status["factoryComponents"].values()
+        ),
+        "Google factory component shape drifted",
+    )
+    require(
+        set(status["effectiveComponents"])
+        == {"gmsCore", "gsfProxy", "playStoreSeed"}
+        and all(
+            set(item)
+            == {
+                "package",
+                "codePath",
+                "versionCode",
+                "versionName",
+                "signerSha256",
+                "enabled",
+                "system",
+                "privileged",
+                "updatedSystemApp",
+                "processState",
+            }
+            for item in status["effectiveComponents"].values()
+        ),
+        "Google effective component shape drifted",
+    )
+    require(
+        set(status["live"]) == {"ok", "checks", "error"}
+        and set(status["live"]["checks"]) == GOOGLE_LIVE_CHECKS
+        and all(
+            set(item) == {"ok", "code"}
+            for item in status["live"]["checks"].values()
+        ),
+        "Google minimal-live shape drifted",
+    )
+    require(
+        status["requiredCapabilities"]
+        == [
+            "googlePlayServices",
+            "accountAuth",
+            "cloudMessaging",
+            "fusedLocation",
+            "playStore",
+        ]
+        and all(
+            set(item)
+            == {"scope", "runtimeState", "releaseState", "evidence"}
+            for item in status["capabilities"].values()
+        ),
+        "Google capability model shape drifted",
+    )
+    unsupported = {
+        "scope": "application",
+        "runtimeState": "unsupported",
+        "releaseState": "unsupported",
+        "evidence": "unsupported",
+    }
+    require(
+        all(
+            status["capabilities"][name] == unsupported
+            for name in (
+                "playIntegrity",
+                "deviceCertification",
+                "drm",
+                "antiCheat",
+            )
+        ),
+        "unsupported Google capabilities were promoted",
+    )
+
+    protection = healthy_snapshot()["components"]["protection"]
+    checks = live_observe._Checks()
+    live_observe.LiveAcceptance()._google_and_protection_checks(
+        None,
+        {
+            "googleServices": status,
+            "sharedProtection": protection,
+        },
+        {},
+        live_observe._Budget(None),
+        checks,
+        {},
+    )
+    require(
+        checks.values["googleBinding"] == {"ok": True, "code": "accepted"},
+        "committed ready v2 Google status failed convergence acceptance",
+    )
+    pending = copy.deepcopy(status)
+    pending["binding"]["state"] = "pending"
+    pending_checks = live_observe._Checks()
+    live_observe.LiveAcceptance()._google_and_protection_checks(
+        None,
+        {
+            "googleServices": pending,
+            "sharedProtection": protection,
+        },
+        {},
+        live_observe._Budget(None),
+        pending_checks,
+        {},
+    )
+    require(
+        pending_checks.values["googleBinding"]
+        == {"ok": False, "code": "google_binding_not_ready"},
+        "pending Google binding satisfied convergence acceptance",
+    )
+
+@case("googleBootstrapGateDispatch")
+def google_bootstrap_gate_dispatch() -> None:
+    manager = object.__new__(RuntimeManager)
+
+    def absent_adb(
+        _self: Any,
+        arguments: list[str],
+        timeout: int = 0,
+    ) -> dict[str, Any]:
+        del timeout
+        if arguments[:3] == ["shell", "pm", "path"]:
+            return {"ok": True, "stdout": ""}
+        prop = arguments[-1]
+        values = {
+            "ro.build.version.release": "13\n",
+            "ro.product.cpu.abilist": "arm64-v8a\n",
+            "ro.build.product": "raven\n",
+        }
+        return {"ok": True, "stdout": values.get(prop, "")}
+
+    with mock.patch.object(RuntimeManager, "adb", new=absent_adb):
+        absent = manager.google_services_bootstrap_gate(None)
+    require(
+        set(absent) == {"ok", "provider", "packages", "platform"}
+        and absent["ok"] is True
+        and absent["provider"] == "none"
+        and set(absent["packages"])
+        == {
+            "com.google.android.gms",
+            "com.google.android.gsf",
+            "com.android.vending",
+        }
+        and all(
+            set(item) == {"present", "expected", "path"}
+            and item == {
+                "present": False,
+                "expected": False,
+                "path": None,
+            }
+            for item in absent["packages"].values()
+        )
+        and absent["platform"]
+        == {
+            "release": "13",
+            "product": "raven",
+            "abilist": "arm64-v8a",
+            "ok": True,
+        },
+        "none-provider bootstrap gate shape drifted",
+    )
+
+    status = microg_google_status()
+    microg_result = {
+        "ok": True,
+        "checks": status["live"]["checks"],
+        "error": None,
+        "components": status["effectiveComponents"],
+    }
+    with mock.patch.object(
+        RuntimeManager,
+        "_google_services_gate_microg",
+        return_value=microg_result,
+    ) as microg_gate:
+        dispatched = manager.google_services_bootstrap_gate(
+            SimpleNamespace(provider="microg")
+        )
+    require(
+        dispatched == microg_result
+        and set(dispatched) == {"ok", "checks", "error", "components"},
+        "microG bootstrap gate did not preserve the v2 live shape",
+    )
+    microg_gate.assert_called_once()
+
+    try:
+        manager.google_services_bootstrap_gate(
+            SimpleNamespace(provider="mindthegapps")
+        )
+    except GoogleServicesError as exc:
+        require(
+            exc.code == "google_services_release_retired",
+            "retired bootstrap dispatch returned an unstable error",
+        )
+    else:
+        raise ContractFailure("retired provider reached a bootstrap gate")
+
 
 
 @case("canonicalPlanAndDigest")

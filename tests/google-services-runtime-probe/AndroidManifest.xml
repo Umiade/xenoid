@@ -21,6 +21,9 @@
         android:debuggable="false"
         android:label="Google Services Runtime Probe"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <meta-data
+            android:name="fake-signature"
+            android:value="@string/fake_signature" />
         <activity android:name=".ProbeActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

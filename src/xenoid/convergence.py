@@ -58,6 +58,26 @@ _PHASES = (
     "accepted",
 )
 _PHASE_INDEX = {name: index for index, name in enumerate(_PHASES)}
+# Phases whose effects live inside the Android guest (daemon bootstrap,
+# control channel, keymint profile, provider acceptance). They are only valid
+# within one runtime activation: a new boot epoch (start, restart, create,
+# recreate) must re-execute them even when a resumed journal completed them
+# for an earlier activation.
+_GUEST_PHASES = frozenset(
+    {
+        "live_resolved",
+        "components_deployed",
+        "control_ready",
+        "identity_converged",
+        "location_converged",
+        "keybox_converged",
+        "camera_converged",
+        "google_converged",
+        "proxy_converged",
+        "protection_converged",
+        "accepted",
+    }
+)
 _PLAN_KEYS = frozenset(
     {
         "schema",
@@ -1183,6 +1203,8 @@ class ConvergencePlanner:
         if image_action == "ensure-desired" and resolution == "complete" and (
             desired_input is None or desired_boot is None
         ):
+            if observation.get("imageError") == "google_services_release_retired":
+                raise ConvergenceError("google_services_release_retired")
             raise ConvergenceError("convergence_image_input_unavailable")
 
         runtime_hides_live = runtime_action != "reuse"
@@ -1665,6 +1687,12 @@ class ConvergenceExecutor:
         elif journal_state is not None:
             self._validate_regeneration_capability(journal_state, regeneration_capability)
         completed = set(journal_state["completed"]) if journal_state else set()
+        if (
+            journal_state is not None
+            and journal_state.get("phase") != "accepted"
+            and plan.runtime_action in {"create", "recreate", "start", "restart"}
+        ):
+            completed -= _GUEST_PHASES
 
         if journal_state is not None and "quarantined" not in completed:
             required = bool(journal_state["proxyQuarantineRequired"])
@@ -1915,7 +1943,11 @@ class ConvergenceExecutor:
                 self._verify_after_phase(journal_state, skip_build=True)
         elif plan.runtime_action in {"start", "restart"}:
             expected = _expected_runtime_id(journal_state) if journal_state else initial_observation["runtime"].get("containerId")
-            if journal_state is None or "runtime_started" not in completed:
+            # A start/restart plan means the runtime is currently stopped; a
+            # resumed journal's earlier runtime_started phase cannot prove the
+            # container and its bounded transports are up now, so the phase is
+            # re-executed (it is idempotent for an already-running container).
+            if journal_state is None or "runtime_started" not in completed or not _runtime_started_current(initial_observation):
                 self._phase_call(
                     "runtime_started",
                     "start_owned_container",
@@ -2250,6 +2282,33 @@ class ConvergenceExecutor:
             reporter.finish(phase, "failed", started, "live_acceptance_invalid")
             raise ConvergenceError("live_acceptance_invalid", phase=phase)
         if mode == "convergence-resolve":
+            # A starting runtime legitimately flaps adb/boot/daemon structural
+            # checks inside the observation window. Re-observe while the owned
+            # container keeps running and the phase deadline has room.
+            while result.get("observationValid") is not True:
+                current_observation = result.get("observation")
+                container_id = (
+                    current_observation.get("containerId")
+                    if isinstance(current_observation, Mapping)
+                    else None
+                )
+                remaining = deadline - time.monotonic() if deadline is not None else 0.0
+                if not isinstance(container_id, str) or not container_id or remaining <= 10.0:
+                    break
+                time.sleep(min(5.0, remaining - 5.0))
+                with reporter.heartbeat(phase, started, mode.replace("convergence-", "")):
+                    result = _call_supported(
+                        observe,
+                        context=context,
+                        expected=expected,
+                        mode=mode,
+                        deadline=deadline,
+                        progress=reporter.callback,
+                    )
+                self._check_deadline(deadline, phase)
+                if not isinstance(result, Mapping):
+                    reporter.finish(phase, "failed", started, "live_acceptance_invalid")
+                    raise ConvergenceError("live_acceptance_invalid", phase=phase)
             if result.get("observationValid") is not True:
                 code = _safe_code(result.get("errorCode"), "live_observation_invalid")
                 reporter.finish(phase, "failed", started, code)
@@ -2691,6 +2750,11 @@ def _regeneration_transaction_id(capability: Any) -> str | None:
     if not isinstance(value, str) or _HEX_32.fullmatch(value) is None:
         raise ConvergenceError("regeneration_capability_invalid")
     return value
+
+
+def _runtime_started_current(observation: Mapping[str, Any]) -> bool:
+    runtime = observation.get("runtime")
+    return isinstance(runtime, Mapping) and runtime.get("state") == "running"
 
 
 def _expected_runtime_id(journal_state: Mapping[str, Any] | None) -> str | None:

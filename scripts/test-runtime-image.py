@@ -379,6 +379,131 @@ def artifact_tuples() -> list[dict[str, Any]]:
         },
     ]
 
+def synthetic_microg_facts() -> dict[str, Any]:
+    return {
+        "components": [
+            {
+                "id": "gmsCore",
+                "runtimePath": "/system/product/priv-app/GmsCore/GmsCore.apk",
+                "sha256": "1" * 64,
+                "size": 105948577,
+            },
+            {
+                "id": "gsfProxy",
+                "runtimePath": "/system/product/priv-app/GsfProxy/GsfProxy.apk",
+                "sha256": "2" * 64,
+                "size": 21872,
+            },
+            {
+                "id": "playStoreSeed",
+                "runtimePath": "/system/product/priv-app/Phonesky/Phonesky.apk",
+                "sha256": "3" * 64,
+                "size": 62447827,
+            },
+        ],
+        "sources": {
+            "mindthegapps": {
+                "metadataSha256": "4" * 64,
+                "importManifestSha256": "5" * 64,
+            },
+            "microg": {
+                "commit": "352f2d72fa52c6c3c4fdd79d575a071a0da72ad1",
+                "tag": "v0.3.15.250932",
+            },
+            "gsfproxy": {
+                "commit": "2fb4385a04d73f66385b325e97ac6cc40339db48",
+                "tag": "v0.1.0",
+            },
+        },
+        "signaturePolicy": {
+            "realSignerSha256": "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165",
+            "fakeSignerSha256": "f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83",
+            "sourceCommits": [
+                "6d2955f0bd55e9938d5d49415182c27b50900b95",
+                "53e2f4b85ce836360dd58bdb2f0d7f42dc796443",
+            ],
+            "apiFields": ["signatures", "signingInfo", "forceQueryable"],
+        },
+        "productPolicy": {
+            "sourceCommit": "bd95ffe12653c1e8e695c841efa847af06d32a15",
+            "inputs": [
+                {
+                    "path": "scripts/generate-microg-product-policy.py",
+                    "sha256": "6" * 64,
+                }
+            ],
+            "outputs": [
+                {
+                    "path": "system/product/etc/microg.xml",
+                    "sha256": "7" * 64,
+                }
+            ],
+        },
+    }
+
+
+def synthetic_digest(value: Any) -> str:
+    return sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+
+
+def synthetic_microg_google_inputs(
+    facts: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected = copy.deepcopy(dict(facts or synthetic_microg_facts()))
+    components = selected["components"]
+    sources = selected["sources"]
+    signature_policy = selected["signaturePolicy"]
+    product_policy = selected["productPolicy"]
+    projection = {
+        "schema": "dev.xenoid.google-release/v2",
+        "provider": "microg",
+        "release": "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0",
+        **selected,
+    }
+    spec_sha = synthetic_digest(projection)
+    play_store = next(
+        item for item in components if item["id"] == "playStoreSeed"
+    )
+    return {
+        "provider": "microg",
+        "release": projection["release"],
+        "specSha256": spec_sha,
+        "dataCompatibilitySha256": spec_sha,
+        "metadataSha256": synthetic_digest({"metadata": projection}),
+        "providerSchema": projection["schema"],
+        "componentSetSha256": synthetic_digest(components),
+        "importManifestSha256": synthetic_digest(
+            {"components": components[:2], "sources": sources}
+        ),
+        "sourceImportManifestSha256": sources["mindthegapps"][
+            "importManifestSha256"
+        ],
+        "sourceMetadataSha256": sources["mindthegapps"]["metadataSha256"],
+        "playStoreSeedSha256": play_store["sha256"],
+        "signaturePolicySha256": synthetic_digest(signature_policy),
+        "productPolicySha256": synthetic_digest(product_policy),
+        "payloadSha256": synthetic_digest(
+            [
+                {
+                    "runtimePath": item["runtimePath"],
+                    "sha256": item["sha256"],
+                    "size": item["size"],
+                }
+                for item in sorted(
+                    components,
+                    key=lambda value: value["runtimePath"].encode("utf-8"),
+                )
+            ]
+        ),
+    }
+
 
 def compute_fixture(
     *,
@@ -434,7 +559,7 @@ def every_boot_critical_input_changes_the_boot_identity() -> None:
     mutations.append(compute_fixture(artifacts_value=payload))
     mutations.append(compute_fixture(base_id="sha256:" + "0" * 64))
     mutations.append(compute_fixture(context={"runtimeTreeSha256": "0" * 64, "patchersSha256": "6" * 64}))
-    mutations.append(compute_fixture(google={"provider": "mindthegapps", "payloadSha256": "0" * 64}))
+    mutations.append(compute_fixture(google=synthetic_microg_google_inputs()))
     mutations.append(compute_fixture(tools={"apktoolSha256": "0" * 64, "javaSha256": "8" * 64}))
     mutations.append(compute_fixture(builder={"dockerSha256": "0" * 64, "platform": "linux/arm64"}))
     mutations.append(compute_fixture(seed_value=seed_contract(package="dev.xenoid.daemon2")))
@@ -453,6 +578,81 @@ def every_boot_critical_input_changes_the_boot_identity() -> None:
     bad_destination = seed_contract()
     bad_destination["systemDestination"] = "/data/local/tmp/xenoid-daemon.apk"
     expect_code("runtime_image_daemon_seed_invalid", compute_fixture, seed_value=bad_destination)
+
+
+@contract_case("CompositeGoogleInputsChangeFullAndBootIdentity")
+def composite_google_inputs_change_full_and_boot_identity() -> None:
+    facts = synthetic_microg_facts()
+    google_inputs = synthetic_microg_google_inputs(facts)
+    baseline = compute_fixture(google=google_inputs)
+    identical = compute_fixture(
+        google=synthetic_microg_google_inputs(copy.deepcopy(facts))
+    )
+    require(identical == baseline, "identical composite inputs changed identity")
+    configured = "registry.example/team/redroid:configured"
+    baseline_tag = runtime_image.derive_tag(
+        configured,
+        baseline["inputSha256"],
+    )
+    require(
+        runtime_image.derive_tag(configured, identical["inputSha256"])
+        == baseline_tag,
+        "identical composite inputs changed the derived tag",
+    )
+
+    mutations: list[tuple[str, dict[str, Any]]] = []
+    for index, component in enumerate(facts["components"]):
+        changed = copy.deepcopy(facts)
+        changed["components"][index]["sha256"] = "0" * 64
+        mutations.append((f"component:{component['id']}", changed))
+
+    source_fields = {
+        "mindthegapps": ("metadataSha256", "8" * 64),
+        "microg": ("commit", "8" * 40),
+        "gsfproxy": ("commit", "9" * 40),
+    }
+    for source, (field, value) in source_fields.items():
+        changed = copy.deepcopy(facts)
+        changed["sources"][source][field] = value
+        mutations.append((f"source:{source}:{field}", changed))
+
+    for field in ("realSignerSha256", "fakeSignerSha256"):
+        changed = copy.deepcopy(facts)
+        changed["signaturePolicy"][field] = "8" * 64
+        mutations.append((f"certificate:{field}", changed))
+
+    for index, _commit in enumerate(facts["signaturePolicy"]["sourceCommits"]):
+        changed = copy.deepcopy(facts)
+        changed["signaturePolicy"]["sourceCommits"][index] = str(index) * 40
+        mutations.append((f"lineageCommit:{index}", changed))
+
+    changed = copy.deepcopy(facts)
+    changed["productPolicy"]["sourceCommit"] = "8" * 40
+    mutations.append(("productPolicy:sourceCommit", changed))
+    changed = copy.deepcopy(facts)
+    changed["productPolicy"]["inputs"][0]["sha256"] = "8" * 64
+    mutations.append(("productPolicy:input", changed))
+    changed = copy.deepcopy(facts)
+    changed["productPolicy"]["outputs"][0]["sha256"] = "8" * 64
+    mutations.append(("productPolicy:output", changed))
+
+    for label, changed_facts in mutations:
+        changed = compute_fixture(
+            google=synthetic_microg_google_inputs(changed_facts)
+        )
+        require(
+            changed["inputSha256"] != baseline["inputSha256"],
+            f"{label} kept the full image identity",
+        )
+        require(
+            changed["bootInputSha256"] != baseline["bootInputSha256"],
+            f"{label} kept the boot image identity",
+        )
+        require(
+            runtime_image.derive_tag(configured, changed["inputSha256"])
+            != baseline_tag,
+            f"{label} kept the derived tag",
+        )
 
 
 @contract_case("PureTagsAndInputsAreCanonicalAndPathFree")

@@ -53,12 +53,16 @@ from .device_identity import (
     validate_identity_value,
 )
 from .google_services import (
-    MINDTHEGAPPS_RELEASE,
-    PROVIDER_MINDTHEGAPPS,
+    AVAILABILITY_PRODUCTION,
+    MICROG_PLAY_RELEASE,
     PROVIDER_NONE,
+    GoogleServicesError,
+    import_microg,
+    ensure_google_services_assets,
     import_mindthegapps,
     load_release_spec,
     quick_validate_assets,
+    registered_releases,
     registry_public,
 )
 from .process import run_bounded
@@ -344,7 +348,55 @@ def _execute_convergence(
             dry_run=bool(getattr(args, "dry_run", False)),
             regeneration_capability=regeneration_capability,
         )
+
+def _prepare_google_assets_for_up(args: argparse.Namespace) -> dict[str, Any]:
+    provider = args.config.google_services_provider
+    release = args.config.google_services_release
+    if provider == PROVIDER_NONE:
+        return {"ok": True, "skipped": True}
+    spec = load_release_spec(args.context.project_root, release)
+    if spec.availability != AVAILABILITY_PRODUCTION:
+        raise GoogleServicesError(
+            "google_services_release_retired",
+            "the configured Google services release is retired; create a new instance",
+        )
+    if bool(args.dry_run) or bool(args.skip_build):
+        quick_validate_assets(args.context.project_root, spec)
+        return {"ok": True, "downloaded": False, "existing": True}
+    _write_up_progress(
+        {
+            "schema": "dev.xenoid.progress/v1",
+            "command": "up",
+            "phase": "google-assets",
+            "state": "started",
+            "durationMs": 0,
+            "detail": "acquiring",
+        }
+    )
+    result = ensure_google_services_assets(args.context.project_root, spec)
+    _write_up_progress(
+        {
+            "schema": "dev.xenoid.progress/v1",
+            "command": "up",
+            "phase": "google-assets",
+            "state": "passed",
+            "durationMs": 0,
+            "detail": (
+                "downloaded"
+                if result.get("downloaded") is True
+                else "ready"
+            ),
+        }
+    )
+    return result
+
+
 def cmd_up(args: argparse.Namespace) -> int:
+    try:
+        _prepare_google_assets_for_up(args)
+    except GoogleServicesError as exc:
+        print_json(exc.as_dict())
+        return 1
     journal = RegenerationJournal(args.context)
     regeneration = journal.load()
     if regeneration is not None and not bool(args.dry_run):
@@ -537,19 +589,36 @@ def cmd_build_all(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    overrides = {
+        key: value
+        for key, value in {
+            "image": args.image,
+            "backend": args.backend,
+        }.items()
+        if value is not None
+    }
+    if bool(args.no_google_services):
+        overrides.update(
+            {
+                "google_services_provider": PROVIDER_NONE,
+                "google_services_release": PROVIDER_NONE,
+            }
+        )
     context, cfg, lease = initialize_instance(
         args.instance_name,
         project_root=args.project_root,
-        overrides={k: v for k, v in {"image": args.image, "backend": args.backend}.items() if v is not None},
+        overrides=overrides,
         template_path=getattr(args, "config", None),
         from_instance=getattr(args, "from_instance", None),
     )
-    print_json({
-        "ok": True,
-        "instance": context.public_dict(),
-        "slot": lease.slot,
-        "config": cfg,
-    })
+    print_json(
+        {
+            "ok": True,
+            "instance": context.public_dict(),
+            "slot": lease.slot,
+            "config": cfg,
+        }
+    )
     return 0
 
 
@@ -599,6 +668,16 @@ def cmd_google_services_import(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_google_services_import_microg(args: argparse.Namespace) -> int:
+    result = import_microg(
+        args.context.project_root,
+        Path(args.gmscore).expanduser(),
+        Path(args.gsfproxy).expanduser(),
+    )
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
 def cmd_google_services_status(args: argparse.Namespace) -> int:
     result = runtime(args).google_services_status(
         require_runtime=bool(args.require_runtime),
@@ -608,8 +687,14 @@ def cmd_google_services_status(args: argparse.Namespace) -> int:
 
 
 def _google_services_enable_result(args: argparse.Namespace) -> dict[str, Any]:
+    spec = load_release_spec(args.context.project_root, args.release)
+    if spec.availability != AVAILABILITY_PRODUCTION:
+        raise GoogleServicesError(
+            "google_services_release_retired",
+            "the requested Google services release is retired and cannot be newly selected",
+        )
     if (
-        args.config.google_services_provider == PROVIDER_MINDTHEGAPPS
+        args.config.google_services_provider == spec.provider
         and args.config.google_services_release == args.release
     ):
         result = runtime(args).google_services_status()
@@ -618,7 +703,6 @@ def _google_services_enable_result(args: argparse.Namespace) -> dict[str, Any]:
         result["runtimeError"] = result.get("error")
         result["ok"] = bool(result.get("configured") and result.get("hostReady"))
         return result
-    spec = load_release_spec(args.context.project_root, args.release)
     quick_validate_assets(args.context.project_root, spec)
     mutable = runtime(args).google_services_configuration_mutable()
     if mutable.get("ok") is not True:
@@ -626,7 +710,7 @@ def _google_services_enable_result(args: argparse.Namespace) -> dict[str, Any]:
     cfg = merge_config(
         args.context,
         {
-            "google_services_provider": PROVIDER_MINDTHEGAPPS,
+            "google_services_provider": spec.provider,
             "google_services_release": args.release,
             "auto_build_runtime_image": True,
         },
@@ -3289,7 +3373,7 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
     if not _regeneration_phase_at_least(state, "google_wiping"):
         state = journal.advance("google_wiping")
     google_wipe: dict[str, Any]
-    if args.config.google_services_provider == PROVIDER_MINDTHEGAPPS:
+    if args.config.google_services_provider != PROVIDER_NONE:
         google_wipe = _wipe_regeneration_google_packages(
             manager,
             journal,
@@ -3701,11 +3785,18 @@ def build_parser() -> argparse.ArgumentParser:
     google = s.add_subparsers(required=True)
     google_import = google.add_parser(
         "import-mindthegapps",
-        help="verify and import the pinned official MindTheGapps release",
+        help="verify and import the pinned official MindTheGapps source release",
     )
     google_import.add_argument("archive")
     google_import.add_argument("certificate")
     google_import.set_defaults(func=cmd_google_services_import)
+    google_import_microg = google.add_parser(
+        "import-microg",
+        help="verify and import the pinned official microG GmsCore and GsfProxy APKs",
+    )
+    google_import_microg.add_argument("gmscore")
+    google_import_microg.add_argument("gsfproxy")
+    google_import_microg.set_defaults(func=cmd_google_services_import_microg)
     google_releases = google.add_parser(
         "releases",
         help="list the pinned Google services release registry",
@@ -3723,8 +3814,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     google_enable.add_argument(
         "--release",
-        default=MINDTHEGAPPS_RELEASE,
-        choices=[MINDTHEGAPPS_RELEASE],
+        default=MICROG_PLAY_RELEASE,
+        choices=list(registered_releases(selectable_only=True)),
     )
     google_enable.set_defaults(func=cmd_google_services_enable)
     google_disable = google.add_parser(
@@ -3739,6 +3830,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--backend")
     s.add_argument("--config", help="operational config template to merge (e.g. examples/config-macos-colima.json)")
     s.add_argument("--from", dest="from_instance", help="clone operational config from an existing instance")
+    s.add_argument(
+        "--no-google-services",
+        action="store_true",
+        help="create this instance with Google services disabled",
+    )
     s.set_defaults(func=cmd_init)
 
 

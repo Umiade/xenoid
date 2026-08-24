@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Any
 
 from .process import run_bounded
@@ -25,6 +25,12 @@ GATE_SCHEMA = "dev.xenoid.gates/v1"
 VERIFY_SCHEMA = "dev.xenoid.verify/v1"
 CI_SCHEMA = "dev.xenoid.ci/v1"
 CACHE_SCHEMA = "dev.xenoid.gate-cache/v1"
+GOOGLE_SMOKE_GATE_SCHEMA = "dev.xenoid.google-services-smoke/v2"
+GOOGLE_REPRODUCIBILITY_SCHEMA = "dev.xenoid.google-reproducibility/v1"
+GOOGLE_CUTOVER_SCHEMA = "dev.xenoid.google-provider-cutover/v1"
+GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA = "dev.xenoid.google-release-acceptance-normalized/v1"
+GOOGLE_ATTESTATION_SCHEMA = "dev.xenoid.google-release-attestation/v1"
+GATE_DEPENDENCY_SNAPSHOT_SCHEMA = "dev.xenoid.gate-dependency-snapshot/v1"
 _PROGRESS_SCHEMA = "dev.xenoid.progress/v1"
 _SAFE_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
@@ -45,6 +51,14 @@ _ENVIRONMENT_KEYS = (
     "CXX",
     "JAVA_HOME",
 )
+
+
+_STDOUT_DOCUMENT_GATES: Mapping[str, tuple[str, str]] = {
+    "google-runtime": ("result", GOOGLE_SMOKE_GATE_SCHEMA),
+    "google-reproducibility": ("result", GOOGLE_REPRODUCIBILITY_SCHEMA),
+    "google-provider-cutover-contract": ("result", GOOGLE_CUTOVER_SCHEMA),
+    "google-release-acceptance": ("acceptance", GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA),
+}
 
 
 @dataclass(frozen=True)
@@ -388,8 +402,8 @@ GATE_CATALOG: tuple[GateSpec, ...] = (
     ),
     GateSpec(
         name="google-runtime",
-        command=("scripts/smoke-google-services-runtime.sh",),
-        inputs=_RUNTIME_INPUTS + ("data/google-services/*.json",),
+        command=("scripts/smoke-google-services-gate.sh",),
+        inputs=_RUNTIME_INPUTS + ("data/google-services/*.json", "tests/google-services-runtime-probe/**/*", "runtime/redroid/microg-policy/**/*"),
         dependencies=("camera-runtime",),
         timeout_seconds=1200,
         cacheable=False,
@@ -398,6 +412,56 @@ GATE_CATALOG: tuple[GateSpec, ...] = (
         tools=("bash", "adb"),
         category="live",
         network=True,
+        privileged=True,
+    ),
+    GateSpec(
+        name="google-provider-cutover-contract",
+        command=("{python}", "scripts/test-google-provider-cutover.py"),
+        inputs=(
+            "src/xenoid/**/*.py",
+            "scripts/*.py",
+            "scripts/*.sh",
+            "data/google-services/*.json",
+            "runtime/redroid/microg-policy/**/*",
+            "tests/google-services-runtime-probe/**/*",
+            "docs/*.md",
+            "README.md",
+            "README_CN.md",
+            "examples/*.json",
+            "skills/**/*.md",
+        ),
+        dependencies=("runtime-image-contract",),
+        timeout_seconds=300,
+        cacheable=False,
+        tools=("python3",),
+        category="static",
+    ),
+    GateSpec(
+        name="google-reproducibility",
+        command=("scripts/smoke-google-services-reproducibility.sh",),
+        inputs=_RUNTIME_INPUTS + ("data/google-services/*.json", "runtime/redroid/microg-policy/**/*", "scripts/make-runtime-context.sh", "scripts/generate-microg-product-policy.py", "scripts/patch-services-runtime.py"),
+        dependencies=("runtime-image-contract", "google-provider-cutover-contract"),
+        timeout_seconds=7200,
+        cacheable=False,
+        runtime_free=False,
+        mutating=True,
+        tools=("bash", "docker"),
+        category="release",
+        network=True,
+        privileged=True,
+    ),
+    GateSpec(
+        name="google-release-acceptance",
+        command=("{python}", "scripts/validate-google-services-release-acceptance.py"),
+        inputs=("scripts/validate-google-services-release-acceptance.py", "data/google-services/*.json"),
+        dependencies=("google-runtime", "google-reproducibility", "google-provider-cutover-contract"),
+        timeout_seconds=1800,
+        cacheable=False,
+        sensitive=True,
+        runtime_free=False,
+        mutating=False,
+        tools=("python3", "adb"),
+        category="release",
         privileged=True,
     ),
     GateSpec(
@@ -449,7 +513,13 @@ GATE_CATALOG: tuple[GateSpec, ...] = (
         cacheable=False,
         category="doctor",
     ),
-    GateSpec(name="release", dependencies=("static", "release-source-contract"), cacheable=False, category="release"),
+    GateSpec(name="release", dependencies=("static", "release-source-contract", "google-provider-cutover-contract"), cacheable=False, category="release"),
+    GateSpec(
+        name="release-google",
+        dependencies=("static", "release-source-contract", "google-provider-cutover-contract", "google-release-acceptance"),
+        cacheable=False,
+        category="release",
+    ),
     GateSpec(name="audit", dependencies=("release",), cacheable=False, category="release"),
 )
 
@@ -461,6 +531,7 @@ PROFILE_TARGETS: Mapping[str, str] = {
     "doctor": "doctor-default",
     "doctor-full": "doctor-full",
     "release": "release",
+    "release-google": "release-google",
     "audit": "audit",
 }
 
@@ -518,6 +589,7 @@ class GateRunner:
         raw_project = Path(project_root).absolute()
         self.project_root = raw_project.resolve()
         self.specs = dict(catalog() if specs is None else specs)
+        self._runtime_mutation_lock = Lock()
         selected_cache = cache_root or self.project_root / ".xenoid/cache/gates"
         selected_locks = lock_root or self.project_root / ".xenoid/locks/gates"
 
@@ -965,8 +1037,10 @@ class GateRunner:
         deadline: float,
         progress: Callable[[Mapping[str, Any]], None] | None,
         cancelled: Event | None,
+        dependency_results: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
+        runtime_mutating = False
         if spec.aggregate:
             return {
                 "state": "passed",
@@ -1011,6 +1085,13 @@ class GateRunner:
                     "inputSha256": input_sha,
                     "durationMs": max(0, int((time.monotonic() - started) * 1000)),
                 }
+            runtime_mutating = spec.mutating and not spec.runtime_free
+            if runtime_mutating:
+                # Gates that mutate the shared live runtime (restarts, image
+                # rebuilds, container recreation) must not overlap; observers
+                # and lighter live gates tolerate a stopped-observer window,
+                # but two mutators racing one container corrupt both proofs.
+                self._runtime_mutation_lock.acquire()
             command = [sys.executable if item == "{python}" else item for item in spec.command]
             child_env = {
                 **os.environ,
@@ -1022,6 +1103,45 @@ class GateRunner:
             }
             child_env.pop("PYTHONDONTWRITEBYTECODE", None)
             child_deadline = min(deadline, time.monotonic() + spec.timeout_seconds)
+            document_rule = _STDOUT_DOCUMENT_GATES.get(spec.name)
+            stdout_capture = bytearray() if document_rule is not None else None
+
+            def _capture_stdout(chunk: bytes) -> None:
+                if stdout_capture is None:
+                    return
+                if len(stdout_capture) + len(chunk) > 256 * 1024:
+                    raise GateInputError("gate_result_document_too_large")
+                stdout_capture.extend(chunk)
+
+            stdin_payload: bytes | None = None
+            if spec.name == "google-release-acceptance":
+                snapshot: dict[str, Any] = {"schema": GATE_DEPENDENCY_SNAPSHOT_SCHEMA, "dependencies": {}}
+                for dependency in ("google-runtime", "google-reproducibility", "google-provider-cutover-contract"):
+                    observed = (dependency_results or {}).get(dependency)
+                    if not isinstance(observed, Mapping):
+                        return {
+                            "state": "failed",
+                            "cacheHit": False,
+                            "inputSha256": input_sha,
+                            "durationMs": max(0, int((time.monotonic() - started) * 1000)),
+                            "errorCode": "gate_dependency_snapshot_unavailable",
+                        }
+                    snapshot["dependencies"][dependency] = {
+                        "state": observed.get("state"),
+                        "inputSha256": observed.get("inputSha256"),
+                        "result": observed.get("result"),
+                    }
+                stdin_payload = (
+                    json.dumps(snapshot, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("ascii")
+                if len(stdin_payload) > 256 * 1024:
+                    return {
+                        "state": "failed",
+                        "cacheHit": False,
+                        "inputSha256": input_sha,
+                        "durationMs": max(0, int((time.monotonic() - started) * 1000)),
+                        "errorCode": "gate_dependency_snapshot_too_large",
+                    }
             result = run_bounded(
                 command,
                 cwd=self.project_root,
@@ -1029,6 +1149,9 @@ class GateRunner:
                 env=child_env,
                 project_root=self.project_root,
                 cancelled=cancelled,
+                input_bytes=stdin_payload,
+                max_input_bytes=256 * 1024 if stdin_payload is not None else 4096,
+                stdout_consumer=_capture_stdout if stdout_capture is not None else None,
                 progress=(
                     (lambda stream, detail: self._emit(progress, spec.name, "running", stream))
                     if progress is not None
@@ -1048,6 +1171,26 @@ class GateRunner:
                 if result.stderr_tail:
                     gate_result["stderrTail"] = result.stderr_tail
                 return gate_result
+            if document_rule is not None:
+                field, schema = document_rule
+                raw_stdout = bytes(stdout_capture or b"")
+                document: Any = None
+                if raw_stdout.endswith(b"\n") and raw_stdout.count(b"\n") == 1:
+                    try:
+                        document = json.loads(raw_stdout[:-1])
+                    except (ValueError, UnicodeError):
+                        document = None
+                if (
+                    not isinstance(document, dict)
+                    or document.get("schema") != schema
+                    or (json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii") != raw_stdout
+                ):
+                    return {
+                        **gate_result,
+                        "state": "failed",
+                        "errorCode": "gate_result_document_invalid",
+                    }
+                gate_result[field] = document
             after_sha, after_command_sha = self._input_identity(spec, deadline)
             if after_sha != input_sha or after_command_sha != command_sha:
                 gate_result["state"] = "failed"
@@ -1065,6 +1208,8 @@ class GateRunner:
                 "errorCode": str(exc),
             }
         finally:
+            if runtime_mutating:
+                self._runtime_mutation_lock.release()
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
@@ -1173,6 +1318,7 @@ class GateRunner:
                             deadline=absolute_deadline,
                             progress=progress,
                             cancelled=cancelled,
+                            dependency_results={dep: results[dep] for dep in dependencies},
                         )
                         running[future] = name
                         made_progress = True
@@ -1487,6 +1633,83 @@ class GateRunner:
                 pass
         return True
 
+    def publish_google_release_attestation(
+        self,
+        report: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        gates = report.get("gates")
+        if report.get("ok") is not True or not isinstance(gates, Mapping):
+            return None
+        acceptance_gate = gates.get("google-release-acceptance")
+        runtime_gate = gates.get("google-runtime")
+        if not isinstance(acceptance_gate, Mapping) or not isinstance(runtime_gate, Mapping):
+            return None
+        acceptance = acceptance_gate.get("acceptance")
+        runtime_input = runtime_gate.get("inputSha256")
+        if (
+            acceptance_gate.get("state") != "passed"
+            or runtime_gate.get("state") != "passed"
+            or not isinstance(acceptance, Mapping)
+            or acceptance.get("schema") != GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA
+            or not isinstance(runtime_input, str)
+            or _HEX_64.fullmatch(runtime_input) is None
+        ):
+            return None
+        required_keys = {
+            "schema",
+            "provider",
+            "release",
+            "specSha256",
+            "runtimeInputSha256",
+            "imageId",
+            "privateEvidenceSha256",
+            "freshDataProofSha256",
+            "testArtifacts",
+            "reproducibility",
+            "effectivePlayStoreVersionCode",
+            "effectivePlayStoreSignerMatches",
+            "checks",
+        }
+        if set(acceptance) != required_keys:
+            return None
+        canonical_acceptance = (
+            json.dumps(acceptance, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        attestation = {key: value for key, value in acceptance.items() if key != "privateEvidenceSha256"}
+        attestation["schema"] = GOOGLE_ATTESTATION_SCHEMA
+        attestation["gateInputsSha256"] = {
+            "google-runtime": runtime_input,
+            "google-release-acceptance": hashlib.sha256(canonical_acceptance).hexdigest(),
+        }
+        encoded = (
+            json.dumps(attestation, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        evidence_key = hashlib.sha256(encoded).hexdigest()
+        directory = self.cache_root / "google-release-attestations"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        path = directory / f"{evidence_key}.json"
+        temporary = path.parent / f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        return {"attestation": attestation, "path": str(path), "sha256": evidence_key}
+
     def observe_full_evidence(
         self,
         instance_name: str,
@@ -1618,6 +1841,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "doctor": 300,
         "doctor-full": 300,
         "release": 7200,
+        "release-google": 21600,
         "audit": 7200,
     }
     args = parser.parse_args(argv)
@@ -1649,6 +1873,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "ok": False,
                     "failedGate": "full-live-evidence",
                     "errorCode": "full_live_evidence_unavailable",
+                }
+        if args.profile == "release-google" and args.fresh and report.get("ok") is True:
+            published = runner.publish_google_release_attestation(report)
+            if published is None:
+                report = {
+                    **report,
+                    "ok": False,
+                    "failedGate": "google-release-attestation",
+                    "errorCode": "google_release_attestation_unavailable",
+                }
+            else:
+                report = {
+                    **report,
+                    "googleReleaseAttestation": {
+                        "path": published["path"],
+                        "sha256": published["sha256"],
+                    },
                 }
     finally:
         for handled_signal, previous in previous_handlers.items():

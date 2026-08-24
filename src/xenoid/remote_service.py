@@ -515,19 +515,46 @@ _PRIVATE_RESULT_KEYS = {
 }
 
 
+_GUEST_PATH_PREFIXES = (
+    "/system/",
+    "/product/",
+    "/system_ext/",
+    "/vendor/",
+    "/odm/",
+    "/apex/",
+    "/data/app/",
+    "/data/user/",
+    "/data/user_de/",
+    "/data/misc/",
+)
+
+
 def _sanitize_value(value: Any, private_roots: tuple[str, ...]) -> Any:
     if isinstance(value, dict):
         clean: dict[str, Any] = {}
         for raw_name, item in value.items():
             name = str(raw_name)
             normalized = "".join(ch for ch in name.lower() if ch.isalnum())
+            if normalized in _PRIVATE_RESULT_KEYS:
+                # Binding/storage lifecycle sources are fixed public enums.
+                if normalized == "source" and isinstance(item, str) and item in {"fresh", "legacy"}:
+                    clean[name] = item
+                continue
             if (
-                normalized in _PRIVATE_RESULT_KEYS
-                or normalized.endswith("password")
+                normalized.endswith("password")
                 or normalized.endswith("secret")
                 or normalized.endswith("token")
-                or normalized.endswith("path")
             ):
+                continue
+            if normalized.endswith("path"):
+                # Android guest paths (e.g. Google services component codePath)
+                # carry no host meaning; keep only exact guest-absolute values.
+                if (
+                    isinstance(item, str)
+                    and item.startswith(_GUEST_PATH_PREFIXES)
+                    and not any(root and root in item for root in private_roots)
+                ):
+                    clean[name] = item
                 continue
             clean[name] = _sanitize_value(item, private_roots)
         return clean

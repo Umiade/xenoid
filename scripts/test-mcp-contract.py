@@ -22,6 +22,10 @@ from xenoid import cli, mcp_server  # noqa: E402
 from xenoid.backend import RuntimeManager  # noqa: E402
 from xenoid.util import command_timeout, run, validate_release_version  # noqa: E402
 
+MICROG_PLAY_RELEASE = (
+    "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0"
+)
+
 
 def require(condition: bool, message: str) -> None:
     if not condition:
@@ -140,6 +144,63 @@ def keybox_is_trusted_local_cli_only() -> None:
         require(str(exc) == "unknown tool: xenoid_keybox_status", "unstable MCP denial")
     else:
         raise AssertionError("unregistered keybox MCP operation was callable")
+
+def google_services_enable_defaults_to_microg_release() -> None:
+    catalog = {entry["name"]: entry for entry in mcp_server.tools()}
+    enable = catalog["xenoid_google_services_enable"]
+    require(
+        "microG production Google services release" in enable["description"],
+        "MCP enable description does not identify the production microG provider",
+    )
+    require(
+        "MindTheGapps" not in enable["description"],
+        "MCP enable description still advertises the retired source",
+    )
+    require(
+        enable["inputSchema"]
+        == {
+            "type": "object",
+            "properties": {"release": {"type": "string"}},
+        },
+        "MCP Google enable schema drifted",
+    )
+
+    observed: list[str] = []
+
+    def capture(arguments: Any) -> dict[str, Any]:
+        observed.append(arguments.release)
+        return {"ok": True, "release": arguments.release}
+
+    runtime = FakeRuntime()
+    with mock.patch.object(
+        mcp_server,
+        "_google_services_enable_result",
+        side_effect=capture,
+    ):
+        defaulted = decoded(
+            mcp_server.call_tool(
+                runtime,
+                "xenoid_google_services_enable",
+                {},
+            )
+        )
+        explicit = decoded(
+            mcp_server.call_tool(
+                runtime,
+                "xenoid_google_services_enable",
+                {"release": "operator-selected"},
+            )
+        )
+    require(
+        observed == [MICROG_PLAY_RELEASE, "operator-selected"],
+        "MCP enable default or explicit release dispatch drifted",
+    )
+    require(
+        defaulted.get("release") == MICROG_PLAY_RELEASE
+        and explicit.get("release") == "operator-selected",
+        "MCP enable result did not preserve the selected release",
+    )
+
 
 def proxy_unreadable_discard_is_explicit() -> None:
     catalog = {entry["name"]: entry for entry in mcp_server.tools()}
@@ -762,6 +823,7 @@ def main() -> int:
     cases = (
         registered_tools_have_handlers,
         keybox_is_trusted_local_cli_only,
+        google_services_enable_defaults_to_microg_release,
         proxy_unreadable_discard_is_explicit,
         netctl_dispatches_to_runtime_manager,
         up_tools_use_in_process_convergence,

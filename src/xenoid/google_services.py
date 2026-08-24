@@ -5,6 +5,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import http.client
 import os
 import re
 import secrets
@@ -13,28 +14,63 @@ import stat
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import unicodedata
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional
 
 from .config import InstanceContext, InstanceError, InstanceLease, XenoidConfig
 from .util import which
 from .process import run_bounded
 
-GOOGLE_RELEASE_SCHEMA = "dev.xenoid.google-release/v1"
+GOOGLE_RELEASE_SCHEMA_V1 = "dev.xenoid.google-release/v1"
+GOOGLE_RELEASE_SCHEMA_V2 = "dev.xenoid.google-release/v2"
+GOOGLE_RELEASE_SCHEMA = GOOGLE_RELEASE_SCHEMA_V1
 GOOGLE_BINDING_SCHEMA = "dev.xenoid.google-runtime-binding/v1"
-GOOGLE_STATUS_SCHEMA = "dev.xenoid.google-services-status/v1"
-GOOGLE_IMPORT_SCHEMA = "dev.xenoid.google-services-import/v1"
-GOOGLE_PROBE_SCHEMA = "dev.xenoid.google-services-probe/v1"
-GOOGLE_SMOKE_SCHEMA = "dev.xenoid.google-services-smoke/v1"
+GOOGLE_STATUS_SCHEMA = "dev.xenoid.google-services-status/v2"
+GOOGLE_IMPORT_SCHEMA_V1 = "dev.xenoid.google-services-import/v1"
+GOOGLE_IMPORT_SCHEMA_V2 = "dev.xenoid.google-services-import/v2"
+GOOGLE_IMPORT_SCHEMA = GOOGLE_IMPORT_SCHEMA_V1
+GOOGLE_PROBE_SCHEMA = "dev.xenoid.google-services-probe/v2"
+GOOGLE_SMOKE_SCHEMA = "dev.xenoid.google-services-smoke/v2"
 
 PROVIDER_NONE = "none"
 PROVIDER_MINDTHEGAPPS = "mindthegapps"
+PROVIDER_MICROG = "microg"
 MINDTHEGAPPS_RELEASE = "MindTheGapps-13.0.0-arm64-20231025_200931"
+MICROG_PLAY_RELEASE = "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0"
 INTEGRATION_REVISION = 1
+INTEGRATION_REVISION_V2 = 2
+
+AVAILABILITY_PRODUCTION = "production"
+AVAILABILITY_RETIRED_SOURCE = "retired-source"
+
+# Pinned signer identities for the composite microG release. The real
+# certificate is the official microG NOGAPPS release key; the fake certificate
+# is the Google Android certificate requested through GmsCore's
+# ``fake-signature`` metadata and presented only through the restricted
+# signature-spoofing framework policy.
+MICROG_REAL_CERT_SHA256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+MICROG_FAKE_CERT_SHA256 = "f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83"
+PHONESKY_CERT_SHA256 = "f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83"
+MICROG_GMSCORE_DOWNLOAD_URL = (
+    "https://github.com/microg/GmsCore/releases/download/"
+    "v0.3.15.250932/com.google.android.gms-250932030.apk"
+)
+MICROG_GSFPROXY_DOWNLOAD_URL = (
+    "https://github.com/microg/GsfProxy/releases/download/v0.1.0/GsfProxy.apk"
+)
+MICROG_GMSCORE_BASENAME = "com.google.android.gms-250932030.apk"
+MICROG_GSFPROXY_BASENAME = "com.google.android.gsf-8.apk"
+PHONESKY_ARCHIVE_PATH = "system/product/priv-app/Phonesky/Phonesky.apk"
+LINEAGE_SPOOFING_BASE_COMMIT = "6d2955f0bd55e9938d5d49415182c27b50900b95"
+LINEAGE_SPOOFING_SIGNING_INFO_COMMIT = "53e2f4b85ce836360dd58bdb2f0d7f42dc796443"
+MICROG_POLICY_UPSTREAM_COMMIT = "bd95ffe12653c1e8e695c841efa847af06d32a15"
 
 GOOGLE_LABEL_PROVIDER = "dev.xenoid.google_provider"
 GOOGLE_LABEL_RELEASE = "dev.xenoid.google_release"
@@ -58,7 +94,14 @@ _RELEASE_REGISTRY: dict[str, dict[str, str]] = {
         "provider": PROVIDER_MINDTHEGAPPS,
         "metadata": "data/google-services/mindthegapps-13.0.0-arm64-20231025_200931.json",
         "metadataSha256": "7ce33b19c10d2aa7f4c8a9ece164765fd0ceddfcfb479457b5fcf07aa4244eab",
-    }
+        "availability": AVAILABILITY_RETIRED_SOURCE,
+    },
+    MICROG_PLAY_RELEASE: {
+        "provider": PROVIDER_MICROG,
+        "metadata": "data/google-services/microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0.json",
+        "metadataSha256": "f21706e7152c480239b569b353a87a8ff2869d0e368e9e317d0c4eb8b41dd656",
+        "availability": AVAILABILITY_PRODUCTION,
+    },
 }
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -77,7 +120,7 @@ _BINDING_KEYS = {
     "transactionId",
     "source",
 }
-_IMPORT_KEYS = {
+_IMPORT_KEYS_V1 = {
     "schema",
     "provider",
     "release",
@@ -91,7 +134,19 @@ _IMPORT_KEYS = {
     "certificateSha256",
     "certificateDerSha256",
 }
-_IMPORT_OWNER = "dev.xenoid.google-services-import/v1\n"
+_IMPORT_KEYS_V2 = {
+    "schema",
+    "provider",
+    "release",
+    "integrationRevision",
+    "metadataSha256",
+    "components",
+    "sourceDependencies",
+}
+_IMPORT_COMPONENT_KEYS_V2 = {"id", "basename", "size", "sha256", "signingCertificateHistorySha256"}
+_IMPORT_SOURCE_DEPENDENCY_KEYS_V2 = {"release", "metadataSha256", "importManifestSha256", "archivePath", "memberSha256"}
+_IMPORT_OWNER_V1 = "dev.xenoid.google-services-import/v1\n"
+_IMPORT_OWNER_V2 = "dev.xenoid.google-services-import/v2\n"
 _RUNTIME_CONTEXT_OWNER = "dev.xenoid.google-runtime-context/v1\n"
 _MAX_COMPONENT_BYTES = 255
 _MAX_PATH_BYTES = 1024
@@ -116,8 +171,19 @@ class ReleaseSpec:
     data_compatibility_fingerprint: str
 
     @property
+    def schema(self) -> str:
+        return str(self.metadata["schema"])
+
+    @property
     def provider(self) -> str:
         return str(self.metadata["provider"])
+
+    @property
+    def availability(self) -> str:
+        entry = _RELEASE_REGISTRY.get(self.release)
+        if entry is None:
+            raise GoogleServicesError("google_services_spec_mismatch", "unsupported Google services release")
+        return entry["availability"]
 
     @property
     def archive(self) -> Mapping[str, Any]:
@@ -140,6 +206,32 @@ class ReleaseSpec:
         return tuple(self.metadata["apks"])
 
     @property
+    def sources(self) -> Mapping[str, Any]:
+        return self.metadata["sources"]
+
+    @property
+    def components(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(self.metadata["components"])
+
+    @property
+    def signature_policy(self) -> Mapping[str, Any]:
+        return self.metadata["signaturePolicy"]
+
+    @property
+    def product_policy(self) -> Mapping[str, Any]:
+        return self.metadata["productPolicy"]
+
+    @property
+    def runtime_requirements(self) -> Mapping[str, Any]:
+        return self.metadata["runtimeRequirements"]
+
+    def component(self, component_id: str) -> Mapping[str, Any]:
+        for item in self.components:
+            if item["id"] == component_id:
+                return item
+        raise GoogleServicesError("google_services_spec_mismatch", "unknown Google services component")
+
+    @property
     def labels(self) -> dict[str, str]:
         return {
             GOOGLE_LABEL_PROVIDER: self.provider,
@@ -153,7 +245,7 @@ class ReleaseSpec:
         return self.release
 
     def public_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "provider": self.provider,
             "release": self.release,
             "specSha256": self.fingerprint,
@@ -162,9 +254,12 @@ class ReleaseSpec:
             "api": self.android["api"],
             "abi": self.android["runtimeAbis"][0],
             "targetProduct": self.android["targetProduct"],
-            "selectionProfile": self.selection["profile"],
             "integrationRevision": self.metadata["integrationRevision"],
+            "availability": self.availability,
         }
+        if self.schema == GOOGLE_RELEASE_SCHEMA_V1:
+            result["selectionProfile"] = self.selection["profile"]
+        return result
 
 
 @dataclass(frozen=True)
@@ -184,8 +279,16 @@ class RuntimeContextHandle:
     token: str
 
 
-def registered_releases() -> tuple[str, ...]:
-    return tuple(sorted(_RELEASE_REGISTRY))
+def registered_releases(*, selectable_only: bool = False) -> tuple[str, ...]:
+    if not selectable_only:
+        return tuple(sorted(_RELEASE_REGISTRY))
+    return tuple(
+        sorted(
+            release
+            for release, entry in _RELEASE_REGISTRY.items()
+            if entry["availability"] == AVAILABILITY_PRODUCTION
+        )
+    )
 
 
 def registered_metadata_files() -> dict[str, str]:
@@ -195,6 +298,11 @@ def registered_metadata_files() -> dict[str, str]:
     }
 
 
+def release_availability(release: str) -> Optional[str]:
+    entry = _RELEASE_REGISTRY.get(release)
+    return None if entry is None else entry["availability"]
+
+
 def registry_public() -> list[dict[str, str]]:
     return [
         {
@@ -202,6 +310,7 @@ def registry_public() -> list[dict[str, str]]:
             "release": release,
             "metadata": _RELEASE_REGISTRY[release]["metadata"],
             "metadataSha256": _RELEASE_REGISTRY[release]["metadataSha256"],
+            "availability": _RELEASE_REGISTRY[release]["availability"],
         }
         for release in registered_releases()
     ]
@@ -213,7 +322,7 @@ def validate_provider_release(provider: Any, release: Any) -> tuple[str, str]:
     if provider == PROVIDER_NONE and release == PROVIDER_NONE:
         return provider, release
     entry = _RELEASE_REGISTRY.get(release)
-    if provider != PROVIDER_MINDTHEGAPPS or entry is None or entry["provider"] != provider:
+    if entry is None or entry["provider"] != provider:
         raise GoogleServicesError("google_services_spec_mismatch", "unsupported Google services provider or release")
     return provider, release
 
@@ -251,6 +360,22 @@ def _canonical_json(data: Mapping[str, Any]) -> bytes:
 
 
 def _spec_payload(metadata: Mapping[str, Any], metadata_sha256: str) -> dict[str, Any]:
+    if metadata.get("schema") == GOOGLE_RELEASE_SCHEMA_V2:
+        return {
+            key: metadata[key]
+            for key in (
+                "schema",
+                "provider",
+                "release",
+                "integrationRevision",
+                "android",
+                "sources",
+                "components",
+                "signaturePolicy",
+                "productPolicy",
+                "runtimeRequirements",
+            )
+        }
     android = metadata["android"]
     archive = metadata["archive"]
     selection = metadata["selection"]
@@ -295,6 +420,231 @@ def _require_mapping(value: Any, *, code: str = "google_services_spec_mismatch")
 
 def _validate_release_metadata(data: Any, release: str) -> Mapping[str, Any]:
     value = _require_mapping(data)
+    schema = value.get("schema")
+    if schema == GOOGLE_RELEASE_SCHEMA_V1:
+        return _validate_release_metadata_v1(value, release)
+    if schema == GOOGLE_RELEASE_SCHEMA_V2:
+        return _validate_release_metadata_v2(value, release)
+    raise GoogleServicesError("google_services_spec_mismatch", "unsupported Google services release metadata")
+
+
+def _require_exact_keys(value: Any, keys: frozenset[str] | set[str]) -> Mapping[str, Any]:
+    item = _require_mapping(value)
+    if set(item) != set(keys):
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services release metadata")
+    return item
+
+
+def _require_hex64(value: Any) -> str:
+    if not isinstance(value, str) or _HEX64.fullmatch(value) is None:
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services digest pin")
+    return value
+
+
+def _require_sorted_unique_strings(value: Any) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services string list")
+    encoded = [item.encode("utf-8") for item in value]
+    if encoded != sorted(encoded) or len(set(encoded)) != len(encoded):
+        raise GoogleServicesError("google_services_spec_mismatch", "Google services list is not bytewise sorted")
+    return list(value)
+
+
+def _validate_release_metadata_v2(value: Mapping[str, Any], release: str) -> Mapping[str, Any]:
+    if set(value) != {
+        "schema",
+        "provider",
+        "release",
+        "integrationRevision",
+        "android",
+        "sources",
+        "components",
+        "signaturePolicy",
+        "productPolicy",
+        "runtimeRequirements",
+    }:
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services release metadata")
+    if (
+        value["provider"] != PROVIDER_MICROG
+        or value["release"] != release
+        or value["integrationRevision"] != INTEGRATION_REVISION_V2
+        or release != MICROG_PLAY_RELEASE
+    ):
+        raise GoogleServicesError("google_services_spec_mismatch", "unsupported Google services release metadata")
+    android = _require_exact_keys(
+        value["android"],
+        {"release", "api", "archiveArch", "runtimeAbis", "targetProduct", "partitionAliases", "setupWizardMode"},
+    )
+    if (
+        android["release"] != "13.0.0"
+        or android["api"] != 33
+        or android["archiveArch"] != "arm64"
+        or android["runtimeAbis"] != ["arm64-v8a"]
+        or android["targetProduct"] != "raven"
+        or android["partitionAliases"] != {"/product": "/system/product", "/system_ext": "/system/system_ext"}
+        or android["setupWizardMode"] != "UNCHANGED"
+    ):
+        raise GoogleServicesError("google_services_spec_mismatch", "unsupported Google services Android target")
+    sources = _require_exact_keys(value["sources"], {"mindthegapps", "microg", "gsfproxy"})
+    mindthegapps = _require_exact_keys(sources["mindthegapps"], {"kind", "release", "metadata", "metadataSha256"})
+    if (
+        mindthegapps["kind"] != "release-v1"
+        or mindthegapps["release"] != MINDTHEGAPPS_RELEASE
+        or mindthegapps["metadata"] != _RELEASE_REGISTRY[MINDTHEGAPPS_RELEASE]["metadata"]
+        or mindthegapps["metadataSha256"] != _RELEASE_REGISTRY[MINDTHEGAPPS_RELEASE]["metadataSha256"]
+    ):
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services source pin")
+    for key, tag, commit in (
+        ("microg", "v0.3.15.250932", "352f2d72fa52c6c3c4fdd79d575a071a0da72ad1"),
+        ("gsfproxy", "v0.1.0", "2fb4385a04d73f66385b325e97ac6cc40339db48"),
+    ):
+        source = _require_exact_keys(sources[key], {"kind", "tag", "commit", "releaseUrl"})
+        if source["kind"] != "github-release-apk" or source["tag"] != tag or source["commit"] != commit:
+            raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services source pin")
+        if source["releaseUrl"] != f"https://github.com/microg/{'GmsCore' if key == 'microg' else 'GsfProxy'}/releases/tag/{tag}":
+            raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services source URL")
+    components = value["components"]
+    if not isinstance(components, list) or [item.get("id") if isinstance(item, Mapping) else None for item in components] != ["gmsCore", "gsfProxy", "playStoreSeed"]:
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services component inventory")
+    expected_components = {
+        "gmsCore": {
+            "source": "microg",
+            "sourcePath": MICROG_GMSCORE_BASENAME,
+            "runtimePath": "/system/product/priv-app/GmsCore/GmsCore.apk",
+            "basename": MICROG_GMSCORE_BASENAME,
+            "package": "com.google.android.gms",
+            "versionCode": 250932030,
+            "versionName": "0.3.15.250932",
+            "size": 105948577,
+            "sha256": "52597e77fd25fdd347574d0457ed1936a4b9561cf4c8d34e7ac8dd8191dfd4b9",
+            "signingCertificateHistorySha256": [MICROG_REAL_CERT_SHA256],
+            "nativeAbis": ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"],
+        },
+        "gsfProxy": {
+            "source": "gsfproxy",
+            "sourcePath": MICROG_GSFPROXY_BASENAME,
+            "runtimePath": "/system/product/priv-app/GsfProxy/GsfProxy.apk",
+            "basename": MICROG_GSFPROXY_BASENAME,
+            "package": "com.google.android.gsf",
+            "versionCode": 8,
+            "versionName": "v0.1.0",
+            "size": 21872,
+            "sha256": "86891b174301f06a1c84187b545a0a2a57044c6b768f3e84e865908743349692",
+            "signingCertificateHistorySha256": [MICROG_REAL_CERT_SHA256],
+            "nativeAbis": [],
+        },
+        "playStoreSeed": {
+            "source": "mindthegapps",
+            "sourcePath": PHONESKY_ARCHIVE_PATH,
+            "runtimePath": "/system/product/priv-app/Phonesky/Phonesky.apk",
+            "basename": "Phonesky.apk",
+            "package": "com.android.vending",
+            "versionCode": 83041710,
+            "versionName": "30.4.17-21 [0] [PR] 445549118",
+            "size": 62447827,
+            "sha256": "a2eba7f37baf3d50fd373c8436cd99acd7589835c9d2b0c9ec4c3dca830d337b",
+            "signingCertificateHistorySha256": [PHONESKY_CERT_SHA256],
+            "nativeAbis": ["arm64-v8a"],
+        },
+    }
+    for item in components:
+        component = _require_exact_keys(
+            item,
+            {
+                "id",
+                "source",
+                "sourcePath",
+                "runtimePath",
+                "basename",
+                "package",
+                "versionCode",
+                "versionName",
+                "size",
+                "sha256",
+                "signingCertificateHistorySha256",
+                "nativeAbis",
+                "privileged",
+            },
+        )
+        expected = expected_components[str(component["id"])]
+        for field, pinned in expected.items():
+            if component[field] != pinned:
+                raise GoogleServicesError("google_services_spec_mismatch", "Google services component pin mismatch")
+        _require_hex64(component["sha256"])
+        if component["privileged"] is not True:
+            raise GoogleServicesError("google_services_spec_mismatch", "Google services component privilege pin mismatch")
+        _require_sorted_unique_strings(component["signingCertificateHistorySha256"])
+        for digest in component["signingCertificateHistorySha256"]:
+            _require_hex64(digest)
+        _require_sorted_unique_strings(component["nativeAbis"])
+        if not isinstance(component["versionCode"], int) or isinstance(component["versionCode"], bool) or component["versionCode"] <= 0:
+            raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services component version")
+        if not isinstance(component["size"], int) or isinstance(component["size"], bool) or component["size"] <= 0:
+            raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services component size")
+    signature_policy = _require_exact_keys(
+        value["signaturePolicy"],
+        {"mode", "packages", "realSignerSha256", "fakeSignerSha256", "sourceCommits", "apiFields"},
+    )
+    if (
+        signature_policy["mode"] != "restricted-spoofing"
+        or signature_policy["packages"] != ["com.google.android.gms"]
+        or signature_policy["realSignerSha256"] != MICROG_REAL_CERT_SHA256
+        or signature_policy["fakeSignerSha256"] != MICROG_FAKE_CERT_SHA256
+        or signature_policy["sourceCommits"] != [LINEAGE_SPOOFING_BASE_COMMIT, LINEAGE_SPOOFING_SIGNING_INFO_COMMIT]
+        or signature_policy["apiFields"] != ["signatures", "signingInfo", "forceQueryable"]
+    ):
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services signature policy")
+    product_policy = _require_exact_keys(value["productPolicy"], {"generator", "sourceCommit", "inputs", "outputs"})
+    if (
+        product_policy["generator"] != "scripts/generate-microg-product-policy.py"
+        or product_policy["sourceCommit"] != MICROG_POLICY_UPSTREAM_COMMIT
+    ):
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services product policy")
+    for field in ("inputs", "outputs"):
+        records = product_policy[field]
+        if not isinstance(records, list) or not records:
+            raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services product policy inventory")
+        paths: list[bytes] = []
+        for record in records:
+            item = _require_exact_keys(record, {"path", "sha256"})
+            if not isinstance(item["path"], str) or not item["path"]:
+                raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services product policy path")
+            _require_hex64(item["sha256"])
+            paths.append(item["path"].encode("utf-8"))
+        if paths != sorted(paths) or len(set(paths)) != len(paths):
+            raise GoogleServicesError("google_services_spec_mismatch", "Google services product policy paths are not bytewise sorted")
+    requirements = _require_exact_keys(
+        value["runtimeRequirements"],
+        {"corePackages", "runtimeCapabilities", "releaseCapabilities", "mapsImplementation", "unsupportedCapabilities"},
+    )
+    core_packages = requirements["corePackages"]
+    if not isinstance(core_packages, list) or len(core_packages) != 3:
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services core package inventory")
+    expected_core = {
+        "com.google.android.gms": ("/system/product/priv-app/GmsCore/GmsCore.apk", 250932030),
+        "com.google.android.gsf": ("/system/product/priv-app/GsfProxy/GsfProxy.apk", 8),
+        "com.android.vending": ("/system/product/priv-app/Phonesky/Phonesky.apk", 83041710),
+    }
+    seen_packages: set[str] = set()
+    for record in core_packages:
+        item = _require_exact_keys(record, {"package", "factoryPath", "minVersionCode", "privileged"})
+        pinned = expected_core.get(item["package"])
+        if pinned is None or item["package"] in seen_packages:
+            raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services core package")
+        seen_packages.add(item["package"])
+        if item["factoryPath"] != pinned[0] or item["minVersionCode"] != pinned[1] or item["privileged"] is not True:
+            raise GoogleServicesError("google_services_spec_mismatch", "Google services core package pin mismatch")
+    if (
+        requirements["runtimeCapabilities"] != ["googlePlayServices", "accountAuth", "cloudMessaging", "fusedLocation", "playStore"]
+        or requirements["releaseCapabilities"] != ["fcmDelivery", "fusedLocationBehavior", "maps", "auth", "playStoreOperations"]
+        or requirements["mapsImplementation"] != "microg-mapbox-maplibre"
+        or requirements["unsupportedCapabilities"] != ["playIntegrity", "deviceCertification", "drm", "antiCheat"]
+    ):
+        raise GoogleServicesError("google_services_spec_mismatch", "invalid Google services capability requirements")
+    return value
+
+
+def _validate_release_metadata_v1(value: Mapping[str, Any], release: str) -> Mapping[str, Any]:
     required = {
         "schema",
         "provider",
@@ -389,7 +739,7 @@ def _validate_release_metadata(data: Any, release: str) -> Mapping[str, Any]:
     return value
 
 
-def load_release_spec(project_root: Path, release: str = MINDTHEGAPPS_RELEASE) -> ReleaseSpec:
+def load_release_spec(project_root: Path, release: str = MICROG_PLAY_RELEASE) -> ReleaseSpec:
     entry = _RELEASE_REGISTRY.get(release)
     if entry is None:
         raise GoogleServicesError("google_services_spec_mismatch", "unsupported Google services release")
@@ -421,14 +771,20 @@ def asset_directory(project_root: Path, release: str) -> Path:
     return project_root / ".xenoid" / "artifacts" / "google-services" / release
 
 
-def _asset_paths(project_root: Path, spec: ReleaseSpec) -> tuple[Path, Path, Path]:
+def asset_paths(project_root: Path, spec: ReleaseSpec) -> dict[str, Path]:
     directory = asset_directory(project_root, spec.release)
+    if spec.schema == GOOGLE_RELEASE_SCHEMA_V2:
+        return {
+            "gmsCore": directory / str(spec.component("gmsCore")["basename"]),
+            "gsfProxy": directory / str(spec.component("gsfProxy")["basename"]),
+            "manifest": directory / "import.json",
+        }
     archive = spec.archive
-    return (
-        directory / str(archive["basename"]),
-        directory / str(archive["certificate"]["basename"]),
-        directory / "import.json",
-    )
+    return {
+        "archive": directory / str(archive["basename"]),
+        "certificate": directory / str(archive["certificate"]["basename"]),
+        "manifest": directory / "import.json",
+    }
 
 
 def _parse_pem(payload: bytes, expected_der_sha256: str) -> bytes:
@@ -453,11 +809,11 @@ def _parse_pem(payload: bytes, expected_der_sha256: str) -> bytes:
     return der
 
 
-def _expected_import_manifest(spec: ReleaseSpec) -> dict[str, Any]:
+def _expected_import_manifest_v1(spec: ReleaseSpec) -> dict[str, Any]:
     archive = spec.archive
     certificate = archive["certificate"]
     return {
-        "schema": GOOGLE_IMPORT_SCHEMA,
+        "schema": GOOGLE_IMPORT_SCHEMA_V1,
         "provider": spec.provider,
         "release": spec.release,
         "integrationRevision": spec.metadata["integrationRevision"],
@@ -472,38 +828,144 @@ def _expected_import_manifest(spec: ReleaseSpec) -> dict[str, Any]:
     }
 
 
-def quick_validate_assets(project_root: Path, spec: ReleaseSpec) -> dict[str, Any]:
-    zip_path, pem_path, manifest_path = _asset_paths(project_root, spec)
-    directory = zip_path.parent
+def _read_validated_v1_import_manifest(project_root: Path) -> tuple[ReleaseSpec, bytes]:
+    spec = load_release_spec(project_root, MINDTHEGAPPS_RELEASE)
+    paths = asset_paths(project_root, spec)
+    manifest_path = paths["manifest"]
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(manifest_path, flags)
+    except OSError as exc:
+        raise GoogleServicesError("google_services_assets_missing", "import the pinned Google services source release first") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+            raise GoogleServicesError("google_services_asset_invalid", "Google services import manifest permissions are unsafe")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            payload = stream.read()
+    finally:
+        os.close(descriptor)
+    try:
+        parsed = json.loads(payload)
+    except (ValueError, UnicodeError) as exc:
+        raise GoogleServicesError("google_services_asset_invalid", "invalid Google services import manifest") from exc
+    if (
+        not isinstance(parsed, Mapping)
+        or set(parsed) != _IMPORT_KEYS_V1
+        or dict(parsed) != _expected_import_manifest_v1(spec)
+        or payload != _canonical_json(parsed) + b"\n"
+    ):
+        raise GoogleServicesError("google_services_asset_invalid", "Google services import manifest does not match imported bytes")
+    return spec, payload
+
+
+def _mindthegapps_source_dependency(project_root: Path, spec: ReleaseSpec) -> dict[str, Any]:
+    _, manifest_payload = _read_validated_v1_import_manifest(project_root)
+    component = spec.component("playStoreSeed")
+    return {
+        "release": MINDTHEGAPPS_RELEASE,
+        "metadataSha256": _RELEASE_REGISTRY[MINDTHEGAPPS_RELEASE]["metadataSha256"],
+        "importManifestSha256": hashlib.sha256(manifest_payload).hexdigest(),
+        "archivePath": str(component["sourcePath"]),
+        "memberSha256": str(component["sha256"]),
+    }
+
+
+def _expected_import_manifest_v2(project_root: Path, spec: ReleaseSpec) -> dict[str, Any]:
+    components = []
+    for component_id in ("gmsCore", "gsfProxy"):
+        component = spec.component(component_id)
+        components.append(
+            {
+                "id": component_id,
+                "basename": str(component["basename"]),
+                "size": int(component["size"]),
+                "sha256": str(component["sha256"]),
+                "signingCertificateHistorySha256": list(component["signingCertificateHistorySha256"]),
+            }
+        )
+    return {
+        "schema": GOOGLE_IMPORT_SCHEMA_V2,
+        "provider": spec.provider,
+        "release": spec.release,
+        "integrationRevision": spec.metadata["integrationRevision"],
+        "metadataSha256": spec.metadata_sha256,
+        "components": components,
+        "sourceDependencies": [_mindthegapps_source_dependency(project_root, spec)],
+    }
+
+
+def _quick_validate_directory(directory: Path, expected_names: set[str]) -> None:
     try:
         directory_info = directory.lstat()
     except FileNotFoundError as exc:
         raise GoogleServicesError("google_services_assets_missing", "import the pinned Google services release first") from exc
     if not stat.S_ISDIR(directory_info.st_mode) or stat.S_ISLNK(directory_info.st_mode) or directory_info.st_mode & 0o077:
         raise GoogleServicesError("google_services_asset_invalid", "Google services asset directory permissions are unsafe")
-    expected_names = {zip_path.name, pem_path.name, manifest_path.name}
     try:
         actual_names = {entry.name for entry in os.scandir(directory)}
     except OSError as exc:
         raise GoogleServicesError("google_services_asset_invalid", "Google services asset directory cannot be read") from exc
     if actual_names != expected_names:
         raise GoogleServicesError("google_services_asset_invalid", "Google services asset directory contains unexpected files")
-    for path in (zip_path, pem_path, manifest_path):
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_mode & 0o077:
-            raise GoogleServicesError("google_services_asset_invalid", "Google services asset permissions are unsafe")
+
+
+def _require_safe_asset_file(path: Path) -> None:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_mode & 0o077:
+        raise GoogleServicesError("google_services_asset_invalid", "Google services asset permissions are unsafe")
+
+
+def _quick_validate_manifest(manifest_path: Path, expected: Mapping[str, Any], keys: set[str]) -> None:
+    try:
+        raw_manifest = json.loads(manifest_path.read_bytes())
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise GoogleServicesError("google_services_asset_invalid", "invalid Google services import manifest") from exc
+    if not isinstance(raw_manifest, Mapping) or set(raw_manifest) != keys or dict(raw_manifest) != dict(expected):
+        raise GoogleServicesError("google_services_asset_invalid", "Google services import manifest does not match imported bytes")
+
+
+def quick_validate_assets(project_root: Path, spec: ReleaseSpec) -> dict[str, Any]:
+    if spec.schema == GOOGLE_RELEASE_SCHEMA_V2:
+        return _quick_validate_assets_v2(project_root, spec)
+    return _quick_validate_assets_v1(project_root, spec)
+
+
+def _quick_validate_assets_v2(project_root: Path, spec: ReleaseSpec) -> dict[str, Any]:
+    paths = asset_paths(project_root, spec)
+    _quick_validate_directory(paths["manifest"].parent, {path.name for path in paths.values()})
+    for path in paths.values():
+        _require_safe_asset_file(path)
+    sizes: dict[str, int] = {}
+    for component_id in ("gmsCore", "gsfProxy"):
+        component = spec.component(component_id)
+        size, digest = _stream_sha256(paths[component_id], int(component["size"]))
+        if digest != component["sha256"]:
+            raise GoogleServicesError("google_services_asset_invalid", "Google services asset pin mismatch")
+        sizes[component_id] = size
+    _quick_validate_manifest(paths["manifest"], _expected_import_manifest_v2(project_root, spec), _IMPORT_KEYS_V2)
+    return {
+        "ok": True,
+        "provider": spec.provider,
+        "release": spec.release,
+        "specSha256": spec.fingerprint,
+        "componentSizes": sizes,
+    }
+
+
+def _quick_validate_assets_v1(project_root: Path, spec: ReleaseSpec) -> dict[str, Any]:
+    paths = asset_paths(project_root, spec)
+    zip_path, pem_path, manifest_path = paths["archive"], paths["certificate"], paths["manifest"]
+    _quick_validate_directory(zip_path.parent, {path.name for path in paths.values()})
+    for path in paths.values():
+        _require_safe_asset_file(path)
     zip_size, zip_sha = _stream_sha256(zip_path, int(spec.archive["size"]))
     pem_size, pem_sha = _stream_sha256(pem_path, int(spec.archive["certificate"]["size"]))
     if zip_sha != spec.archive["sha256"] or pem_sha != spec.archive["certificate"]["sha256"]:
         raise GoogleServicesError("google_services_asset_invalid", "Google services asset pin mismatch")
     pem_payload = pem_path.read_bytes()
     _parse_pem(pem_payload, str(spec.archive["certificate"]["derSha256"]))
-    try:
-        raw_manifest = json.loads(manifest_path.read_bytes())
-    except (OSError, ValueError, UnicodeError) as exc:
-        raise GoogleServicesError("google_services_asset_invalid", "invalid Google services import manifest") from exc
-    if not isinstance(raw_manifest, Mapping) or set(raw_manifest) != _IMPORT_KEYS or dict(raw_manifest) != _expected_import_manifest(spec):
-        raise GoogleServicesError("google_services_asset_invalid", "Google services import manifest does not match imported bytes")
+    _quick_validate_manifest(manifest_path, _expected_import_manifest_v1(spec), _IMPORT_KEYS_V1)
     return {
         "ok": True,
         "provider": spec.provider,
@@ -795,7 +1257,12 @@ def _validate_apk_native_payload(
             for info in native_infos:
                 abi = info.filename.split("/")[1]
                 elf_class, machine = _elf_identity(bundle.read(info)[:64])
-                expected = (2, 183) if abi == "arm64-v8a" else (1, 40) if abi == "armeabi-v7a" else None
+                expected = {
+                    "arm64-v8a": (2, 183),
+                    "armeabi-v7a": (1, 40),
+                    "x86": (1, 3),
+                    "x86_64": (2, 62),
+                }.get(abi)
                 exception = exceptions.get(info.filename)
                 if exception is not None:
                     pinned = _require_mapping(exception, code="google_services_asset_invalid")
@@ -964,12 +1431,12 @@ def _write_private_json(path: Path, data: Mapping[str, Any]) -> None:
 
 def _cleanup_abandoned_imports(parent: Path) -> None:
     for entry in os.scandir(parent):
-        if not entry.name.startswith(".import-mindthegapps-") or not entry.is_dir(follow_symlinks=False):
+        if not entry.name.startswith(".import-") or not entry.is_dir(follow_symlinks=False):
             continue
         candidate = parent / entry.name
         marker = candidate / ".owner"
         try:
-            if marker.is_symlink() or marker.read_text(encoding="ascii") != _IMPORT_OWNER:
+            if marker.is_symlink() or marker.read_text(encoding="ascii") not in {_IMPORT_OWNER_V1, _IMPORT_OWNER_V2}:
                 continue
         except (OSError, UnicodeError):
             continue
@@ -996,7 +1463,7 @@ def import_mindthegapps(project_root: Path, source_zip: Path, source_pem: Path) 
         temp = Path(tempfile.mkdtemp(prefix=".import-mindthegapps-", dir=parent))
         temp.chmod(0o700)
         marker = temp / ".owner"
-        marker.write_text(_IMPORT_OWNER, encoding="ascii")
+        marker.write_text(_IMPORT_OWNER_V1, encoding="ascii")
         marker.chmod(0o600)
         try:
             target_zip = temp / str(spec.archive["basename"])
@@ -1011,7 +1478,7 @@ def import_mindthegapps(project_root: Path, source_zip: Path, source_pem: Path) 
             ):
                 raise GoogleServicesError("google_services_asset_invalid", "Google services import source does not match the pinned release")
             deep_validate_assets(target_zip, target_pem, spec)
-            _write_private_json(temp / "import.json", _expected_import_manifest(spec))
+            _write_private_json(temp / "import.json", _expected_import_manifest_v1(spec))
             marker.unlink()
             _fsync_directory(temp)
             try:
@@ -1037,6 +1504,526 @@ def import_mindthegapps(project_root: Path, source_zip: Path, source_pem: Path) 
             os.close(lock_descriptor)
 
 
+_MICROG_SDK_PINS = {
+    "gmsCore": (19, 29),
+    "gsfProxy": (10, 23),
+}
+
+
+def _parse_sdk_levels(output: str) -> tuple[Optional[int], Optional[int]]:
+    min_sdk = re.search(r"^minSdkVersion:'([0-9]+)'", output, flags=re.MULTILINE)
+    target_sdk = re.search(r"^targetSdkVersion:'([0-9]+)'", output, flags=re.MULTILINE)
+    return (
+        int(min_sdk.group(1)) if min_sdk is not None else None,
+        int(target_sdk.group(1)) if target_sdk is not None else None,
+    )
+
+
+class _XmltreeMetadataScanner:
+    """Bounded streaming extractor for meta-data name/value pairs."""
+
+    def __init__(self, wanted: str) -> None:
+        self.wanted = wanted
+        self.value: Optional[str] = None
+        self._block: Optional[list[str]] = None
+        self._pending = bytearray()
+
+    def _close_block(self) -> None:
+        block, self._block = self._block, None
+        if not block or not any(f'="{self.wanted}"' in line for line in block):
+            return
+        for line in block:
+            match = re.search(r":value\(0x[0-9a-f]+\)=(@0x[0-9a-f]+|\"[0-9a-fA-F]+\")", line)
+            if match is not None:
+                self.value = match.group(1)
+                return
+
+    def __call__(self, chunk: bytes) -> None:
+        self._pending.extend(chunk)
+        while True:
+            newline = self._pending.find(b"\n")
+            if newline < 0:
+                if len(self._pending) > 64 * 1024:
+                    raise GoogleServicesError("google_services_asset_invalid", "Google services APK manifest line is too long")
+                return
+            line = bytes(self._pending[:newline]).decode("utf-8", "replace")
+            del self._pending[: newline + 1]
+            if "E: meta-data" in line:
+                self._close_block()
+                self._block = []
+            elif "E: " in line:
+                self._close_block()
+            elif self._block is not None and " A: " in line:
+                if len(self._block) >= 8:
+                    raise GoogleServicesError("google_services_asset_invalid", "Google services APK meta-data block is too large")
+                self._block.append(line)
+
+
+class _ResourceValueScanner:
+    """Bounded streaming extractor for one string resource value."""
+
+    def __init__(self, resource_id: str, name: str) -> None:
+        self.anchor = f"resource {resource_id} string/{name}"
+        self.candidates: set[str] = set()
+        self._armed = 0
+        self._pending = bytearray()
+
+    def __call__(self, chunk: bytes) -> None:
+        self._pending.extend(chunk)
+        while True:
+            newline = self._pending.find(b"\n")
+            if newline < 0:
+                if len(self._pending) > 64 * 1024:
+                    raise GoogleServicesError("google_services_asset_invalid", "Google services resource line is too long")
+                return
+            line = bytes(self._pending[:newline]).decode("utf-8", "replace")
+            del self._pending[: newline + 1]
+            if self.anchor in line:
+                self._armed = 2
+                continue
+            if self._armed > 0:
+                self._armed -= 1
+                match = re.search(r'\(\) "([0-9a-fA-F]+)"', line.strip())
+                if match is not None:
+                    self.candidates.add(match.group(1))
+                    self._armed = 0
+                    if len(self.candidates) > 2:
+                        raise GoogleServicesError("google_services_asset_invalid", "Google services fake-signature resource is ambiguous")
+
+
+def _run_scanner(command: list[str], scanner: Callable[[bytes], None], message: str) -> None:
+    try:
+        bounded = run_bounded(
+            command,
+            cwd=Path.cwd(),
+            deadline=time.monotonic() + 300,
+            project_root=Path.cwd(),
+            stdout_consumer=scanner,
+        )
+    except OSError as exc:
+        raise GoogleServicesError("google_services_asset_invalid", message) from exc
+    if not bounded.ok:
+        raise GoogleServicesError("google_services_asset_invalid", message)
+
+
+def _microg_fake_signature_der(apk_path: Path, tools: Mapping[str, str]) -> bytes:
+    scanner = _XmltreeMetadataScanner("fake-signature")
+    _run_scanner(
+        [tools["aapt2"], "dump", "xmltree", "--file", "AndroidManifest.xml", str(apk_path)],
+        scanner,
+        "Google services APK manifest cannot be read",
+    )
+    scanner._close_block()
+    value = scanner.value
+    if value is None:
+        raise GoogleServicesError("google_services_asset_invalid", "Google services GmsCore fake-signature metadata is missing")
+    if value.startswith("@0x"):
+        resources = _ResourceValueScanner(value[1:], "fake_signature")
+        _run_scanner(
+            [tools["aapt2"], "dump", "resources", str(apk_path)],
+            resources,
+            "Google services GmsCore resources cannot be read",
+        )
+        if len(resources.candidates) != 1:
+            raise GoogleServicesError("google_services_asset_invalid", "Google services GmsCore fake-signature resource is missing")
+        value = f'"{resources.candidates.pop()}"'
+    hex_value = value.strip('"')
+    try:
+        return bytes.fromhex(hex_value)
+    except ValueError as exc:
+        raise GoogleServicesError("google_services_asset_invalid", "invalid Google services fake-signature encoding") from exc
+
+
+def _validate_microg_maps_payload(apk_path: Path) -> None:
+    try:
+        with zipfile.ZipFile(apk_path) as bundle:
+            names = set(bundle.namelist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise GoogleServicesError("google_services_asset_invalid", "invalid Google services APK") from exc
+    required = {
+        "lib/arm64-v8a/libmapbox-gl.so",
+        "lib/armeabi-v7a/libmapbox-gl.so",
+        "lib/x86/libmapbox-gl.so",
+        "lib/x86_64/libmapbox-gl.so",
+        "assets/sdk_versions/com.mapbox.mapboxsdk",
+    }
+    if not required.issubset(names):
+        raise GoogleServicesError(
+            "google_services_asset_invalid",
+            "Google services GmsCore does not contain the pinned Mapbox/MapLibre Maps implementation",
+        )
+
+
+def _validate_microg_apk(
+    apk_path: Path,
+    component: Mapping[str, Any],
+    spec: ReleaseSpec,
+    tools: Mapping[str, str],
+) -> None:
+    badging = _run_checked(
+        [tools["aapt2"], "dump", "badging", str(apk_path)],
+        "google_services_asset_invalid",
+        "Google services APK package identity verification failed",
+    )
+    package, version_code, version_name = _parse_badging(badging.stdout)
+    if (
+        package != component["package"]
+        or version_code != component["versionCode"]
+        or version_name != component["versionName"]
+    ):
+        raise GoogleServicesError("google_services_asset_invalid", "Google services APK identity mismatch")
+    min_sdk, target_sdk = _parse_sdk_levels(badging.stdout)
+    if (min_sdk, target_sdk) != _MICROG_SDK_PINS[str(component["id"])]:
+        raise GoogleServicesError("google_services_asset_invalid", "Google services APK SDK inventory mismatch")
+    signer = _run_checked(
+        [tools["apksigner"], "verify", "--verbose", "--print-certs", str(apk_path)],
+        "google_services_asset_invalid",
+        "Google services APK signature verification failed",
+    )
+    histories = _signer_histories(signer.stdout)
+    if histories != list(component["signingCertificateHistorySha256"]):
+        raise GoogleServicesError("google_services_asset_invalid", "Google services APK signer mismatch")
+    _validate_apk_native_payload(apk_path, component)
+    if component["id"] == "gmsCore":
+        der = _microg_fake_signature_der(apk_path, tools)
+        if hashlib.sha256(der).hexdigest() != spec.signature_policy["fakeSignerSha256"]:
+            raise GoogleServicesError("google_services_asset_invalid", "Google services GmsCore fake certificate mismatch")
+        _validate_microg_maps_payload(apk_path)
+
+
+def import_microg(project_root: Path, source_gmscore: Path, source_gsfproxy: Path) -> dict[str, Any]:
+    if source_gmscore.name != MICROG_GMSCORE_BASENAME or source_gsfproxy.name != MICROG_GSFPROXY_BASENAME:
+        raise GoogleServicesError("google_services_asset_invalid", "Google services import filenames do not match the pinned release")
+    spec = load_release_spec(project_root, MICROG_PLAY_RELEASE)
+    source_spec = load_release_spec(project_root, MINDTHEGAPPS_RELEASE)
+    quick_validate_assets(project_root, source_spec)
+    parent = project_root / ".xenoid" / "artifacts" / "google-services"
+    parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    parent.chmod(0o700)
+    lock_path = parent / ".import.lock"
+    lock_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(lock_descriptor, 0o600)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        _cleanup_abandoned_imports(parent)
+        final = parent / spec.asset_dirname
+        if final.exists():
+            quick_validate_assets(project_root, spec)
+            return {"ok": True, **spec.public_dict(), "imported": False, "existing": True}
+        temp = Path(tempfile.mkdtemp(prefix=".import-microg-", dir=parent))
+        temp.chmod(0o700)
+        marker = temp / ".owner"
+        marker.write_text(_IMPORT_OWNER_V2, encoding="ascii")
+        marker.chmod(0o600)
+        try:
+            targets: dict[str, Path] = {}
+            for component_id, source in (("gmsCore", source_gmscore), ("gsfProxy", source_gsfproxy)):
+                component = spec.component(component_id)
+                target = temp / str(component["basename"])
+                size, digest = _copy_regular_source(source, target)
+                if size != component["size"] or digest != component["sha256"]:
+                    raise GoogleServicesError("google_services_asset_invalid", "Google services import source does not match the pinned release")
+                targets[component_id] = target
+            tools = _tool_paths()
+            for component_id in ("gmsCore", "gsfProxy"):
+                _validate_microg_apk(targets[component_id], spec.component(component_id), spec, tools)
+            _write_private_json(temp / "import.json", _expected_import_manifest_v2(project_root, spec))
+            marker.unlink()
+            _fsync_directory(temp)
+            try:
+                os.rename(temp, final)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                quick_validate_assets(project_root, spec)
+                shutil.rmtree(temp, ignore_errors=True)
+                return {"ok": True, **spec.public_dict(), "imported": False, "existing": True}
+            final.chmod(0o700)
+            _fsync_directory(parent)
+            quick_validate_assets(project_root, spec)
+            return {"ok": True, **spec.public_dict(), "imported": True, "existing": False}
+        except Exception:
+            if temp.exists():
+                shutil.rmtree(temp, ignore_errors=True)
+            raise
+    finally:
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+
+
+_ACQUISITION_OWNER = "dev.xenoid.google-services-acquisition/v1\n"
+
+
+def _asset_set_ready(project_root: Path, spec: ReleaseSpec) -> bool:
+    try:
+        quick_validate_assets(project_root, spec)
+        return True
+    except GoogleServicesError as exc:
+        if exc.code == "google_services_assets_missing":
+            return False
+        raise
+
+
+def _download_pinned_asset(
+    url: str,
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise GoogleServicesError(
+            "google_services_asset_download_failed",
+            "automatic Google services asset acquisition failed",
+        )
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
+    created = False
+    success = False
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+        created = True
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "xenoid-google-services-acquisition/1",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=600) as response:
+            final = urllib.parse.urlsplit(response.geturl())
+            final_host = final.hostname or ""
+            if (
+                final.scheme != "https"
+                or not (
+                    final_host == "github.com"
+                    or final_host.endswith(".githubusercontent.com")
+                )
+                or response.getcode() != 200
+                or response.headers.get("Content-Encoding") not in {
+                    None,
+                    "identity",
+                }
+            ):
+                raise GoogleServicesError(
+                    "google_services_asset_download_failed",
+                    "automatic Google services asset acquisition failed",
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except ValueError as exc:
+                    raise GoogleServicesError(
+                        "google_services_asset_download_failed",
+                        "automatic Google services asset acquisition failed",
+                    ) from exc
+                if declared_size != expected_size:
+                    raise GoogleServicesError(
+                        "google_services_asset_download_failed",
+                        "automatic Google services asset acquisition failed",
+                    )
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = response.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > expected_size:
+                    raise GoogleServicesError(
+                        "google_services_asset_download_failed",
+                        "automatic Google services asset acquisition failed",
+                    )
+                digest.update(chunk)
+                _write_all(descriptor, chunk)
+        if size != expected_size or digest.hexdigest() != expected_sha256:
+            raise GoogleServicesError(
+                "google_services_asset_download_failed",
+                "automatic Google services asset acquisition failed",
+            )
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        success = True
+    except GoogleServicesError:
+        raise
+    except (
+        OSError,
+        urllib.error.URLError,
+        http.client.HTTPException,
+        ValueError,
+    ) as exc:
+        raise GoogleServicesError(
+            "google_services_asset_download_failed",
+            "automatic Google services asset acquisition failed",
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created and not success:
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _cleanup_abandoned_acquisitions(parent: Path) -> None:
+    for entry in os.scandir(parent):
+        if (
+            not entry.name.startswith(".acquire-")
+            or not entry.is_dir(follow_symlinks=False)
+        ):
+            continue
+        candidate = parent / entry.name
+        marker = candidate / ".owner"
+        try:
+            if (
+                marker.is_symlink()
+                or marker.read_text(encoding="ascii") != _ACQUISITION_OWNER
+            ):
+                continue
+        except (OSError, UnicodeError):
+            continue
+        shutil.rmtree(candidate)
+
+
+
+def ensure_google_services_assets(
+    project_root: Path,
+    spec: ReleaseSpec,
+) -> dict[str, Any]:
+    if (
+        spec.provider != PROVIDER_MICROG
+        or spec.availability != AVAILABILITY_PRODUCTION
+    ):
+        raise GoogleServicesError(
+            "google_services_spec_mismatch",
+            "automatic acquisition supports only the production Google services release",
+        )
+    if _asset_set_ready(project_root, spec):
+        return {
+            "ok": True,
+            **spec.public_dict(),
+            "downloaded": False,
+            "existing": True,
+        }
+
+    parent = project_root / ".xenoid" / "artifacts" / "google-services"
+    parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    parent.chmod(0o700)
+    lock_descriptor = os.open(
+        parent / ".acquire.lock",
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(lock_descriptor, 0o600)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        _cleanup_abandoned_acquisitions(parent)
+        if _asset_set_ready(project_root, spec):
+            return {
+                "ok": True,
+                **spec.public_dict(),
+                "downloaded": False,
+                "existing": True,
+            }
+
+        temporary = Path(
+            tempfile.mkdtemp(prefix=".acquire-", dir=parent)
+        )
+        temporary.chmod(0o700)
+        marker = temporary / ".owner"
+        marker.write_text(_ACQUISITION_OWNER, encoding="ascii")
+        marker.chmod(0o600)
+        downloaded = False
+        try:
+            source_spec = load_release_spec(
+                project_root,
+                MINDTHEGAPPS_RELEASE,
+            )
+            if not _asset_set_ready(project_root, source_spec):
+                source = source_spec.metadata["source"]
+                archive = source_spec.archive
+                certificate = archive["certificate"]
+                zip_path = (
+                    temporary / f"{MINDTHEGAPPS_RELEASE}.zip"
+                )
+                pem_path = temporary / "release.x509.pem"
+                _download_pinned_asset(
+                    str(source["zipUrl"]),
+                    zip_path,
+                    expected_size=int(archive["size"]),
+                    expected_sha256=str(archive["sha256"]),
+                )
+                _download_pinned_asset(
+                    str(source["certificateUrl"]),
+                    pem_path,
+                    expected_size=int(certificate["size"]),
+                    expected_sha256=str(certificate["sha256"]),
+                )
+                import_mindthegapps(
+                    project_root,
+                    zip_path,
+                    pem_path,
+                )
+                downloaded = True
+
+            if not _asset_set_ready(project_root, spec):
+                gmscore = spec.component("gmsCore")
+                gsfproxy = spec.component("gsfProxy")
+                gmscore_path = temporary / MICROG_GMSCORE_BASENAME
+                gsfproxy_path = temporary / MICROG_GSFPROXY_BASENAME
+                _download_pinned_asset(
+                    MICROG_GMSCORE_DOWNLOAD_URL,
+                    gmscore_path,
+                    expected_size=int(gmscore["size"]),
+                    expected_sha256=str(gmscore["sha256"]),
+                )
+                _download_pinned_asset(
+                    MICROG_GSFPROXY_DOWNLOAD_URL,
+                    gsfproxy_path,
+                    expected_size=int(gsfproxy["size"]),
+                    expected_sha256=str(gsfproxy["sha256"]),
+                )
+                import_microg(
+                    project_root,
+                    gmscore_path,
+                    gsfproxy_path,
+                )
+                downloaded = True
+            quick_validate_assets(project_root, spec)
+            return {
+                "ok": True,
+                **spec.public_dict(),
+                "downloaded": downloaded,
+                "existing": not downloaded,
+            }
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+    finally:
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+
+
 def resolve_google_runtime_spec(
     context: InstanceContext,
     cfg: XenoidConfig,
@@ -1050,6 +2037,11 @@ def resolve_google_runtime_spec(
     )
     if provider == PROVIDER_NONE:
         return None
+    if _RELEASE_REGISTRY[release]["availability"] != AVAILABILITY_PRODUCTION:
+        raise GoogleServicesError(
+            "google_services_release_retired",
+            "the configured Google services release is retired; create a new instance with a production release",
+        )
     if not cfg.auto_build_runtime_image:
         raise GoogleServicesError("google_services_auto_build_required", "Google services requires auto_build_runtime_image=true")
     if cfg.extra_docker_args:
@@ -1115,6 +2107,40 @@ def _stage_manifests(spec: ReleaseSpec) -> tuple[dict[str, dict[str, Any]], dict
     return files, directories
 
 
+def _stage_manifests_v2(spec: ReleaseSpec) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    files: dict[str, dict[str, Any]] = {}
+    directories: dict[str, dict[str, Any]] = {}
+
+    def add(relative: str, entry: dict[str, Any]) -> None:
+        files[relative] = entry
+        parts = relative.split("/")[:-1]
+        for length in range(1, len(parts) + 1):
+            directories.setdefault("/".join(parts[:length]), {"mode": 0o755})
+
+    for component in spec.components:
+        relative = str(component["runtimePath"]).lstrip("/")
+        add(
+            relative,
+            {
+                "sha256": str(component["sha256"]),
+                "size": int(component["size"]),
+                "mode": 0o644,
+            },
+        )
+    for output in spec.product_policy["outputs"]:
+        relative = str(output["path"]).lstrip("/")
+        add(
+            relative,
+            {
+                "sha256": str(output["sha256"]),
+                "size": None,
+                "mode": 0o644,
+                "policy": True,
+            },
+        )
+    return files, directories
+
+
 def _write_all(descriptor: int, payload: bytes) -> None:
     view = memoryview(payload)
     while view:
@@ -1126,7 +2152,123 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 
 
 
-def _stage_payload(zip_path: Path, spec: ReleaseSpec) -> StageHandle:
+def _stage_stream_into(
+    stream: Any,
+    descriptor: int,
+    *,
+    size: int,
+    sha256: str,
+    budget: list[int],
+    limit: int,
+) -> None:
+    digest = hashlib.sha256()
+    count = 0
+    while True:
+        chunk = stream.read(_COPY_CHUNK)
+        if not chunk:
+            break
+        count += len(chunk)
+        budget[0] += len(chunk)
+        if count > size or budget[0] > limit:
+            raise GoogleServicesError("google_services_asset_invalid", "Google services stage exceeds pinned limits")
+        digest.update(chunk)
+        _write_all(descriptor, chunk)
+    if count != size or digest.hexdigest() != sha256:
+        raise GoogleServicesError("google_services_asset_invalid", "Google services staged member pin mismatch")
+
+
+def _stage_one(
+    root_descriptor: int,
+    relative: str,
+    stream: Any,
+    expected: Mapping[str, Any],
+    budget: list[int],
+    limit: int,
+) -> None:
+    components = _safe_member_name(relative)
+    parent_descriptor = _open_directory_chain(root_descriptor, components[:-1], True)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            components[-1],
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        with stream:
+            _stage_stream_into(
+                stream,
+                descriptor,
+                size=int(expected["size"]),
+                sha256=str(expected["sha256"]),
+                budget=budget,
+                limit=limit,
+            )
+        os.fchmod(descriptor, int(expected["mode"]))
+        os.utime(descriptor, ns=(0, 0))
+        os.fsync(descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.fsync(parent_descriptor)
+        os.close(parent_descriptor)
+
+
+def _stage_payload_v1(project_root: Path, spec: ReleaseSpec, root_descriptor: int, files: Mapping[str, Any]) -> None:
+    zip_path = asset_paths(project_root, spec)["archive"]
+    with zipfile.ZipFile(zip_path) as bundle:
+        _validate_zip_inventory(bundle, spec)
+        budget = [0]
+        for member in sorted((item for item in spec.members if item["selected"] is True), key=lambda item: item["runtimePath"]):
+            relative = str(member["runtimePath"]).lstrip("/")
+            _stage_one(
+                root_descriptor,
+                relative,
+                bundle.open(str(member["archivePath"])),
+                files[relative],
+                budget,
+                int(spec.archive["maxExpandedBytes"]),
+            )
+
+
+def _stage_payload_v2(project_root: Path, spec: ReleaseSpec, root_descriptor: int, files: Mapping[str, Any]) -> None:
+    paths = asset_paths(project_root, spec)
+    source_spec = load_release_spec(project_root, MINDTHEGAPPS_RELEASE)
+    source_zip = asset_paths(project_root, source_spec)["archive"]
+    limit = sum(int(component["size"]) for component in spec.components)
+    budget = [0]
+    with zipfile.ZipFile(source_zip) as bundle:
+        _validate_zip_inventory(bundle, source_spec)
+        for component in sorted(spec.components, key=lambda item: str(item["runtimePath"])):
+            relative = str(component["runtimePath"]).lstrip("/")
+            component_id = str(component["id"])
+            if component_id in {"gmsCore", "gsfProxy"}:
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(paths[component_id], flags)
+                try:
+                    info = os.fstat(descriptor)
+                    if not stat.S_ISREG(info.st_mode):
+                        raise GoogleServicesError("google_services_asset_invalid", "Google services asset is not a regular file")
+                    stream = os.fdopen(descriptor, "rb", closefd=False)
+                except Exception:
+                    os.close(descriptor)
+                    raise
+                try:
+                    _stage_one(root_descriptor, relative, stream, files[relative], budget, limit)
+                finally:
+                    os.close(descriptor)
+            else:
+                _stage_one(
+                    root_descriptor,
+                    relative,
+                    bundle.open(str(component["sourcePath"])),
+                    files[relative],
+                    budget,
+                    limit,
+                )
+
+
+def _stage_payload(project_root: Path, spec: ReleaseSpec) -> StageHandle:
     root = Path(tempfile.mkdtemp(prefix="xenoid-gapps-stage-"))
     root.chmod(0o700)
     token = secrets.token_hex(16)
@@ -1135,49 +2277,25 @@ def _stage_payload(zip_path: Path, spec: ReleaseSpec) -> StageHandle:
     marker.chmod(0o600)
     tree = root / "tree"
     tree.mkdir(mode=0o700)
-    files, directories = _stage_manifests(spec)
+    if spec.schema == GOOGLE_RELEASE_SCHEMA_V2:
+        files, directories = _stage_manifests_v2(spec)
+    else:
+        files, directories = _stage_manifests(spec)
     root_descriptor = os.open(tree, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        with zipfile.ZipFile(zip_path) as bundle:
-            _validate_zip_inventory(bundle, spec)
-            total = 0
-            for member in sorted((item for item in spec.members if item["selected"] is True), key=lambda item: item["runtimePath"]):
-                relative = str(member["runtimePath"]).lstrip("/")
-                components = _safe_member_name(relative)
-                parent_descriptor = _open_directory_chain(root_descriptor, components[:-1], True)
-                descriptor = -1
-                try:
-                    descriptor = os.open(
-                        components[-1],
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                        0o600,
-                        dir_fd=parent_descriptor,
-                    )
-                    digest = hashlib.sha256()
-                    count = 0
-                    with bundle.open(str(member["archivePath"])) as source:
-                        while True:
-                            chunk = source.read(_COPY_CHUNK)
-                            if not chunk:
-                                break
-                            count += len(chunk)
-                            total += len(chunk)
-                            if count > member["size"] or total > spec.archive["maxExpandedBytes"]:
-                                raise GoogleServicesError("google_services_asset_invalid", "Google services stage exceeds pinned limits")
-                            digest.update(chunk)
-                            _write_all(descriptor, chunk)
-                    if count != member["size"] or digest.hexdigest() != member["sha256"]:
-                        raise GoogleServicesError("google_services_asset_invalid", "Google services staged member pin mismatch")
-                    os.fchmod(descriptor, int(files[relative]["mode"]))
-                    os.utime(descriptor, ns=(0, 0))
-                    os.fsync(descriptor)
-                finally:
-                    if descriptor >= 0:
-                        os.close(descriptor)
-                    os.fsync(parent_descriptor)
-                    os.close(parent_descriptor)
+        if spec.schema == GOOGLE_RELEASE_SCHEMA_V2:
+            _stage_payload_v2(project_root, spec, root_descriptor, files)
+        else:
+            _stage_payload_v1(project_root, spec, root_descriptor, files)
         for relative, expected in sorted(directories.items(), key=lambda pair: pair[0].count("/"), reverse=True):
-            descriptor = _open_directory_chain(root_descriptor, tuple(relative.split("/")), False)
+            try:
+                descriptor = _open_directory_chain(root_descriptor, tuple(relative.split("/")), False)
+            except FileNotFoundError:
+                if spec.schema == GOOGLE_RELEASE_SCHEMA_V2:
+                    # Generated product-policy directories are materialized and
+                    # normalized inside the runtime context, not the stage tree.
+                    continue
+                raise
             try:
                 os.fchmod(descriptor, int(expected["mode"]))
                 os.utime(descriptor, ns=(0, 0))
@@ -1216,9 +2334,11 @@ def cleanup_stage(handle: StageHandle) -> None:
 
 @contextmanager
 def staged_google_payload(context: InstanceContext, spec: ReleaseSpec) -> Iterator[StageHandle]:
-    zip_path, _, _ = _asset_paths(context.project_root, spec)
     quick_validate_assets(context.project_root, spec)
-    handle = _stage_payload(zip_path, spec)
+    if spec.schema == GOOGLE_RELEASE_SCHEMA_V2:
+        source_spec = load_release_spec(context.project_root, MINDTHEGAPPS_RELEASE)
+        quick_validate_assets(context.project_root, source_spec)
+    handle = _stage_payload(context.project_root, spec)
     try:
         yield handle
     finally:
@@ -1325,10 +2445,24 @@ def _load_context_manifest_entries(context_root: Path) -> dict[str, Mapping[str,
     return entries
 
 
+def _policy_stage_entries(spec: ReleaseSpec) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    if spec.schema != GOOGLE_RELEASE_SCHEMA_V2:
+        return entries
+    for output in spec.product_policy["outputs"]:
+        relative = str(output["path"]).lstrip("/")
+        entries[relative] = {"sha256": str(output["sha256"]), "mode": 0o644, "policy": True}
+    return entries
+
+
 def verify_context_copy(context_root: Path, spec: ReleaseSpec, stage: StageHandle) -> dict[str, Any]:
     payload_root = context_root / "payload" / "google-services"
     actual_files, actual_directories = _walk_tree(payload_root)
-    if set(actual_files) != set(stage.file_manifest) or set(actual_directories) != set(stage.directory_manifest):
+    policy_entries = _policy_stage_entries(spec)
+    expected_files = dict(stage.file_manifest)
+    if set(policy_entries) - set(expected_files):
+        raise GoogleServicesError("google_services_asset_invalid", "Google services product policy is not staged")
+    if set(actual_files) != set(expected_files) or set(actual_directories) != set(stage.directory_manifest):
         raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context inventory mismatch")
     manifest_entries = _load_context_manifest_entries(context_root)
     manifest_prefix = "payload/google-services/"
@@ -1338,31 +2472,38 @@ def verify_context_copy(context_root: Path, spec: ReleaseSpec, stage: StageHandl
         if path.startswith(manifest_prefix)
     }
     expected_paths = {
-        *(f"{manifest_prefix}{relative}" for relative in stage.file_manifest),
+        *(f"{manifest_prefix}{relative}" for relative in expected_files),
         *(f"{manifest_prefix}{relative}" for relative in stage.directory_manifest),
     }
     if set(google_entries) != expected_paths:
         raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context manifest inventory mismatch")
-    for relative, expected in stage.file_manifest.items():
+    for relative, expected in expected_files.items():
         path = payload_root / relative
         info = actual_files[relative]
-        digest = _stream_sha256(path, int(expected["size"]))[1]
+        digest = _stream_sha256(path)[1] if policy_entries.get(relative) else _stream_sha256(path, int(expected["size"]))[1]
+        if digest != expected["sha256"]:
+            raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context file mismatch")
         manifest_entry = google_entries[f"{manifest_prefix}{relative}"]
-        if (
+        expected_entry = {
+            "path": f"{manifest_prefix}{relative}",
+            "type": "file",
+            "mode": f"0{int(expected['mode']):03o}",
+            "size": info.st_size,
+            "sha256": expected["sha256"],
+        }
+        if relative not in policy_entries and (
             info.st_size != expected["size"]
             or stat.S_IMODE(info.st_mode) != expected["mode"]
             or info.st_mtime_ns != 0
-            or digest != expected["sha256"]
-            or manifest_entry
-            != {
-                "path": f"{manifest_prefix}{relative}",
-                "type": "file",
-                "mode": f"0{int(expected['mode']):03o}",
-                "size": int(expected["size"]),
-                "sha256": expected["sha256"],
-            }
+            or manifest_entry != expected_entry
         ):
             raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context file mismatch")
+        if relative in policy_entries and (
+            stat.S_IMODE(info.st_mode) != expected["mode"]
+            or info.st_mtime_ns != 0
+            or manifest_entry != expected_entry
+        ):
+            raise GoogleServicesError("google_services_asset_invalid", "Google services runtime context policy mismatch")
     for relative, expected in stage.directory_manifest.items():
         info = actual_directories[relative]
         manifest_entry = google_entries[f"{manifest_prefix}{relative}"]
@@ -1395,9 +2536,13 @@ def verify_context_copy(context_root: Path, spec: ReleaseSpec, stage: StageHandl
         props = props_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise GoogleServicesError("google_services_asset_invalid", "Google services runtime system properties are missing") from exc
-    setup_mode = f"ro.setupwizard.mode={spec.android['setupWizardMode']}"
-    if props.splitlines().count(setup_mode) != 1:
-        raise GoogleServicesError("google_services_asset_invalid", "Google services setup-wizard mode mismatch")
+    if spec.android["setupWizardMode"] == "UNCHANGED":
+        if any(line.startswith("ro.setupwizard.mode=") for line in props.splitlines()):
+            raise GoogleServicesError("google_services_asset_invalid", "Google services setup-wizard mode must remain unchanged")
+    else:
+        setup_mode = f"ro.setupwizard.mode={spec.android['setupWizardMode']}"
+        if props.splitlines().count(setup_mode) != 1:
+            raise GoogleServicesError("google_services_asset_invalid", "Google services setup-wizard mode mismatch")
     owned_copy_positions = [
         position
         for marker in ("COPY payload/daemon", "COPY payload/xenoid", "COPY --chmod")
@@ -1577,34 +2722,92 @@ def transition_decision(
     raise GoogleServicesError("google_services_new_instance_required", "Google services changes require a new instance and do not erase existing data")
 
 
+_RUNTIME_CAPABILITY_SHAPES = {
+    "googlePlayServices": ("runtime", "minimal-live"),
+    "accountAuth": ("runtime-release", "authenticator"),
+    "cloudMessaging": ("runtime-release", "fcm-registrar"),
+    "fusedLocation": ("runtime-release", "fused-provider"),
+    "playStore": ("runtime-release", "launcher"),
+}
+_UNSUPPORTED_CAPABILITIES = ("playIntegrity", "deviceCertification", "drm", "antiCheat")
+
+
 def capability_model(provider: str, runtime_state: str) -> dict[str, Any]:
-    configured = provider == PROVIDER_MINDTHEGAPPS
-    if not configured:
-        google_state = "absent"
-        store_state = "absent"
-        required: list[str] = []
+    configured = provider in {PROVIDER_MICROG, PROVIDER_MINDTHEGAPPS}
+    capabilities: dict[str, Any] = {}
+    if configured:
+        state = runtime_state if runtime_state in {"ready", "failed"} else "notEvaluated"
+        required = (
+            ["googlePlayServices", "accountAuth", "cloudMessaging", "fusedLocation", "playStore"]
+            if provider == PROVIDER_MICROG
+            else ["googlePlayServices", "playStore"]
+        )
+        for name, (scope, evidence) in _RUNTIME_CAPABILITY_SHAPES.items():
+            capabilities[name] = {
+                "scope": scope,
+                "runtimeState": state,
+                "releaseState": "notEvaluated",
+                "evidence": evidence,
+            }
+        capabilities["maps"] = {
+            "scope": "release",
+            "runtimeState": "notEvaluated",
+            "releaseState": "notEvaluated",
+            "evidence": "release-attestation",
+        }
     else:
-        google_state = runtime_state if runtime_state in {"configured", "ready", "failed"} else "configured"
-        store_state = google_state
-        required = ["googlePlayServices", "playStore"]
-    return {
-        "requiredCapabilities": required,
-        "capabilities": {
-            "googlePlayServices": {"scope": "runtime", "state": google_state},
-            "playStore": {
-                "scope": "runtime",
-                "state": store_state,
-                "evidence": "package-launch" if store_state == "ready" else "notEvaluated",
-                "accountFunctionalState": "notEvaluated",
-            },
-            "playIntegrity": {"scope": "application", "state": "unsupported", "evaluated": False},
-        },
-    }
+        required = []
+        for name, (scope, _) in _RUNTIME_CAPABILITY_SHAPES.items():
+            capabilities[name] = {
+                "scope": scope,
+                "runtimeState": "absent",
+                "releaseState": "notEvaluated",
+                "evidence": "none",
+            }
+        capabilities["maps"] = {
+            "scope": "release",
+            "runtimeState": "absent",
+            "releaseState": "notEvaluated",
+            "evidence": "none",
+        }
+    for name in _UNSUPPORTED_CAPABILITIES:
+        capabilities[name] = {
+            "scope": "application",
+            "runtimeState": "unsupported",
+            "releaseState": "unsupported",
+            "evidence": "unsupported",
+        }
+    return {"requiredCapabilities": required, "capabilities": capabilities}
+
+
+def _implementation_literals(provider: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    if provider == PROVIDER_MICROG:
+        return "microg", "restricted-spoofing", "google-play"
+    if provider == PROVIDER_MINDTHEGAPPS:
+        return "mindthegapps", "coherent", "google-play"
+    return None, None, None
+
+
+def factory_components(spec: Optional[ReleaseSpec]) -> Optional[dict[str, Any]]:
+    if spec is None or spec.schema != GOOGLE_RELEASE_SCHEMA_V2:
+        return None
+    result: dict[str, Any] = {}
+    for component in spec.components:
+        result[str(component["id"])] = {
+            "package": str(component["package"]),
+            "path": str(component["runtimePath"]),
+            "versionCode": int(component["versionCode"]),
+            "sha256": str(component["sha256"]),
+            "signingCertificateHistorySha256": list(component["signingCertificateHistorySha256"]),
+            "privileged": bool(component["privileged"]),
+        }
+    return result
 
 
 def base_status(provider: str, release: str, spec: Optional[ReleaseSpec]) -> dict[str, Any]:
-    configured = provider == PROVIDER_MINDTHEGAPPS
+    configured = provider != PROVIDER_NONE
     model = capability_model(provider, "configured" if configured else "absent")
+    implementation, signature_model, store_implementation = _implementation_literals(provider)
     return {
         "schema": GOOGLE_STATUS_SCHEMA,
         "ok": True,
@@ -1617,6 +2820,9 @@ def base_status(provider: str, release: str, spec: Optional[ReleaseSpec]) -> dic
         "runtimeChecked": False,
         "ready": False,
         "skipped": True,
+        "implementation": implementation,
+        "signatureModel": signature_model,
+        "storeImplementation": store_implementation,
         "specSha256": spec.fingerprint if spec else disabled_runtime_spec_fingerprint(),
         "dataCompatibilitySha256": spec.data_compatibility_fingerprint if spec else disabled_runtime_spec_fingerprint(),
         "binding": None,
@@ -1624,10 +2830,19 @@ def base_status(provider: str, release: str, spec: Optional[ReleaseSpec]) -> dic
             "desiredImageSha256": None,
             "containerImageSha256": None,
             "rootfsSourceImageSha256": None,
+            "desiredInputSha256": None,
+            "desiredBootInputSha256": None,
+            "containerInputSha256": None,
+            "containerBootInputSha256": None,
+            "imageMatch": None,
+            "rootfsBootInputMatches": None,
             "labelsMatch": None,
             "commandMatch": None,
             "skipped": True,
         },
+        "factoryComponents": factory_components(spec),
+        "effectiveComponents": None,
+        "live": None,
         **model,
         "error": None,
         "nextActions": [],

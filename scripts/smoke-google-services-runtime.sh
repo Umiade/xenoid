@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Prove that an ordinary unprivileged app can discover and use the configured
-# Google runtime: packages, account authenticator, GMS Core Binder, and launcher.
+# Run the ordinary, non-debuggable application probe. The aggregate
+# google-services smoke/v2 document is owned by smoke-google-services-gate.sh.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -14,38 +14,51 @@ fi
 xenoid_cli() { ./xenoid --instance "$INSTANCE" "$@"; }
 PACKAGE="org.example.googleservicesruntimeprobe"
 PROBE_BUILD="$ROOT/tests/google-services-runtime-probe/build.sh"
-OUT_DIR="${XENOID_STATE_ROOT:-$HOME/.xenoid/instances}/google-services-probe"
-REPORT="$OUT_DIR/report.json"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/xenoid-google-services.XXXXXX")"
-mkdir -p "$OUT_DIR"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/xenoid-google-services-probe.XXXXXX")"
 cleanup() {
   xenoid_cli adb uninstall "$PACKAGE" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
 
-log() { echo "[google-services] $*" >&2; }
-fail() { echo "[google-services] FAIL: $*" >&2; exit 1; }
+log() { echo "[google-services-probe] $*" >&2; }
+fail() { echo "[google-services-probe] FAIL: $*" >&2; exit 1; }
 adb_shell() { xenoid_cli adb shell "$@"; }
 
-log "checking pinned runtime readiness"
+log "checking microG runtime readiness"
 xenoid_cli google-services status --require-runtime > "$TMP/status.json" \
   || fail "configured Google services runtime is not ready"
-python3 - "$TMP/status.json" <<'PY' || exit 1
+python3 - "$TMP/status.json" <<'PY' || fail "microG status contract mismatch"
 import json
 import sys
 from pathlib import Path
-status = json.loads(Path(sys.argv[1]).read_text())
-if not status.get("ok") or not status.get("ready"):
-    raise SystemExit("Google services status is not ready")
-if status.get("provider") != "mindthegapps":
-    raise SystemExit("Google services provider is not mindthegapps")
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if status.get("schema") != "dev.xenoid.google-services-status/v2":
+    raise SystemExit(1)
+if status.get("ok") is not True or status.get("ready") is not True:
+    raise SystemExit(1)
+if status.get("provider") != "microg":
+    raise SystemExit(1)
+if status.get("release") != "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0":
+    raise SystemExit(1)
 PY
 
 log "building ordinary application probe"
 [[ -x "$PROBE_BUILD" ]] || fail "probe build script missing"
 APK="$("$PROBE_BUILD")"
 [[ -f "$APK" ]] || fail "probe APK missing"
+python3 - "$APK" > "$TMP/apk-sha256" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+digest = hashlib.sha256()
+with Path(sys.argv[1]).open("rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
 
 xenoid_cli adb uninstall "$PACKAGE" >/dev/null 2>&1 || true
 xenoid_cli adb install -r "$APK" >/dev/null 2>&1 || fail "probe install failed"
@@ -56,6 +69,7 @@ sleep 7
 adb_shell "logcat -d -s XenoidGoogleServicesProbe:I" | python3 -c '
 import json
 import sys
+
 response = json.load(sys.stdin)
 raw = response.get("stdout", "") if isinstance(response, dict) else ""
 for line in reversed(raw.splitlines()):
@@ -66,27 +80,40 @@ for line in reversed(raw.splitlines()):
         data = json.loads(payload)
     except Exception:
         continue
-    if data.get("ok") is True:
-        print(json.dumps(data, sort_keys=True))
+    if (
+        data.get("schema") == "dev.xenoid.google-services-probe/v2"
+        and data.get("provider") == "microg"
+        and data.get("ok") is True
+    ):
+        print(json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         raise SystemExit(0)
 raise SystemExit(1)
-' > "$TMP/probe.json" || fail "ordinary application probe did not pass"
+' > "$TMP/device-probe.json" || fail "ordinary application probe did not pass"
 
-python3 - "$TMP/status.json" "$TMP/probe.json" "$REPORT" "$INSTANCE" <<'PY'
+python3 - \
+  "$TMP/status.json" "$TMP/device-probe.json" "$TMP/apk-sha256" \
+  "$INSTANCE" "$PACKAGE" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
-status = json.loads(Path(sys.argv[1]).read_text())
-probe = json.loads(Path(sys.argv[2]).read_text())
-report = {
-    "schema": "dev.xenoid.google-services-smoke/v1",
-    "ok": True,
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+probe = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+apk_sha256 = Path(sys.argv[3]).read_text(encoding="ascii").strip()
+if re.fullmatch(r"[0-9a-f]{64}", apk_sha256) is None:
+    raise SystemExit("probe APK digest is invalid")
+probe.update({
     "instance": sys.argv[4],
     "provider": status["provider"],
     "release": status["release"],
-    "probe": probe,
-}
-Path(sys.argv[3]).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-print(json.dumps(report, indent=2, sort_keys=True))
+    "specSha256": status["specSha256"],
+    "package": sys.argv[5],
+    "apkSha256": apk_sha256,
+})
+sys.stdout.write(
+    json.dumps(probe, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    + "\n"
+)
 PY
-log "ordinary Google services runtime probe passed"
+log "ordinary microG runtime probe passed"

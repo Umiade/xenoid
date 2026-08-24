@@ -1,0 +1,27 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <boolean name="checkin_enable_service" value="false" />
+    <boolean name="gcm_enable_mcs_service" value="false" />
+    <boolean name="auth_manager_trust_google" value="true" />
+    <boolean name="auth_manager_visible" value="true" />
+    <boolean name="safetynet_enabled" value="false" />
+    <boolean name="droidguard_enabled" value="false" />
+    <boolean name="location_wifi_mls" value="true" />
+    <boolean name="location_wifi_moving" value="true" />
+    <boolean name="location_wifi_learning" value="true" />
+    <boolean name="location_cell_mls" value="true" />
+    <boolean name="location_cell_learning" value="true" />
+    <boolean name="location_geocoder_nominatim" value="true" />
+    <boolean name="exposure_scanner_enabled" value="false" />
+    <boolean name="wifi_mls" value="true" />
+    <boolean name="cell_mls" value="true" />
+    <boolean name="wifi_learning" value="true" />
+    <boolean name="cell_learning" value="true" />
+    <boolean name="wifi_moving" value="true" />
+    <boolean name="nominatim_enabled" value="true" />
+    <boolean name="vending_licensing" value="true" />
+    <boolean name="vending_licensing_purchase_free_apps" value="true" />
+    <boolean name="vending_billing" value="true" />
+    <boolean name="vending_asset_delivery" value="true" />
+    <boolean name="vending_device_sync" value="true" />
+</map>

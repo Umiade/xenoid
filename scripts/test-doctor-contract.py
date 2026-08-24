@@ -89,6 +89,7 @@ class FakeGateRunner:
 
 class FakeAcceptance:
     calls = 0
+    google_binding_ok = True
 
     def __init__(self, manager: object) -> None:
         self.manager = manager
@@ -100,7 +101,19 @@ class FakeAcceptance:
             "ok": True,
             "observationValid": True,
             "checks": {
-                name: {"ok": True}
+                name: {
+                    "ok": (
+                        type(self).google_binding_ok
+                        if name == "googleBinding"
+                        else True
+                    ),
+                    "code": (
+                        "accepted"
+                        if name != "googleBinding"
+                        or type(self).google_binding_ok
+                        else "google_binding_not_ready"
+                    ),
+                }
                 for name in (
                     "storageIdentity",
                     "cellular",
@@ -183,6 +196,37 @@ def main() -> int:
             require(online["ok"] is True and online["complete"] is True, "fresh live acceptance was not authoritative")
             require(FakeAcceptance.calls == 2, "doctor did not invoke exactly one fresh observer per running report")
             require(online["sections"]["runtime"]["acceptance"]["fresh"] is True, "live evidence was cacheable")
+            require(
+                online["sections"]["runtime"]["acceptance"]["checks"][
+                    "googleBinding"
+                ]
+                == {"ok": True, "code": "accepted"},
+                "committed Google binding semantics drifted",
+            )
+            FakeAcceptance.google_binding_ok = False
+            unbound = doctor.build_doctor_report(
+                context,
+                object(),
+                lease,
+                full=True,
+                require_runtime=True,
+            )
+            require(
+                unbound["ok"] is False
+                and unbound["sections"]["runtime"]["acceptance"]["checks"][
+                    "googleBinding"
+                ]
+                == {
+                    "ok": False,
+                    "code": "google_binding_not_ready",
+                },
+                "uncommitted Google binding satisfied full doctor",
+            )
+            require(
+                FakeAcceptance.calls == 3,
+                "Google binding doctor check was not freshly observed",
+            )
+            FakeAcceptance.google_binding_ok = True
     finally:
         doctor.RuntimeManager = original_manager
         doctor.GateRunner = original_runner

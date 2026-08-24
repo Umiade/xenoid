@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<exceptions>
+    <exception package="com.google.android.gms">
+      <!-- Body sensors -->
+      <permission name="android.permission.BODY_SENSORS" fixed="false" />
+      <!-- Account / Contacts -->
+      <permission name="android.permission.GET_ACCOUNTS" fixed="false" />
+      <permission name="android.permission.READ_CONTACTS" fixed="false" />
+      <permission name="android.permission.WRITE_CONTACTS" fixed="false" />
+      <!-- Location -->
+      <permission name="android.permission.ACCESS_COARSE_LOCATION" fixed="false" />
+      <permission name="android.permission.ACCESS_FINE_LOCATION" fixed="false" />
+      <!-- %ACCESS_BACKGROUND_LOCATION% -->
+      <!-- SMS -->
+      <permission name="android.permission.RECEIVE_SMS" fixed="false" whitelisted="true" />
+      <!-- Phone -->
+      <permission name="android.permission.READ_PHONE_STATE" fixed="false" />
+      <!-- Storage -->
+      <permission name="android.permission.READ_EXTERNAL_STORAGE" fixed="false" />
+      <permission name="android.permission.WRITE_EXTERNAL_STORAGE" fixed="false" />
+      <!-- Camera -->
+      <permission name="android.permission.CAMERA" fixed="false" />
+
+      <!-- Notifications -->
+      <permission name="android.permission.POST_NOTIFICATIONS" fixed="false" />
+      <!-- Draw over other apps -->
+      <permission name="android.permission.SYSTEM_ALERT_WINDOW" fixed="false" />
+   </exception>
+</exceptions>

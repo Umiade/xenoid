@@ -46,6 +46,185 @@ from xenoid.remote_service import (  # noqa: E402
 )
 
 
+MICROG_PLAY_RELEASE = (
+    "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0"
+)
+GOOGLE_STATUS_KEYS = {
+    "schema",
+    "ok",
+    "provider",
+    "release",
+    "configured",
+    "state",
+    "hostReady",
+    "runtimeRequired",
+    "runtimeChecked",
+    "ready",
+    "skipped",
+    "implementation",
+    "signatureModel",
+    "storeImplementation",
+    "specSha256",
+    "dataCompatibilitySha256",
+    "binding",
+    "runtimeIdentity",
+    "factoryComponents",
+    "effectiveComponents",
+    "live",
+    "requiredCapabilities",
+    "capabilities",
+    "error",
+    "nextActions",
+}
+GOOGLE_LIVE_CHECKS = {
+    "components",
+    "signaturePolicy",
+    "productPolicy",
+    "accountAuthenticator",
+    "boundBroker",
+    "fcmRegistrar",
+    "fusedProvider",
+    "playStoreLauncher",
+    "processStability",
+}
+
+
+def microg_status_v2() -> dict[str, Any]:
+    digest = "1" * 64
+    packages = (
+        (
+            "gmsCore",
+            "com.google.android.gms",
+            "/system/product/priv-app/GmsCore/GmsCore.apk",
+            250932030,
+        ),
+        (
+            "gsfProxy",
+            "com.google.android.gsf",
+            "/system/product/priv-app/GsfProxy/GsfProxy.apk",
+            8,
+        ),
+        (
+            "playStoreSeed",
+            "com.android.vending",
+            "/system/product/priv-app/Phonesky/Phonesky.apk",
+            83041710,
+        ),
+    )
+    factory = {
+        name: {
+            "package": package,
+            "path": path,
+            "versionCode": version,
+            "sha256": digest,
+            "signingCertificateHistorySha256": [digest],
+            "privileged": True,
+        }
+        for name, package, path, version in packages
+    }
+    effective = {
+        name: {
+            "package": package,
+            "codePath": path,
+            "versionCode": version,
+            "versionName": str(version),
+            "signerSha256": digest,
+            "enabled": True,
+            "system": True,
+            "privileged": True,
+            "updatedSystemApp": False,
+            "processState": "stable" if name == "gmsCore" else "dormant",
+        }
+        for name, package, path, version in packages
+    }
+    capability_shapes = {
+        "googlePlayServices": ("runtime", "minimal-live"),
+        "accountAuth": ("runtime-release", "authenticator"),
+        "cloudMessaging": ("runtime-release", "fcm-registrar"),
+        "fusedLocation": ("runtime-release", "fused-provider"),
+        "maps": ("release", "release-attestation"),
+        "playStore": ("runtime-release", "launcher"),
+    }
+    capabilities = {
+        name: {
+            "scope": scope,
+            "runtimeState": (
+                "notEvaluated" if name == "maps" else "ready"
+            ),
+            "releaseState": "notEvaluated",
+            "evidence": evidence,
+        }
+        for name, (scope, evidence) in capability_shapes.items()
+    }
+    for name in ("playIntegrity", "deviceCertification", "drm", "antiCheat"):
+        capabilities[name] = {
+            "scope": "application",
+            "runtimeState": "unsupported",
+            "releaseState": "unsupported",
+            "evidence": "unsupported",
+        }
+    return {
+        "schema": "dev.xenoid.google-services-status/v2",
+        "ok": True,
+        "provider": "microg",
+        "release": MICROG_PLAY_RELEASE,
+        "configured": True,
+        "state": "ready",
+        "hostReady": True,
+        "runtimeRequired": True,
+        "runtimeChecked": True,
+        "ready": True,
+        "skipped": False,
+        "implementation": "microg",
+        "signatureModel": "restricted-spoofing",
+        "storeImplementation": "google-play",
+        "specSha256": digest,
+        "dataCompatibilitySha256": digest,
+        "binding": {
+            "provider": "microg",
+            "release": MICROG_PLAY_RELEASE,
+            "specSha256": digest,
+            "dataCompatibilitySha256": digest,
+            "state": "committed",
+            "source": "fresh",
+            "inferred": False,
+        },
+        "runtimeIdentity": {
+            "desiredImageSha256": "sha256:" + digest,
+            "containerImageSha256": "sha256:" + digest,
+            "rootfsSourceImageSha256": "sha256:" + digest,
+            "desiredInputSha256": digest,
+            "desiredBootInputSha256": digest,
+            "containerInputSha256": digest,
+            "containerBootInputSha256": digest,
+            "imageMatch": "matching",
+            "rootfsBootInputMatches": True,
+            "labelsMatch": True,
+            "commandMatch": True,
+            "skipped": False,
+        },
+        "factoryComponents": factory,
+        "effectiveComponents": effective,
+        "live": {
+            "ok": True,
+            "checks": {
+                name: {"ok": True, "code": None}
+                for name in GOOGLE_LIVE_CHECKS
+            },
+            "error": None,
+        },
+        "requiredCapabilities": [
+            "googlePlayServices",
+            "accountAuth",
+            "cloudMessaging",
+            "fusedLocation",
+            "playStore",
+        ],
+        "capabilities": capabilities,
+        "error": None,
+        "nextActions": [],
+    }
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -153,17 +332,20 @@ def catalog_and_routing_contract(
     def fake_call(runtime: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         require(not hasattr(runtime, "auto_ensure_daemon"), "remote retained daemon bypass")
         calls.append((runtime.context.instance_name, name, dict(arguments)))
-        value = {
-            "ok": True,
-            "instance": runtime.context.instance_name,
-            "operation": name,
-            "token": "must-not-leak",
-            "hostPath": str(fixture.project / "private"),
-            "authorization": "Bearer must-not-leak",
-            "apiKey": "must-not-leak",
-            "endpoint": "https" + "://service.example/path?to" + "ken=must-not-leak",
-            "externalError": "failed at /srv/operator/private-state",
-        }
+        if name == "xenoid_google_services_status":
+            value = microg_status_v2()
+        else:
+            value = {
+                "ok": True,
+                "instance": runtime.context.instance_name,
+                "operation": name,
+                "token": "must-not-leak",
+                "hostPath": str(fixture.project / "private"),
+                "authorization": "Bearer must-not-leak",
+                "apiKey": "must-not-leak",
+                "endpoint": "https" + "://service.example/path?to" + "ken=must-not-leak",
+                "externalError": "failed at /srv/operator/private-state",
+            }
         return {"content": [{"type": "text", "text": json.dumps(value)}]}
 
     app = ServiceApplication(
@@ -190,6 +372,53 @@ def catalog_and_routing_contract(
     require("xenoid_up" not in reader_names, "control tool leaked to reader")
     require("xenoid_root_exec" not in operator_tools, "root leaked to control scope")
     require("xenoid_up" in operator_tools, "production up missing")
+    require(
+        "xenoid_google_services_status" in reader_names
+        and "xenoid_google_services_enable" not in reader_names
+        and "xenoid_google_services_disable" not in reader_names,
+        "Google services remote read/control allowlist drifted",
+    )
+    require(
+        {
+            "xenoid_google_services_status",
+            "xenoid_google_services_enable",
+            "xenoid_google_services_disable",
+        }
+        <= set(operator_tools),
+        "operator Google services allowlist is incomplete",
+    )
+    google_policies = {
+        "xenoid_google_services_status": (
+            "read",
+            False,
+            False,
+            frozenset({"requireRuntime"}),
+        ),
+        "xenoid_google_services_enable": (
+            "control",
+            True,
+            False,
+            frozenset({"release"}),
+        ),
+        "xenoid_google_services_disable": (
+            "control",
+            True,
+            True,
+            frozenset(),
+        ),
+    }
+    for name, expected in google_policies.items():
+        policy = REMOTE_TOOL_POLICIES[name]
+        require(
+            (
+                policy.scope,
+                policy.mutating,
+                policy.destructive,
+                policy.schema_properties,
+            )
+            == expected,
+            f"{name} remote policy drifted",
+        )
     require(
         all(policy.schema_properties is not None for policy in REMOTE_TOOL_POLICIES.values()),
         "remote schema policy is fail-open",
@@ -265,6 +494,59 @@ def catalog_and_routing_contract(
     )
     require(structured["externalError"] == "[redacted]", "absolute path leak")
     require(calls[-1][:2] == ("phone-a", "xenoid_status"), "wrong runtime selected")
+
+    expected_google_status = microg_status_v2()
+    require(
+        set(expected_google_status) == GOOGLE_STATUS_KEYS
+        and set(expected_google_status["runtimeIdentity"])
+        == {
+            "desiredImageSha256",
+            "containerImageSha256",
+            "rootfsSourceImageSha256",
+            "desiredInputSha256",
+            "desiredBootInputSha256",
+            "containerInputSha256",
+            "containerBootInputSha256",
+            "imageMatch",
+            "rootfsBootInputMatches",
+            "labelsMatch",
+            "commandMatch",
+            "skipped",
+        }
+        and set(expected_google_status["live"]) == {"ok", "checks", "error"}
+        and set(expected_google_status["live"]["checks"]) == GOOGLE_LIVE_CHECKS
+        and all(
+            set(check) == {"ok", "code"}
+            for check in expected_google_status["live"]["checks"].values()
+        )
+        and all(
+            set(capability)
+            == {"scope", "runtimeState", "releaseState", "evidence"}
+            for capability in expected_google_status["capabilities"].values()
+        ),
+        "Google status v2 fixture does not match the public contract",
+    )
+    google_status = app.dispatch(
+        reader,
+        mcp_request(
+            "tools/call",
+            name="xenoid_google_services_status",
+            arguments={"instance": "phone-a", "requireRuntime": True},
+        ),
+    )["result"]["structuredContent"]
+    require(
+        google_status == expected_google_status,
+        "remote service did not pass through Google status v2",
+    )
+    require(
+        calls[-1]
+        == (
+            "phone-a",
+            "xenoid_google_services_status",
+            {"requireRuntime": True},
+        ),
+        "remote Google status routing or arguments drifted",
+    )
 
     denied = app.dispatch(
         reader,

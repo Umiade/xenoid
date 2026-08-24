@@ -20,7 +20,7 @@ Xenoid 是面向移动安全工作的受控 Android 13 ARM64 运行时，支持 
 - 通过 token-gated rootd 提供受控 root 操作，不暴露应用可见的 `su`。
 - KeyMint/keybox、相机媒体注入、传感器、Radio、输入、应用、自动化、OTA、Frida 与 MCP 控制。
 - 多实例安全共享的 engine 级 kmod/eBPF 保护。
-- 可选的本地 MindTheGapps 导入。Xenoid 不声明支持 Play Integrity 或 Google 设备认证。
+- 新实例默认启用镜像内置 microG 组合运行时。
 
 Frida 只用于显式检查，不进入正常生产启动。凭据、代理源、keybox、Google 二进制、设备采集和运行时状态只保留在本机，不进入版本库。
 
@@ -49,8 +49,6 @@ Xenoid 只支持一条生产架构：ARM64 主机运行 Android 13 `64only`。x8
 ```bash
 ./xenoid install-runtime
 ./xenoid init --config examples/config-macos-colima.json
-./xenoid up
-./xenoid view
 ```
 
 ### Linux ARM64
@@ -58,7 +56,13 @@ Xenoid 只支持一条生产架构：ARM64 主机运行 Android 13 `64only`。x8
 ```bash
 sudo ./scripts/setup-linux-binderfs.sh
 ./xenoid init --config examples/config-linux-arm.json
+```
+
+新实例默认启用 Google 服务。第一次执行 `up` 时会通过 HTTPS 下载固定的第三方资产，完整校验 release、哈希、证书、包名、签名、SDK 与 ABI，并且只把字节保存在被忽略的 `.xenoid/` 本机状态中：
+
+```bash
 ./xenoid up
+./xenoid view
 ```
 
 每个实例只执行一次 `init`。后续 `up` 会复用健康的 artifact、镜像、存储和容器。
@@ -85,7 +89,7 @@ sudo ./scripts/setup-linux-binderfs.sh
 
 ```bash
 ./xenoid instance list
-./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-a init --config examples/config-macos-colima.json --no-google-services
 ./xenoid --instance phone-a up
 ./xenoid --instance phone-a status
 ```
@@ -140,21 +144,10 @@ python -m pip install frida-tools
 ./xenoid frida stop
 ```
 
-### 可选 Google 服务
+### Google 服务
 
-导入仅在本机执行，并且必须在实例产生 Android data 前完成：
+新实例默认使用 `microg` release `microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0`；仅在创建时通过 `init --no-google-services` 显式关闭。第一次 `up` 会安全获取并校验固定资产；原理和手工导入备用命令见[运维文档](docs/operations.md#google-play-services-default)。
 
-```bash
-./xenoid --instance play init --config examples/config-macos-colima.json
-./xenoid --instance play google-services import-mindthegapps \
-  /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
-  /path/to/release.x509.pem
-./xenoid --instance play google-services enable
-./xenoid --instance play up
-./xenoid --instance play google-services status --require-runtime
-```
-
-Xenoid 会校验固定 release、归档清单、成员摘要、包版本、签名沿革与 ABI。Google 二进制不会被隐式下载，也不会进入 Xenoid release。
 
 ### MCP、构建与验证
 
@@ -188,6 +181,8 @@ Xenoid 建立在可靠的上游工作之上。贡献应归于真正完成它的�
 
 - [Android Open Source Project](https://source.android.com/)
 - [redroid](https://github.com/remote-android/redroid-doc)
+- [microG](https://microg.org/)
+- [LineageOS for microG](https://github.com/lineageos4microg)
 - [MindTheGapps](https://gitlab.com/MindTheGapps/vendor_gapps)
 - [TEESimulator](https://github.com/JingMatrix/TEESimulator)
 - [Frida](https://frida.re/)

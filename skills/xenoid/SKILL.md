@@ -73,20 +73,24 @@ Device identity is generated once per instance. `device regenerate` records ever
 
 `doctor` combines digest-aware GateRunner records with a fresh read-only `LiveAcceptance` observation of an already-running instance. `doctor --full` only selects the broader doctor-safe record set; it never calls `up`, ensures daemon/rootd, builds/packages, invokes mutating gates, or recursively runs a suite. Use `--require-runtime` when `complete=true` is mandatory. Use `./scripts/verify.sh --fresh` for fresh static evidence.
 
-## Optional Google services
+## Google services
 
-Google services are disabled by default and may be selected only before an instance has Android storage. The sole known release is `MindTheGapps-13.0.0-arm64-20231025_200931`. Import the official ZIP and matching `release.x509.pem` locally, then enable and converge:
+New instances default to production provider/release `microg`/`microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0`: official microG GmsCore `v0.3.15.250932`, official GsfProxy `v0.1.0`, and the Google-signed Phonesky `30.4.17` factory seed from retired MindTheGapps source. Use `init --no-google-services` only for an explicit no-GMS instance. The first ordinary `up` automatically acquires and verifies both private sources; the trusted-local commands below are manual/offline fallback:
 
 ```bash
 ./xenoid --instance play google-services import-mindthegapps \
   /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
   /path/to/release.x509.pem
-./xenoid --instance play google-services enable
+./xenoid --instance play google-services import-microg \
+  /path/to/com.google.android.gms-250932030.apk \
+  /path/to/com.google.android.gsf-8.apk
 ./xenoid --instance play up
 ./xenoid --instance play google-services status --require-runtime
 ```
 
-Never download the payload implicitly, pass import paths through MCP, copy private Google assets out of `.xenoid/`, or claim Play Integrity/device certification from package presence. A provider change after data creation requires a new instance. Account login remains manual.
+Only the first ordinary `up` may acquire missing payloads, and only from the pinned GitHub release URLs before full importer verification. Never fetch mutable/unpinned assets, pass import paths/bytes through MCP or remote control, or copy private Google assets out of `.xenoid/`. MindTheGapps is importable only as the Phonesky/policy source and is never newly selectable; an old configured instance fails `google_services_release_retired`. Any provider, release, policy, or signer rotation requires a new instance, and `/data` is never migrated.
+
+Restricted spoofing applies only to official microG `com.google.android.gms`: API-visible `signatures`, `signingInfo`, and `forceQueryable` use an exact package/real-signer/fake-certificate predicate while the on-disk signer remains microG. Phonesky and GsfProxy stay signer-coherent. `up` proves only minimal live runtime-tier `googlePlayServices`, `accountAuth`, `cloudMessaging`, `fusedLocation`, and `playStore`; release-tier cloud/API claims require the packaged attestation. Maps is `microg-mapbox-maplibre`. Never claim Google equivalence. `playIntegrity`, `deviceCertification`, `drm`, and `antiCheat` are unsupported. No Google SetupWizard is installed; setup-wizard mode is unchanged and AOSP `Provision` remains.
 
 ## Device and application operations
 

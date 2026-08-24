@@ -24,9 +24,9 @@ DEFAULT_ANDROID_ADB_PORT = 62111
 DEFAULT_ANDROID_DAEMON_PORT = 18765
 DEFAULT_ROOTD_PORT = 18767
 DEFAULT_RUNTIME_TAG = "xenoid/redroid:local"
-DEFAULT_GOOGLE_SERVICES_PROVIDER = "none"
-DEFAULT_GOOGLE_SERVICES_RELEASE = "none"
-MINDTHEGAPPS_RELEASE = "MindTheGapps-13.0.0-arm64-20231025_200931"
+MICROG_PLAY_RELEASE = "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0"
+DEFAULT_GOOGLE_SERVICES_PROVIDER = "microg"
+DEFAULT_GOOGLE_SERVICES_RELEASE = MICROG_PLAY_RELEASE
 INSTANCE_SCHEMA_VERSION = 2
 LEASE_SCHEMA_VERSION = 1
 INSTANCE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -340,7 +340,7 @@ class XenoidConfig:
     android_adb_port: int = DEFAULT_ANDROID_ADB_PORT
     extra_docker_args: list[str] = field(default_factory=list)
     runtime_image_tag: str = DEFAULT_RUNTIME_TAG
-    auto_build_runtime_image: bool = False
+    auto_build_runtime_image: bool = True
     docker_context: str = ""
     google_services_provider: str = DEFAULT_GOOGLE_SERVICES_PROVIDER
     google_services_release: str = DEFAULT_GOOGLE_SERVICES_RELEASE
@@ -384,15 +384,9 @@ def _validate_config(cfg: XenoidConfig) -> None:
         )
     if not isinstance(cfg.google_services_provider, str) or not isinstance(cfg.google_services_release, str):
         raise InstanceError("google_services_spec_mismatch", "invalid Google services provider configuration")
-    valid_google_pair = (
-        cfg.google_services_provider == DEFAULT_GOOGLE_SERVICES_PROVIDER
-        and cfg.google_services_release == DEFAULT_GOOGLE_SERVICES_RELEASE
-    ) or (
-        cfg.google_services_provider == "mindthegapps"
-        and cfg.google_services_release == MINDTHEGAPPS_RELEASE
-    )
-    if not valid_google_pair:
-        raise InstanceError("google_services_spec_mismatch", "unsupported Google services provider or release")
+    from .google_services import validate_provider_release
+
+    validate_provider_release(cfg.google_services_provider, cfg.google_services_release)
     if not isinstance(cfg.android_adb_port, int) or not 1024 <= cfg.android_adb_port <= 65535:
         raise InstanceError("resource_conflict", "invalid Android ADB port")
     if not isinstance(cfg.extra_docker_args, list) or not all(
@@ -975,14 +969,32 @@ def initialize_instance(
     if name == "default" and (root / ".xenoid" / "config.json").is_file():
         return _migrate_legacy_default(root, state_home)
     if template_path is not None and from_instance is not None:
-        raise InstanceError("resource_conflict", "init template and source instance are mutually exclusive")
-    if overrides and from_instance is not None:
-        raise InstanceError("resource_conflict", "init source and direct overrides are mutually exclusive")
+        raise InstanceError(
+            "resource_conflict",
+            "init template and source instance are mutually exclusive",
+        )
+    if (
+        overrides
+        and from_instance is not None
+        and set(overrides)
+        - {"google_services_provider", "google_services_release"}
+    ):
+        raise InstanceError(
+            "resource_conflict",
+            "init source accepts only explicit Google-services overrides",
+        )
     config_path = instance_config_path(root, name)
-    registry_root = Path(state_home).expanduser().resolve() if state_home else default_state_home()
+    registry_root = (
+        Path(state_home).expanduser().resolve()
+        if state_home
+        else default_state_home()
+    )
     with _registry_lock(registry_root):
         if config_path.exists():
-            raise InstanceError("resource_conflict", "instance is already initialized")
+            raise InstanceError(
+                "resource_conflict",
+                "instance is already initialized",
+            )
         instance_id = str(uuid.uuid4())
         context = _context(root, name, instance_id, registry_root)
         resolved_overrides: dict[str, Any] = {}
@@ -993,21 +1005,39 @@ def initialize_instance(
             )
             resolved_overrides = _config_template_overrides(template)
             if overrides:
-                unknown_override = set(overrides) - resolved_overrides
+                allowed_override_keys = set(resolved_overrides) | {
+                    "google_services_provider",
+                    "google_services_release",
+                }
+                unknown_override = set(overrides) - allowed_override_keys
                 if unknown_override:
-                    raise InstanceError("resource_conflict", "init overrides are not allowed with a template")
+                    raise InstanceError(
+                        "resource_conflict",
+                        "init overrides are not allowed with a template",
+                    )
                 resolved_overrides.update(overrides)
         elif from_instance is not None:
             source_name = validate_instance_name(from_instance)
             if source_name == name:
-                raise InstanceError("resource_conflict", "init source must be a different instance")
+                raise InstanceError(
+                    "resource_conflict",
+                    "init source must be a different instance",
+                )
             source_config_path = instance_config_path(root, source_name)
             source_cfg = _config_from_dict(
-                _read_json_object(source_config_path, "instance_identity_mismatch")
+                _read_json_object(
+                    source_config_path,
+                    "instance_identity_mismatch",
+                )
             )
             if source_cfg.instance_name != source_name:
-                raise InstanceError("instance_identity_mismatch", "source instance config mismatch")
+                raise InstanceError(
+                    "instance_identity_mismatch",
+                    "source instance config mismatch",
+                )
             resolved_overrides = _clone_config_overrides(source_cfg)
+            if overrides:
+                resolved_overrides.update(overrides)
         elif overrides:
             resolved_overrides = dict(overrides)
         cfg = new_instance_config(name, instance_id, resolved_overrides)

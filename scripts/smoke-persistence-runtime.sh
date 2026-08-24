@@ -34,8 +34,10 @@ collect_probe() {
   local phase="$1"
   local out="$TMP/probe-$phase.json"
   adb_shell "am start -W -n $PACKAGE/.ProbeActivity" >/dev/null 2>&1 || true
-  sleep 2
-  adb_shell "logcat -d -s XenoidPersistenceProbe:I" | python3 -c '
+  local attempt
+  for attempt in $(seq 1 15); do
+    sleep 2
+    if adb_shell "logcat -d -s XenoidPersistenceProbe:I" | python3 -c '
 import json, sys
 response = json.load(sys.stdin)
 raw = response.get("stdout", "") if isinstance(response, dict) else ""
@@ -50,7 +52,13 @@ for line in reversed(raw.splitlines()):
         except Exception:
             continue
 sys.exit(1)
-' > "$out" || fail "probe output missing in phase $phase"
+' > "$out"; then
+      break
+    fi
+    if [ "$attempt" = 15 ]; then
+      fail "probe output missing in phase $phase"
+    fi
+  done
   cat "$out"
 }
 
@@ -126,7 +134,22 @@ APK="$("$PROBE_BUILD")"
 
 xenoid_cli adb uninstall "$PACKAGE" >/dev/null 2>&1 || true
 log "phase 0: install probe and collect baseline"
-xenoid_cli adb install -r "$APK" >/dev/null 2>&1 || fail "probe install failed"
+installed=0
+for attempt in $(seq 1 5); do
+  if xenoid_cli adb install -r "$APK" >"$TMP/install.log" 2>&1 \
+    && ! grep -q "Failure" "$TMP/install.log"; then
+    installed=1
+    break
+  fi
+  sleep 3
+done
+[ "$installed" = 1 ] || { tail -3 "$TMP/install.log" >&2; fail "probe install failed"; }
+for attempt in $(seq 1 10); do
+  if xenoid_cli adb shell "pm path $PACKAGE" 2>/dev/null | grep -q "package:"; then
+    break
+  fi
+  sleep 2
+done
 collect_probe initial > "$TMP/baseline.json"
 BASE_MARKER="$(cat "$TMP/baseline.json" | json_get marker)"
 BASE_ANDROID_ID="$(cat "$TMP/baseline.json" | json_get androidId)"
@@ -140,7 +163,28 @@ compare_phase recreate
 
 log "stop-up: verify persistence across stop -> up"
 xenoid_cli stop >/dev/null 2>&1 || fail "stop failed"
-xenoid_cli up --skip-build >/dev/null 2>&1 || fail "up after stop failed"
+if ! xenoid_cli up --skip-build >"$TMP/up-after-stop.log" 2>&1; then
+  python3 - "$TMP/up-after-stop.log" <<'PY' >&2
+import json
+import sys
+
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+code = None
+for line in raw.splitlines():
+    line = line.strip()
+    if line.startswith("{") and '"error"' in line:
+        try:
+            code = json.loads(line).get("error") or code
+        except ValueError:
+            continue
+if code is None and '"error":' in raw:
+    import re
+    match = re.search(r'"error":\s*"([a-z0-9_]+)"', raw)
+    code = match.group(1) if match else None
+print(f"up after stop failed: {code or raw[-200:]}")
+PY
+  exit 1
+fi
 collect_probe stopped > "$TMP/stopped.json"
 compare_phase stopped
 

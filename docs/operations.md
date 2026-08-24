@@ -5,15 +5,15 @@
 Requirements: Apple Silicon, macOS, Homebrew, Python 3.9 or newer, and at least 8 GB of allocatable memory.
 
 Clone this repository as `xenoid`, then:
-
 ```bash
 cd xenoid
 ./xenoid install-runtime
+./xenoid init --config examples/config-macos-colima.json
 ./xenoid up
 ./xenoid view
 ```
 
-`install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs and initializes the `default` instance from `examples/config-macos-colima.json` when absent. It does not start Android.
+`install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs; `init` remains the explicit instance-creation step.
 
 `up` is the sole production convergence owner. It validates/reuses artifacts, ensures a content-addressed image only when needed, selects the minimum safe runtime action, reconciles independent components, and returns success only after fresh `LiveAcceptance` for the final runtime. Healthy repeated runs are no-ops apart from fresh observation; daemon/helper/proxy-only drift does not recreate the container.
 
@@ -40,14 +40,14 @@ Multiple instances share one Colima VM (macOS) or one Docker engine/binderfs (Li
 Artifact builds use content-addressed records plus output-directory locks: disjoint targets/instances can proceed concurrently, while shared output directories serialize. Runtime images are shared by immutable content identity rather than per-instance mutable tags. Shared kmod/eBPF protection is deployed once per Docker engine host and reused by all matching instances.
 
 ```bash
-./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-a init --config examples/config-macos-colima.json --no-google-services
 ./xenoid --instance phone-b init --from phone-a
 ./xenoid --instance phone-a up
 ./xenoid --instance phone-b up
 ./xenoid --instance phone-a stop
 ```
 
-Device identity is generated once per instance. `device regenerate` publishes all stable/network/SIM/data/rootfs targets once in a v2 journal, then recreates and converges through the shared executor; configured Google packages are cleared only after fresh pre-Google acceptance. Plain `up` resumes a validated v2 transaction. A v1-only journal blocks until the operator explicitly runs `device regenerate --restart-legacy-transaction`.
+Device identity is generated once per instance. `device regenerate` publishes all stable/network/SIM/data/rootfs targets once in a v2 journal, then recreates and converges through the shared executor; for any configured non-`none` Google provider, fresh pre-Google acceptance gates clearing exactly `com.google.android.gms`, `com.google.android.gsf`, and `com.android.vending`. Plain `up` resumes a validated v2 transaction. A v1-only journal blocks until the operator explicitly runs `device regenerate --restart-legacy-transaction`.
 
 ## Linux ARM
 
@@ -128,32 +128,49 @@ Configuration examples:
 
 Local configuration and runtime state belong under `.xenoid/` and must not be committed.
 
-## Optional Google Play services
+## Google Play services (default)
 
-The default provider/release pair is `none`/`none`. The only accepted enabled pair is `mindthegapps`/`MindTheGapps-13.0.0-arm64-20231025_200931`. The runtime must remain Android 13/API 33, `arm64-v8a`, and product `raven`; custom Docker arguments are rejected because they would make container identity ambiguous.
+New instances default to provider/release `microg`/`microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0` for Android 13/API 33, `arm64-v8a`, and product `raven`. Use `init --no-google-services` only when an instance must be created without GMS. The retired `mindthegapps` pair remains loadable for observation and private source verification, but is never selectable as a runtime.
 
-Prerequisites:
+Xenoid does not redistribute proprietary Google binaries in source or release archives. On the first ordinary `up`, it automatically downloads these exact upstream assets over HTTPS into ignored local state and validates every registered size, SHA-256, certificate, package, signer, SDK, ABI, fake-signature, and Maps-flavor contract before publishing them:
 
-- the official `MindTheGapps-13.0.0-arm64-20231025_200931.zip`;
-- the `release.x509.pem` asset from the same [upstream GitHub release](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931);
-- JDK `keytool`/`jarsigner` and Android SDK `aapt2`/`apksigner` (installed and checked by `./xenoid install-runtime`);
-- a fresh initialized instance with no Docker data volume or Android storage state.
+- [`MindTheGapps-13.0.0-arm64-20231025_200931`](https://github.com/MindTheGapps/13.0.0-arm64/releases/tag/MindTheGapps-13.0.0-arm64-20231025_200931): `MindTheGapps-13.0.0-arm64-20231025_200931.zip` and `release.x509.pem`, used only as the retired Phonesky/Store-policy source;
+- [microG GmsCore `v0.3.15.250932`](https://github.com/microg/GmsCore/releases/tag/v0.3.15.250932): the standard `com.google.android.gms-250932030.apk` asset, not the `-hw` or user-preview variant;
+- [microG GsfProxy `v0.1.0`](https://github.com/microg/GsfProxy/releases/tag/v0.1.0): download `GsfProxy.apk` and rename it to the pinned import basename `com.google.android.gsf-8.apk`;
+- JDK `keytool`/`jarsigner` and Android SDK `aapt2`/`apksigner`, installed and checked by `./xenoid install-runtime`.
+
+Manual or offline pre-staging remains available:
 
 ```bash
 ./xenoid --instance play init --config examples/config-macos-colima.json
 ./xenoid --instance play google-services import-mindthegapps \
   /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
   /path/to/release.x509.pem
-./xenoid --instance play google-services enable
+./xenoid --instance play google-services import-microg \
+  /path/to/com.google.android.gms-250932030.apk \
+  /path/to/com.google.android.gsf-8.apk
 ./xenoid --instance play up
 ./xenoid --instance play google-services status --require-runtime
 ```
 
-Import is project-scoped and repeatable. It accepts only the exact pinned filenames and bytes, copies from regular non-symlink sources, performs no network access, uses `0700` directories and `0600` files, and publishes the final private asset directory atomically. Failure output uses stable error codes and never returns source or stored paths.
+For an explicit no-GMS instance:
 
-`enable` selects the pinned Google identity. When an image is required, `up` publishes a content-addressed image whose immutable record binds base image ID, Google specification/data-compatibility inputs, artifact closure, and boot policy; it commits the instance binding only after PackageManager readiness. A later provider/release mismatch fails without touching `/data`; create a new instance instead. `disable` has the same fresh-instance restriction.
+```bash
+./xenoid --instance no-gms init \
+  --config examples/config-macos-colima.json \
+  --no-google-services
+./xenoid --instance no-gms up
+```
 
-Ordinary `up` automatically reuses a compatible running or stopped runtime. `--skip-build` only validates the prebuilt artifact/object records; there is no runtime-reuse override.
+Automatic acquisition and manual imports are project-scoped, repeatable, and converge through the same deep validation and atomic `0700`/`0600` publication path. Automatic acquisition accepts only the metadata-derived pinned GitHub release URLs; manual imports perform no network access. MCP and remote control never accept import paths or bytes. Failure output uses stable error codes and never returns stored paths.
+
+`enable` remains available only for a fresh instance that was explicitly created without GMS. When an image is required, `up` publishes a content-addressed image whose immutable record binds both source releases, all component bytes/signers/paths, framework signature policy, product policy, artifact closure, and boot policy. Any provider, release, policy, or signer change after data creation requires a new instance; Xenoid never wipes or migrates `/data`. An old MindTheGapps-configured instance fails with `google_services_release_retired` and a create-new-instance action without touching its data.
+
+The image applies `restricted-spoofing` only to the official microG `com.google.android.gms`, using the behavior pinned from LineageOS commits `6d2955f0bd55e9938d5d49415182c27b50900b95` and `53e2f4b85ce836360dd58bdb2f0d7f42dc796443`. PackageManager `signatures`, `signingInfo`, and `forceQueryable` are changed only when the package, real microG signer, and requested Google certificate all match. The APK remains microG-signed on disk; GsfProxy and Phonesky keep matching API-visible/on-disk signers. This detectable exception is not Google equivalence.
+
+No Google SetupWizard is installed. `ro.setupwizard.mode` remains unchanged and AOSP `Provision` remains installed. Product policy enables the required account, background-service, messaging, location, and Store integration without granting a general signature-spoofing permission.
+
+Status v2 reports `implementation=microg`, `signatureModel=restricted-spoofing`, `storeImplementation=google-play`, exact factory/effective components, immutable binding and image/rootfs identity, live checks, and capability state. Ordinary `up` requires minimal live health for runtime-tier `googlePlayServices`, `accountAuth`, `cloudMessaging`, `fusedLocation`, and `playStore`; it does not run cloud/API tests. Full release-tier `fcmDelivery`, `fusedLocationBehavior`, `maps`, `auth`, and `playStoreOperations` are claimed only by the packaged release attestation, and Maps uses `microg-mapbox-maplibre`. `playIntegrity`, `deviceCertification`, `drm`, and `antiCheat` are always `unsupported`.
 
 Focused smoke commands are explicit validation operations. They do not call doctor from inside the runtime transaction, and production convergence/regeneration never calls them:
 
@@ -162,9 +179,9 @@ Focused smoke commands are explicit validation operations. They do not call doct
 ./scripts/smoke-google-services-convergence.sh --instance play
 ```
 
-The focused smoke installs an ordinary non-debuggable app that verifies the three packages, discovers the framework `com.google` account authenticator, binds GMS Core through its exported service, and resolves the Play Store launcher. It does not submit account credentials; account login remains a manual acceptance step. Play Integrity verdicts and Google device certification are explicitly `unsupported`/`notEvaluated` until separately proven. If Google reports the device as uncertified, follow Google's [uncertified-device registration](https://www.google.com/android/uncertified/) process; Xenoid does not automate it.
+The runtime smoke uses an ordinary non-debuggable probe to validate component/signature policy, authenticator, broker, FCM registrar, fused provider, Store launcher, process stability, and the negative signature-spoof boundary. Once-per-release cloud/API and Play Store operations are separate release-gate inputs and may be reflected publicly only through sanitized `evidence/google-services-release.json`.
 
-Xenoid publishes only the verification metadata needed for reproducibility. Google application binaries remain subject to their upstream terms and are never included in Xenoid source, release archives, or OTA bundles.
+Xenoid publishes only verification metadata and a normalized release attestation needed for reproducibility. Imported APK/ZIP/certificate bytes and private test evidence remain local and are never included in Xenoid source, release archives, or OTA bundles.
 
 ## Remote Linux Docker engine
 
@@ -350,7 +367,7 @@ python -m pip install frida-tools
 
 The production template is Android 13 Pixel 6 Pro `raven`, model `G8V0U`, build `TP1A.221005.002`/`9012097`, shipping API 31. Profile application converges SettingsProvider, partition/property-area identity, display/input, native sensor and camera HAL inputs, battery, memory/storage, and reboot-persistent data. Recollect the complete profile after a change.
 
-`device regenerate` creates a private `dev.xenoid.device-regenerate/v2` transaction and generates every stable/network/SIM/data/rootfs target exactly once before mutation. It quarantines, removes the owned container, commits each fixed target idempotently, and invokes the convergence executor directly. Fresh pre-Google acceptance gates the allowlisted package clears; fresh final acceptance gates journal deletion. User data, installed apps, keystore state, proxy/Keybox semantics, and location country/carrier are preserved.
+`device regenerate` creates a private `dev.xenoid.device-regenerate/v2` transaction and generates every stable/network/SIM/data/rootfs target exactly once before mutation. It quarantines, removes the owned container, commits each fixed target idempotently, and invokes the convergence executor directly. For any configured non-`none` Google provider, fresh pre-Google acceptance gates clearing exactly `com.google.android.gms`, `com.google.android.gsf`, and `com.android.vending`; fresh final acceptance gates journal deletion. User data, installed apps, keystore state, proxy/Keybox semantics, and location country/carrier are preserved.
 
 An interrupted v2 transaction is resumable by either `device regenerate` or plain `up`; both reuse recorded targets and completed phases. A legacy v1 journal lacks the values required for exactly-once recovery, so ordinary `up` fails `device_regeneration_legacy_pending`. The only destructive escape is `./xenoid device regenerate --restart-legacy-transaction`, which records a digest of the v1 evidence and atomically publishes a complete v2 target before mutation; factors already changed by v1 may rotate once more.
 
@@ -390,9 +407,9 @@ A matching module/link/map inventory is reused across instances. eBPF replacemen
 ./xenoid verify-release dist/release/xenoid-0.1.0.tar.gz
 ```
 
-Normal builds reuse content-addressed artifact records; `--force` rebuilds and rejects nondeterministic output for an unchanged input/tool identity. Release packaging runs the non-recursive release gate profile fresh, stages validated immutable objects, creates canonical OTA/package archives with fixed `SOURCE_DATE_EPOCH`, and requires `verify-release` on the candidate before publication. Packaged `doctor.json` is deliberately offline with `complete=false`; sanitized gate evidence is not a live-runtime claim.
+Normal builds reuse content-addressed artifact records; `--force` rebuilds and rejects nondeterministic output for an unchanged input/tool identity. Release packaging runs the non-recursive release gate profile fresh, stages validated immutable objects, creates canonical OTA/package archives with fixed `SOURCE_DATE_EPOCH`, and requires `verify-release` on the candidate before publication. A selectable microG provider requires the fresh `release-google` profile and packages only its normalized `evidence/google-services-release.json`; ordinary offline evidence never claims live Google capability.
 
-Public releases exclude imported Google bytes, credentials/tokens/cookies, private registry/endpoint details, proxy sources or keys, Keybox bytes, runtime state, captures/device identifiers, workstation paths, and assessment details.
+Public releases exclude imported Google bytes, credentials/tokens/cookies, private registry/endpoint details, proxy sources or keys, Keybox bytes, raw/private Google acceptance evidence, runtime state, captures/device identifiers, workstation paths, and assessment details. The sanitized Google release attestation may contain only immutable identities, artifact/reproducibility proofs, bounded versions, and capability booleans.
 
 ## OTA
 

@@ -39,7 +39,7 @@ The daemon is listener-first: transport binds before component reconciliation, a
 Initialize instances locally first:
 
 ```bash
-./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-a init --config examples/config-macos-colima.json --no-google-services
 ./xenoid --instance phone-b init --from phone-a
 ```
 

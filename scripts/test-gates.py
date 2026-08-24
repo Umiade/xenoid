@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
+import stat
 import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from xenoid.gates import GateRunner, GateSpec
+from xenoid.gates import (
+    GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA,
+    GOOGLE_ATTESTATION_SCHEMA,
+    GOOGLE_CUTOVER_SCHEMA,
+    GOOGLE_REPRODUCIBILITY_SCHEMA,
+    GOOGLE_SMOKE_GATE_SCHEMA,
+    GATE_DEPENDENCY_SNAPSHOT_SCHEMA,
+    PROFILE_TARGETS,
+    GateRunner,
+    GateSpec,
+    catalog,
+)
 from xenoid.process import run_bounded
 
 
@@ -19,11 +32,344 @@ def require(value: bool, message: str) -> None:
     if not value:
         raise AssertionError(message)
 
+def canonical_document(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def catalog_contract() -> None:
+    specs = catalog()
+    expected_new = {
+        "google-runtime",
+        "google-reproducibility",
+        "google-provider-cutover-contract",
+        "google-release-acceptance",
+        "release-google",
+    }
+    require(expected_new <= set(specs), "Google release gate set is incomplete")
+    require(
+        specs["google-runtime"].command
+        == ("scripts/smoke-google-services-gate.sh",)
+        and not specs["google-runtime"].cacheable
+        and not specs["google-runtime"].runtime_free
+        and specs["google-runtime"].mutating
+        and specs["google-runtime"].privileged,
+        "google-runtime does not use the non-recursive gate wrapper",
+    )
+    require(
+        specs["google-provider-cutover-contract"].dependencies
+        == ("runtime-image-contract",)
+        and specs["google-provider-cutover-contract"].runtime_free
+        and not specs["google-provider-cutover-contract"].mutating,
+        "provider cutover contract policy drifted",
+    )
+    require(
+        specs["google-reproducibility"].dependencies
+        == ("runtime-image-contract", "google-provider-cutover-contract")
+        and not specs["google-reproducibility"].runtime_free
+        and specs["google-reproducibility"].mutating
+        and specs["google-reproducibility"].privileged,
+        "Google reproducibility gate policy drifted",
+    )
+    require(
+        specs["google-release-acceptance"].dependencies
+        == (
+            "google-runtime",
+            "google-reproducibility",
+            "google-provider-cutover-contract",
+        )
+        and specs["google-release-acceptance"].sensitive
+        and not specs["google-release-acceptance"].runtime_free
+        and not specs["google-release-acceptance"].mutating
+        and specs["google-release-acceptance"].privileged,
+        "Google release acceptance policy drifted",
+    )
+    require(
+        specs["release-google"].dependencies
+        == (
+            "static",
+            "release-source-contract",
+            "google-provider-cutover-contract",
+            "google-release-acceptance",
+        ),
+        "release-google aggregate closure drifted",
+    )
+    require(
+        specs["release"].dependencies
+        == (
+            "static",
+            "release-source-contract",
+            "google-provider-cutover-contract",
+        ),
+        "ordinary release aggregate lost cutover closure",
+    )
+    require(
+        PROFILE_TARGETS
+        == {
+            "verify": "verify",
+            "static": "ci-static",
+            "runtime": "ci-runtime",
+            "full": "ci-full",
+            "doctor": "doctor-default",
+            "doctor-full": "doctor-full",
+            "release": "release",
+            "release-google": "release-google",
+            "audit": "audit",
+        },
+        "profile targets drifted",
+    )
+    require(
+        all(
+            not spec.cacheable
+            for spec in specs.values()
+            if spec.sensitive or spec.category == "release"
+        ),
+        "sensitive or release gate became cacheable",
+    )
+
+
+def stdout_document_and_attestation_contract(root: Path) -> None:
+    def output_command(document: dict[str, object]) -> tuple[str, ...]:
+        return (
+            sys.executable,
+            "-c",
+            f"import sys;sys.stdout.write({canonical_document(document)!r})",
+        )
+
+    dependency_documents = {
+        "google-runtime": {"schema": GOOGLE_SMOKE_GATE_SCHEMA, "ok": True},
+        "google-reproducibility": {
+            "schema": GOOGLE_REPRODUCIBILITY_SCHEMA,
+            "ok": True,
+        },
+        "google-provider-cutover-contract": {
+            "schema": GOOGLE_CUTOVER_SCHEMA,
+            "ok": True,
+            "mode": "production",
+        },
+    }
+    acceptance_program = (
+        "import json,sys;"
+        "d=json.load(sys.stdin);"
+        f"assert d['schema']=={GATE_DEPENDENCY_SNAPSHOT_SCHEMA!r};"
+        "assert set(d)=={'schema','dependencies'};"
+        "deps=d['dependencies'];"
+        "assert set(deps)=={'google-runtime','google-reproducibility','google-provider-cutover-contract'};"
+        "assert all(set(v)=={'state','inputSha256','result'} and v['state']=='passed' "
+        "and isinstance(v['inputSha256'],str) and isinstance(v['result'],dict) "
+        "for v in deps.values());"
+        f"sys.stdout.write({canonical_document({'schema': GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA, 'ok': True})!r})"
+    )
+    specs = {
+        name: GateSpec(
+            name=name,
+            command=output_command(document),
+            inputs=("input.txt",),
+            cacheable=False,
+        )
+        for name, document in dependency_documents.items()
+    }
+    specs["google-release-acceptance"] = GateSpec(
+        name="google-release-acceptance",
+        command=(sys.executable, "-c", acceptance_program),
+        inputs=("input.txt",),
+        dependencies=(
+            "google-runtime",
+            "google-reproducibility",
+            "google-provider-cutover-contract",
+        ),
+        cacheable=False,
+        sensitive=True,
+    )
+    runner = GateRunner(
+        root,
+        specs=specs,
+        cache_root=root / ".document-cache",
+        lock_root=root / ".document-locks",
+    )
+    report = runner.run(
+        ["google-release-acceptance"],
+        deadline=time.monotonic() + 30,
+    )
+    require(report["ok"] is True, "canonical gate stdout or dependency stdin failed")
+    require(
+        report["gates"]["google-release-acceptance"]["acceptance"]
+        == {"schema": GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA, "ok": True},
+        "normalized acceptance stdout was not retained",
+    )
+    for name, document in dependency_documents.items():
+        require(
+            report["gates"][name]["result"] == document,
+            f"{name} canonical stdout was not retained",
+        )
+
+    noisy = GateRunner(
+        root,
+        specs={
+            "google-runtime": GateSpec(
+                name="google-runtime",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import sys;"
+                    f"sys.stdout.write('progress\\n'+{canonical_document(dependency_documents['google-runtime'])!r})",
+                ),
+                inputs=("input.txt",),
+                cacheable=False,
+            )
+        },
+        cache_root=root / ".noisy-cache",
+        lock_root=root / ".noisy-locks",
+    ).run(["google-runtime"], deadline=time.monotonic() + 30)
+    require(
+        noisy["gates"]["google-runtime"].get("errorCode")
+        == "gate_result_document_invalid",
+        "stdout diagnostics were accepted by a document gate",
+    )
+    missing_newline = GateRunner(
+        root,
+        specs={
+            "google-runtime": GateSpec(
+                name="google-runtime",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import sys;"
+                    f"sys.stdout.write({canonical_document(dependency_documents['google-runtime']).rstrip()!r})",
+                ),
+                inputs=("input.txt",),
+                cacheable=False,
+            )
+        },
+        cache_root=root / ".newline-cache",
+        lock_root=root / ".newline-locks",
+    ).run(["google-runtime"], deadline=time.monotonic() + 30)
+    require(
+        missing_newline["gates"]["google-runtime"].get("errorCode")
+        == "gate_result_document_invalid",
+        "stdout document without one trailing LF was accepted",
+    )
+
+
+    missing_snapshot = GateRunner(
+        root,
+        specs={
+            "google-release-acceptance": GateSpec(
+                name="google-release-acceptance",
+                command=output_command(
+                    {"schema": GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA, "ok": True}
+                ),
+                inputs=("input.txt",),
+                cacheable=False,
+            )
+        },
+        cache_root=root / ".missing-cache",
+        lock_root=root / ".missing-locks",
+    ).run(["google-release-acceptance"], deadline=time.monotonic() + 30)
+    require(
+        missing_snapshot["gates"]["google-release-acceptance"].get("errorCode")
+        == "gate_dependency_snapshot_unavailable",
+        "acceptance ran without its same-invocation dependency snapshot",
+    )
+
+    acceptance = {
+        "schema": GOOGLE_ACCEPTANCE_NORMALIZED_SCHEMA,
+        "provider": "microg",
+        "release": "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0",
+        "specSha256": "1" * 64,
+        "runtimeInputSha256": "2" * 64,
+        "imageId": "sha256:" + "3" * 64,
+        "privateEvidenceSha256": "4" * 64,
+        "freshDataProofSha256": "5" * 64,
+        "testArtifacts": {},
+        "reproducibility": {},
+        "effectivePlayStoreVersionCode": 83041711,
+        "effectivePlayStoreSignerMatches": True,
+        "checks": {},
+    }
+    runtime_gate_input = "6" * 64
+    publication = runner.publish_google_release_attestation(
+        {
+            "ok": True,
+            "gates": {
+                "google-runtime": {
+                    "state": "passed",
+                    "inputSha256": runtime_gate_input,
+                },
+                "google-release-acceptance": {
+                    "state": "passed",
+                    "acceptance": acceptance,
+                },
+            },
+        }
+    )
+    require(publication is not None, "valid normalized acceptance was not published")
+    attestation = publication["attestation"]
+    require(
+        attestation.get("schema") == GOOGLE_ATTESTATION_SCHEMA
+        and "privateEvidenceSha256" not in attestation,
+        "private acceptance data leaked into the public attestation",
+    )
+    normalized_sha = hashlib.sha256(
+        canonical_document(acceptance).encode("ascii")
+    ).hexdigest()
+    require(
+        attestation.get("gateInputsSha256")
+        == {
+            "google-runtime": runtime_gate_input,
+            "google-release-acceptance": normalized_sha,
+        },
+        "attestation gate input closure drifted",
+    )
+    published_path = Path(publication["path"])
+    published_bytes = published_path.read_bytes()
+    require(
+        published_bytes == canonical_document(attestation).encode("ascii"),
+        "attestation file is not canonical JSON",
+    )
+    require(
+        stat.S_IMODE(published_path.stat().st_mode) == 0o600,
+        "attestation file mode is not private",
+    )
+    require(
+        stat.S_IMODE(published_path.parent.stat().st_mode) == 0o700,
+        "attestation directory mode is not private",
+    )
+    require(
+        hashlib.sha256(published_bytes).hexdigest() == publication["sha256"],
+        "attestation evidence key does not cover its exact bytes",
+    )
+    rejected_publication = runner.publish_google_release_attestation(
+        {
+            "ok": True,
+            "gates": {
+                "google-runtime": {
+                    "state": "passed",
+                    "inputSha256": runtime_gate_input,
+                },
+                "google-release-acceptance": {
+                    "state": "passed",
+                    "acceptance": {**acceptance, "unexpected": True},
+                },
+            },
+        }
+    )
+    require(
+        rejected_publication is None,
+        "attestation publisher accepted an extra normalized field",
+    )
+
 
 def main() -> int:
+    catalog_contract()
     with tempfile.TemporaryDirectory(prefix="xenoid-gates-contract-") as raw:
         root = Path(raw)
         (root / "input.txt").write_text("one\n", encoding="utf-8")
+        stdout_document_and_attestation_contract(root)
         counter = root / "counter.txt"
         command = (
             sys.executable,

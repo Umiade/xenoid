@@ -851,7 +851,13 @@ class RuntimeImageBuilder:
                 "payloadSha256": _digest([]),
             }
         try:
-            from .google_services import quick_validate_assets
+            from .google_services import (
+                GOOGLE_RELEASE_SCHEMA_V2,
+                MINDTHEGAPPS_RELEASE,
+                asset_paths,
+                load_release_spec,
+                quick_validate_assets,
+            )
 
             quick_validate_assets(self.project_root, google_spec)
             provider = str(google_spec.provider)
@@ -860,11 +866,67 @@ class RuntimeImageBuilder:
             data_sha = _require_sha256(
                 google_spec.data_compatibility_fingerprint, "runtime_image_google_input_invalid"
             )
+            metadata_sha = _require_sha256(google_spec.metadata_sha256, "runtime_image_google_input_invalid")
+            if google_spec.schema == GOOGLE_RELEASE_SCHEMA_V2:
+                source_spec = load_release_spec(self.project_root, MINDTHEGAPPS_RELEASE)
+                quick_validate_assets(self.project_root, source_spec)
+                own_manifest = asset_paths(self.project_root, google_spec)["manifest"].read_bytes()
+                source_manifest = asset_paths(self.project_root, source_spec)["manifest"].read_bytes()
+                phonesky = google_spec.component("playStoreSeed")
+                component_set_sha = _digest(
+                    [
+                        {
+                            "id": str(item["id"]),
+                            "package": str(item["package"]),
+                            "runtimePath": str(item["runtimePath"]),
+                            "sha256": _require_sha256(item["sha256"], "runtime_image_google_input_invalid"),
+                            "size": int(item["size"]),
+                            "signingCertificateHistorySha256": [
+                                _require_sha256(entry, "runtime_image_google_input_invalid")
+                                for entry in item["signingCertificateHistorySha256"]
+                            ],
+                            "nativeAbis": [str(abi) for abi in item["nativeAbis"]],
+                            "privileged": bool(item["privileged"]),
+                        }
+                        for item in google_spec.components
+                    ]
+                )
+                signature_policy = google_spec.signature_policy
+                product_policy = google_spec.product_policy
+                return {
+                    "provider": provider,
+                    "release": release,
+                    "specSha256": spec_sha,
+                    "dataCompatibilitySha256": data_sha,
+                    "metadataSha256": metadata_sha,
+                    "providerSchema": str(google_spec.schema),
+                    "componentSetSha256": component_set_sha,
+                    "importManifestSha256": hashlib.sha256(own_manifest).hexdigest(),
+                    "sourceImportManifestSha256": hashlib.sha256(source_manifest).hexdigest(),
+                    "sourceMetadataSha256": _require_sha256(
+                        source_spec.metadata_sha256, "runtime_image_google_input_invalid"
+                    ),
+                    "playStoreSeedSha256": _require_sha256(phonesky["sha256"], "runtime_image_google_input_invalid"),
+                    "signaturePolicySha256": _digest(dict(signature_policy)),
+                    "productPolicySha256": _digest(dict(product_policy)),
+                    "payloadSha256": _digest(
+                        [
+                            {
+                                "runtimePath": str(item["runtimePath"]),
+                                "sha256": _require_sha256(item["sha256"], "runtime_image_google_input_invalid"),
+                                "size": int(item["size"]),
+                            }
+                            for item in sorted(
+                                google_spec.components,
+                                key=lambda entry: str(entry["runtimePath"]).encode("utf-8"),
+                            )
+                        ]
+                    ),
+                }
             archive_sha = _require_sha256(google_spec.archive["sha256"], "runtime_image_google_input_invalid")
             certificate_sha = _require_sha256(
                 google_spec.archive["certificate"]["sha256"], "runtime_image_google_input_invalid"
             )
-            metadata_sha = _require_sha256(google_spec.metadata_sha256, "runtime_image_google_input_invalid")
             payload_sha = _digest(
                 [
                     {
@@ -1117,10 +1179,9 @@ class RuntimeImageBuilder:
             )
             if google_spec is not None:
                 try:
-                    from .google_services import _asset_paths, _stage_payload, cleanup_stage, verify_context_copy
+                    from .google_services import _stage_payload, cleanup_stage, verify_context_copy
 
-                    zip_path, _, _ = _asset_paths(self.project_root, google_spec)
-                    google_handle = _stage_payload(zip_path, google_spec)
+                    google_handle = _stage_payload(self.project_root, google_spec)
                     google_verifier = verify_context_copy
                     environment.update(
                         {

@@ -20,7 +20,7 @@ A successful `up` means the runtime, daemon, device profile, protection, storage
 - Token-gated root operations without an application-visible `su` path.
 - KeyMint/keybox, camera media injection, sensor, radio, input, application, automation, OTA, Frida, and MCP controls.
 - Engine-scoped kmod/eBPF protection shared safely across multiple instances.
-- Optional, locally imported MindTheGapps runtime. Play Integrity and Google device certification are not claimed.
+- Image-bound composite microG runtime enabled by default for new instances.
 
 Frida is an explicit inspection capability. It is never part of normal production startup. Credentials, proxy sources, keyboxes, imported Google binaries, captures, and runtime state remain local and untracked.
 
@@ -49,8 +49,6 @@ Xenoid supports one production architecture: an ARM64 host running Android 13 `6
 ```bash
 ./xenoid install-runtime
 ./xenoid init --config examples/config-macos-colima.json
-./xenoid up
-./xenoid view
 ```
 
 ### Linux ARM64
@@ -58,7 +56,13 @@ Xenoid supports one production architecture: an ARM64 host running Android 13 `6
 ```bash
 sudo ./scripts/setup-linux-binderfs.sh
 ./xenoid init --config examples/config-linux-arm.json
+```
+
+New instances enable Google services by default. The first `up` downloads the exact pinned third-party assets over HTTPS, verifies all release, hash, certificate, package, signer, SDK, and ABI contracts, and keeps the bytes only in ignored `.xenoid/` state:
+
+```bash
 ./xenoid up
+./xenoid view
 ```
 
 Run `init` once per instance. Later calls to `up` reuse healthy artifacts, images, storage, and containers.
@@ -85,7 +89,7 @@ Run `init` once per instance. Later calls to `up` reuse healthy artifacts, image
 
 ```bash
 ./xenoid instance list
-./xenoid --instance phone-a init --config examples/config-macos-colima.json
+./xenoid --instance phone-a init --config examples/config-macos-colima.json --no-google-services
 ./xenoid --instance phone-a up
 ./xenoid --instance phone-a status
 ```
@@ -140,21 +144,10 @@ python -m pip install frida-tools
 ./xenoid frida stop
 ```
 
-### Optional Google Services
+### Google Services
 
-Import is local-only and must happen before the instance has Android data:
+New instances default to `microg` release `microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0`; use `init --no-google-services` to disable it explicitly. The first `up` securely acquires and verifies the pinned assets; details and manual fallback commands are in [operations](docs/operations.md#google-play-services-default).
 
-```bash
-./xenoid --instance play init --config examples/config-macos-colima.json
-./xenoid --instance play google-services import-mindthegapps \
-  /path/to/MindTheGapps-13.0.0-arm64-20231025_200931.zip \
-  /path/to/release.x509.pem
-./xenoid --instance play google-services enable
-./xenoid --instance play up
-./xenoid --instance play google-services status --require-runtime
-```
-
-Xenoid verifies the pinned release, archive inventory, member digests, package versions, signer histories, and ABI before accepting it. Google binaries are not downloaded implicitly or included in Xenoid releases.
 
 ### MCP, Build, and Verification
 
@@ -188,6 +181,8 @@ Xenoid stands on upstream work. Credit belongs where it was earned:
 
 - [Android Open Source Project](https://source.android.com/)
 - [redroid](https://github.com/remote-android/redroid-doc)
+- [microG](https://microg.org/)
+- [LineageOS for microG](https://github.com/lineageos4microg)
 - [MindTheGapps](https://gitlab.com/MindTheGapps/vendor_gapps)
 - [TEESimulator](https://github.com/JingMatrix/TEESimulator)
 - [Frida](https://frida.re/)

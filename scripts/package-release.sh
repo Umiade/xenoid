@@ -51,19 +51,42 @@ Path(os.environ["OUTPUT"]).write_text(
 PY
 }
 capture_inventory "$STAGE/source-before.json"
+# The provider cutover contract selects the release profile: the complete
+# production microG cutover requires release-google; the complete reverse
+# cutover requires the ordinary release profile; anything mixed fails here.
+CUTOVER_JSON="$STAGE/cutover.json"
+PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 "$ROOT/scripts/test-google-provider-cutover.py" > "$CUTOVER_JSON" || {
+  echo "google_provider_cutover_invalid" >&2
+  exit 1
+}
+GATE_PROFILE="$(python3 - "$CUTOVER_JSON" <<'PY'
+import json
+import sys
+
+document = json.loads(open(sys.argv[1], encoding="utf-8").read())
+mode = document.get("mode") if document.get("ok") is True else None
+print({"production": "release-google", "disabled-clean": "release"}.get(mode, ""))
+PY
+)"
+if [[ "$GATE_PROFILE" != "release-google" && "$GATE_PROFILE" != "release" ]]; then
+  echo "google_provider_cutover_invalid" >&2
+  exit 1
+fi
 # Direct release calls consume the same fresh, non-recursive gate owner as CI.
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m xenoid.gates release --fresh > "$STAGE/raw-gate-evidence.json"
-RAW_GATES="$STAGE/raw-gate-evidence.json" OUTPUT="$REL/gate-evidence.json" python3 - <<'PY'
+  python3 -m xenoid.gates "$GATE_PROFILE" --fresh > "$STAGE/raw-gate-evidence.json"
+RAW_GATES="$STAGE/raw-gate-evidence.json" OUTPUT="$REL/gate-evidence.json" EXPECTED_PROFILE="$GATE_PROFILE" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
 
 raw = json.loads(Path(os.environ["RAW_GATES"]).read_text(encoding="utf-8"))
+profile = os.environ["EXPECTED_PROFILE"]
 if (
     raw.get("schema") != "dev.xenoid.gates/v1"
     or raw.get("ok") is not True
-    or raw.get("profile") != "release"
+    or raw.get("profile") != profile
     or raw.get("fresh") is not True
     or raw.get("failedGate") is not None
     or not isinstance(raw.get("gates"), dict)
@@ -81,7 +104,7 @@ for name, result in sorted(raw["gates"].items()):
 evidence = {
     "schema": "dev.xenoid.gates/v1",
     "ok": True,
-    "profile": "release",
+    "profile": profile,
     "fresh": True,
     "failedGate": None,
     "gates": gates,
@@ -91,6 +114,42 @@ Path(os.environ["OUTPUT"]).write_text(
     encoding="utf-8",
 )
 PY
+if [[ "$GATE_PROFILE" == "release-google" ]]; then
+  RAW_GATES="$STAGE/raw-gate-evidence.json" DEST="$REL/evidence/google-services-release.json" ROOT="$ROOT" python3 - <<'PY'
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path
+
+raw = json.loads(Path(os.environ["RAW_GATES"]).read_text(encoding="utf-8"))
+published = raw.get("googleReleaseAttestation")
+if not isinstance(published, dict):
+    raise SystemExit("google_release_attestation_missing")
+path = Path(str(published.get("path") or ""))
+expected = str(published.get("sha256") or "")
+root = Path(os.environ["ROOT"]).resolve()
+try:
+    resolved = path.resolve()
+except OSError:
+    raise SystemExit("google_release_attestation_invalid")
+parent = root / ".xenoid" / "cache" / "gates" / "google-release-attestations"
+if resolved.parent != parent or resolved.name != f"{expected}.json":
+    raise SystemExit("google_release_attestation_invalid")
+info = resolved.lstat()
+if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+    raise SystemExit("google_release_attestation_invalid")
+payload = resolved.read_bytes()
+if len(expected) != 64 or hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("google_release_attestation_mismatch")
+document = json.loads(payload)
+if document.get("schema") != "dev.xenoid.google-release-attestation/v1":
+    raise SystemExit("google_release_attestation_invalid")
+destination = Path(os.environ["DEST"])
+destination.parent.mkdir(parents=True, exist_ok=True)
+destination.write_bytes(payload)
+PY
+fi
 
 ROOT="$ROOT" ARTIFACT_STAGE="$ARTIFACT_STAGE" RELEASE_DEADLINE="$RELEASE_DEADLINE" PYTHONPATH="$ROOT/src" python3 - <<'PY'
 import os

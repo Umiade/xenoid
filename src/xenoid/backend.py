@@ -19,6 +19,7 @@ import time
 import threading
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import tempfile
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Mapping, Optional
@@ -59,7 +60,11 @@ from .google_services import (
     GOOGLE_LABEL_PROVIDER,
     GOOGLE_LABEL_RELEASE,
     GOOGLE_LABEL_SPEC,
-    PROVIDER_MINDTHEGAPPS,
+    GOOGLE_RELEASE_SCHEMA_V2,
+    MICROG_FAKE_CERT_SHA256,
+    MICROG_PLAY_RELEASE,
+    MICROG_REAL_CERT_SHA256,
+    PROVIDER_MICROG,
     PROVIDER_NONE,
     GoogleBindingStore,
     GoogleServicesError,
@@ -68,6 +73,7 @@ from .google_services import (
     binding_matches,
     capability_model,
     expected_binding_identity,
+    factory_components,
     load_release_spec,
     public_binding,
     quick_validate_assets,
@@ -438,7 +444,7 @@ class RuntimeManager:
         elif info["system"] == "Linux" and info["machine"] not in {"arm64", "aarch64"}:
             checks.append(Check("linux-arm", False, f"machine={info['machine']}", "Use a Linux ARM host"))
         checks.append(Check("backend", True, self.cfg.backend))
-        if self.cfg.google_services_provider == PROVIDER_MINDTHEGAPPS:
+        if self.cfg.google_services_provider != PROVIDER_NONE:
             for command in ("keytool", "jarsigner", "aapt2", "apksigner"):
                 resolved = which(command)
                 checks.append(
@@ -4657,6 +4663,16 @@ cat >/dev/null
         self,
         spec: Optional[ReleaseSpec],
     ) -> dict[str, Any]:
+        if spec is None:
+            return self._google_services_gate_absent()
+        if spec.provider == PROVIDER_MICROG:
+            return self._google_services_gate_microg(spec)
+        raise GoogleServicesError(
+            "google_services_release_retired",
+            "the configured Google services release is retired; create a new instance with a production release",
+        )
+
+    def _google_services_gate_absent(self) -> dict[str, Any]:
         packages: dict[str, Any] = {}
         package_ok = True
         for package in (
@@ -4667,13 +4683,12 @@ cat >/dev/null
             path = self.adb(["shell", "pm", "path", package], timeout=20)
             output = str(path.get("stdout") or "").strip()
             present = path.get("ok") is True and "package:" in output
-            expected = spec is not None
             packages[package] = {
                 "present": present,
-                "expected": expected,
+                "expected": False,
                 "path": output if present else None,
             }
-            package_ok = package_ok and present is expected
+            package_ok = package_ok and not present
         release = self.adb(["shell", "getprop", "ro.build.version.release"])
         abilist = self.adb(["shell", "getprop", "ro.product.cpu.abilist"])
         product = self.adb(["shell", "getprop", "ro.build.product"])
@@ -4682,94 +4697,11 @@ cat >/dev/null
             and str(product.get("stdout") or "").strip() == "raven"
             and str(abilist.get("stdout") or "").strip() == "arm64-v8a"
         )
-        launcher: dict[str, Any] = {"ok": spec is None, "skipped": spec is None}
-        system_flags: dict[str, Any] = {
-            "ok": spec is None,
-            "skipped": spec is None,
-        }
-        provision: dict[str, Any] = {
-            "ok": True,
-            "skipped": spec is None,
-            "present": False,
-        }
-        if spec is not None:
-            resolved = self.adb(
-                [
-                    "shell",
-                    "cmd",
-                    "package",
-                    "resolve-activity",
-                    "--brief",
-                    "-a",
-                    "android.intent.action.MAIN",
-                    "-c",
-                    "android.intent.category.LAUNCHER",
-                    "com.android.vending",
-                ],
-                timeout=20,
-            )
-            resolved_lines = [
-                line.strip()
-                for line in str(resolved.get("stdout") or "").splitlines()
-                if line.strip()
-            ]
-            resolved_text = resolved_lines[-1] if resolved_lines else ""
-            launcher = {
-                "ok": resolved.get("ok") is True
-                and resolved_text.startswith("com.android.vending/"),
-                "component": resolved_text,
-            }
-            flags = self.adb(
-                [
-                    "shell",
-                    "dumpsys",
-                    "package",
-                    "com.google.android.gms",
-                ],
-                timeout=30,
-            )
-            flags_text = str(flags.get("stdout") or "")
-            system_flags = {
-                "ok": flags.get("ok") is True
-                and (
-                    "SYSTEM" in flags_text
-                    or "system_ext/priv-app/GmsCore" in flags_text
-                    or "product/priv-app/GmsCore" in flags_text
-                ),
-                "updatedSystemApp": "UPDATED_SYSTEM_APP" in flags_text,
-            }
-            provision_path = self.adb(
-                ["shell", "pm", "path", "com.android.provision"],
-                timeout=20,
-            )
-            provision_present = (
-                "package:" in str(provision_path.get("stdout") or "")
-            )
-            provision_absence_checked = (
-                provision_path.get("ok") is True
-                or (
-                    provision_path.get("returncode") == 1
-                    and not str(provision_path.get("stderr") or "").strip()
-                )
-            )
-            provision = {
-                "ok": provision_absence_checked and not provision_present,
-                "present": provision_present,
-            }
-        ok = bool(
-            package_ok
-            and platform_ok
-            and launcher.get("ok")
-            and system_flags.get("ok")
-            and provision.get("ok")
-        )
+        ok = bool(package_ok and platform_ok)
         return {
             "ok": ok,
-            "provider": spec.provider if spec is not None else PROVIDER_NONE,
+            "provider": PROVIDER_NONE,
             "packages": packages,
-            "launcher": launcher,
-            "systemPackage": system_flags,
-            "provisionConflict": provision,
             "platform": {
                 "release": str(release.get("stdout") or "").strip(),
                 "product": str(product.get("stdout") or "").strip(),
@@ -4781,9 +4713,509 @@ cat >/dev/null
                 if ok
                 else {
                     "error": "google_services_runtime_not_ready",
-                    "message": "Android PackageManager Google services bootstrap gate failed",
+                    "message": "unexpected Google services packages are present",
                 }
             ),
+        }
+
+    # -- microG minimal live acceptance -------------------------------------
+
+    _EXIT_REASONS_IGNORE = {
+        "EXIT_SELF",
+        "LOW_MEMORY",
+        "USER_REQUESTED",
+        "USER_STOPPED",
+        "OTHER",
+        "FREEZER",
+        "PACKAGE_STATE_CHANGE",
+        "PACKAGE_UPDATED",
+    }
+    _EXIT_REASONS_FAIL_ONCE = {"ANR", "INITIALIZATION_FAILURE"}
+    _EXIT_REASONS_CRASH_CLASS = {
+        "SIGNALED",
+        "CRASH",
+        "CRASH_NATIVE",
+        "EXCESSIVE_RESOURCE_USAGE",
+        "DEPENDENCY_DIED",
+    }
+    _EXIT_REASON_BY_CODE = {
+        1: "EXIT_SELF",
+        2: "SIGNALED",
+        3: "LOW_MEMORY",
+        4: "CRASH",
+        5: "CRASH_NATIVE",
+        6: "ANR",
+        7: "INITIALIZATION_FAILURE",
+        9: "EXCESSIVE_RESOURCE_USAGE",
+        10: "USER_REQUESTED",
+        11: "USER_STOPPED",
+        12: "DEPENDENCY_DIED",
+        13: "OTHER",
+        14: "FREEZER",
+        15: "PACKAGE_STATE_CHANGE",
+        16: "PACKAGE_UPDATED",
+    }
+
+    def _adb_shell_text(self, args: list[str], timeout: float = 20) -> Optional[str]:
+        result = self.adb(["shell", *args], timeout=timeout)
+        if result.get("ok") is not True:
+            return None
+        return str(result.get("stdout") or "")
+
+    def _adb_read_file_bytes(self, device_path: str, timeout: float, max_bytes: int) -> Optional[bytes]:
+        adb_bin = which("adb")
+        if adb_bin is None:
+            return None
+        owned, _ = self._owned_container()
+        if not owned:
+            return None
+        try:
+            proc = run(
+                [adb_bin, "-s", self.adb_target, "exec-out", "cat", "--", device_path],
+                capture_output=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0 or not proc.stdout or len(proc.stdout) > max_bytes:
+            return None
+        return bytes(proc.stdout)
+
+    def _device_file_sha256(self, device_path: str) -> Optional[str]:
+        for command in (["sha256sum", device_path], ["toybox", "sha256sum", device_path]):
+            output = self._adb_shell_text(command, timeout=60)
+            if output:
+                match = re.match(r"^([0-9a-f]{64})\s", output.strip())
+                if match:
+                    return match.group(1)
+        return None
+
+    def _apk_signer_history(self, apk_bytes: bytes) -> Optional[list[str]]:
+        apksigner = which("apksigner")
+        if apksigner is None:
+            sdk_root = os.environ.get("ANDROID_SDK_ROOT")
+            candidate = Path(sdk_root) / "build-tools" / "35.0.0" / "apksigner" if sdk_root else None
+            apksigner = str(candidate) if candidate is not None and candidate.exists() else None
+        if apksigner is None:
+            return None
+        with tempfile.TemporaryDirectory(prefix="xenoid-gate-apk-") as temp:
+            apk_path = Path(temp) / "component.apk"
+            apk_path.write_bytes(apk_bytes)
+            apk_path.chmod(0o600)
+            try:
+                proc = run(
+                    [apksigner, "verify", "--verbose", "--print-certs", str(apk_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            except Exception:
+                return None
+        if proc.returncode != 0:
+            return None
+        history: list[str] = []
+        for line in proc.stdout.splitlines():
+            if " certificate SHA-256 digest: " in line:
+                digest = line.rsplit(": ", 1)[1].strip().lower()
+                if digest not in history:
+                    history.append(digest)
+        return history or None
+
+    def _microg_component_record(
+        self,
+        spec: ReleaseSpec,
+        component: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        package = str(component["package"])
+        factory_path = str(component["runtimePath"])
+        min_version = int(component["versionCode"])
+        pinned_history = [str(item) for item in component["signingCertificateHistorySha256"]]
+        record: dict[str, Any] = {
+            "package": package,
+            "codePath": None,
+            "versionCode": None,
+            "versionName": None,
+            "signerSha256": None,
+            "enabled": False,
+            "system": False,
+            "privileged": False,
+            "updatedSystemApp": False,
+            "processState": "failed",
+            "ok": False,
+            "code": "google_services_component_mismatch",
+        }
+        path_output = self._adb_shell_text(["pm", "path", package], timeout=20)
+        code_path = ""
+        for line in (path_output or "").splitlines():
+            if line.startswith("package:"):
+                code_path = line[len("package:"):].strip()
+                break
+        if not code_path:
+            return record
+        record["codePath"] = code_path
+        enabled_list = self._adb_shell_text(["pm", "list", "packages", "-e", package], timeout=20)
+        record["enabled"] = enabled_list is not None and f"package:{package}" in enabled_list
+        dump = self._adb_shell_text(["dumpsys", "package", package], timeout=30)
+        if not dump:
+            return record
+        version_code_match = re.search(r"^\s*versionCode=(\d+)", dump, flags=re.MULTILINE)
+        version_name_match = re.search(r"^\s*versionName=(\S*)", dump, flags=re.MULTILINE)
+        flags_match = re.search(r"^\s*flags=\[(.*?)\]", dump, flags=re.MULTILINE)
+        private_flags_match = re.search(r"^\s*privateFlags=\[(.*?)\]", dump, flags=re.MULTILINE)
+        if version_code_match is None or private_flags_match is None or flags_match is None:
+            return record
+        version_code = int(version_code_match.group(1))
+        flags = flags_match.group(1)
+        private_flags = private_flags_match.group(1)
+        record["versionCode"] = version_code
+        record["versionName"] = version_name_match.group(1) if version_name_match else None
+        record["system"] = "SYSTEM" in flags
+        record["privileged"] = "PRIVILEGED" in private_flags
+        record["updatedSystemApp"] = "UPDATED_SYSTEM_APP" in private_flags
+        if version_code < min_version:
+            return record
+        if not (record["enabled"] and record["system"] and record["privileged"]):
+            return record
+        if code_path == factory_path:
+            digest = self._device_file_sha256(code_path)
+            if digest is None or digest != str(component["sha256"]):
+                return record
+            record["signerSha256"] = pinned_history[0]
+        else:
+            if not record["updatedSystemApp"] or not code_path.startswith("/data/app/"):
+                return record
+            apk_bytes = self._adb_read_file_bytes(code_path, timeout=120, max_bytes=512 * 1024 * 1024)
+            if apk_bytes is None:
+                return record
+            history = self._apk_signer_history(apk_bytes)
+            if history != pinned_history:
+                return record
+            record["signerSha256"] = history[0]
+        record["ok"] = True
+        record["code"] = None
+        return record
+
+    @staticmethod
+    def _parse_exit_info(payload: str, packages: set[str]) -> Optional[list[dict[str, Any]]]:
+        """Parse dumpsys activity exit-info, returning records for the given packages."""
+        records: list[dict[str, Any]] = []
+        tracked = False
+        current_package = ""
+        pending: Optional[dict[str, Any]] = None
+        for line in payload.splitlines():
+            stripped = line.strip()
+            package_match = re.match(r"^package: (\S+)$", stripped)
+            if package_match:
+                if pending is not None:
+                    return None
+                current_package = package_match.group(1)
+                tracked = current_package in packages
+                continue
+            if not tracked:
+                continue
+            if stripped.startswith("Historical Process Exit"):
+                continue
+            if stripped.startswith("ApplicationExitInfo"):
+                if pending is not None:
+                    return None
+                pending = {"package": current_package}
+                continue
+            if stripped.startswith("timestamp="):
+                if pending is None:
+                    return None
+                timestamp_match = re.match(
+                    r"^timestamp=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.\d+)?\s+pid=\d+",
+                    stripped,
+                )
+                if timestamp_match is None:
+                    return None
+                pending["timestamp"] = timestamp_match.group(1)
+                continue
+            if stripped.startswith("process="):
+                if pending is None or "timestamp" not in pending:
+                    return None
+                reason_match = re.search(r"\breason=(\d+)", stripped)
+                if reason_match is None:
+                    return None
+                pending["reasonCode"] = int(reason_match.group(1))
+                records.append(pending)
+                pending = None
+                continue
+        if pending is not None:
+            return None
+        return records
+
+    @staticmethod
+    def _parse_exit_timestamp(value: str, tz_offset: str) -> Optional[float]:
+        match = re.fullmatch(r"([+-])(\d{2})(\d{2})", tz_offset or "")
+        offset = 0
+        if match:
+            sign = 1 if match.group(1) == "+" else -1
+            offset = sign * (int(match.group(2)) * 3600 + int(match.group(3)) * 60)
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%y %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(value[:19], fmt)
+            except ValueError:
+                continue
+            return parsed.replace(tzinfo=timezone.utc).timestamp() - offset
+        return None
+
+    def _microg_exit_history(self, packages: set[str], deadline: float) -> dict[str, Any]:
+        unavailable = {"ok": False, "code": "google_services_process_unstable", "detail": "exitInfoUnavailable"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return unavailable
+        payload = self._adb_shell_text(
+            ["dumpsys", "activity", "exit-info"],
+            timeout=min(20.0, max(1.0, remaining)),
+        )
+        if payload is None or not payload.strip():
+            return unavailable
+        encoded = payload.encode("utf-8", "replace")
+        if len(encoded) > 256 * 1024:
+            return unavailable
+        records = self._parse_exit_info(payload, packages)
+        if records is None or len(records) > 32:
+            return unavailable
+        uptime_output = self._adb_shell_text(["cat", "/proc/uptime"], timeout=10)
+        epoch_output = self._adb_shell_text(["date", "+%s"], timeout=10)
+        zone_output = self._adb_shell_text(["date", "+%z"], timeout=10)
+        if not uptime_output or not epoch_output:
+            return unavailable
+        try:
+            uptime_seconds = float(uptime_output.split()[0])
+            now_seconds = int(epoch_output.strip())
+        except (ValueError, IndexError):
+            return unavailable
+        boot_epoch = now_seconds - uptime_seconds
+        relevant: dict[str, list[dict[str, Any]]] = {package: [] for package in packages}
+        for record in records:
+            package = record["package"]
+            if package not in relevant:
+                continue
+            reason = self._EXIT_REASON_BY_CODE.get(record["reasonCode"])
+            if reason is None:
+                return unavailable
+            timestamp = self._parse_exit_timestamp(record["timestamp"], (zone_output or "").strip())
+            if timestamp is None:
+                return unavailable
+            if timestamp < boot_epoch - 60:
+                continue
+            relevant[package].append({"reason": reason, "timestamp": timestamp})
+        now = time.time()
+        for package, entries in relevant.items():
+            crash_recent = 0
+            for entry in entries:
+                reason = entry["reason"]
+                if reason in self._EXIT_REASONS_IGNORE:
+                    continue
+                if reason in self._EXIT_REASONS_FAIL_ONCE:
+                    return {"ok": False, "code": "google_services_process_unstable", "detail": f"{package}:{reason}"}
+                if reason in self._EXIT_REASONS_CRASH_CLASS and now - entry["timestamp"] <= 600:
+                    crash_recent += 1
+            if crash_recent >= 2:
+                return {"ok": False, "code": "google_services_process_unstable", "detail": f"{package}:crashLoop"}
+        return {"ok": True, "code": None, "detail": None}
+
+    def _microg_process_identity(self, process: str) -> Optional[tuple[int, int]]:
+        pid_output = self._adb_shell_text(["pidof", process], timeout=10)
+        if not pid_output or not pid_output.strip().isdigit():
+            return None
+        pid = int(pid_output.strip())
+        stat_output = self._adb_shell_text(["cat", f"/proc/{pid}/stat"], timeout=10)
+        if not stat_output:
+            return None
+        try:
+            start_ticks = int(stat_output.rsplit(")", 1)[1].split()[19])
+        except (ValueError, IndexError):
+            return None
+        return pid, start_ticks
+
+    def _microg_process_stability(self, components: Mapping[str, Any], deadline: float) -> dict[str, Any]:
+        unstable = {"ok": False, "code": "google_services_process_unstable"}
+        first = self._microg_process_identity("com.google.android.gms:persistent")
+        if first is None:
+            return {**unstable, "detail": "gmsCorePersistentMissing"}
+        time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
+        second = self._microg_process_identity("com.google.android.gms:persistent")
+        if second is None or second != first:
+            return {**unstable, "detail": "gmsCorePersistentRestarted"}
+        history = self._microg_exit_history(
+            {"com.google.android.gms", "com.android.vending"},
+            deadline,
+        )
+        if history.get("ok") is not True:
+            return history
+        store_state = "dormant"
+        store_identity = self._microg_process_identity("com.android.vending")
+        if store_identity is not None:
+            store_state = "stable"
+        else:
+            receivers = self._adb_shell_text(
+                [
+                    "cmd",
+                    "package",
+                    "query-receivers",
+                    "-a",
+                    "android.intent.action.BOOT_COMPLETED",
+                    "com.android.vending",
+                ],
+                timeout=20,
+            )
+            enabled = components.get("playStoreSeed", {}).get("enabled") is True
+            if receivers is None or "com.android.vending" not in receivers or not enabled:
+                store_state = "failed"
+                return {**unstable, "detail": "playStoreDormantInvalid"}
+        return {"ok": True, "code": None, "detail": None, "playStoreState": store_state}
+
+    def _google_services_gate_microg(self, spec: ReleaseSpec) -> dict[str, Any]:
+        deadline = time.monotonic() + 120.0
+        checks: dict[str, Any] = {}
+
+        components: dict[str, Any] = {}
+        components_ok = True
+        for component in spec.components:
+            record = self._microg_component_record(spec, component)
+            components[str(component["id"])] = record
+            components_ok = components_ok and record["ok"] is True
+        checks["components"] = {
+            "ok": components_ok,
+            "code": None if components_ok else "google_services_component_mismatch",
+        }
+
+        policy_ok = True
+        gms_dump = self._adb_shell_text(["dumpsys", "package", "com.google.android.gms"], timeout=30)
+        if not gms_dump:
+            policy_ok = False
+        else:
+            for permission in (
+                "android.permission.CHANGE_DEVICE_IDLE_TEMP_WHITELIST",
+                "android.permission.UPDATE_DEVICE_STATS",
+                "android.permission.POST_NOTIFICATIONS",
+            ):
+                if f"{permission}: granted=true" not in gms_dump:
+                    policy_ok = False
+                    break
+        if policy_ok:
+            whitelist = self._adb_shell_text(["dumpsys", "deviceidle", "whitelist"], timeout=20)
+            if whitelist is None or "com.google.android.gms" not in whitelist:
+                policy_ok = False
+        checks["productPolicy"] = {
+            "ok": policy_ok,
+            "code": None if policy_ok else "google_services_policy_mismatch",
+        }
+
+        signature_ok = bool(
+            components.get("gmsCore", {}).get("ok") is True
+            and components["gmsCore"]["signerSha256"] == MICROG_REAL_CERT_SHA256
+            and components.get("gsfProxy", {}).get("ok") is True
+            and components.get("playStoreSeed", {}).get("ok") is True
+        )
+        if signature_ok:
+            desired: dict[str, Any] = {}
+            try:
+                desired = self.selected_runtime_image(spec=spec)
+            except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError):
+                desired = {}
+            image, _ = self._inspect_docker_object("image", str(desired.get("derivedTag") or ""))
+            config = image.get("Config") if isinstance(image, dict) else None
+            labels = config.get("Labels") if isinstance(config, dict) else None
+            labels = labels if isinstance(labels, dict) else {}
+            signature_ok = bool(
+                desired.get("imageId")
+                and isinstance(image, dict)
+                and image.get("Id") == desired.get("imageId")
+                and all(labels.get(key) == value for key, value in spec.labels.items())
+            )
+        checks["signaturePolicy"] = {
+            "ok": signature_ok,
+            "code": None if signature_ok else "google_services_signature_policy_mismatch",
+        }
+
+        service_missing = "google_services_service_unavailable"
+        authenticator_dump = self._adb_shell_text(["dumpsys", "account"], timeout=20)
+        authenticator_ok = bool(
+            authenticator_dump
+            and "AuthenticatorDescription {type=com.google}" in authenticator_dump
+            and "com.google.android.gms/" in authenticator_dump
+        )
+        checks["accountAuthenticator"] = {
+            "ok": authenticator_ok,
+            "code": None if authenticator_ok else service_missing,
+        }
+
+        def _service_owner(action: str) -> Optional[str]:
+            output = self._adb_shell_text(
+                ["cmd", "package", "query-services", "--brief", "-a", action, "com.google.android.gms"],
+                timeout=20,
+            )
+            if not output or "services found" not in output:
+                return None
+            for line in output.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("com.google.android.gms/"):
+                    return stripped
+            return None
+
+        broker_ok = _service_owner("com.google.android.gms.common.service.START") is not None
+        checks["boundBroker"] = {"ok": broker_ok, "code": None if broker_ok else service_missing}
+        registrar_ok = _service_owner("com.google.android.c2dm.intent.REGISTER") is not None
+        checks["fcmRegistrar"] = {"ok": registrar_ok, "code": None if registrar_ok else service_missing}
+        fused_ok = (
+            _service_owner("com.google.android.location.internal.GoogleLocationManagerService.START")
+            is not None
+        )
+        checks["fusedProvider"] = {"ok": fused_ok, "code": None if fused_ok else service_missing}
+
+        resolved = self.adb(
+            [
+                "shell",
+                "cmd",
+                "package",
+                "resolve-activity",
+                "--brief",
+                "-a",
+                "android.intent.action.MAIN",
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "com.android.vending",
+            ],
+            timeout=20,
+        )
+        resolved_lines = [
+            line.strip()
+            for line in str(resolved.get("stdout") or "").splitlines()
+            if line.strip()
+        ]
+        resolved_text = resolved_lines[-1] if resolved_lines else ""
+        launcher_ok = resolved.get("ok") is True and resolved_text.startswith("com.android.vending/")
+        checks["playStoreLauncher"] = {
+            "ok": launcher_ok,
+            "code": None if launcher_ok else service_missing,
+        }
+
+        if components_ok:
+            stability = self._microg_process_stability(components, deadline)
+        else:
+            stability = {"ok": False, "code": "google_services_component_mismatch", "detail": "componentsUnavailable"}
+        checks["processStability"] = {"ok": stability.get("ok") is True, "code": stability.get("code")}
+        store_state = stability.get("playStoreState")
+        if isinstance(store_state, str) and components.get("playStoreSeed", {}).get("ok") is True:
+            components["playStoreSeed"]["processState"] = store_state
+        if stability.get("ok") is True and components.get("gmsCore", {}).get("ok") is True:
+            components["gmsCore"]["processState"] = "stable"
+        if components.get("gsfProxy", {}).get("ok") is True:
+            components["gsfProxy"]["processState"] = "dormant"
+
+        ok = all(check.get("ok") is True for check in checks.values())
+        for component in components.values():
+            component.pop("ok", None)
+            component.pop("code", None)
+        return {
+            "ok": ok,
+            "checks": checks,
+            "error": None if ok else "google_services_runtime_not_ready",
+            "components": components,
         }
 
     def _select_convergence_image(
@@ -5261,6 +5693,27 @@ cat >/dev/null
         )
         if result["daemonForward"].get("ok") is not True:
             return {**result, "ok": False, "error": "daemon_forward_failed"}
+        try:
+            storage_state = StorageStateStore(self.context, self.lease).load()
+        except StorageError:
+            storage_state = None
+        if isinstance(storage_state, Mapping) and storage_state.get("state") == "committed":
+            # A committed runtime already owns the daemon app: starting the
+            # container must also establish the bounded daemon transport before
+            # later phases observe daemon-owned state (storage sentinel, gates).
+            result["daemonTransport"] = self.wait_daemon_transport(
+                max(1.0, min(120.0, deadline - time.monotonic())),
+                allow_activity_launch=False,
+            )
+            if result["daemonTransport"].get("ok") is not True:
+                return {
+                    **result,
+                    "ok": False,
+                    "error": str(
+                        result["daemonTransport"].get("error")
+                        or "daemon_transport_timeout"
+                    ),
+                }
         return result
 
     def start_seed_runtime(
@@ -5799,7 +6252,7 @@ cat >/dev/null
             and spec is not None
             and binding_matches(binding, spec)
             and binding.get("state") == "committed"
-        ) if provider == PROVIDER_MINDTHEGAPPS else (
+        ) if provider != PROVIDER_NONE else (
             binding is None
             or (
                 binding_matches(binding, None)
@@ -5963,15 +6416,25 @@ cat >/dev/null
             and container_labels_match is True
             and command_match is True
         )
-        live: dict[str, Any] = {
-            "ok": False,
-            "skipped": True,
-            "reason": "Android runtime is not running",
-        }
+        live: dict[str, Any] = {"ok": False, "checks": None, "error": None}
+        effective_components: Optional[dict[str, Any]] = None
         if running:
-            live = self.google_services_bootstrap_gate(spec)
+            gate = self.google_services_bootstrap_gate(spec)
+            if spec is not None and spec.provider == PROVIDER_MICROG:
+                effective_components = gate.get("components")
+                live = {
+                    "ok": gate.get("ok") is True,
+                    "checks": gate.get("checks"),
+                    "error": gate.get("error"),
+                }
+            else:
+                live = {
+                    "ok": gate.get("ok") is True,
+                    "checks": None,
+                    "error": gate.get("error"),
+                }
 
-        configured = provider == PROVIDER_MINDTHEGAPPS
+        configured = provider != PROVIDER_NONE
         ready = bool(
             configured
             and host_ready
@@ -6011,11 +6474,26 @@ cat >/dev/null
         model = capability_model(provider, runtime_state)
         selected = f"./xenoid --instance {self.context.instance_name}"
         next_actions: list[str] = []
-        if configured and not host_ready:
+        if error == "google_services_release_retired":
             next_actions.append(
-                f"{selected} google-services import-mindthegapps "
-                f"<{release}.zip> <release.x509.pem>"
+                "the configured Google services release is retired; create a new instance with "
+                f"the microG production release ({MICROG_PLAY_RELEASE}); existing data is never migrated"
             )
+        if configured and not host_ready and error != "google_services_release_retired":
+            if provider == PROVIDER_MICROG:
+                next_actions.append(
+                    f"{selected} google-services import-mindthegapps "
+                    f"<MindTheGapps-13.0.0-arm64-20231025_200931.zip> <release.x509.pem>"
+                )
+                next_actions.append(
+                    f"{selected} google-services import-microg "
+                    "<com.google.android.gms-250932030.apk> <com.google.android.gsf-8.apk>"
+                )
+            else:
+                next_actions.append(
+                    f"{selected} google-services import-mindthegapps "
+                    f"<{release}.zip> <release.x509.pem>"
+                )
         if configured and not running:
             next_actions.append(f"{selected} up")
         elif configured and not ready:
@@ -6064,6 +6542,7 @@ cat >/dev/null
                 "skipped": not owned_container,
             },
             "live": live,
+            "effectiveComponents": effective_components,
             **model,
             "error": error,
             "nextActions": next_actions,
@@ -8905,6 +9384,8 @@ cat >/dev/null
     def wait_daemon_transport(
         self,
         timeout: float = _DAEMON_TRANSPORT_TIMEOUT_SECONDS,
+        *,
+        allow_activity_launch: bool = True,
     ) -> dict[str, Any]:
         """Bind and prove the listener without consulting aggregate health."""
         started = time.monotonic()
@@ -8949,7 +9430,7 @@ cat >/dev/null
                     "midpointRecovery": recovered,
                 }
             now = time.monotonic()
-            if launches == 0:
+            if launches == 0 and allow_activity_launch:
                 launch_remaining = remaining(_DAEMON_TRANSPORT_TIMEOUT_SECONDS)
                 if launch_remaining <= 0:
                     continue
@@ -8965,7 +9446,7 @@ cat >/dev/null
                 forward_remaining = remaining(_DAEMON_TRANSPORT_TIMEOUT_SECONDS)
                 if forward_remaining > 0:
                     self.forward_daemon_port(timeout=forward_remaining)
-            elif not recovered and now >= midpoint:
+            elif not recovered and allow_activity_launch and now >= midpoint:
                 force_stop_remaining = remaining(10.0)
                 if force_stop_remaining <= 0:
                     continue

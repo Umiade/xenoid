@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 import stat
 import sys
@@ -286,7 +287,12 @@ def _self_check(root: Path) -> int:
     package = (root / "scripts/package-release.sh").read_text(encoding="utf-8")
     verifier = (root / "scripts/verify-release.py").read_text(encoding="utf-8")
     canonical = root / "scripts/canonical-tar.py"
-    _check(checks, "fresh-gate-owner", "xenoid.gates release --fresh" in package)
+    _check(
+        checks,
+        "fresh-gate-owner",
+        'xenoid.gates "$GATE_PROFILE" --fresh' in package
+        and "test-google-provider-cutover.py" in package,
+    )
     _check(checks, "artifact-snapshot", "ArtifactBuilder" in package and ".stage(" in package)
     _check(checks, "canonical-ota", "make-ota-bundle.sh" in package and canonical.is_file())
     _check(checks, "canonical-release", "canonical-tar.py" in package)
@@ -304,6 +310,160 @@ def _self_check(root: Path) -> int:
     }
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0 if report["ok"] else 1
+
+
+
+_GOOGLE_ATTESTATION_KEYS = {
+    "schema",
+    "provider",
+    "release",
+    "specSha256",
+    "runtimeInputSha256",
+    "imageId",
+    "freshDataProofSha256",
+    "testArtifacts",
+    "reproducibility",
+    "effectivePlayStoreVersionCode",
+    "effectivePlayStoreSignerMatches",
+    "checks",
+    "gateInputsSha256",
+}
+_GOOGLE_ATTESTATION_CHECKS = {
+    "fcmTokenRegistration",
+    "fcmForeground",
+    "fcmBackgroundDoze",
+    "fcmAfterReboot",
+    "fusedCoarse",
+    "fusedFineContinuous",
+    "fusedPermissionDenied",
+    "fusedProviderUnavailable",
+    "mapsInitialize",
+    "mapsRender",
+    "authSuccess",
+    "authDenied",
+    "playStoreSelfUpdate",
+    "playStoreLogin",
+    "playStoreInstallFree",
+    "playStoreForegroundUpdate",
+    "playStoreBackgroundUpdate",
+    "playStoreAfterReboot",
+    "gmsCoreDifferentSignerRejected",
+    "providerNoAnr",
+    "providerNoCrashLoop",
+    "gmsCoreProcessStable",
+    "playStoreStableOrDormant",
+    "artifactReproducible",
+    "runtimeImageReproducible",
+    "contentTagReused",
+    "noOpConvergencePass1",
+    "noOpConvergencePass2",
+    "instrumentationInactive",
+}
+_GOOGLE_PROBE_COORDINATES = [
+    "com.google.android.gms:play-services-auth:21.6.0",
+    "com.google.android.gms:play-services-base:18.10.1",
+    "com.google.android.gms:play-services-location:21.4.0",
+    "com.google.android.gms:play-services-maps:20.0.0",
+    "com.google.firebase:firebase-messaging:25.1.2",
+]
+_GOOGLE_REPRODUCIBILITY_KEYS = {
+    "artifactManifestSha256A",
+    "artifactManifestSha256B",
+    "contextManifestSha256A",
+    "contextManifestSha256B",
+    "inputSha256A",
+    "inputSha256B",
+    "bootInputSha256A",
+    "bootInputSha256B",
+    "imageIdA",
+    "imageIdB",
+}
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _google_attestation_valid(payload) -> bool:
+    if payload is None or len(payload) > 256 * 1024:
+        return False
+    try:
+        document = json.loads(payload)
+    except (ValueError, UnicodeError):
+        return False
+    if not isinstance(document, dict) or set(document) != _GOOGLE_ATTESTATION_KEYS:
+        return False
+    if payload != _canonical_json(document):
+        return False
+    if (
+        document["schema"] != "dev.xenoid.google-release-attestation/v1"
+        or document["provider"] != "microg"
+        or document["release"] != "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0"
+    ):
+        return False
+    for key in ("specSha256", "runtimeInputSha256", "freshDataProofSha256"):
+        if not isinstance(document[key], str) or _HEX64_RE.fullmatch(document[key]) is None:
+            return False
+    image_id = document["imageId"]
+    if (
+        not isinstance(image_id, str)
+        or not image_id.startswith("sha256:")
+        or _HEX64_RE.fullmatch(image_id[7:]) is None
+    ):
+        return False
+    test_artifacts = document["testArtifacts"]
+    if not isinstance(test_artifacts, dict) or set(test_artifacts) != {
+        "runtimeProbePackage",
+        "runtimeProbeApkSha256",
+        "cloudProbePackage",
+        "cloudProbeApkSha256",
+        "dependencyLockSha256",
+        "coordinates",
+    }:
+        return False
+    if (
+        test_artifacts["runtimeProbePackage"] != "org.example.googleservicesruntimeprobe"
+        or test_artifacts["cloudProbePackage"] != "org.example.googleservicescapabilityprobe"
+        or test_artifacts["coordinates"] != _GOOGLE_PROBE_COORDINATES
+    ):
+        return False
+    for key in ("runtimeProbeApkSha256", "cloudProbeApkSha256", "dependencyLockSha256"):
+        if not isinstance(test_artifacts[key], str) or _HEX64_RE.fullmatch(test_artifacts[key]) is None:
+            return False
+    reproducibility = document["reproducibility"]
+    if not isinstance(reproducibility, dict) or set(reproducibility) != _GOOGLE_REPRODUCIBILITY_KEYS:
+        return False
+    for key in _GOOGLE_REPRODUCIBILITY_KEYS:
+        value = reproducibility[key]
+        if key.startswith("imageId"):
+            if not isinstance(value, str) or not value.startswith("sha256:") or _HEX64_RE.fullmatch(value[7:]) is None:
+                return False
+        elif not isinstance(value, str) or _HEX64_RE.fullmatch(value) is None:
+            return False
+    for left, right in (
+        ("artifactManifestSha256A", "artifactManifestSha256B"),
+        ("contextManifestSha256A", "contextManifestSha256B"),
+        ("inputSha256A", "inputSha256B"),
+        ("bootInputSha256A", "bootInputSha256B"),
+        ("imageIdA", "imageIdB"),
+    ):
+        if reproducibility[left] != reproducibility[right]:
+            return False
+    if (
+        not isinstance(document["effectivePlayStoreVersionCode"], int)
+        or isinstance(document["effectivePlayStoreVersionCode"], bool)
+        or document["effectivePlayStoreVersionCode"] <= 83041710
+        or document["effectivePlayStoreSignerMatches"] is not True
+    ):
+        return False
+    checks = document["checks"]
+    if (
+        not isinstance(checks, dict)
+        or set(checks) != _GOOGLE_ATTESTATION_CHECKS
+        or any(value is not True for value in checks.values())
+    ):
+        return False
+    gate_inputs = document["gateInputsSha256"]
+    if not isinstance(gate_inputs, dict) or set(gate_inputs) != {"google-runtime", "google-release-acceptance"}:
+        return False
+    return all(isinstance(value, str) and _HEX64_RE.fullmatch(value) is not None for value in gate_inputs.values())
 
 
 def verify(archive: Path) -> dict[str, Any]:
@@ -477,14 +637,33 @@ def verify(archive: Path) -> dict[str, Any]:
         isinstance(gate_evidence, dict)
         and gate_evidence.get("schema") == "dev.xenoid.gates/v1"
         and gate_evidence.get("ok") is True
-        and gate_evidence.get("profile") == "release"
+        and gate_evidence.get("profile") in {"release", "release-google"}
         and gate_evidence.get("fresh") is True
         and gate_evidence.get("failedGate") is None
         and isinstance(gate_evidence.get("gates"), dict)
         and gate_evidence["gates"].get("sensitive-data", {}).get("cacheHit") is False
     )
+    gate_profile = gate_evidence.get("profile") if isinstance(gate_evidence, dict) else None
+    if gate_ok and gate_profile == "release-google":
+        gate_ok = all(
+            gate_evidence["gates"].get(name, {}).get("state") == "passed"
+            for name in (
+                "google-runtime",
+                "google-reproducibility",
+                "google-provider-cutover-contract",
+                "google-release-acceptance",
+            )
+        )
     gate_digest = hashlib.sha256(gate_bytes or b"").hexdigest()
     _check(checks, "fresh-gate-evidence", gate_ok and manifest.get("gateEvidenceSha256") == gate_digest, "release_gate_evidence_invalid")
+
+    attestation_bytes = file_bytes.get("evidence/google-services-release.json")
+    attestation_ok = True
+    if gate_profile == "release-google":
+        attestation_ok = _google_attestation_valid(attestation_bytes)
+    elif attestation_bytes is not None:
+        attestation_ok = False
+    _check(checks, "google-release-attestation", attestation_ok, "release_google_attestation_invalid")
 
     doctor_bytes = file_bytes.get("doctor.json")
     try:

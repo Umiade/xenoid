@@ -28,7 +28,7 @@ EXPECTED_ROOTFS_UUID="${12:--}"
 [[ "$BACKUP_IMAGE" == "-" || "$BACKUP_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo "invalid backup image" >&2; exit 2; }
 [[ "$BACKUP_UUID" == "-" || "$BACKUP_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "invalid backup UUID" >&2; exit 2; }
 [[ "$EXPECTED_ROOTFS_UUID" == "-" || "$EXPECTED_ROOTFS_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "invalid expected rootfs UUID" >&2; exit 2; }
-[[ "$GOOGLE_PROVIDER" == "none" || "$GOOGLE_PROVIDER" == "mindthegapps" ]] || { echo "invalid Google services provider" >&2; exit 2; }
+[[ "$GOOGLE_PROVIDER" == "none" || "$GOOGLE_PROVIDER" == "mindthegapps" || "$GOOGLE_PROVIDER" == "microg" ]] || { echo "invalid Google services provider" >&2; exit 2; }
 [[ "$DATA_SIZE_BYTES" =~ ^[0-9]+$ ]] && (( DATA_SIZE_BYTES == 128000000000 )) || {
   echo "data image size must be the canonical 128000000000 bytes" >&2
   exit 2

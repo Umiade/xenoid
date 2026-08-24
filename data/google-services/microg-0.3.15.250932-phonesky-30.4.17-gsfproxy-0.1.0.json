@@ -1,0 +1,228 @@
+{
+  "android": {
+    "api": 33,
+    "archiveArch": "arm64",
+    "partitionAliases": {
+      "/product": "/system/product",
+      "/system_ext": "/system/system_ext"
+    },
+    "release": "13.0.0",
+    "runtimeAbis": [
+      "arm64-v8a"
+    ],
+    "setupWizardMode": "UNCHANGED",
+    "targetProduct": "raven"
+  },
+  "components": [
+    {
+      "basename": "com.google.android.gms-250932030.apk",
+      "id": "gmsCore",
+      "nativeAbis": [
+        "arm64-v8a",
+        "armeabi-v7a",
+        "x86",
+        "x86_64"
+      ],
+      "package": "com.google.android.gms",
+      "privileged": true,
+      "runtimePath": "/system/product/priv-app/GmsCore/GmsCore.apk",
+      "sha256": "52597e77fd25fdd347574d0457ed1936a4b9561cf4c8d34e7ac8dd8191dfd4b9",
+      "signingCertificateHistorySha256": [
+        "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+      ],
+      "size": 105948577,
+      "source": "microg",
+      "sourcePath": "com.google.android.gms-250932030.apk",
+      "versionCode": 250932030,
+      "versionName": "0.3.15.250932"
+    },
+    {
+      "basename": "com.google.android.gsf-8.apk",
+      "id": "gsfProxy",
+      "nativeAbis": [],
+      "package": "com.google.android.gsf",
+      "privileged": true,
+      "runtimePath": "/system/product/priv-app/GsfProxy/GsfProxy.apk",
+      "sha256": "86891b174301f06a1c84187b545a0a2a57044c6b768f3e84e865908743349692",
+      "signingCertificateHistorySha256": [
+        "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+      ],
+      "size": 21872,
+      "source": "gsfproxy",
+      "sourcePath": "com.google.android.gsf-8.apk",
+      "versionCode": 8,
+      "versionName": "v0.1.0"
+    },
+    {
+      "basename": "Phonesky.apk",
+      "id": "playStoreSeed",
+      "nativeAbis": [
+        "arm64-v8a"
+      ],
+      "package": "com.android.vending",
+      "privileged": true,
+      "runtimePath": "/system/product/priv-app/Phonesky/Phonesky.apk",
+      "sha256": "a2eba7f37baf3d50fd373c8436cd99acd7589835c9d2b0c9ec4c3dca830d337b",
+      "signingCertificateHistorySha256": [
+        "f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83"
+      ],
+      "size": 62447827,
+      "source": "mindthegapps",
+      "sourcePath": "system/product/priv-app/Phonesky/Phonesky.apk",
+      "versionCode": 83041710,
+      "versionName": "30.4.17-21 [0] [PR] 445549118"
+    }
+  ],
+  "integrationRevision": 2,
+  "productPolicy": {
+    "generator": "scripts/generate-microg-product-policy.py",
+    "inputs": [
+      {
+        "path": "com.google.android.gms-250932030.apk",
+        "sha256": "52597e77fd25fdd347574d0457ed1936a4b9561cf4c8d34e7ac8dd8191dfd4b9"
+      },
+      {
+        "path": "policy-inputs/api33-permissions.json",
+        "sha256": "227f6fb7feb23fca2dd24c32b43fcbf167112e002ea9fbac9ab37b4f1caa8499"
+      },
+      {
+        "path": "policy-inputs/framework-res.apk",
+        "sha256": "7a73dbb5211c34429489297ec2008f557faba7de44ed73ad8951ed76689ef2b1"
+      },
+      {
+        "path": "runtime/redroid/microg-policy/upstream/default-permissions-com.google.android.gms.xml",
+        "sha256": "2ac59e3bf0cf8fa26829c47e88edfcf63a3974faf3539a9cb2cacfbd093c886b"
+      },
+      {
+        "path": "runtime/redroid/microg-policy/upstream/microg.xml",
+        "sha256": "9a8cf951826761213342b8ea425ec031b79079c8247701696be4dcbeca3292b8"
+      },
+      {
+        "path": "runtime/redroid/microg-policy/upstream/privapp-permissions-com.google.android.gms.xml",
+        "sha256": "b7ecddf8808126f5a2acee5394ea940aee323bce140debf19bdb0fddb92feae6"
+      },
+      {
+        "path": "runtime/redroid/microg-policy/upstream/sysconfig-com.google.android.gms.xml",
+        "sha256": "9ae07a588a73c3d8322d855bd76bf243f0804a8095d6b784db4569e82f6ead92"
+      },
+      {
+        "path": "scripts/generate-microg-product-policy.py",
+        "sha256": "0692c97a8ed5d3cf9b48b209aa154f9e1cdb2c63774ef05d73d80e9d57cc6c54"
+      },
+      {
+        "path": "system/product/etc/default-permissions/default-permissions-google.xml",
+        "sha256": "3cdec8685f7d5e9dd368a82d3814ea0a2f437606362ba79bf932dd68d11f98ee"
+      },
+      {
+        "path": "system/product/etc/permissions/privapp-permissions-google-product.xml",
+        "sha256": "7b0cb5608a5ac9dd3d1e3649f4bc0783c166e2ac003a5c660dde62b9bb274394"
+      },
+      {
+        "path": "tools/aapt2-35.0.0",
+        "sha256": "1f1c73b944326a1849e9394e60cbd49f1e1937c3f9a73bd1cd7cbe7994779034"
+      }
+    ],
+    "outputs": [
+      {
+        "path": "/system/product/etc/default-permissions/default-permissions-xenoid-microg.xml",
+        "sha256": "add9276a557cb7fd2f451469b87e67cde80928fe6939863d13347998bae2173c"
+      },
+      {
+        "path": "/system/product/etc/microg.xml",
+        "sha256": "0559927a2ed2a65993929a51d929550f4f9ea2c42d950697a4ec5b1c87fbf389"
+      },
+      {
+        "path": "/system/product/etc/permissions/privapp-permissions-xenoid-microg.xml",
+        "sha256": "e6ff386860297a67cd6cd7c552cc242420c0883c7139e5258219fce6fa68deca"
+      },
+      {
+        "path": "/system/product/etc/sysconfig/xenoid-microg.xml",
+        "sha256": "0c7f014fe97387ec9ee20c366d680682d48e504814866d593a1be0a3f3408e57"
+      }
+    ],
+    "sourceCommit": "bd95ffe12653c1e8e695c841efa847af06d32a15"
+  },
+  "provider": "microg",
+  "release": "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0",
+  "runtimeRequirements": {
+    "corePackages": [
+      {
+        "factoryPath": "/system/product/priv-app/GmsCore/GmsCore.apk",
+        "minVersionCode": 250932030,
+        "package": "com.google.android.gms",
+        "privileged": true
+      },
+      {
+        "factoryPath": "/system/product/priv-app/GsfProxy/GsfProxy.apk",
+        "minVersionCode": 8,
+        "package": "com.google.android.gsf",
+        "privileged": true
+      },
+      {
+        "factoryPath": "/system/product/priv-app/Phonesky/Phonesky.apk",
+        "minVersionCode": 83041710,
+        "package": "com.android.vending",
+        "privileged": true
+      }
+    ],
+    "mapsImplementation": "microg-mapbox-maplibre",
+    "releaseCapabilities": [
+      "fcmDelivery",
+      "fusedLocationBehavior",
+      "maps",
+      "auth",
+      "playStoreOperations"
+    ],
+    "runtimeCapabilities": [
+      "googlePlayServices",
+      "accountAuth",
+      "cloudMessaging",
+      "fusedLocation",
+      "playStore"
+    ],
+    "unsupportedCapabilities": [
+      "playIntegrity",
+      "deviceCertification",
+      "drm",
+      "antiCheat"
+    ]
+  },
+  "schema": "dev.xenoid.google-release/v2",
+  "signaturePolicy": {
+    "apiFields": [
+      "signatures",
+      "signingInfo",
+      "forceQueryable"
+    ],
+    "fakeSignerSha256": "f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83",
+    "mode": "restricted-spoofing",
+    "packages": [
+      "com.google.android.gms"
+    ],
+    "realSignerSha256": "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165",
+    "sourceCommits": [
+      "6d2955f0bd55e9938d5d49415182c27b50900b95",
+      "53e2f4b85ce836360dd58bdb2f0d7f42dc796443"
+    ]
+  },
+  "sources": {
+    "gsfproxy": {
+      "commit": "2fb4385a04d73f66385b325e97ac6cc40339db48",
+      "kind": "github-release-apk",
+      "releaseUrl": "https://github.com/microg/GsfProxy/releases/tag/v0.1.0",
+      "tag": "v0.1.0"
+    },
+    "microg": {
+      "commit": "352f2d72fa52c6c3c4fdd79d575a071a0da72ad1",
+      "kind": "github-release-apk",
+      "releaseUrl": "https://github.com/microg/GmsCore/releases/tag/v0.3.15.250932",
+      "tag": "v0.3.15.250932"
+    },
+    "mindthegapps": {
+      "kind": "release-v1",
+      "metadata": "data/google-services/mindthegapps-13.0.0-arm64-20231025_200931.json",
+      "metadataSha256": "7ce33b19c10d2aa7f4c8a9ece164765fd0ceddfcfb479457b5fcf07aa4244eab",
+      "release": "MindTheGapps-13.0.0-arm64-20231025_200931"
+    }
+  }
+}

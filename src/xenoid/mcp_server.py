@@ -39,7 +39,7 @@ from .device_identity import (
     validate_identity_value,
 )
 from .process import run_bounded
-from .google_services import MINDTHEGAPPS_RELEASE
+from .google_services import MICROG_PLAY_RELEASE
 from .location import (
     DEFAULT_COUNTRY,
     LocationError,
@@ -138,7 +138,7 @@ def tools() -> list[dict[str, Any]]:
         ),
         tool(
             "xenoid_google_services_enable",
-            "Enable the one known Google services release on a fresh selected instance",
+            "Enable the pinned microG production Google services release on a fresh selected instance",
             {"release": {"type": "string"}},
         ),
         tool(
@@ -449,7 +449,7 @@ def _google_services_result(
 ) -> dict[str, Any]:
     args = _feature_args(
         runtime,
-        release=release or MINDTHEGAPPS_RELEASE,
+        release=release or MICROG_PLAY_RELEASE,
     )
     try:
         with command_timeout(3600):

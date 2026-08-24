@@ -79,20 +79,22 @@ Run/dry-run Linux binderfs setup
 Show Xenoid config
 _No parameters._
 
-## Optional Google services
+## Google services
 
-MCP exposes status and the fresh-instance provider transition, but intentionally does not accept host paths or proprietary import bytes. Import the pinned official release with the CLI before enabling it.
+New instances already select the production microG release. The first ordinary `up` automatically acquires and deeply verifies the pinned third-party assets; trusted-local `google-services import-mindthegapps <zip> <pem>` and `google-services import-microg <gmscore.apk> <gsfproxy.apk>` remain as manual/offline fallback. MCP exposes status plus fresh-instance enable/disable transitions, but intentionally accepts no host import paths or proprietary bytes.
 
 ### `xenoid_google_services_status`
-Show provider/release configuration, immutable binding, image/rootfs identity, live package readiness, and capability state.
+Show provider/release configuration, immutable binding, image/rootfs identity, exact factory/effective components, minimal live checks, and capability state. Status schema v2 includes `implementation` (`microg`), `signatureModel` (`restricted-spoofing`), and `storeImplementation` (`google-play`) for the production provider.
   - `requireRuntime` (boolean): fail unless the configured runtime is running and ready
 
+An observed retired MindTheGapps configuration reports `google_services_release_retired`; MCP does not migrate its data or make that release selectable.
+
 ### `xenoid_google_services_enable`
-Enable the known pinned release on the fixed fresh instance.
-  - `release` (string): optional; only `MindTheGapps-13.0.0-arm64-20231025_200931` is accepted
+Enable the production composite release on a fresh instance that was explicitly created without Google services.
+  - `release` (string): optional; defaults to and accepts only `microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0`
 
 ### `xenoid_google_services_disable`
-Disable Google services on the fixed fresh instance.
+Disable Google services on the fixed fresh instance. Provider/release/policy/signer transitions require new instance data.
 _No parameters._
 
 ## Daemon & root

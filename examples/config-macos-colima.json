@@ -4,8 +4,8 @@
   "runtime_image_tag": "xenoid/redroid:local",
   "auto_build_runtime_image": true,
   "docker_context": "",
-  "google_services_provider": "none",
-  "google_services_release": "none",
+  "google_services_provider": "microg",
+  "google_services_release": "microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0",
   "network_dns_servers": ["1.1.1.1", "8.8.8.8"],
   "extra_docker_args": []
 }
