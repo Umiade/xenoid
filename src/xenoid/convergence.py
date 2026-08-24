@@ -58,26 +58,6 @@ _PHASES = (
     "accepted",
 )
 _PHASE_INDEX = {name: index for index, name in enumerate(_PHASES)}
-# Phases whose effects live inside the Android guest (daemon bootstrap,
-# control channel, keymint profile, provider acceptance). They are only valid
-# within one runtime activation: a new boot epoch (start, restart, create,
-# recreate) must re-execute them even when a resumed journal completed them
-# for an earlier activation.
-_GUEST_PHASES = frozenset(
-    {
-        "live_resolved",
-        "components_deployed",
-        "control_ready",
-        "identity_converged",
-        "location_converged",
-        "keybox_converged",
-        "camera_converged",
-        "google_converged",
-        "proxy_converged",
-        "protection_converged",
-        "accepted",
-    }
-)
 _PLAN_KEYS = frozenset(
     {
         "schema",
@@ -1687,12 +1667,6 @@ class ConvergenceExecutor:
         elif journal_state is not None:
             self._validate_regeneration_capability(journal_state, regeneration_capability)
         completed = set(journal_state["completed"]) if journal_state else set()
-        if (
-            journal_state is not None
-            and journal_state.get("phase") != "accepted"
-            and plan.runtime_action in {"create", "recreate", "start", "restart"}
-        ):
-            completed -= _GUEST_PHASES
 
         if journal_state is not None and "quarantined" not in completed:
             required = bool(journal_state["proxyQuarantineRequired"])

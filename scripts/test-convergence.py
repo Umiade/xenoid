@@ -1682,6 +1682,68 @@ def mutation_crash_after_engine_boundary_resumes() -> None:
 
 
 
+@case("postGuestFailureResumesAtNextPhase")
+def post_guest_failure_resumes_at_next_phase() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["createSpecMatches"] = False
+    for component in (
+        "daemon",
+        "identity",
+        "location",
+        "proxy",
+        "keybox",
+        "camera",
+        "google",
+        "protection",
+    ):
+        snapshot["components"][component]["state"] = "unknown"
+    for component in snapshot["components"]["deploy"]:
+        snapshot["components"]["deploy"][component] = "unknown"
+
+    with manager_fixture(snapshot) as manager:
+        manager.fail_once["proxy"] = "policy_route_failed"
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False
+            and first["error"] == "policy_route_failed",
+            "post-guest failure fixture did not stop at proxy convergence",
+        )
+        retained = convergence.ConvergenceJournal(manager).load()
+        require(
+            retained is not None and retained["phase"] == "google_converged",
+            "post-guest failure journal did not retain the last completed phase",
+        )
+        calls_before = {
+            name: [entry for entry, _ in manager.calls].count(name)
+            for name in ("deploy", "control", "identity", "location", "keybox", "camera", "google")
+        }
+
+        resumed = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            resumed["ok"] is True,
+            f"post-guest phase resume failed: {resumed.get('error')}",
+        )
+        require(
+            all(
+                [entry for entry, _ in manager.calls].count(name) == count
+                for name, count in calls_before.items()
+            ),
+            "resume replayed already-journaled guest mutations",
+        )
+        require(
+            [name for name, _ in manager.calls].count("proxy") == 2,
+            "resume did not retry exactly the failed proxy phase",
+        )
+
+
 @case("thirdStateResumeRefusesMutation")
 def third_state_resume_refuses_mutation() -> None:
     with manager_fixture() as manager:

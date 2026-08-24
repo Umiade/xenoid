@@ -13,7 +13,7 @@ cd xenoid
 ./xenoid view
 ```
 
-`install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs; `init` remains the explicit instance-creation step.
+`install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs and explicitly pulls the canonical ARM64 redroid base at its pinned image identity. If direct Docker Hub access is unavailable, it uses a content-addressed mirror and rejects any identity mismatch; `up` never implicitly refreshes the base and `init` remains the explicit instance-creation step.
 
 `up` is the sole production convergence owner. It validates/reuses artifacts, ensures a content-addressed image only when needed, selects the minimum safe runtime action, reconciles independent components, and returns success only after fresh `LiveAcceptance` for the final runtime. Healthy repeated runs are no-ops apart from fresh observation; daemon/helper/proxy-only drift does not recreate the container.
 

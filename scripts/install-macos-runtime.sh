@@ -7,6 +7,13 @@ DRY=0
 [[ "${1:-}" == "--dry-run" ]] && DRY=1
 SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 NDK_VERSION="${XENOID_NDK_VERSION:-27.2.12479018}"
+read -r BASE_IMAGE BASE_IMAGE_ID < <(
+  PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from xenoid.config import DEFAULT_IMAGE, DEFAULT_IMAGE_ID; print(DEFAULT_IMAGE, DEFAULT_IMAGE_ID)'
+)
+BASE_IMAGE_REPOSITORY="${BASE_IMAGE%:*}"
+BASE_IMAGE_DIRECT="$BASE_IMAGE_REPOSITORY@$BASE_IMAGE_ID"
+BASE_IMAGE_MIRROR="docker.m.daocloud.io/$BASE_IMAGE_REPOSITORY@$BASE_IMAGE_ID"
 BINDER_SETUP='set -e; if ! sudo modprobe binder_linux 2>/dev/null; then sudo apt-get update -qq && sudo apt-get install -y -qq linux-modules-extra-$(uname -r) && sudo modprobe binder_linux; fi; sudo mkdir -p /dev/binderfs; mountpoint -q /dev/binderfs || sudo mount -t binder binder /dev/binderfs; test -e /dev/binderfs/binder-control'
 
 sdkmanager_path() {
@@ -28,11 +35,13 @@ sdkmanager_path() {
 }
 
 cmds=(
-  "brew install docker colima android-platform-tools scrcpy"
-  "brew install --cask temurin@17 android-commandlinetools"
+  "brew install docker colima android-platform-tools scrcpy openjdk@17"
+  "brew link --force openjdk@17"
+  "brew install --cask android-commandlinetools"
   "sdkmanager --sdk_root=$SDK_ROOT --licenses"
   "sdkmanager --sdk_root=$SDK_ROOT platform-tools platforms;android-35 build-tools;35.0.0 ndk;$NDK_VERSION"
   "colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8"
+  "docker pull --platform linux/arm64 $BASE_IMAGE_DIRECT (content-addressed mirror fallback)"
   "colima ssh -- sh -c '<ensure binder_linux and mount binderfs>'"
 )
 if [[ "$DRY" == 1 ]]; then
@@ -63,7 +72,7 @@ MSG
   exit 127
 fi
 
-if brew install docker colima android-platform-tools scrcpy; then
+if brew install docker colima android-platform-tools scrcpy openjdk@17; then
   :
 else
   brew_status=$?
@@ -81,7 +90,16 @@ MSG
   fi
   exit "$brew_status"
 fi
-brew install --cask temurin@17 android-commandlinetools
+JDK_PREFIX="$(brew --prefix openjdk@17)"
+JAVA_HOME="$JDK_PREFIX/libexec/openjdk.jdk/Contents/Home"
+[[ -x "$JAVA_HOME/bin/java" ]] || {
+  echo "Homebrew openjdk@17 did not provide a usable JDK" >&2
+  exit 127
+}
+export JAVA_HOME
+export PATH="$JAVA_HOME/bin:$PATH"
+brew link --force openjdk@17
+brew install --cask android-commandlinetools
 SDKMANAGER="$(sdkmanager_path)" || {
   echo "sdkmanager was not installed by the android-commandlinetools cask" >&2
   exit 127
@@ -98,6 +116,18 @@ mkdir -p "$SDK_ROOT"
   "ndk;$NDK_VERSION"
 
 colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8
+if docker pull --platform linux/arm64 "$BASE_IMAGE_DIRECT"; then
+  BASE_IMAGE_SOURCE="$BASE_IMAGE_DIRECT"
+else
+  BASE_IMAGE_SOURCE="$BASE_IMAGE_MIRROR"
+  docker pull --platform linux/arm64 "$BASE_IMAGE_SOURCE"
+fi
+ACTUAL_BASE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$BASE_IMAGE_SOURCE")"
+if [[ "$ACTUAL_BASE_IMAGE_ID" != "$BASE_IMAGE_ID" ]]; then
+  echo "redroid base image identity mismatch: expected $BASE_IMAGE_ID" >&2
+  exit 1
+fi
+docker image tag "$BASE_IMAGE_SOURCE" "$BASE_IMAGE"
 colima ssh -- sh -c "$BINDER_SETUP"
 
 
@@ -125,6 +155,7 @@ NDK_CLANG="$(find "$SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt" -type f 
   exit 127
 }
 docker info >/dev/null
+docker image inspect "$BASE_IMAGE" >/dev/null
 colima ssh -- test -e /dev/binderfs/binder-control
 
 cat <<'MSG'

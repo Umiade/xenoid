@@ -1749,7 +1749,7 @@ class ArtifactBuilder:
         self._ensure_private_directory(self._cache_root / "objects")
         self._ensure_private_directory(self._object_root)
         locks_parent = self.project_root / ".xenoid" / "locks"
-        self._ensure_private_directory(locks_parent)
+        self._ensure_owned_ancestor(locks_parent)
         self._ensure_private_directory(self._lock_root)
 
     def _ensure_owned_ancestor(self, path: Path) -> None:

@@ -90,6 +90,18 @@ def main() -> int:
     except (TypeError, ValueError, json.JSONDecodeError):
         dry_run_result = {}
         dry_run_script_result = {}
+    planned_commands = dry_run_script_result.get("commands", [])
+    jdk_plan_ok = (
+        planned_commands[:3]
+        == [
+            "brew install docker colima android-platform-tools scrcpy openjdk@17",
+            "brew link --force openjdk@17",
+            "brew install --cask android-commandlinetools",
+        ]
+        and all("temurin" not in command for command in planned_commands)
+        and "docker pull --platform linux/arm64 redroid/redroid@sha256:5a42a569ee1d7c71796c0385e906cbaa4c3e0a162a56d9f26b29bdb1befac13b (content-addressed mirror fallback)"
+        in planned_commands
+    )
     required_guidance = (
         "Xenoid detected the deprecated Homebrew docker-completion formula.",
         "brew uninstall docker-completion",
@@ -123,6 +135,10 @@ def main() -> int:
             "returncode": dry_run.returncode,
             "stdout": dry_run.stdout,
             "stderr": dry_run.stderr,
+        },
+        "installRuntimeUsesUnprivilegedJdkFormula": {
+            "ok": jdk_plan_ok,
+            "commands": planned_commands,
         },
     }
     result = {"ok": all(case["ok"] for case in cases.values()), "cases": cases}

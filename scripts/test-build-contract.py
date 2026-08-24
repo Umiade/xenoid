@@ -404,6 +404,33 @@ def source_tool_environment_invalidation() -> None:
                 "deterministic environment or nested rebuild allocation was not forced")
 
 
+@contract_case("sharedLockParentCompatibility")
+def shared_lock_parent_compatibility() -> None:
+    target = make_target("unit")
+    with tempfile.TemporaryDirectory(prefix="xenoid-artifact-lock-parent-") as directory:
+        root = Path(directory)
+        initialize_inputs(root, {"unit": target})
+        gate_locks = root / ".xenoid" / "locks" / "gates"
+        gate_locks.mkdir(mode=0o700, parents=True)
+        gate_locks.chmod(0o700)
+        shared_parent = gate_locks.parent
+        shared_parent.chmod(0o755)
+
+        artifacts.ArtifactBuilder(
+            root,
+            catalog={"unit": target},
+            runner=FakeRunner(),
+        )
+
+        info = (shared_parent / "artifacts").lstat()
+        require(
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700,
+            "artifact locks were not safely created below the shared lock parent",
+        )
+
+
 @contract_case("successfulReuseSnapshotAndRematerialization")
 def successful_reuse_snapshot_and_rematerialization() -> None:
     target = make_target("unit")

@@ -19,6 +19,7 @@ from typing import Any, Iterator, Mapping, Optional, Union
 
 
 DEFAULT_IMAGE = "redroid/redroid:13.0.0_64only-latest"
+DEFAULT_IMAGE_ID = "sha256:5a42a569ee1d7c71796c0385e906cbaa4c3e0a162a56d9f26b29bdb1befac13b"
 _OBSOLETE_DEFAULT_IMAGES = frozenset({"redroid/redroid:13.0.0-latest"})
 DEFAULT_ANDROID_ADB_PORT = 62111
 DEFAULT_ANDROID_DAEMON_PORT = 18765
