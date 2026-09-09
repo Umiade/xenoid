@@ -34,6 +34,14 @@ if [[ "$ACTION" == stage ]]; then
   fi
   host_root install -d -o root -g root -m 0700 "$STAGE" "$BUILD"
   for name in Makefile xenoid_kmod.c; do host_root sh -c "umask 077; cat > '$BUILD/$name'" < "$SRC/$name"; host_root chmod 0600 "$BUILD/$name"; done
+  # A VM kernel upgrade leaves /lib/modules/$(uname -r)/build missing until the
+  # matching headers package is installed; install it on apt-managed engine
+  # hosts (colima VM, ssh targets) the same way ensure_binder installs
+  # linux-modules-extra. Local Linux hosts keep managing their own headers.
+  if [[ "$MODE" != local ]] && ! host_root test -d "/lib/modules/$(host uname -r)/build"; then
+    host_root sh -c 'apt-get update -qq && apt-get install -y -qq "linux-headers-$(uname -r)"' >&2 || { echo '{"ok":false,"error":"shared_protection_kmod_headers_unavailable"}'; exit 1; }
+    host_root test -d "/lib/modules/$(host uname -r)/build" || { echo '{"ok":false,"error":"shared_protection_kmod_headers_unavailable"}'; exit 1; }
+  fi
   host_root sh -c "cd '$BUILD' && SOURCE_DATE_EPOCH=0 KBUILD_BUILD_TIMESTAMP='1970-01-01 00:00:00 +0000' KBUILD_BUILD_USER=xenoid KBUILD_BUILD_HOST=xenoid make KCFLAGS='-fdebug-prefix-map=$BUILD=. -ffile-prefix-map=$BUILD=. -fmacro-prefix-map=$BUILD=.'" >&2 || { echo '{"ok":false,"error":"shared_protection_kmod_build_failed"}'; exit 1; }
   host_root test -f "$BUILD_OUTPUT" && host_root test ! -L "$BUILD_OUTPUT" || { echo '{"ok":false,"error":"shared_protection_kmod_build_failed"}'; exit 1; }
   host_root install -o root -g root -m 0600 "$BUILD_OUTPUT" "$STAGED"

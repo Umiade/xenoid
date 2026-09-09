@@ -392,6 +392,22 @@ def _prepare_google_assets_for_up(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_up(args: argparse.Namespace) -> int:
+    manager = runtime(args)
+    engine = manager.ensure_engine_started()
+    if engine.get("started") is True:
+        _write_up_progress(
+            {
+                "schema": "dev.xenoid.progress/v1",
+                "command": "up",
+                "phase": "engine",
+                "state": "passed",
+                "durationMs": 0,
+                "detail": "started",
+            }
+        )
+    if engine.get("ok") is not True:
+        print_json({"command": "up", "ok": False, **engine})
+        return 1
     try:
         _prepare_google_assets_for_up(args)
     except GoogleServicesError as exc:
@@ -413,7 +429,6 @@ def cmd_up(args: argparse.Namespace) -> int:
                 ),
             }
     else:
-        manager = runtime(args)
         capability = (
             {"transactionId": regeneration["transactionId"]}
             if regeneration is not None

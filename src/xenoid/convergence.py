@@ -1495,8 +1495,20 @@ class ConvergenceExecutor:
                     retained,
                     current_observation,
                 )
+                try:
+                    self._validate_resume_state(retained, current_observation)
+                except ConvergenceError as exc:
+                    if exc.code != "convergence_inputs_changed":
+                        raise
+                    # Engine-host or build inputs changed after the journal was
+                    # recorded (kernel upgrade, protection source edit, module
+                    # load). The retained plan is obsolete; discard it and
+                    # converge from a fresh plan instead of failing.
+                    self.journal.clear()
+                    retained = None
+                    result_context["resumed"] = False
+            if retained is not None:
                 selected_plan = ConvergencePlan.from_dict(retained["plan"])
-                self._validate_resume_state(retained, current_observation)
             elif plan is None:
                 selected_plan = self.planner.inspect(
                     skip_build=skip_build,

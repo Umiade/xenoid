@@ -1844,6 +1844,42 @@ def input_drift_gets_one_follow_up_only() -> None:
         require(result["ok"] is False, "second input drift looped convergence")
         require(result["error"] == "convergence_inputs_changed", "second drift error changed")
 
+@case("staleJournalInputsTriggerFreshReplan")
+def stale_journal_inputs_trigger_fresh_replan() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["createSpecMatches"] = False
+    for component in (
+        "daemon",
+        "identity",
+        "location",
+        "proxy",
+        "keybox",
+        "camera",
+        "google",
+        "protection",
+    ):
+        snapshot["components"][component]["state"] = "unknown"
+    for component in snapshot["components"]["deploy"]:
+        snapshot["components"]["deploy"][component] = "unknown"
+    with manager_fixture(snapshot) as manager:
+        manager.interrupt_once.add("remove")
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(first["ok"] is False, "interrupt fixture did not retain a journal")
+        # Engine-host inputs drift after the journal was recorded: resume must
+        # discard the obsolete journal and converge from a fresh plan.
+        manager.snapshot["components"]["protection"]["expectedDigest"] = "6" * 64
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(second["ok"] is True, f"fresh replan failed: {second.get('error')}")
+        require(second.get("resumed") is False, "stale journal must not be resumed")
+
 
 @case("deadlineCancellationProgressHeartbeatAndRedaction")
 def deadline_cancellation_progress_heartbeat_and_redaction() -> None:

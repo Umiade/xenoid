@@ -43,6 +43,9 @@ class FakeRuntime:
         finally:
             self._shared_protection_capability = None
 
+    def ensure_binder(self) -> dict[str, Any]:
+        return {"ok": True, "skipped": True}
+
 
 class Harness(SharedProtectionManager):
     def __init__(self, instance_id: str):

@@ -460,6 +460,71 @@ class RuntimeManager:
     def colima_start_command(self) -> list[str]:
         return ["colima", "start", "--arch", "aarch64", "--vm-type", "vz", "--memory", "8", "--cpu", "8"]
 
+    def engine_reachable(self) -> bool:
+        """True when the configured Docker engine answers a bounded probe."""
+        if which("docker") is None:
+            return False
+        proc = run(
+            [*self.docker_base_cmd(), "version", "--format", "{{.Server.Version}}"],
+            timeout=20,
+            env=self.docker_env(),
+        )
+        return proc.returncode == 0
+
+    def ensure_engine_started(self) -> dict[str, Any]:
+        """Start a stopped local engine so `up` converges instead of failing.
+
+        Starts only what install-runtime/init already installed: the existing
+        Colima VM on macOS or the local docker service on Linux. Remote
+        engines (ssh:// / tcp://) and first-time installation are never
+        attempted here.
+        """
+        if self.engine_reachable():
+            return {"ok": True, "started": False}
+        if self._docker_host_is_remote():
+            return {
+                "ok": False,
+                "error": "engine_unavailable",
+                "message": "remote Docker engine is unreachable; start it on its host",
+            }
+        if self.should_use_colima():
+            if which("colima") is None:
+                return {
+                    "ok": False,
+                    "error": "engine_unavailable",
+                    "message": "colima not found; run ./xenoid install-runtime",
+                }
+            started = run(self.colima_start_command(), timeout=600)
+            if started.returncode != 0:
+                return {
+                    "ok": False,
+                    "error": "colima_start_failed",
+                    "message": started.stderr.strip()[-500:],
+                }
+        elif host_info()["system"] == "Linux":
+            commands = (
+                ["systemctl", "--user", "start", "docker"],
+                ["sudo", "-n", "systemctl", "start", "docker"],
+            )
+            started_ok = any(
+                which(cmd[0]) is not None and run(cmd, timeout=120).returncode == 0
+                for cmd in commands
+            )
+            if not started_ok:
+                return {
+                    "ok": False,
+                    "error": "engine_unavailable",
+                    "message": "local docker service is not running; start it (sudo systemctl start docker)",
+                }
+        else:
+            return {"ok": False, "error": "engine_unavailable"}
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            if self.engine_reachable():
+                return {"ok": True, "started": True}
+            time.sleep(2.0)
+        return {"ok": False, "error": "engine_start_timeout"}
+
     def google_runtime_spec(
         self,
         purpose: str,

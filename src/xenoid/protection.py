@@ -217,62 +217,11 @@ class SharedProtectionManager:
 set -eu
 sha_stream() { sha256sum | cut -d ' ' -f 1; }
 file_hash() { if [ -r "$1" ] && [ -f "$1" ]; then resolved=$(readlink -f -- "$1") && [ -f "$resolved" ] && sha256sum "$resolved" | cut -d ' ' -f 1; else printf missing; fi; }
-tool_hash() {
-    if ! path=$(command -v "$1" 2>/dev/null); then printf missing; return; fi
-    resolved=$(readlink -f -- "$path" 2>/dev/null || true)
-    {
-        if [ -n "$resolved" ] && [ -f "$resolved" ]; then
-            sha256sum "$resolved"
-            stat -c '%u:%g:%a:%s' "$resolved"
-        else
-            printf 'builtin:%s\n' "$path"
-        fi
-        "$1" --version 2>&1 || "$1" version 2>&1 || true
-    } | sha_stream
-}
-libbpf_hash() {
-    library=$(ldconfig -p 2>/dev/null | awk '$1 ~ /^libbpf[.]so/ {print $NF; exit}')
-    if [ -z "$library" ] && ! command -v pkg-config >/dev/null 2>&1; then
-        printf missing
-        return
-    fi
-    {
-        if [ -n "$library" ]; then file_hash "$library"; fi
-        if command -v pkg-config >/dev/null 2>&1; then
-            pkg-config --modversion libbpf 2>/dev/null || true
-            pkg-config --libs --cflags libbpf 2>/dev/null || true
-        fi
-    } | sha_stream
-}
-tree_hash() {
-    resolved=$(readlink -f -- "$1" 2>/dev/null || true)
-    if [ -z "$resolved" ] || [ ! -d "$resolved" ]; then printf missing; return; fi
-    (cd "$resolved" && find -L . -xdev -type f -print0 | LC_ALL=C sort -z |
-        xargs -0r sha256sum) | sha_stream
-}
-library_hash() {
-    pattern="$1"
-    library=$(ldconfig -p 2>/dev/null | awk -v p="$pattern" '$1 ~ p {print $NF; exit}')
-    if [ -n "$library" ]; then file_hash "$library"; else printf missing; fi
-}
 kernel=$(uname -r)
 printf 'kernelReleaseSha256=%s\n' "$(printf %s "$kernel" | sha_stream)"
 if [ -r /proc/config.gz ]; then config=$(gzip -cd /proc/config.gz | sha_stream); elif [ -r "/boot/config-$kernel" ]; then config=$(file_hash "/boot/config-$kernel"); else config=missing; fi
 printf 'kernelConfigSha256=%s\n' "$config"
 printf 'btfSha256=%s\n' "$(file_hash /sys/kernel/btf/vmlinux)"
-printf 'headersSha256=%s\n' "$(tree_hash "/lib/modules/$kernel/build")"
-printf 'moduleSymversSha256=%s\n' "$(file_hash "/lib/modules/$kernel/build/Module.symvers")"
-printf 'userspaceHeadersSha256=%s\n' "$({ tree_hash /usr/include/bpf; tree_hash /usr/include/linux; file_hash /usr/include/elf.h; } | sha_stream)"
-symbols=$(awk '$3 ~ /^vfs_statfs([.]|$)/ || $3 == "security_socket_create" || $3 == "security_netlink_send" || $3 == "binder_transaction" {print $3}' /proc/kallsyms | LC_ALL=C sort -u | sha_stream)
-printf 'symbolsSha256=%s\n' "$symbols"
-printf 'clangSha256=%s\n' "$(tool_hash clang)"
-printf 'bpftoolSha256=%s\n' "$(tool_hash bpftool)"
-printf 'llvmStripSha256=%s\n' "$(tool_hash llvm-strip)"
-printf 'ccSha256=%s\n' "$(tool_hash cc)"
-printf 'makeSha256=%s\n' "$(tool_hash make)"
-printf 'libbpfSha256=%s\n' "$(libbpf_hash)"
-printf 'libelfSha256=%s\n' "$(library_hash '^libelf[.]so')"
-printf 'zlibSha256=%s\n' "$(library_hash '^libz[.]so')"
 printf 'bpfLsmSha256=%s\n' "$(if [ -r /sys/kernel/security/lsm ]; then cat /sys/kernel/security/lsm | sha_stream; else printf missing; fi)"
 '''
         proc = self.runtime._engine_host_shell(script, timeout=60)
@@ -290,18 +239,6 @@ printf 'bpfLsmSha256=%s\n' "$(if [ -r /sys/kernel/security/lsm ]; then cat /sys/
             "kernelReleaseSha256",
             "kernelConfigSha256",
             "btfSha256",
-            "headersSha256",
-            "moduleSymversSha256",
-            "userspaceHeadersSha256",
-            "symbolsSha256",
-            "clangSha256",
-            "llvmStripSha256",
-            "bpftoolSha256",
-            "ccSha256",
-            "makeSha256",
-            "libbpfSha256",
-            "libelfSha256",
-            "zlibSha256",
             "bpfLsmSha256",
         }
         if set(facts) != expected:
@@ -318,20 +255,19 @@ printf 'bpfLsmSha256=%s\n' "$(if [ -r /sys/kernel/security/lsm ]; then cat /sys/
                     "kernelReleaseSha256",
                     "kernelConfigSha256",
                     "btfSha256",
-                    "headersSha256",
-                    "moduleSymversSha256",
-                    "userspaceHeadersSha256",
-                    "symbolsSha256",
                     "bpfLsmSha256",
                 )
             }
         )
+        # Only artifact-defining inputs belong in the deployment digests.
+        # Build orchestration (build/load scripts, tool versions, headers,
+        # Module.symvers, kallsyms) is verified through the artifact sha256
+        # and build-id at publish/install time; binding it here would force a
+        # pointless kmod/eBPF replacement on every tool or script change.
         kmod_source = self._source_digest(
             (
                 "native/xenoid-kmod/Makefile",
                 "native/xenoid-kmod/xenoid_kmod.c",
-                "scripts/build-kmod.sh",
-                "scripts/with-shared-protection-lock.py",
             )
         )
         ebpf_source = self._source_digest(
@@ -339,10 +275,6 @@ printf 'bpfLsmSha256=%s\n' "$(if [ -r /sys/kernel/security/lsm ]; then cat /sys/
                 "native/xenoid-ebpf/Makefile",
                 "native/xenoid-ebpf/loader.c",
                 "native/xenoid-ebpf/xenoid_pathhide.bpf.c",
-                "scripts/build-ebpf.sh",
-                "scripts/load-ebpf.sh",
-                "scripts/smoke-ebpf.sh",
-                "scripts/with-shared-protection-lock.py",
             )
         )
         kmod_input = self._digest(
@@ -350,11 +282,6 @@ printf 'bpfLsmSha256=%s\n' "$(if [ -r /sys/kernel/security/lsm ]; then cat /sys/
                 "engineId": engine_id,
                 "kernelDigest": kernel_digest,
                 "sourceSha256": kmod_source,
-                "tools": {
-                    "cc": facts["ccSha256"],
-                    "make": facts["makeSha256"],
-                    "moduleSymvers": facts["moduleSymversSha256"],
-                },
                 "modules": list(KMOD_MODULES),
                 "probes": list(KMOD_PROBES),
             }
@@ -364,16 +291,6 @@ printf 'bpfLsmSha256=%s\n' "$(if [ -r /sys/kernel/security/lsm ]; then cat /sys/
                 "engineId": engine_id,
                 "kernelDigest": kernel_digest,
                 "sourceSha256": ebpf_source,
-                "tools": {
-                    "clang": facts["clangSha256"],
-                    "llvmStrip": facts["llvmStripSha256"],
-                    "userspaceHeaders": facts["userspaceHeadersSha256"],
-                    "bpftool": facts["bpftoolSha256"],
-                    "libbpf": facts["libbpfSha256"],
-                    "libelf": facts["libelfSha256"],
-                    "zlib": facts["zlibSha256"],
-                    "make": facts["makeSha256"],
-                },
                 "attachModes": ["lsm", "fmod_ret", "kprobe"],
                 "links": list(EBPF_LINKS),
                 "maps": list(EBPF_MAPS),
@@ -1776,6 +1693,13 @@ sync -f "$base"
 
     def ensure(self, expected_digest: Optional[str] = None) -> dict[str, Any]:
         try:
+            # The kmod registers a kprobe on binder_transaction at insmod time,
+            # and binder/binderfs state feeds the protection inputs. On a fresh
+            # engine host the binder module is absent, so ensure it before the
+            # inputs snapshot instead of between snapshot and install.
+            binder = self.runtime.ensure_binder()
+            if binder.get("ok") is not True:
+                raise SharedProtectionError("shared_protection_binder_unavailable")
             inputs = self.inputs()
             if expected_digest is not None and (
                 _SHA256.fullmatch(expected_digest) is None

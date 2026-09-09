@@ -17,6 +17,8 @@ cd xenoid
 
 `up` is the sole production convergence owner. It validates/reuses artifacts, ensures a content-addressed image only when needed, selects the minimum safe runtime action, reconciles independent components, and returns success only after fresh `LiveAcceptance` for the final runtime. Healthy repeated runs are no-ops apart from fresh observation; daemon/helper/proxy-only drift does not recreate the container.
 
+When the configured engine is stopped — Colima VM after a macOS reboot, or the local docker service on Linux — `up` starts it before observing; remote engines and first-time installation are never attempted (that stays with `install-runtime`/`init`). The same phase ensures the engine host's kernel-matched prerequisites: the binder module is loaded before protection maintenance, and missing `linux-headers-$(uname -r)` are installed on apt-managed engine hosts before the kmod build. A retained convergence journal whose recorded inputs no longer match the environment is discarded and replanned fresh rather than failing `convergence_inputs_changed`.
+
 ## Instance lifecycle and data persistence
 
 Each instance is a logical device with three persistent components:
