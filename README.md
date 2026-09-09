@@ -69,6 +69,8 @@ Run `init` once per instance. Later calls to `up` reuse healthy artifacts, image
 
 ## Common Operations
 
+This section covers the everyday subset. The [command reference](docs/commands.md) lists every command and subcommand.
+
 ### Runtime
 
 ```bash
@@ -163,6 +165,7 @@ New instances default to `microg` release `microg-0.3.15.250932-phonesky-30.4.17
 
 Detailed contracts:
 
+- [Command reference](docs/commands.md)
 - [Architecture](docs/architecture.md)
 - [Operations](docs/operations.md)
 - [Build and release](docs/build.md)

@@ -69,6 +69,8 @@ sudo ./scripts/setup-linux-binderfs.sh
 
 ## 常用操作
 
+本节只覆盖日常高频子集。完整命令与子命令清单见[命令参考](docs/commands.md)。
+
 ### 运行时
 
 ```bash
@@ -163,6 +165,7 @@ python -m pip install frida-tools
 
 详细契约：
 
+- [命令参考](docs/commands.md)
 - [架构](docs/architecture.md)
 - [运维](docs/operations.md)
 - [构建与发布](docs/build.md)
