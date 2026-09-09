@@ -628,6 +628,14 @@ on property:sys.boot_completed=1
     start xenoid-cellular-ready
     start xenoid-props
 
+# Every adbd start/stop/restart bumps the init.svc.adbd area serial. App
+# processes inherit the zygote's expected generation (2), and out-of-band
+# writes cannot update that watcher, so any drift makes every app spin in
+# futex(EAGAIN). Re-run the area patcher on each adbd state change to
+# re-normalize the serial instead of waiting for the next convergence.
+on property:init.svc.adbd=*
+    start xenoid-props
+
 service xenoid-props /system/bin/xenoid-prop-area --identity
     class main
     user root
