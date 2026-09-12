@@ -1279,6 +1279,8 @@ cat >/dev/null
             "! grep -q 'setenv LD_PRELOAD' /system/etc/init/hw/init.zygote64.rc && "
             "test -x /system/bin/xenoid-app-process && "
             "! grep -a -q 'libpiex_shim.so' /system/bin/xenoid-app-process && "
+            "test -r /system/lib64/libxenoid_svcman.so && "
+            "grep -a -q 'libxenoid_svcman.so' /system/bin/servicemanager && "
             "test -x /system/bin/hw/android.hardware.security.keymint-service && "
             "test -r /system/etc/init/android.hardware.security.keymint-service.rc && "
             "grep -q '^service vendor.keymint-aidl ' "

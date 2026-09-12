@@ -49,6 +49,7 @@ _CONTEXT_INPUT_PATHS = (
     "scripts/smoke-hardware-features.py",
     "scripts/patch-runtime-props.py",
     "scripts/patch-app-process-needed.py",
+    "scripts/patch-servicemanager-needed.py",
     "scripts/patch-runtime-libselinux.py",
     "scripts/patch-services-runtime.py",
     "scripts/patch-telephony-legacy-lte-band.py",

@@ -69,6 +69,7 @@ _ARTIFACT_PAIRS = {
     "artifacts/xenoid-keymint": "native/xenoid-keymint/xenoid-keymint",
     "artifacts/xenoid-proxy-sandbox": "native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",
     "artifacts/libxenoid_zygote.so": "native/xenoid-zygote/libxenoid_zygote.so",
+    "artifacts/libxenoid_svcman.so": "native/xenoid-svcman/libxenoid_svcman.so",
     "artifacts/libxenoid_shim-arm64.so": "native/xenoid-shim/libxenoid_shim-arm64.so",
     "artifacts/xenoid-pivot": "native/xenoid-pivot/xenoid-pivot",
     "artifacts/xenoid-sensorshal": "native/xenoid-sensorshal/xenoid-sensorshal",

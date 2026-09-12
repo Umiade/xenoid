@@ -225,13 +225,13 @@ def function_text(relative: str, name: str) -> str:
 def exact_catalog_and_virtual_dag() -> None:
     expected = (
         "daemon", "keymint", "input", "hide", "profile", "rootd", "netctl",
-        "overlay", "zygote", "sensorsHal", "gralloc", "hwcomposer",
+        "overlay", "zygote", "svcman", "sensorsHal", "gralloc", "hwcomposer",
         "cameraProvider", "ril", "radioConfig", "shimArm64", "pivot",
         "propArea", "ssaid", "proxySandbox",
     )
-    require(artifacts.ALL_TARGETS == expected, "the exact 20 target names/order changed")
+    require(artifacts.ALL_TARGETS == expected, "the exact 21 target names/order changed")
     require(tuple(artifacts.TARGETS) == expected, "TARGETS does not match ALL_TARGETS")
-    require(len(set(artifacts.ALL_TARGETS)) == 20, "duplicate target name")
+    require(len(set(artifacts.ALL_TARGETS)) == 21, "duplicate target name")
     require(dataclasses.is_dataclass(artifacts.BuildTarget), "BuildTarget is not a record")
     require(artifacts.BuildTarget.__dataclass_params__.frozen, "BuildTarget is mutable")
     require(artifacts.OutputSpec.__dataclass_params__.frozen, "OutputSpec is mutable")
@@ -241,7 +241,7 @@ def exact_catalog_and_virtual_dag() -> None:
             "virtual consumer set changed")
     require(consumers["runtimeContext"] == (
         "daemon", "keymint", "input", "hide", "profile", "netctl", "overlay",
-        "propArea", "pivot", "zygote", "sensorsHal", "gralloc", "hwcomposer",
+        "propArea", "pivot", "zygote", "svcman", "sensorsHal", "gralloc", "hwcomposer",
         "cameraProvider", "ril", "radioConfig",
     ), "runtimeContext dependency closure changed")
     require(consumers["liveDeploy"] ==
@@ -263,6 +263,7 @@ def exact_catalog_and_virtual_dag() -> None:
         "netctl": ("native/xenoid-netctl/xenoid-netctl",),
         "overlay": ("native/xenoid-hide/xenoid-overlay",),
         "zygote": ("native/xenoid-zygote/libxenoid_zygote.so",),
+        "svcman": ("native/xenoid-svcman/libxenoid_svcman.so",),
         "sensorsHal": (
             "native/xenoid-sensorshal/xenoid-sensorshal",
             "native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml",
@@ -992,6 +993,7 @@ def hidden_build_callsites_are_removed() -> None:
             "build-native-hide.sh", "build-native-overlay.sh",
             "build-native-profile.sh", "build-native-netctl.sh",
             "build-native-for-arch.sh", "build-native-zygote.sh",
+            "build-native-svcman.sh",
             "build-sensors-hal.sh", "build-gralloc.sh", "build-hwcomposer.sh",
             "build-camera-hal.sh", "build-ril.sh", "build-radio-config.sh",
         ),

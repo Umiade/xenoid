@@ -296,6 +296,7 @@ PROFILE="$ARTIFACT_ROOT/native/xenoid-profile/xenoid-profile"
 NETCTL="$ARTIFACT_ROOT/native/xenoid-netctl/xenoid-netctl"
 PROP_AREA="$ARTIFACT_ROOT/native/xenoid-hide/xenoid-prop-area"
 ZYGOTE="$ARTIFACT_ROOT/native/xenoid-zygote/libxenoid_zygote.so"
+SVCMAN="$ARTIFACT_ROOT/native/xenoid-svcman/libxenoid_svcman.so"
 PIVOT="$ARTIFACT_ROOT/native/xenoid-pivot/xenoid-pivot"
 SENSORSHAL="$ARTIFACT_ROOT/native/xenoid-sensorshal/xenoid-sensorshal"
 CAMERA_PROVIDER="$ARTIFACT_ROOT/native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"
@@ -376,6 +377,7 @@ cmp -s "$HARDWARE_FEATURES" "$OUT/payload/xenoid-hardware-features.xml" || {
 }
 cp "$ROOT/runtime/redroid/xenoid-cellular-overlay/system/etc/permissions/privapp-permissions-xenoid.xml" "$OUT/payload/privapp-permissions-xenoid.xml"
 cp "$ZYGOTE" "$OUT/payload/libpiex_shim.so"
+cp "$SVCMAN" "$OUT/payload/libxenoid_svcman.so"
 # app_process64 loads the compatibility layer as an ordinary leading
 # dependency. Unlike LD_PRELOAD this does not populate bionic's preload vector.
 if command -v "${DOCKER[0]}" >/dev/null 2>&1; then
@@ -399,6 +401,7 @@ if command -v "${DOCKER[0]}" >/dev/null 2>&1; then
     # the canonical hardware identity is correct before graphics initialization.
     _required_extract_ok=1
     "${DOCKER[@]}" cp "$_cid:/system/bin/app_process64" "$OUT/payload/app_process64" >/dev/null || _required_extract_ok=0
+    "${DOCKER[@]}" cp "$_cid:/system/bin/servicemanager" "$OUT/payload/servicemanager" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/bin/app_process64" "$OUT/payload/xenoid-app-process" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libui.so" "$OUT/payload/libui.so" >/dev/null || _required_extract_ok=0
     "${DOCKER[@]}" cp "$_cid:/system/lib64/libselinux.so" "$OUT/payload/libselinux.so" >/dev/null || _required_extract_ok=0
@@ -432,6 +435,10 @@ if command -v "${DOCKER[0]}" >/dev/null 2>&1; then
     fi
     python3 "${_props_args[@]}"
     python3 "$ROOT/scripts/patch-app-process-needed.py" "$OUT/payload/app_process64"
+    # servicemanager loads the isolated-inventory shim as a leading dependency
+    # the same way app_process64 loads libpiex_shim.so; its string table has no
+    # in-segment padding, so the sibling patcher relocates it to end of file.
+    python3 "$ROOT/scripts/patch-servicemanager-needed.py" "$OUT/payload/servicemanager" --library libxenoid_svcman.so
     python3 "$ROOT/scripts/patch-runtime-libselinux.py" "$OUT/payload/libselinux.so"
     python3 "$ROOT/scripts/patch-telephony-legacy-lte-band.py"       "$OUT/payload/telephony-common.base.jar" "$OUT/payload/telephony-common.jar"
     rm -f "$OUT/payload/telephony-common.base.jar"
@@ -795,6 +802,10 @@ COPY --chmod=644 payload/telephony-common.jar /system/framework/telephony-common
 COPY --chmod=755 payload/app_process64 /system/bin/app_process64
 COPY --chmod=755 payload/xenoid-app-process /system/bin/xenoid-app-process
 COPY --chmod=644 payload/libpiex_shim.so /system/lib64/libpiex_shim.so
+# servicemanager gets a leading libxenoid_svcman.so dependency that restores
+# the stock isolated_app service find/add restriction (no kernel SELinux).
+COPY --chmod=755 payload/servicemanager /system/bin/servicemanager
+COPY --chmod=644 payload/libxenoid_svcman.so /system/lib64/libxenoid_svcman.so
 COPY payload/props/system_build.prop /system/build.prop
 COPY payload/props/vendor_build.prop /vendor/build.prop
 COPY payload/props/product_build.prop /system/product/etc/build.prop

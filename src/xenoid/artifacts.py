@@ -397,6 +397,13 @@ _TARGET_LIST = (
         "native/xenoid-zygote",
     ),
     _target(
+        "svcman",
+        ("scripts/build-native-svcman.sh", "arm64"),
+        (*_COMMON_ANDROID, "scripts/build-native-svcman.sh", "native/xenoid-svcman/xenoid_svcman.c"),
+        (_out("native/xenoid-svcman/libxenoid_svcman.so"),),
+        "native/xenoid-svcman",
+    ),
+    _target(
         "sensorsHal",
         ("scripts/build-sensors-hal.sh", "arm64"),
         (
@@ -564,6 +571,7 @@ CONSUMER_TARGETS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "propArea",
             "pivot",
             "zygote",
+            "svcman",
             "sensorsHal",
             "gralloc",
             "hwcomposer",
