@@ -94,6 +94,17 @@ static int write_bytes(const char *path, const void *data, size_t n) {
 static int write_text(const char *path, const char *s) {
   return write_bytes(path, s, strlen(s));
 }
+
+/* Stock procfs exposes read-only nodes at 0444, with the per-pid uid/gid map
+ * and attr files writable at 0644. Staging files must carry the stock mode
+ * or stat() on the bind-mounted node betrays the overlay. */
+static int staging_mode_for(const char *target) {
+  if (strncmp(target, "/proc/", 6) != 0) return -1;
+  if (strncmp(target, "/proc/sys/", 10) == 0) return -1; /* sysctl: 0644 stock */
+  if (strstr(target, "/uid_map") || strstr(target, "/gid_map")) return 0644;
+  if (strstr(target, "/attr/")) return 0644;
+  return 0444;
+}
 static char *first_or_default(const char *path, const char *fallback) {
   char *s = read_all(path); if (!s || !s[0]) { free(s); return strdup(fallback); }
   size_t n = strcspn(s, "\r\n"); char *o = calloc(1, n + 2); if (!o) { free(s); return strdup(fallback); }
@@ -352,12 +363,14 @@ static int bind_file(const char *fake, const char *target) {
 static int overlay_text(const char *name, const char *target, const char *content) {
   char fake[256]; snprintf(fake, sizeof(fake), "%s/%s", OVERLAY_DIR, name);
   int rc = write_text(fake, content); if (rc) return -1;
+  { int m = staging_mode_for(target); if (m >= 0) chmod(fake, (mode_t)m); }
   return bind_file(fake, target);
 }
 static int overlay_bytes_optional(const char *name, const char *target, const void *content, size_t size) {
   if (access(target, F_OK) != 0) return 0;
   char fake[256]; snprintf(fake, sizeof(fake), "%s/%s", OVERLAY_DIR, name);
   int rc = write_bytes(fake, content, size); if (rc) return -1;
+  { int m = staging_mode_for(target); if (m >= 0) chmod(fake, (mode_t)m); }
   return bind_file(fake, target);
 }
 static int overlay_text_optional(const char *name, const char *target, const char *content) {
@@ -1199,6 +1212,7 @@ static int overlay_mount_namespace_texts(void) {
       "tmpfs / tmpfs rw,seclabel,nosuid,nodev,relatime,size=%lluk,mode=755 0 0\n"
       "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
       "sysfs /sys sysfs rw,seclabel,nosuid,nodev,noexec,relatime 0 0\n"
+      "selinuxfs /sys/fs/selinux selinuxfs rw,seclabel,relatime 0 0\n"
       "devpts /dev/pts devpts rw,seclabel,nosuid,noexec,relatime,mode=600,ptmxmode=000 0 0\n"
       "/dev/block/dm-0 /system ext4 ro,seclabel,relatime 0 0\n"
       "/dev/block/dm-1 /vendor ext4 ro,seclabel,relatime 0 0\n"
@@ -1209,9 +1223,10 @@ static int overlay_mount_namespace_texts(void) {
       "21 0 0:20 / / rw,seclabel shared:1 - tmpfs tmpfs rw,seclabel,size=%lluk,mode=755\n"
       "22 21 0:3 / /proc rw,nosuid,nodev,noexec,relatime shared:2 - proc proc rw\n"
       "23 21 0:7 / /sys rw,seclabel,nosuid,nodev,noexec,relatime shared:3 - sysfs sysfs rw,seclabel\n"
-      "24 21 259:0 / /system ro,seclabel,relatime shared:4 - ext4 /dev/block/dm-0 ro\n"
-      "25 21 259:1 / /vendor ro,seclabel,relatime shared:5 - ext4 /dev/block/dm-1 ro\n"
-      "26 21 %u:%u / /data rw,seclabel,nosuid,nodev,noatime - %s %s rw,discard,inlinecrypt,atgc,checkpoint_merge,reserve_root=32768,resgid=1065,fsync_mode=nobarrier\n",
+      "24 23 0:16 / /sys/fs/selinux rw,seclabel,relatime shared:6 - selinuxfs selinuxfs rw\n"
+      "25 21 259:0 / /system ro,seclabel,relatime shared:4 - ext4 /dev/block/dm-0 ro\n"
+      "26 21 259:1 / /vendor ro,seclabel,relatime shared:5 - ext4 /dev/block/dm-1 ro\n"
+      "27 21 %u:%u / /data rw,seclabel,nosuid,nodev,noatime - %s %s rw,discard,inlinecrypt,atgc,checkpoint_merge,reserve_root=32768,resgid=1065,fsync_mode=nobarrier\n",
       memory.total_kib, storage.dev_major, storage.dev_minor,
       storage.filesystem, storage.mount_source);
   if (mounts_written < 0 || (size_t)mounts_written >= sizeof(mounts)
@@ -1236,6 +1251,7 @@ static int overlay_mount_namespace_texts(void) {
     int mountstats_written = snprintf(
         mountstats, sizeof(mountstats),
         "device tmpfs mounted on / with fstype tmpfs\n"
+        "device selinuxfs mounted on /sys/fs/selinux with fstype selinuxfs\n"
         "device %s mounted on /data with fstype %s\n",
         storage.mount_source, storage.filesystem);
     if (mountstats_written < 0

@@ -410,10 +410,38 @@ static bool path_hidden(const char *path)
     /* Stock Android policy keeps the adbd control socket outside app domains. */
     if (!strcmp(path, "/dev/socket/adbd"))
         return true;
-    /* Isolated application domains must retain the stock procfs access view. */
-    if (current_is_isolated_android_app() && !strcmp(path, "/proc/version"))
-        return false;
     return path_has_dotdot_component(path) || str_has_any(path, path_markers);
+}
+
+/* Stock sepolicy grants no application domain any selinuxfs access, so
+ * opening a control node already fails with -EACCES via the shared eBPF
+ * policy. Reads of the node metadata (stat and friends) must fail the same
+ * way or a behavioral probe can tell the control plane is fake. */
+static bool path_selinux_control(const char *path)
+{
+    if (!path) return false;
+    if (!current_is_xenoid_android_app()) return false;
+    return strstr(path, "/sys/fs/selinux/") != NULL;
+}
+
+/* Stock sepolicy leaves isolated_app with no grant at all on non-pid procfs
+ * files: not just open/read (neverallow) but even getattr, so stat() on
+ * /proc/version and friends fails with -EACCES for sandboxed processes.
+ * Per-pid entries keep their owner-domain labels and stay reachable. */
+static bool path_denied_isolated_proc(const char *path)
+{
+    const char *rest;
+
+    if (!path || strncmp(path, "/proc/", 6))
+        return false;
+    if (!current_is_isolated_android_app())
+        return false;
+    rest = path + 6;
+    if (!strncmp(rest, "self", 4) || !strncmp(rest, "thread-self", 11))
+        return false;
+    if (*rest >= '0' && *rest <= '9')
+        return false;
+    return true;
 }
 
 
@@ -423,6 +451,7 @@ static bool path_hidden(const char *path)
 #define STASH_SIZE 64
 struct path_stash {
     struct task_struct *task;
+    long veto;
     char path[256];
 };
 static struct path_stash stash[STASH_SIZE];
@@ -434,15 +463,22 @@ static void stash_put(const char __user *upath)
     int i;
     char buf[256];
     long n;
+    long veto;
     if (!upath) return;
     n = strncpy_from_user(buf, upath, sizeof(buf) - 1);
     if (n <= 0) return;
     buf[sizeof(buf) - 1] = 0;
-    if (!path_hidden(buf)) return;
+    if (path_selinux_control(buf))
+        veto = -EACCES;
+    else if (path_hidden(buf))
+        veto = -ENOENT;
+    else
+        return;
     spin_lock_irqsave(&stash_lock, flags);
     for (i = 0; i < STASH_SIZE; i++) {
         if (stash[i].task == current || stash[i].task == NULL) {
             stash[i].task = current;
+            stash[i].veto = veto;
             strscpy(stash[i].path, buf, sizeof(stash[i].path));
             spin_unlock_irqrestore(&stash_lock, flags);
             return;
@@ -451,23 +487,65 @@ static void stash_put(const char __user *upath)
     spin_unlock_irqrestore(&stash_lock, flags);
 }
 
-static bool stash_take(void)
+/* Stock sepolicy grants every domain getattr on selinuxfs files and search on
+ * the directory; only read/write is denied to apps. The stat family must
+ * therefore succeed while open and access(R_OK) fail with -EACCES. */
+static void stash_put_kind(const char __user *upath, bool allow_selinux_getattr,
+			   bool allow_isolated_proc_existence)
 {
     unsigned long flags;
     int i;
-    bool found = false;
+    char buf[256];
+    long n;
+    long veto;
+    if (!upath) return;
+    n = strncpy_from_user(buf, upath, sizeof(buf) - 1);
+    if (n <= 0) return;
+    buf[sizeof(buf) - 1] = 0;
+    if (path_selinux_control(buf)) {
+        if (allow_selinux_getattr)
+            return;
+        veto = -EACCES;
+    } else if (path_denied_isolated_proc(buf) && !allow_isolated_proc_existence) {
+        veto = -EACCES;
+    } else if (path_hidden(buf)) {
+        veto = -ENOENT;
+    } else {
+        return;
+    }
+    spin_lock_irqsave(&stash_lock, flags);
+    for (i = 0; i < STASH_SIZE; i++) {
+        if (stash[i].task == current || stash[i].task == NULL) {
+            stash[i].task = current;
+            stash[i].veto = veto;
+            strscpy(stash[i].path, buf, sizeof(stash[i].path));
+            spin_unlock_irqrestore(&stash_lock, flags);
+            return;
+        }
+    }
+    spin_unlock_irqrestore(&stash_lock, flags);
+}
+
+static long stash_take(void)
+{
+    unsigned long flags;
+    int i;
+    long veto = 0;
     spin_lock_irqsave(&stash_lock, flags);
     for (i = 0; i < STASH_SIZE; i++) {
         if (stash[i].task == current) {
-            found = true;
+            veto = stash[i].veto;
             stash[i].task = NULL;
+            stash[i].veto = 0;
             stash[i].path[0] = 0;
             break;
         }
     }
     spin_unlock_irqrestore(&stash_lock, flags);
-    return found;
+    return veto;
 }
+
+
 
 /* ------------------------------------------------------------------ */
 /* kprobe: open/openat post — close fd and return -ENOENT for hidden   */
@@ -479,6 +557,7 @@ static int open_post_handler(struct kretprobe_instance *ri, struct pt_regs *regs
     char *buf, *path;
     bool hidden;
 
+
     if (retval < 0) return 0;
     f = fget((unsigned int)retval);
     if (!f) return 0;
@@ -486,9 +565,14 @@ static int open_post_handler(struct kretprobe_instance *ri, struct pt_regs *regs
     if (buf) {
         path = d_path(&f->f_path, buf, 512);
         if (!IS_ERR(path)) {
-            /* proc-fd memfds are executable capabilities, not filesystem
-             * paths. Frida uses one for explicit inspection; filtering its
-             * backing name here breaks dlopen("/proc/self/fd/N"). */
+            /* isolated_app gets no grant on non-pid procfs files (stock). */
+            if (path_denied_isolated_proc(path)) {
+                fput(f);
+                close_fd((unsigned int)retval);
+                regs_set_return_value(regs, -EACCES);
+                kfree(buf);
+                return 0;
+            }
             hidden = strncmp(path, "/memfd:", 7) && path_hidden(path);
             if (hidden) {
                 fput(f);
@@ -518,13 +602,30 @@ static int stat_pre_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct pt_regs *sr = (struct pt_regs *)regs->regs[0];
     const char __user *upath = sr ? (const char __user *)sr->regs[1] : NULL;
-    stash_put(upath);
+    /* stat/statx = getattr: selinuxfs getattr is allowed on stock, but
+     * isolated_app has no grant on non-pid procfs files at all. */
+    stash_put_kind(upath, true, false);
+    return 0;
+}
+static int access_pre_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct pt_regs *sr = (struct pt_regs *)regs->regs[0];
+    const char __user *upath = sr ? (const char __user *)sr->regs[1] : NULL;
+    long mode = sr ? (long)sr->regs[2] : 0;
+    /* access(F_OK) is a lookup-only existence check: allowed on stock even for
+     * isolated_app on denied-node types. access(R_OK) on a selinuxfs node is
+     * a read-permission probe: denied. */
+    if (mode == 0)
+        stash_put_kind(upath, true, true);
+    else
+        stash_put_kind(upath, false, false);
     return 0;
 }
 static int stat_post_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    if (stash_take())
-        regs_set_return_value(regs, -ENOENT);
+    long veto = stash_take();
+    if (veto)
+        regs_set_return_value(regs, veto);
     return 0;
 }
 static struct kretprobe stat_kp = {
@@ -541,21 +642,28 @@ static struct kretprobe statx_kp = {
 };
 static struct kretprobe access_kp = {
     .handler = stat_post_handler,
-    .entry_handler = stat_pre_handler,
+    .entry_handler = access_pre_handler,
     .kp = { .symbol_name = "__arm64_sys_faccessat2" },
     .maxactive = 32,
 };
 static struct kretprobe faccessat_kp = {
     .handler = stat_post_handler,
-    .entry_handler = stat_pre_handler,
+    .entry_handler = access_pre_handler,
     .kp = { .symbol_name = "__arm64_sys_faccessat" },
     .maxactive = 32,
 };
 
 /* Keep filename-backed filesystem probes consistent across the syscall family. */
+static int unlinkat_pre_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct pt_regs *sr = (struct pt_regs *)regs->regs[0];
+    const char __user *upath = sr ? (const char __user *)sr->regs[1] : NULL;
+    stash_put_kind(upath, false, false);
+    return 0;
+}
 static struct kretprobe unlinkat_kp = {
     .handler = stat_post_handler,
-    .entry_handler = stat_pre_handler,
+    .entry_handler = unlinkat_pre_handler,
     .kp = { .symbol_name = "__arm64_sys_unlinkat" },
     .maxactive = 32,
 };
@@ -674,6 +782,70 @@ static int maps_seq_post(struct kretprobe_instance *ri, struct pt_regs *regs)
     seq->count = ctx->count + record_len;
     return 0;
 }
+struct status_seq_ctx {
+    struct seq_file *seq;
+    size_t count;
+    kuid_t target_uid;
+};
+
+static int status_seq_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct status_seq_ctx *ctx = (void *)ri->data;
+    struct task_struct *task = (struct task_struct *)regs->regs[3];
+
+    ctx->seq = (struct seq_file *)regs->regs[0];
+    ctx->count = ctx->seq ? ctx->seq->count : 0;
+    ctx->target_uid = task ? task_uid(task) : GLOBAL_ROOT_UID;
+    return 0;
+}
+
+/* Stock Android clears supplementary groups and sets no_new_privs for
+ * isolated processes. Container runtimes must report the same state to
+ * readers of /proc/<pid>/status. */
+static int status_seq_post(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct status_seq_ctx *ctx = (void *)ri->data;
+    struct seq_file *seq = ctx->seq;
+    char *record, *groups, *groups_end, *nnp;
+    size_t len, tail;
+    uid_t appid;
+
+    if (!seq || !seq->buf || seq->count <= ctx->count)
+        return 0;
+    if (!current_net_is_xenoid_android_runtime())
+        return 0;
+    appid = from_kuid_munged(current_user_ns(), ctx->target_uid) % 100000;
+    if (appid < 90000 || appid >= 100000)
+        return 0;
+
+    record = seq->buf + ctx->count;
+    len = seq->count - ctx->count;
+
+    nnp = bounded_find(record, len, "NoNewPrivs:\t0\n");
+    if (nnp)
+        nnp[sizeof("NoNewPrivs:\t") - 1] = '1';
+
+    groups = bounded_find(record, len, "Groups:\t");
+    if (groups) {
+        groups_end = memchr(groups, '\n', record + len - groups);
+        if (groups_end) {
+            groups += sizeof("Groups:\t") - 1;
+            tail = (record + len) - (groups_end + 1);
+            if (groups_end > groups)
+                memmove(groups, groups_end, tail + 1);
+            seq->count = ctx->count + (len - (groups_end - groups));
+        }
+    }
+    return 0;
+}
+
+static struct kretprobe status_seq_kp = {
+    .handler = status_seq_post,
+    .entry_handler = status_seq_pre,
+    .data_size = sizeof(struct status_seq_ctx),
+    .kp = { .symbol_name = "proc_pid_status" },
+    .maxactive = 32,
+};
 
 
 static struct kretprobe maps_seq_kp = {
@@ -806,8 +978,9 @@ static int mountinfo_seq_post(struct kretprobe_instance *ri,
     u32 dev_minor;
 
     (void)regs;
-    if (!mount_seq_record(ctx, &seq, &record, &record_len) ||
-        !bounded_has(record, record_len, " / /data ") ||
+    if (!mount_seq_record(ctx, &seq, &record, &record_len))
+        return 0;
+    if (!bounded_has(record, record_len, " / /data ") ||
         !parse_mountinfo_identity(record, record_len, &mount_id, &parent_id,
                                   &dev_major, &dev_minor))
         return 0;
@@ -837,6 +1010,7 @@ static int mounts_seq_post(struct kretprobe_instance *ri, struct pt_regs *regs)
                XENOID_DATA_F2FS_OPTIONS " 0 0\n");
     return 0;
 }
+
 
 static int mountstats_seq_post(struct kretprobe_instance *ri,
                                struct pt_regs *regs)
@@ -979,6 +1153,7 @@ static bool dentry_name_matches(const struct dentry *dentry, const char *name)
 	return dentry->d_name.len == length &&
 	       !memcmp(dentry->d_name.name, name, length);
 }
+
 
 static bool inode_has_decimal_name(struct inode *inode)
 {
@@ -1200,6 +1375,8 @@ static int vfs_xattr_pre(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
+static const char *data_label_for_dentry(struct dentry *dentry,
+					 char *buf, size_t buflen);
 static int vfs_xattr_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct vfs_xattr_ctx *c = (void *)ri->data;
@@ -1208,7 +1385,7 @@ static int vfs_xattr_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	char tmp[64];
 	size_t len;
 
-	if (!c->android_runtime || ret < 0 || !c->dentry || !c->name ||
+	if (!c->android_runtime || !c->dentry || !c->name ||
 	    strcmp(c->name, "security.selinux") != 0)
 		return 0;
 	if (c->dentry->d_name.name &&
@@ -1216,6 +1393,14 @@ static int vfs_xattr_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 		uid_t uid = from_kuid_munged(current_user_ns(), current_euid());
 
 		label = domain_for_uid(uid, tmp, sizeof(tmp));
+	} else if (ret == -ENODATA || ret == -EOPNOTSUPP) {
+		char pathbuf[256];
+
+		label = data_label_for_dentry(c->dentry, pathbuf, sizeof(pathbuf));
+		if (!label)
+			return 0;
+	} else if (ret < 0) {
+		return 0;
 	} else if (c->dentry->d_sb && c->dentry->d_sb->s_type &&
 		   !strcmp(c->dentry->d_sb->s_type->name, "proc")) {
 		label = proc_label_for_dentry(c->dentry, tmp, sizeof(tmp));
@@ -1239,6 +1424,88 @@ static int vfs_xattr_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	}
 	regs_set_return_value(regs, len);
 	return 0;
+}
+
+/* The /data volume f2fs carries no SELinux xattrs, so getxattr on an app
+ * private file returns -ENODATA. Stock labels every file; detection code
+ * reads the label of its own data files through /proc/self/fd/<n> and expects
+ * app_data_file for private data (apk_data_file for installed APKs under
+ * /data/app). Synthesize the label for the app-data shapes stock assigns it
+ * to: /data/{data,user/<n>,user_de/<n>}/<pkg>[/...] and /data/app/... */
+static bool path_has_component_then_boundary(const char *p)
+{
+	size_t n = 0;
+
+	while (p[n] && p[n] != '/')
+		n++;
+	if (!n)
+		return false;
+	return p[n] == '\0' || p[n] == '/';
+}
+
+static const char *data_label_for_dentry(struct dentry *dentry,
+					 char *buf, size_t buflen)
+{
+	char *path;
+	const char *p;
+	const char *fstype;
+
+	if (!dentry->d_sb || !dentry->d_sb->s_type)
+		return NULL;
+	fstype = dentry->d_sb->s_type->name;
+	if (!strcmp(fstype, "devpts"))
+		return "u:object_r:pts_device:s0";
+	path = dentry_path_raw(dentry, buf, buflen);
+	if (IS_ERR(path))
+		return NULL;
+	if (!strcmp(fstype, "tmpfs")) {
+		/* /dev is the only tmpfs carrying these stock device labels. */
+		static const struct {
+			const char *name;
+			const char *label;
+		} devs[] = {
+			{ "/ptmx", "u:object_r:ptmx_device:s0" },
+			{ "/null", "u:object_r:null_device:s0" },
+			{ "/zero", "u:object_r:zero_device:s0" },
+			{ "/full", "u:object_r:full_device:s0" },
+			{ "/random", "u:object_r:random_device:s0" },
+			{ "/urandom", "u:object_r:urandom_device:s0" },
+			{ "/tty", "u:object_r:tty_device:s0" },
+			{ "/console", "u:object_r:console_device:s0" },
+			{ "/binder", "u:object_r:binder_device:s0" },
+			{ "/hwbinder", "u:object_r:hwbinder_device:s0" },
+			{ "/vndbinder", "u:object_r:vndbinder_device:s0" },
+		};
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(devs); i++)
+			if (!strcmp(path, devs[i].name))
+				return devs[i].label;
+		return NULL;
+	}
+	if (strcmp(fstype, "f2fs") && strcmp(fstype, "ext4"))
+		return NULL;
+	if (!strncmp(path, "/user/", 6) || !strncmp(path, "/user_de/", 9)) {
+		p = strchr(path + 1, '/') + 1;
+		if (*p < '0' || *p > '9')
+			return NULL;
+		while (*p >= '0' && *p <= '9')
+			p++;
+		if (*p != '/')
+			return NULL;
+		if (path_has_component_then_boundary(p + 1))
+			return "u:object_r:app_data_file:s0";
+		return NULL;
+	}
+	if (!strncmp(path, "/data/", 6) &&
+	    path_has_component_then_boundary(path + 6))
+		return "u:object_r:app_data_file:s0";
+	if (!strncmp(path, "/app/", 5)) {
+		p = strchr(path + 5, '/');
+		if (p && path_has_component_then_boundary(p + 1))
+			return "u:object_r:apk_data_file:s0";
+	}
+	return NULL;
 }
 
 static struct kretprobe vfs_xattr_kp = {
@@ -1285,6 +1552,24 @@ static int gpa_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	/* ret < 0 (proc falls back to "unconfined") or unconfined label: synthesize */
 	uid = from_kuid_munged(current_user_ns(), task_uid(c->task));
 	label = domain_for_uid(uid, tmp, sizeof(tmp));
+	/* attr/prev is the pre-transition domain: an app forked from a zygote
+	 * keeps the zygote's domain there, not its own. Synthesize the fork
+	 * parent's domain for app processes so current and prev agree with the
+	 * stock transition record. */
+	if (!strcmp(c->name, "prev") && uid >= 10000) {
+		uid_t parent_uid;
+		rcu_read_lock();
+		parent_uid = c->task->real_parent ?
+			from_kuid_munged(current_user_ns(),
+					 task_uid(c->task->real_parent)) : (uid_t)-1;
+		rcu_read_unlock();
+		if (parent_uid == 0)
+			label = "u:r:zygote:s0";
+		else if (parent_uid == 1053)
+			label = "u:r:webview_zygote:s0";
+		else if (parent_uid != (uid_t)-1 && parent_uid % 100000 >= 10000)
+			label = "u:r:app_zygote:s0";
+	}
 	len = strlen(label);
 	newv = kstrdup(label, GFP_ATOMIC);
 	if (!newv)
@@ -1701,8 +1986,7 @@ static struct selinux_class_dir selinux_class_dirs[] = {
  * The host has no loaded SELinux policy, so this node is metadata only.
  * Production eBPF denies Android application opens with EACCES, matching
  * AOSP's untrusted_app neverallow. Trusted callers receive EOPNOTSUPP rather
- * than fabricated access-vector decisions.
- */
+ * than fabricated access-vector decisions. */
 static ssize_t selinux_access_show(struct kobject *kobj,
 				   struct kobj_attribute *attr, char *buf)
 {
@@ -1895,8 +2179,7 @@ static int xb_get_property(struct power_supply *psy, enum power_supply_property 
     case POWER_SUPPLY_PROP_TECHNOLOGY:    val->intval = POWER_SUPPLY_TECHNOLOGY_LION; break;
     case POWER_SUPPLY_PROP_CHARGE_TYPE:
         val->intval = battery_plugged_android && battery_status_android == 2
-            ? POWER_SUPPLY_CHARGE_TYPE_STANDARD
-            : POWER_SUPPLY_CHARGE_TYPE_NONE;
+            ? POWER_SUPPLY_CHARGE_TYPE_STANDARD : POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
         break;
     case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
         val->intval = battery_charge_full_design_uah;
@@ -1926,7 +2209,7 @@ static struct power_supply *xb_psy;
 static struct kretprobe *rprobes[] = {
     &open_kp, &stat_kp, &statx_kp, &access_kp,
     &faccessat_kp, &unlinkat_kp, &readlink_kp, &maps_seq_kp, &smaps_seq_kp,
-    &mountinfo_seq_kp, &mounts_seq_kp, &mountstats_seq_kp,
+    &mountinfo_seq_kp, &mounts_seq_kp, &mountstats_seq_kp, &status_seq_kp,
     &affinity_kp, &statfs_kp,
 };
 static struct kretprobe *seclabel_rprobes[] = {
@@ -2025,6 +2308,9 @@ static int __init xenoid_kmod_init(void)
         goto fail;
     }
     selinux_groups_registered = true;
+    /* Stock selinuxfs marks enforce and checkreqprot writable for root. */
+    sysfs_chmod_file(xenoid_selinux_kobj, &enforce_attr.attr, 0644);
+    sysfs_chmod_file(xenoid_selinux_kobj, &checkreqprot_attr.attr, 0644);
     ret = selinux_context_create_file();
     if (ret) {
         pr_err("xenoid_kmod: required selinux context node failed: %d\n", ret);

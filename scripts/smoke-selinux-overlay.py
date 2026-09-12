@@ -16,6 +16,12 @@ class_builder = kmod.partition("static int selinux_class_create_dirs")[2].partit
 proc_labels = kmod.partition("static const char *proc_label_for_inode")[2].partition(
     "static bool inode_name_has_suffix"
 )[0]
+vfs_xattr = kmod.partition("static int vfs_xattr_post")[2].partition(
+    "/* The /data volume f2fs"
+)[0]
+data_label = kmod.partition("/* The /data volume f2fs")[2].partition(
+    "static struct kretprobe vfs_xattr_kp"
+)[0]
 access_placeholder = kmod.partition("static ssize_t selinux_access_show")[2].partition(
     "static int selinux_access_create_file"
 )[0]
@@ -28,9 +34,22 @@ checks = {
     and "&policyvers_attr.attr" in kmod
     and "&mls_attr.attr" in kmod,
     "hide_apply_reapplies_overlay": "xenoid-overlay-helper apply" in hide,
-    "proc_pid_label_follows_task_domain": proc_labels.count(
-        "return domain_for_uid(uid, buf, buflen);"
-    ) == 2,
+    # Restored stock synthesis: attr/current/exec/prev -> proc_security,
+    # per-pid dirs -> owner domain via domain_for_uid, root fallback proc:s0.
+    "proc_labels_synthesized_per_domain": proc_labels.count(
+        '"u:object_r:proc_security:s0"'
+    ) == 2
+    and proc_labels.count("domain_for_uid") == 2
+    and proc_labels.count('return "u:object_r:proc:s0";') == 2
+    and "static bool inode_has_decimal_name" in kmod,
+    # /proc/self/exe getxattr returns the process domain, not the proc label.
+    "proc_exe_label_uses_process_domain": '!strcmp(c->dentry->d_name.name, "exe")' in vfs_xattr
+    and "label = domain_for_uid(uid, tmp, sizeof(tmp));" in vfs_xattr,
+    # App-private data is app_data_file; only installed APKs are apk_data_file.
+    "app_private_data_uses_app_data_file": data_label.count(
+        '"u:object_r:app_data_file:s0"'
+    ) == 2
+    and data_label.count('"u:object_r:apk_data_file:s0"') == 1,
     "class_index_at_stock_path": '.attr = { .name = "index", .mode = 0444 }'
     in kmod
     and "sysfs_create_file(dir->kobj, dir->index)" in class_builder
@@ -47,6 +66,17 @@ checks = {
     and "return -EACCES;" in bpf
     and '"selinux_permission_link"' in loader
     and "xenoid_fmod_security_inode_permission" in loader,
+    "app_selinux_metadata_reads_denied": "static bool path_selinux_control" in kmod
+    and 'strstr(path, "/sys/fs/selinux/")' in kmod
+    and "veto = -EACCES;" in kmod
+    and "long veto = stash_take();" in kmod
+    and "regs_set_return_value(regs, veto);" in kmod,
+    # isolated_app has no grant on non-pid procfs files on stock: even
+    # getattr (/proc/version stat) is EACCES; pid entries stay reachable.
+    "isolated_app_proc_getattr_denied": "static bool path_denied_isolated_proc" in kmod
+    and "stash_put_kind(upath, true, false);" in kmod
+    and 'current_is_isolated_android_app() && !strcmp(path, "/proc/version")' not in kmod
+    and 'path_denied_isolated_proc(path)' in kmod,
 }
 out = {"ok": all(checks.values()), "checks": checks}
 print(json.dumps(out, indent=2))
