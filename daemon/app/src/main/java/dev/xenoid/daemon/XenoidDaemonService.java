@@ -38,6 +38,35 @@ public class XenoidDaemonService extends Service {
             Collections.newSetFromMap(new ConcurrentHashMap<Client, Boolean>());
     public IBinder onBind(Intent intent) { return null; }
     public int onStartCommand(Intent intent, int flags, int startId) { enterForeground(); startServer(); return START_STICKY; }
+    {
+        // Display resolution is runtime state lost on every container restart;
+        // replay this instance's own effective profile so it self-heals even
+        // when the host skips identity convergence for an already-converged
+        // instance. The root helper may not be up yet at early boot, so apply
+        // on a background thread and retry a few times before giving up.
+        Thread reapply = new Thread(() -> {
+            for (int attempt = 0; attempt < 30; attempt++) {
+                try {
+                    Map<String, Object> result = DeviceProfileManager.reapplyDisplayFromEffectiveProfile();
+                    boolean skipped = result != null && result.get("skipped") != null;
+                    if (result != null && Boolean.TRUE.equals(result.get("ok")) && !skipped) {
+                        android.util.Log.i("XenoidDisplay", "display reapplied on attempt " + attempt);
+                        return;
+                    }
+                    if (skipped) {
+                        // No effective profile yet: host will apply identity; stop retrying.
+                        return;
+                    }
+                    // rootd not reachable yet (it is started by the host's up path); keep retrying.
+                } catch (Throwable ignored) {
+                }
+                try { Thread.sleep(3000L); } catch (InterruptedException interrupted) { return; }
+            }
+            android.util.Log.w("XenoidDisplay", "display reapply gave up: rootd unavailable");
+        }, "xenoid-display-reapply");
+        reapply.setDaemon(true);
+        reapply.start();
+    }
     public void onDestroy() {
         ServerSocket listener = server;
         try { if (listener != null) listener.close(); } catch(Exception ignored) {}

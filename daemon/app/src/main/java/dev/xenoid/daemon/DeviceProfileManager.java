@@ -589,6 +589,65 @@ final class DeviceProfileManager {
         return out;
     }
 
+
+
+    /**
+     * Re-applies the display metrics from this instance's effective profile on
+     * every service start. The wm size/density override is runtime state that
+     * does not survive a container restart, while the host only re-runs
+     * identity convergence when the persisted identity actually drifts. Reading
+     * the instance's own staged effective profile keeps this per-instance and
+     * free of any hardcoded resolution.
+     */
+    static Map<String,Object> reapplyDisplayFromEffectiveProfile() {
+        Map<String,Object> out = new LinkedHashMap<>();
+        out.put("field", "display.metrics");
+        out.put("operation", "reapplyDisplayFromEffectiveProfile");
+        Map<String,Object> read = RootHelper.exec(
+                "cat /data/local/tmp/xenoid-profile/effective.json 2>/dev/null || true");
+        // A failed exec means the root helper is not reachable yet; that is
+        // retryable and must NOT be mistaken for "no profile staged".
+        if (read == null || !Boolean.TRUE.equals(read.get("ok"))) {
+            out.put("ok", false);
+            out.put("retryable", "rootd_unavailable");
+            return out;
+        }
+        String text = String.valueOf(read.get("stdout"));
+        JSONObject display = null;
+        if (text != null && !text.trim().isEmpty()) {
+            try {
+                display = new JSONObject(text).optJSONObject("display");
+            } catch (Exception ignored) {
+                display = null;
+            }
+        }
+        if (display == null) {
+            // Nothing staged yet: the host applies identity on the normal path
+            // for a fresh instance; there is no per-instance value to replay.
+            out.put("ok", true);
+            android.util.Log.i("XenoidDisplay", "reapply skipped: no display profile in effective.json");
+            out.put("skipped", "display_profile_absent");
+            return out;
+        }
+        try {
+            String width = requiredString(display, "width");
+            String height = requiredString(display, "height");
+            String densityDpi = requiredString(display, "densityDpi");
+            Map<String,Object> applied = applyDisplayMetrics(width, height, densityDpi);
+            out.put("ok", applied.get("ok"));
+            out.put("applied", applied.get("ok"));
+            android.util.Log.i("XenoidDisplay", "reapply applied " + width + "x" + height + "@" + densityDpi + " ok=" + applied.get("ok"));
+            out.put("value", width + "x" + height + "@" + densityDpi);
+            return out;
+        } catch (Exception failure) {
+            android.util.Log.w("XenoidDisplay", "reapply error: " + failure);
+            out.put("ok", false);
+            out.put("applied", false);
+            out.put("error", "display_profile_invalid");
+            return out;
+        }
+    }
+
     static Map<String,Object> setField(String field, String value) {
         Map<String,Object> out = applyField(field, value);
         boolean inputField = field != null
