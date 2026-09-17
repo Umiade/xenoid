@@ -99,6 +99,16 @@ def remote_service_version_sourced() -> None:
     require(remote_service.SERVER_INFO["version"] == __version__,
             f"SERVER_INFO version {remote_service.SERVER_INFO['version']!r} != {__version__!r}")
 
+@contract_case("daemon_health_version_sourced")
+def daemon_health_version_sourced() -> None:
+    service = source("daemon/app/src/main/java/dev/xenoid/daemon/XenoidDaemonService.java")
+    require(service.count("BuildConfig.VERSION_NAME") >= 2,
+            "daemon /health version not sourced from BuildConfig")
+    require(re.search(r'"version",\s*"[0-9]', service) is None,
+            "daemon /health still carries a hardcoded version literal")
+    require("buildConfig true" in source("daemon/app/build.gradle"),
+            "BuildConfig generation disabled in daemon/app/build.gradle")
+
 
 @contract_case("changelog_newest_matches_version")
 def changelog_newest_matches_version() -> None:

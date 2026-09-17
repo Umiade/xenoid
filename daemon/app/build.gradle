@@ -10,6 +10,7 @@ android {
         versionCode 901
         versionName '0.9.1'
     }
+    buildFeatures { buildConfig true }
 }
 
 dependencies {

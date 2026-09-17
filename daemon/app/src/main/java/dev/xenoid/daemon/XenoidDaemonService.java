@@ -632,9 +632,9 @@ public class XenoidDaemonService extends Service {
                         || !cameraMediaManager.healthReady()
                         || !rootHealthReady()) {
                     return map("ok", false, "service", "xenoid-daemon",
-                            "version", "0.1.0", "error", "service_not_ready");
+                            "version", BuildConfig.VERSION_NAME, "error", "service_not_ready");
                 }
-                return map("ok", true, "service", "xenoid-daemon", "version", "0.1.0");
+                return map("ok", true, "service", "xenoid-daemon", "version", BuildConfig.VERSION_NAME);
             }
             if (path.startsWith("/proxy/")) return routeProxy(method, path, body);
             if (path.startsWith("/location/")) return routeLocation(method, path, body);
