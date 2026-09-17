@@ -173,6 +173,21 @@ def _smoke(name: str, script: str, *, mutating: bool = False) -> GateSpec:
 
 
 _CONTRACTS = (
+    _py(
+        "version-contract",
+        "scripts/test-version-contract.py",
+        inputs=(
+            "scripts/test-version-contract.py",
+            "src/xenoid/__init__.py",
+            "src/xenoid/cli.py",
+            "src/xenoid/remote_service.py",
+            "pyproject.toml",
+            "setup.py",
+            "daemon/app/build.gradle",
+            "CHANGELOG.md",
+            "CHANGELOG_CN.md",
+        ),
+    ),
     _py("bootstrap-contract", "scripts/test-bootstrap-contract.py"),
     _py("proxy-instance-contract", "scripts/test-proxy.py"),
     _py(

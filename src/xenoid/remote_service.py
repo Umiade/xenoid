@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
+from . import __version__
 from .backend import RuntimeManager
 from .config import (
     INSTANCE_NAME_RE,
@@ -51,7 +52,7 @@ from .util import command_timeout
 
 
 PROTOCOL_VERSION = "2026-07-28"
-SERVER_INFO = {"name": "xenoid-service", "version": "0.1.0"}
+SERVER_INFO = {"name": "xenoid-service", "version": __version__}
 ACCESS_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 1024 * 1024
 DEFAULT_REQUESTS_PER_MINUTE = 120

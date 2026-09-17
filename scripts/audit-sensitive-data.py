@@ -120,7 +120,7 @@ PATTERNS = ()
 FORBIDDEN_DISCLOSURES = ()
 
 CJK = re.compile(r"[\u3400-\u9fff]")
-NON_ENGLISH_EXEMPT = {"README_CN.md"}
+NON_ENGLISH_EXEMPT = {"README_CN.md", "CHANGELOG_CN.md"}
 
 
 class InventoryError(RuntimeError):

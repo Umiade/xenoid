@@ -2,6 +2,8 @@
 
 [English](README.md)
 
+[更新日志](CHANGELOG_CN.md)
+
 Xenoid 是面向移动安全工作的受控 Android 13 ARM64 运行时，支持 Apple Silicon macOS 与 Linux ARM64。它将 redroid 收敛为持久化的 Raven 设备，生产入口只有一个：
 
 ```bash

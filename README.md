@@ -2,6 +2,8 @@
 
 [Chinese Version](README_CN.md)
 
+[Changelog](CHANGELOG.md)
+
 Xenoid is a controlled Android 13 ARM64 runtime for mobile security work on Apple Silicon macOS and Linux ARM64. It turns redroid into a persistent Raven-class device with one production entrypoint:
 
 ```bash

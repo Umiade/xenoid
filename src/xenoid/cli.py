@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
+from . import __version__
 from .backend import RuntimeManager
 from .convergence import ConvergenceExecutor
 from .live_observe import LiveAcceptance
@@ -3698,6 +3699,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--instance",
         help="immutable instance name (default: XENOID_INSTANCE or default)",
     )
+    p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="top_command", required=True)
 
     s = sub.add_parser("install-runtime", help="install macOS runtime dependencies via Homebrew and start Colima")
