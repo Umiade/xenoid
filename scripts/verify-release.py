@@ -38,6 +38,7 @@ _REQUIRED = {
     "bin/xenoid",
     "bin/xenoid-mcp",
     "bin/xenoid-service",
+    "src/xenoid/__init__.py",
     "src/xenoid/gates.py",
     "src/xenoid/sensitive.py",
     "src/xenoid/process.py",
@@ -298,6 +299,16 @@ def _self_check(root: Path) -> int:
     _check(checks, "canonical-ota", "make-ota-bundle.sh" in package and canonical.is_file())
     _check(checks, "canonical-release", "canonical-tar.py" in package)
     _check(checks, "mandatory-verification", "verify-release.py" in package and "archiveSha256" in verifier)
+    _check(
+        checks,
+        "version-provenance",
+        "release_version_mismatch" in package
+        and "release_tag_commit_mismatch" in package
+        and '"version": version' in package
+        and '"sourceCommit": source_commit' in package
+        and "versioned-archive" in verifier
+        and "packaged-version" in verifier,
+    )
     _check(
         checks,
         "bounded-release-tools",
@@ -595,9 +606,38 @@ def verify(archive: Path) -> dict[str, Any]:
         manifest = json.loads(manifest_bytes) if manifest_bytes is not None else None
     except json.JSONDecodeError:
         manifest = None
-    if not isinstance(manifest, dict) or set(manifest) != {"schema", "sourceDateEpoch", "gateEvidenceSha256", "files"}:
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema",
+        "version",
+        "sourceCommit",
+        "sourceDateEpoch",
+        "gateEvidenceSha256",
+        "files",
+    }:
         report["errorCode"] = "release_manifest_invalid"
         return report
+    version = manifest.get("version")
+    source_commit = manifest.get("sourceCommit")
+    version_valid = isinstance(version, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", version
+    ) is not None
+    commit_valid = isinstance(source_commit, str) and re.fullmatch(
+        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_commit
+    ) is not None
+    _check(checks, "release-version", version_valid, "release_version_invalid")
+    _check(checks, "source-commit", commit_valid, "release_source_commit_invalid")
+    _check(
+        checks,
+        "versioned-root",
+        version_valid and root_name == "xenoid-" + version,
+        "release_root_version_mismatch",
+    )
+    _check(
+        checks,
+        "versioned-archive",
+        version_valid and archive.name == "xenoid-" + version + ".tar.gz",
+        "release_archive_version_mismatch",
+    )
     _check(checks, "manifest-canonical-json", manifest_bytes == _canonical_json(manifest), "release_manifest_not_canonical")
     epoch = manifest.get("sourceDateEpoch")
     _check(checks, "source-date-epoch", isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 and gzip_mtime == epoch, "release_epoch_mismatch")
@@ -628,6 +668,22 @@ def verify(archive: Path) -> dict[str, Any]:
     )
     _check(checks, "manifest-hashes", manifest_hashes_ok, "release_manifest_hash_mismatch")
     _check(checks, "required-files", _REQUIRED <= set(files), "release_required_file_missing")
+    init_bytes = file_bytes.get("src/xenoid/__init__.py")
+    try:
+        init_text = init_bytes.decode("utf-8") if init_bytes is not None else ""
+    except UnicodeError:
+        init_text = ""
+    init_match = re.search(
+        r'^__version__ = "([A-Za-z0-9][A-Za-z0-9._-]{0,63})"$',
+        init_text,
+        re.MULTILINE,
+    )
+    _check(
+        checks,
+        "packaged-version",
+        init_match is not None and init_match.group(1) == version,
+        "release_packaged_version_mismatch",
+    )
 
     gate_bytes = file_bytes.get("gate-evidence.json")
     try:
@@ -742,6 +798,8 @@ def verify(archive: Path) -> dict[str, Any]:
         )
         _check(checks, "canonical-ota", ota_ok, "release_ota_not_canonical")
 
+    report["version"] = version
+    report["sourceCommit"] = source_commit
     report["releaseSchema"] = manifest.get("schema")
     report["fileCount"] = len(files)
     report["ok"] = manifest.get("schema") == RELEASE_SCHEMA and all(item["ok"] for item in checks)

@@ -33,37 +33,43 @@ public class XenoidDaemonService extends Service {
     private volatile ProxyAgentChannel proxyAgentChannel;
     private volatile LocationIdentityManager locationIdentityManager;
     private volatile KeyboxManager keyboxManager;
+    private volatile GoogleIdentityManager googleIdentityManager;
     private volatile BootstrapCoordinator bootstrapCoordinator;
     private final Set<Client> clients =
             Collections.newSetFromMap(new ConcurrentHashMap<Client, Boolean>());
     public IBinder onBind(Intent intent) { return null; }
     public int onStartCommand(Intent intent, int flags, int startId) { enterForeground(); startServer(); return START_STICKY; }
     {
-        // Display resolution is runtime state lost on every container restart;
-        // replay this instance's own effective profile so it self-heals even
-        // when the host skips identity convergence for an already-converged
-        // instance. The root helper may not be up yet at early boot, so apply
-        // on a background thread and retry a few times before giving up.
+        // wm overrides and net.hostname are runtime state lost on container
+        // restart. Replay each instance's staged values after rootd returns.
         Thread reapply = new Thread(() -> {
             for (int attempt = 0; attempt < 30; attempt++) {
                 try {
-                    Map<String, Object> result = DeviceProfileManager.reapplyDisplayFromEffectiveProfile();
-                    boolean skipped = result != null && result.get("skipped") != null;
-                    if (result != null && Boolean.TRUE.equals(result.get("ok")) && !skipped) {
-                        android.util.Log.i("XenoidDisplay", "display reapplied on attempt " + attempt);
+                    Map<String, Object> display =
+                            DeviceProfileManager.reapplyDisplayFromEffectiveProfile();
+                    Map<String, Object> identity =
+                            DeviceProfileManager.reapplyRuntimeIdentityFromStagedProfile();
+                    boolean displayDone = display != null
+                            && Boolean.TRUE.equals(display.get("ok"));
+                    boolean identityDone = identity != null
+                            && Boolean.TRUE.equals(identity.get("ok"));
+                    if (displayDone && identityDone) {
+                        android.util.Log.i(
+                                "XenoidRuntime",
+                                "runtime profile replayed on attempt " + attempt);
                         return;
                     }
-                    if (skipped) {
-                        // No effective profile yet: host will apply identity; stop retrying.
-                        return;
-                    }
-                    // rootd not reachable yet (it is started by the host's up path); keep retrying.
                 } catch (Throwable ignored) {
                 }
-                try { Thread.sleep(3000L); } catch (InterruptedException interrupted) { return; }
+                try {
+                    Thread.sleep(3000L);
+                } catch (InterruptedException interrupted) {
+                    return;
+                }
             }
-            android.util.Log.w("XenoidDisplay", "display reapply gave up: rootd unavailable");
-        }, "xenoid-display-reapply");
+            android.util.Log.w(
+                    "XenoidRuntime", "runtime profile replay gave up: rootd unavailable");
+        }, "xenoid-runtime-reapply");
         reapply.setDaemon(true);
         reapply.start();
     }
@@ -75,6 +81,8 @@ public class XenoidDaemonService extends Service {
         ProxyAgentChannel channel = proxyAgentChannel;
         if (channel != null) channel.close();
         ProxyManager manager = proxyManager;
+        GoogleIdentityManager googleIdentity = googleIdentityManager;
+        if (googleIdentity != null) googleIdentity.close();
         if (manager != null) manager.close();
         for (Client client : clients) client.close();
         ExecutorService workers = pool;
@@ -185,6 +193,12 @@ public class XenoidDaemonService extends Service {
                 locationError = "location_unavailable";
                 android.util.Log.e("xenoid-daemon", "location identity initialization failed");
             }
+            try {
+                googleIdentityManager = new GoogleIdentityManager(this);
+            } catch (Throwable ignored) {
+                android.util.Log.e("xenoid-daemon", "Google identity initialization failed");
+            }
+
 
             String cameraError = null;
             try {
@@ -496,6 +510,7 @@ public class XenoidDaemonService extends Service {
             if ("/location/status".equals(path) && "GET".equals(method)) return 0;
             return "POST".equals(method) ? 128 * 1024 : 0;
         }
+        if (path.startsWith("/google-identity/")) return 256;
         if (path.startsWith("/keybox/")) return KeyboxManager.MAX_REQUEST_BODY_BYTES;
         if (path.startsWith("/camera/")) return 2048;
         return MAX_DEFAULT_BODY_BYTES;
@@ -640,6 +655,9 @@ public class XenoidDaemonService extends Service {
             if (path.startsWith("/location/")) return routeLocation(method, path, body);
             if (path.startsWith("/camera/")) return routeCamera(method, path, body);
             if (path.startsWith("/keybox/")) return routeKeybox(method, path, body);
+            if (path.startsWith("/google-identity/")) {
+                return routeGoogleIdentity(method, path, body);
+            }
             if (path.equals("/root/status")) return RootHelper.status();
             if (path.equals("/root/exec")) return RootHelper.exec(SimpleJson.stringValue(body, "command", "id"));
             if (path.equals("/profile/helper/status")) return RootHelper.profileStatus();
@@ -664,6 +682,42 @@ public class XenoidDaemonService extends Service {
             return map("ok", false, "error", "not_found");
         } catch(Exception ignored) {
             return map("ok", false, "error", "internal_error");
+        }
+    }
+
+    private Map<String, Object> routeGoogleIdentity(
+            String method, String path, String body) {
+        GoogleIdentityManager manager = googleIdentityManager;
+        if (manager == null) {
+            return map("ok", false, "schema", GoogleIdentityManager.SCHEMA,
+                    "error", "google_identity_unavailable");
+        }
+        try {
+            if ("/google-identity/inspect".equals(path)) {
+                requireProxyMethod(method, "GET");
+                ProxyManager.requireEmptyBody(body);
+                return manager.inspect();
+            }
+            if ("/google-identity/status".equals(path)) {
+                requireProxyMethod(method, "GET");
+                ProxyManager.requireEmptyBody(body);
+                return manager.status();
+            }
+            if ("/google-identity/activate".equals(path)) {
+                requireProxyMethod(method, "POST");
+                Map<String, Object> request = ProxyManager.parseObject(body, 256);
+                if (!request.keySet().equals(Collections.singleton("gsfAndroidId"))
+                        || !(request.get("gsfAndroidId") instanceof String)) {
+                    return map("ok", false, "schema", GoogleIdentityManager.SCHEMA,
+                            "error", "invalid_request");
+                }
+                return manager.activate((String) request.get("gsfAndroidId"));
+            }
+            return map("ok", false, "schema", GoogleIdentityManager.SCHEMA,
+                    "error", "not_found");
+        } catch (Throwable ignored) {
+            return map("ok", false, "schema", GoogleIdentityManager.SCHEMA,
+                    "error", "google_identity_unavailable");
         }
     }
 

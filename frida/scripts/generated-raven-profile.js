@@ -540,7 +540,6 @@ const XENOID_PROFILE = {
   "ids": {
     "android_id": "REGENERATE",
     "boot_id": "REGENERATE",
-    "random_uuid": "REGENERATE",
     "serial": "REGENERATE",
     "imei": "REGENERATE",
     "imeisv": "REGENERATE"

@@ -392,7 +392,7 @@ _TARGET_LIST = (
     _target(
         "zygote",
         ("scripts/build-native-zygote.sh", "arm64"),
-        (*_COMMON_ANDROID, "scripts/build-native-zygote.sh", "native/xenoid-zygote/xenoid_zygote.c", "native/xenoid-shim/xenoid_shim.c"),
+        (*_COMMON_ANDROID, "scripts/build-native-zygote.sh", "native/xenoid-zygote/xenoid_zygote.c", "native/xenoid-zygote/xenoid_drm.c", "native/xenoid-zygote/xenoid_drm_sret.S", "native/xenoid-shim/xenoid_shim.c"),
         (_out("native/xenoid-zygote/libxenoid_zygote.so"),),
         "native/xenoid-zygote",
     ),

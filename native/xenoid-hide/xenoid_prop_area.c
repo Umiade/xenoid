@@ -42,6 +42,7 @@ static char g_abilist64[PROP_VALUE_MAX] = "arm64-v8a";
 static char g_bionic_arch[PROP_VALUE_MAX] = "arm64";
 static char g_dalvik_isa_arm64[PROP_VALUE_MAX] = "arm64";
 static char g_dalvik_isa_arm[PROP_VALUE_MAX] = "";
+static char g_serial[PROP_VALUE_MAX] = "";
 
 static char *read_text_file(const char *path){
   int fd=open(path,O_RDONLY|O_CLOEXEC); if(fd<0) return NULL;
@@ -115,7 +116,9 @@ static void json_copy_string(const char *json, const char *key, char *dst, size_
 static void load_profile_values(void){
   char *json=read_text_file(PROFILE_JSON); if(!json) return;
   char *build=json_top_level_object(json,"build");
+  char *ids=json_top_level_object(json,"ids");
   free(json);
+  if(ids){ json_copy_string(ids,"serial",g_serial,sizeof(g_serial)); free(ids); }
   if(!build) return;
   json_copy_string(build,"brand",g_brand,sizeof(g_brand));
   json_copy_string(build,"manufacturer",g_manufacturer,sizeof(g_manufacturer));
@@ -263,8 +266,8 @@ static const char *desired_value(const char *full){
   if(!strcmp(full,"ro.warranty_bit")) return "0";
   if(!strcmp(full,"ro.bootmode")) return "normal";
   if(!strcmp(full,"ro.boot.mode")) return "normal";
-  if(!strcmp(full,"ro.boot.serialno")) return "";
-  if(!strcmp(full,"ro.serialno")) return "";
+  if(!strcmp(full,"ro.boot.serialno")) return g_serial;
+  if(!strcmp(full,"ro.serialno")) return g_serial;
   if(!strcmp(full,"ro.boot.hardware.sku") || !strcmp(full,"ro.hardware.sku")) return g_sku;
   if(strstr(full,"cpu.abilist64")) return g_abilist64;
   if(strstr(full,"cpu.abilist32")) return g_abilist32;
@@ -337,6 +340,7 @@ int main(int argc, char **argv){
   const char *files[]={
     "/dev/__properties__/u:object_r:userdebug_or_eng_prop:s0",
     "/dev/__properties__/u:object_r:build_prop:s0",
+    "/dev/__properties__/u:object_r:serialno_prop:s0",
     "/dev/__properties__/u:object_r:fingerprint_prop:s0",
     "/dev/__properties__/u:object_r:build_odm_prop:s0",
     "/dev/__properties__/u:object_r:build_vendor_prop:s0",

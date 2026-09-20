@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="xenoid",
-    version="0.9.1",
+    version="0.9.2",
     description="Xenoid Android runtime orchestration for Apple Silicon macOS and Linux ARM",
     package_dir={"": "src"},
     packages=find_packages("src"),

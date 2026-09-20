@@ -16,7 +16,7 @@ Commands marked *(internal)* run as part of `up` convergence and are not everyda
 - `./xenoid install-runtime [--dry-run]` — install macOS runtime dependencies via Homebrew and start Colima.
 - `./xenoid linux-binderfs [--dry-run]` — set up Linux binderfs devices for redroid.
 - `./xenoid init [--image IMAGE] [--backend BACKEND] [--config CONFIG] [--from FROM_INSTANCE] [--no-google-services]` — initialize the selected immutable instance.
-- `./xenoid up [--dry-run] [--skip-build]` — converge the complete Xenoid production runtime.
+- `./xenoid up [--dry-run] [--skip-build]` — converge the complete Xenoid production runtime. `--skip-build` remains supported and validates existing artifact records without compiling. The final result is `dev.xenoid.convergence/v1` normally, or the canonical top-level `dev.xenoid.device-regenerate/v3` result when `up` resumes a pending regeneration.
 - `./xenoid start [--dry-run] [--no-wait] [--start-colima] [--install-daemon APK] [--no-adb-root] [--skip-preflight] [--recreate]` — start the low-level Android runtime without full Xenoid state convergence.
 - `./xenoid stop` — stop and retain the owned Android runtime container.
 - `./xenoid status` — observe runtime state and report the recommended convergence action.
@@ -93,7 +93,7 @@ Commands marked *(internal)* run as part of `up` convergence and are not everyda
 - `./xenoid device keybox set FILE` — import a trusted-local KeyMint keybox.
 - `./xenoid device keybox status` — show KeyMint keybox state.
 - `./xenoid device keybox clear` — clear the configured keybox.
-- `./xenoid device regenerate [--skip-build] [--dry-run] [--restart-legacy-transaction]` — rotate every per-device uniqueness factor (IDs, MAC, filesystem identity, per-app SSAID) and re-converge the runtime.
+- `./xenoid device regenerate [--dry-run]` — first fail-closed checks that the current checkout and live runtime already converge without mutation, then rotates every per-device uniqueness factor (IDs, SIM, boot, filesystem identity, per-app SSAID, GAID/GSF, Bluetooth address, DRM `deviceUniqueId`) in place across one soft reboot; the container is never recreated. The command no longer accepts `--skip-build` (`up --skip-build` remains available). Successful microG regeneration enters `googleIdentityMode=offline-seeded`: FCM registration and delivery are unavailable, and status reports `cloudMessaging=unsupported` with `offline-checkin-disabled`. Run `./xenoid up` first when preflight reports `device_regeneration_runtime_not_converged`.
 
 ## Camera
 

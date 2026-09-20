@@ -42,7 +42,9 @@ The full profile is staged at:
 /data/local/tmp/xenoid-profile/effective.json
 ```
 
-System services and native helpers consume the staged profile for non-mutable surfaces such as sensors, boot ID reads, and battery values.
+System services and native helpers consume the staged profile for non-mutable surfaces such as sensors, boot ID reads, the `/data` `statfs` `f_fsid`, the Widevine DRM `deviceUniqueId`, and battery values. `device regenerate` rewrites these staged values in place and rotates the profile's uniqueness factors without recreating the container.
+
+For microG, regeneration also enters `googleIdentityMode=offline-seeded`: GSF check-in remains disabled, so FCM registration/delivery are unavailable and `cloudMessaging` is no longer a required runtime capability.
 
 ## Canonical Raven contract
 

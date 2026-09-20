@@ -47,9 +47,8 @@ from .daemon_client import (
     DaemonClient,
 )
 from .device_identity import (
-    GOOGLE_CLEAR_PACKAGES,
-    GOOGLE_MARKER_ROOTS,
     DeviceIdentityStore,
+    container_epoch,
     IdentityError,
     RegenerationJournal,
     public_identity_state,
@@ -89,7 +88,6 @@ from .storage import (
     backup_image_name,
     parse_storage_result,
     public_storage_state,
-    storage_rotation_target,
 )
 from .runtime_image import RuntimeImageBuilder
 from .protection import SharedProtectionManager
@@ -101,18 +99,13 @@ from .util import bounded_timeout, host_info, run, validate_release_version, whi
 _DAEMON_TRANSPORT_TIMEOUT_SECONDS = 30.0
 _ROOTD_PROVISION_TIMEOUT_SECONDS = 30.0
 _BOOTSTRAP_SEQUENCE_TIMEOUT_SECONDS = 300.0
+_SOFT_REBOOT_TIMEOUT_SECONDS = 180.0
 _ROOTD_REMOTE_PATH = "/data/local/tmp/xenoid-rootd"
 _ROOTD_LEGACY_PATH = "/data/local/tmp/.netd-helper"
 _ROOTD_RUN_DIRECTORY = "/data/local/tmp/xenoid-rootd-run"
 _ROOTD_PROCESS_RECORD = f"{_ROOTD_RUN_DIRECTORY}/process.json"
+_REGENERATION_RESTART_RECEIPT = "/data/local/tmp/xenoid-profile/regeneration_restart_receipt"
 _ROOTD_PROCESS_SCHEMA = "dev.xenoid.rootd-process/v1"
-_ROOTD_ERROR_CODES = frozenset({
-    "daemon_token_unavailable",
-    "rootd_unauthorized",
-    "rootd_unavailable",
-    "rootd_resource_conflict",
-    "rootd_deploy_failed",
-})
 _DAEMON_RUNTIME_PERMISSIONS = (
     "android.permission.ACCESS_COARSE_LOCATION",
     "android.permission.ACCESS_FINE_LOCATION",
@@ -210,6 +203,33 @@ class Check:
     ok: bool
     detail: str
     fix: Optional[str] = None
+
+
+def _google_identity_capability_model(
+    provider: str,
+    runtime_state: str,
+    *,
+    offline_identity_seeded: bool,
+) -> dict[str, Any]:
+    model = capability_model(provider, runtime_state)
+    if not offline_identity_seeded:
+        return model
+    capabilities = dict(model["capabilities"])
+    capabilities["cloudMessaging"] = {
+        "scope": "runtime-release",
+        "runtimeState": "unsupported",
+        "releaseState": "unsupported",
+        "evidence": "offline-checkin-disabled",
+    }
+    return {
+        **model,
+        "requiredCapabilities": [
+            name
+            for name in model["requiredCapabilities"]
+            if name != "cloudMessaging"
+        ],
+        "capabilities": capabilities,
+    }
 
 
 class RuntimeManager:
@@ -1229,7 +1249,22 @@ cat >/dev/null
                     process.wait()
 
     def shared_protection_status(self) -> dict[str, Any]:
-        return self.shared_protection_manager().status()
+        status = dict(self.shared_protection_manager().status())
+        statfs_fsid = self.shared_protection_manager().statfs_fsid_status()
+        status["statfsFsid"] = statfs_fsid
+        if (
+            status.get("ok") is True
+            and statfs_fsid.get("running") is True
+            and (
+                statfs_fsid.get("ok") is not True
+                or statfs_fsid.get("published") is not True
+            )
+        ):
+            status["ok"] = False
+            status["error"] = str(
+                statfs_fsid.get("error") or "statfs_fsid_diverged"
+            )
+        return status
 
     def build_shared_protection(self) -> dict[str, Any]:
         return self.shared_protection_manager().prepare()
@@ -2133,500 +2168,9 @@ cat >/dev/null
         })
         return result
 
-    def _run_storage_identity_rotation(
-        self,
-        expected_uuid: str,
-        *,
-        target_uuid: str,
-        expected_rootfs_source_sha256: str,
-        expected_rootfs_size_bytes: int,
-        expected_rootfs_uuid: str,
-        target_rootfs_uuid: str,
-    ) -> dict[str, Any]:
-        script = self.context.project_root / "scripts" / "rotate-storage-identity.sh"
-        command = [
-            str(script),
-            self.lease.volume_name,
-            expected_uuid,
-            target_uuid,
-            expected_rootfs_uuid,
-            expected_rootfs_source_sha256,
-            str(expected_rootfs_size_bytes),
-            target_rootfs_uuid,
-        ]
-        env = self.docker_env()
-        ssh_cmd = self.remote_docker_ssh_cmd()
-        if ssh_cmd:
-            env["XENOID_ENGINE_SSH"] = ssh_cmd[-1]
-            if "-p" in ssh_cmd:
-                env["XENOID_ENGINE_SSH_PORT"] = ssh_cmd[ssh_cmd.index("-p") + 1]
-        proc = run(command, timeout=1800, env=env)
-        result: dict[str, Any] = {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-        }
-        if proc.returncode != 0:
-            result["error"] = (
-                "storage_identity_mismatch"
-                if proc.returncode == 42
-                else (
-                    "storage_image_invalid"
-                    if proc.returncode in (41, 58, 59, 60, 63)
-                    else "storage_rotation_failed"
-                )
-            )
-            result["message"] = (
-                "data image identity matches neither the pending expectation nor the rotation target"
-                if proc.returncode == 42
-                else "instance storage identity rotation failed"
-            )
-            return result
-        try:
-            geometry = parse_storage_result(proc.stdout, require_rootfs=True)
-        except StorageError as exc:
-            return {**result, **exc.as_dict(), "ok": False}
-        rotated = any(
-            line.strip() == "XENOID_DATA_ROTATED=1" for line in proc.stdout.splitlines()
-        )
-        result.update({**geometry, "rotated": rotated})
-        return result
-
-    def complete_legacy_pending_storage(
-        self,
-        legacy_evidence_sha256: str,
-    ) -> dict[str, Any]:
-        """Finish only an already-recorded v1 storage transition."""
-        journal = RegenerationJournal(self.context)
-        try:
-            if journal.legacy_source_digest() != legacy_evidence_sha256:
-                raise StorageError(
-                    "device_regeneration_state_invalid",
-                    "legacy evidence digest mismatch",
-                )
-            store = StorageStateStore(self.context, self.lease)
-            state = store.load()
-            if state is None:
-                raise StorageError(
-                    "storage_not_initialized",
-                    "legacy storage state is missing",
-                )
-            if state["state"] == "committed":
-                return {"ok": True, "completed": False}
-            if (
-                state["temporaryImage"] != ""
-                or not state["rotationTargetUuid"]
-            ):
-                raise StorageError(
-                    "storage_identity_mismatch",
-                    "legacy pending storage is not a rotation window",
-                )
-            volume, _ = self._inspect_docker_object(
-                "volume",
-                self.lease.volume_name,
-            )
-            data = (
-                self._inspect_volume_image(dict(volume))
-                if isinstance(volume, Mapping)
-                else {}
-            )
-            rootfs = (
-                self._inspect_volume_image(
-                    dict(volume),
-                    image_name=ROOTFS_IMAGE_NAME,
-                )
-                if isinstance(volume, Mapping)
-                else {}
-            )
-            if (
-                data.get("ok") is not True
-                or rootfs.get("ok") is not True
-                or data.get("filesystemUuid")
-                not in {
-                    state["filesystemUuid"],
-                    state["rotationTargetUuid"],
-                }
-            ):
-                raise StorageError(
-                    "storage_identity_mismatch",
-                    "legacy storage matches neither old nor target",
-                )
-            data_uuid = str(data["filesystemUuid"])
-            rootfs_uuid = str(rootfs["filesystemUuid"])
-            migrated = self._run_storage_image_action(
-                "preserve",
-                expected_uuid=data_uuid,
-                transaction_id=str(state["transactionId"]),
-                expected_rootfs_uuid=rootfs_uuid,
-            )
-            if migrated.get("ok") is not True:
-                return {
-                    "ok": False,
-                    "error": str(
-                        migrated.get("error")
-                        or "storage_v4_migration_failed"
-                    ),
-                }
-            normalized = store.pending(
-                str(state["source"]),
-                transaction_id=str(state["transactionId"]),
-                filesystem_uuid=data_uuid,
-                observed_logical_size_bytes=int(migrated["logicalSizeBytes"]),
-                observed_filesystem_size_bytes=int(
-                    migrated["filesystemSizeBytes"]
-                ),
-                host_allocated_bytes=int(migrated["allocatedBytes"]),
-                rootfs_image=ROOTFS_IMAGE_NAME,
-                rootfs_filesystem_uuid=rootfs_uuid,
-                rootfs_source_sha256=str(migrated["rootfsSourceSha256"]),
-                observed_rootfs_size_bytes=int(migrated["rootfsSizeBytes"]),
-                legacy_volume=str(state["legacyVolume"]),
-                legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
-                backup_image=str(state["backupImage"]),
-                backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
-                backup_size_bytes=int(state["backupSizeBytes"]),
-                backup_rootfs_image=str(
-                    migrated.get("backupRootfsImage") or ""
-                ),
-                backup_rootfs_filesystem_uuid=str(
-                    migrated.get("backupRootfsFilesystemUuid") or ""
-                ),
-                backup_rootfs_size_bytes=int(
-                    migrated.get("backupRootfsSizeBytes") or 0
-                ),
-                growth=True,
-            )
-            committed = store.commit(normalized, migrated)
-            committed = self._cleanup_committed_rootfs_backup(
-                store,
-                committed,
-            )
-            return {
-                "ok": True,
-                "completed": True,
-                "dataUuid": committed["filesystemUuid"],
-                "rootfsUuid": committed["rootfsFilesystemUuid"],
-            }
-        except (IdentityError, StorageError) as exc:
-            return exc.as_dict()
-
-
-    def rotate_storage_identity(
-        self,
-        *,
-        transaction_id: str,
-        data_target_uuid: str,
-        rootfs_target_uuid: str,
-        expected_data_uuid: str,
-        expected_rootfs_uuid: str,
-        regeneration_capability: Any = None,
-    ) -> dict[str, Any]:
-        """Converge both persistent ext4 identities to journal-pinned targets."""
-        self.ensure_instance_lease()
-        journal = RegenerationJournal(self.context)
-        try:
-            regeneration = journal.load()
-            if regeneration is not None:
-                regeneration = journal.require_capability(regeneration_capability)
-                target = regeneration["target"]
-                if (
-                    transaction_id != target["storageTransactionId"]
-                    or data_target_uuid != target["dataFilesystemUuid"]
-                    or rootfs_target_uuid != target["rootfsFilesystemUuid"]
-                ):
-                    raise IdentityError(
-                        "device_regeneration_state_invalid",
-                        "storage targets do not match the regeneration journal",
-                    )
-            elif regeneration_capability is not None:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "regeneration capability has no journal",
-                )
-        except IdentityError as exc:
-            return exc.as_dict()
-        container, error = self._owned_container_record()
-        if container is not None:
-            return {
-                "ok": False,
-                "error": "storage_rotation_requires_stop",
-                "message": "the owned Android container must be absent before storage identity rotation",
-            }
-        if error != "instance container does not exist":
-            return {
-                "ok": False,
-                "error": "resource_conflict",
-                "message": error,
-            }
-        store = StorageStateStore(self.context, self.lease)
-        try:
-            state = store.load()
-            if (
-                isinstance(state, Mapping)
-                and state.get("state") == "pending"
-                and state.get("temporaryImage") == ""
-                and not state.get("rootfsFilesystemUuid")
-                and isinstance(regeneration, Mapping)
-                and regeneration.get("legacyEvidenceSha256") is not None
-            ):
-                volume, _ = self._inspect_docker_object(
-                    "volume",
-                    self.lease.volume_name,
-                )
-                observed_data = (
-                    self._inspect_volume_image(dict(volume))
-                    if isinstance(volume, Mapping)
-                    else {}
-                )
-                observed_rootfs = (
-                    self._inspect_volume_image(
-                        dict(volume),
-                        image_name=ROOTFS_IMAGE_NAME,
-                    )
-                    if isinstance(volume, Mapping)
-                    else {}
-                )
-                if (
-                    observed_data.get("ok") is not True
-                    or observed_rootfs.get("ok") is not True
-                    or observed_data.get("filesystemUuid")
-                    != expected_data_uuid
-                    or observed_rootfs.get("filesystemUuid")
-                    != expected_rootfs_uuid
-                ):
-                    raise StorageError(
-                        "storage_identity_mismatch",
-                        "legacy pending storage differs from its v2 snapshot",
-                    )
-                migrated = self._run_storage_image_action(
-                    "preserve",
-                    expected_uuid=expected_data_uuid,
-                    transaction_id=str(state["transactionId"]),
-                    expected_rootfs_uuid=expected_rootfs_uuid,
-                )
-                if migrated.get("ok") is not True:
-                    return {
-                        "ok": False,
-                        "error": str(
-                            migrated.get("error")
-                            or "storage_v4_migration_failed"
-                        ),
-                    }
-                migrated_backup = str(
-                    migrated.get("backupRootfsImage") or ""
-                )
-                if migrated_backup:
-                    expected_backup = (
-                        f"{ROOTFS_IMAGE_NAME}.pre-source-"
-                        f"{state['transactionId']}"
-                    )
-                    if migrated_backup != expected_backup:
-                        raise StorageError(
-                            "storage_state_invalid",
-                            "legacy rootfs backup owner is invalid",
-                        )
-                    mountpoint = (
-                        volume.get("Mountpoint")
-                        if isinstance(volume, Mapping)
-                        else None
-                    )
-                    if not isinstance(mountpoint, str):
-                        raise StorageError(
-                            "storage_image_invalid",
-                            "legacy rootfs backup path is unavailable",
-                        )
-                    backup_path = (
-                        f"{mountpoint.rstrip('/')}/{migrated_backup}"
-                    )
-                    cleanup = self._engine_host_shell(
-                        "set -eu; p="
-                        + shlex.quote(backup_path)
-                        + "; if [ ! -e \"$p\" ]; then exit 0; fi; "
-                        + "[ -f \"$p\" ] && [ ! -L \"$p\" ]; "
-                        + "[ \"$(blkid -p -s UUID -o value -- \"$p\" | tr A-F a-f)\" = "
-                        + shlex.quote(
-                            str(migrated["backupRootfsFilesystemUuid"])
-                        )
-                        + " ]; [ \"$(stat -c %s -- \"$p\")\" = "
-                        + shlex.quote(
-                            str(migrated["backupRootfsSizeBytes"])
-                        )
-                        + " ]; rm -- \"$p\"; sync -f "
-                        + shlex.quote(mountpoint)
-                    )
-                    if cleanup.returncode != 0:
-                        raise StorageError(
-                            "storage_image_invalid",
-                            "legacy rootfs backup cleanup failed",
-                        )
-                state = store.pending(
-                    str(state["source"]),
-                    transaction_id=transaction_id,
-                    filesystem_uuid=expected_data_uuid,
-                    observed_logical_size_bytes=int(
-                        migrated["logicalSizeBytes"]
-                    ),
-                    observed_filesystem_size_bytes=int(
-                        migrated["filesystemSizeBytes"]
-                    ),
-                    host_allocated_bytes=int(migrated["allocatedBytes"]),
-                    rootfs_image=ROOTFS_IMAGE_NAME,
-                    rootfs_filesystem_uuid=expected_rootfs_uuid,
-                    rootfs_source_sha256=str(
-                        migrated["rootfsSourceSha256"]
-                    ),
-                    observed_rootfs_size_bytes=int(
-                        migrated["rootfsSizeBytes"]
-                    ),
-                    legacy_volume=str(state["legacyVolume"]),
-                    legacy_filesystem_uuid=str(
-                        state["legacyFilesystemUuid"]
-                    ),
-                    backup_image=str(state["backupImage"]),
-                    backup_filesystem_uuid=str(
-                        state["backupFilesystemUuid"]
-                    ),
-                    backup_size_bytes=int(state["backupSizeBytes"]),
-                    growth=True,
-                    backup_rootfs_image="",
-                    backup_rootfs_filesystem_uuid="",
-                    backup_rootfs_size_bytes=0,
-                    rotation_target_uuid=data_target_uuid,
-                    rotation_target_rootfs_uuid=rootfs_target_uuid,
-                )
-            if (
-                isinstance(state, Mapping)
-                and state.get("state") == "committed"
-                and not state.get("rootfsFilesystemUuid")
-                and isinstance(regeneration, Mapping)
-                and regeneration.get("legacyEvidenceSha256") is not None
-            ):
-                migrated = self.ensure_instance_storage()
-                if migrated.get("ok") is not True:
-                    return {
-                        "ok": False,
-                        "error": str(
-                            migrated.get("error")
-                            or "storage_v4_migration_failed"
-                        ),
-                    }
-                state = store.load()
-                if (
-                    not isinstance(state, Mapping)
-                    or state.get("rootfsFilesystemUuid")
-                    != expected_rootfs_uuid
-                ):
-                    raise StorageError(
-                        "storage_identity_mismatch",
-                        "v3 rootfs migration changed the recorded identity",
-                    )
-            if (
-                state is None
-                or state["state"] == "pending"
-                and state["temporaryImage"]
-                or not state.get("rootfsFilesystemUuid")
-                or not state.get("rootfsSourceSha256")
-            ):
-                raise StorageError(
-                    "storage_not_initialized",
-                    "instance data/rootfs storage is not committed",
-                )
-            if state["state"] == "committed":
-                state = self._cleanup_committed_rootfs_backup(store, state)
-                if (
-                    state["filesystemUuid"] == data_target_uuid
-                    and state["rootfsFilesystemUuid"] == rootfs_target_uuid
-                ):
-                    state = self._cleanup_committed_rootfs_backup(store, state)
-                    return {
-                        "ok": True,
-                        "rotated": False,
-                        "filesystemUuid": data_target_uuid,
-                        "rootfsFilesystemUuid": rootfs_target_uuid,
-                        "previousFilesystemUuid": expected_data_uuid,
-                        "previousRootfsFilesystemUuid": expected_rootfs_uuid,
-                    }
-                if (
-                    state["filesystemUuid"] != expected_data_uuid
-                    or state["rootfsFilesystemUuid"] != expected_rootfs_uuid
-                ):
-                    raise StorageError(
-                        "storage_identity_mismatch",
-                        "storage matches neither regeneration before nor target",
-                    )
-                pending = store.pending(
-                    str(state["source"]),
-                    transaction_id=transaction_id,
-                    filesystem_uuid=str(state["filesystemUuid"]),
-                    observed_logical_size_bytes=int(state["observedLogicalSizeBytes"]),
-                    observed_filesystem_size_bytes=int(state["observedFilesystemSizeBytes"]),
-                    host_allocated_bytes=int(state["hostAllocatedBytes"]),
-                    rootfs_image=str(state["rootfsImage"]),
-                    rootfs_filesystem_uuid=str(state["rootfsFilesystemUuid"]),
-                    rootfs_source_sha256=str(state["rootfsSourceSha256"]),
-                    observed_rootfs_size_bytes=int(state["observedRootfsSizeBytes"]),
-                    legacy_volume=str(state["legacyVolume"]),
-                    legacy_filesystem_uuid=str(state["legacyFilesystemUuid"]),
-                    backup_image=str(state["backupImage"]),
-                    backup_filesystem_uuid=str(state["backupFilesystemUuid"]),
-                    backup_size_bytes=int(state["backupSizeBytes"]),
-                    backup_rootfs_image=str(state["backupRootfsImage"]),
-                    backup_rootfs_filesystem_uuid=str(
-                        state["backupRootfsFilesystemUuid"]
-                    ),
-                    backup_rootfs_size_bytes=int(state["backupRootfsSizeBytes"]),
-                    growth=True,
-                    rotation_target_uuid=data_target_uuid,
-                    rotation_target_rootfs_uuid=rootfs_target_uuid,
-                )
-            else:
-                if (
-                    state["transactionId"] != transaction_id
-                    or state["filesystemUuid"] != expected_data_uuid
-                    or state["rootfsFilesystemUuid"] != expected_rootfs_uuid
-                    or state["rotationTargetUuid"] != data_target_uuid
-                    or state["rotationTargetRootfsUuid"] != rootfs_target_uuid
-                ):
-                    raise StorageError(
-                        "storage_identity_mismatch",
-                        "pending storage rotation does not match the fixed transaction",
-                    )
-                pending = state
-        except StorageError as exc:
-            return exc.as_dict()
-        action = self._run_storage_identity_rotation(
-            str(pending["filesystemUuid"]),
-            target_uuid=str(pending["rotationTargetUuid"]),
-            expected_rootfs_uuid=str(pending["rootfsFilesystemUuid"]),
-            expected_rootfs_source_sha256=str(pending["rootfsSourceSha256"]),
-            expected_rootfs_size_bytes=int(pending["observedRootfsSizeBytes"]),
-            target_rootfs_uuid=str(pending["rotationTargetRootfsUuid"]),
-        )
-        if not action.get("ok"):
-            return action
-        try:
-            committed = store.commit(pending, action)
-            committed = self._cleanup_committed_rootfs_backup(store, committed)
-        except (StorageError, KeyError, TypeError, ValueError) as exc:
-            if isinstance(exc, StorageError):
-                return exc.as_dict()
-            return {
-                "ok": False,
-                "error": "storage_state_invalid",
-                "message": "rotated storage observations are incomplete",
-            }
-        return {
-            "ok": True,
-            "rotated": action["rotated"],
-            "filesystemUuid": committed["filesystemUuid"],
-            "rootfsFilesystemUuid": committed["rootfsFilesystemUuid"],
-            "previousFilesystemUuid": pending["filesystemUuid"],
-            "previousRootfsFilesystemUuid": pending["rootfsFilesystemUuid"],
-            "imageAction": action,
-        }
-
-    def _run_boot_identity_seed(self, boot_id: str, random_uuid: str) -> dict[str, Any]:
+    def _run_boot_identity_seed(self, boot_id: str) -> dict[str, Any]:
         script = self.context.project_root / "scripts" / "seed-boot-identity.sh"
-        command = [str(script), self.lease.volume_name, boot_id, random_uuid]
+        command = [str(script), self.lease.volume_name, boot_id]
         env = self.docker_env()
         ssh_cmd = self.remote_docker_ssh_cmd()
         if ssh_cmd:
@@ -2653,7 +2197,7 @@ cat >/dev/null
             seeded = store.seed_next_boot()
         except IdentityError as exc:
             return exc.as_dict()
-        result = self._run_boot_identity_seed(str(seeded["bootId"]), str(seeded["randomUuid"]))
+        result = self._run_boot_identity_seed(str(seeded["bootId"]))
         if not result.get("ok"):
             return {
                 "ok": False,
@@ -3142,19 +2686,6 @@ cat >/dev/null
             and state["state"] == "pending"
             and state["temporaryImage"] == ""
         ):
-            if state.get("rotationTargetUuid"):
-                # An interrupted identity rotation is not an ordinary growth in
-                # either window (image still old, or already at the target):
-                # fail closed and let `device regenerate` resume and commit it.
-                return self._storage_error(
-                    "storage_identity_mismatch",
-                    "interrupted storage identity rotation; re-run `./xenoid device regenerate` to resume and commit it",
-                    storage=public_storage_state(
-                        state,
-                        healthy=False,
-                        error="storage_identity_mismatch",
-                    ),
-                )
             if volume is None:
                 return self._storage_error(
                     "storage_volume_missing",
@@ -3298,9 +2829,17 @@ cat >/dev/null
 
         if state is None:
             if volume is None:
+                # A caller-pinned data UUID (convergence boot-seed journal)
+                # is the fixed identity of the fresh image: the pending
+                # record must carry it so initialize/commit produce exactly
+                # that UUID instead of silently generating a divergent one.
+                # The rootfs pin cannot join the pending record (rootfs
+                # identity is all-or-nothing), so it is enforced at the
+                # initialize action and the post-action check below.
                 state = store.pending(
                     "fresh",
                     transaction_id=storage_transaction_id,
+                    filesystem_uuid=str(pinned_data_uuid or ""),
                 )
             else:
                 adopted = self._inspect_volume_image(volume)
@@ -3406,21 +2945,22 @@ cat >/dev/null
                     "resource_conflict",
                     "created instance data volume identity is invalid",
                 )
-
         if state["source"] == "fresh":
+            if (
+                pinned_data_uuid is not None
+                and state["filesystemUuid"]
+                and state["filesystemUuid"] != pinned_data_uuid
+            ):
+                return self._storage_error(
+                    "storage_identity_mismatch",
+                    "pending fresh storage differs from the convergence journal pin",
+                )
             action = self._run_storage_image_action(
                 "initialize",
-                expected_uuid=(
-                    str(state["filesystemUuid"])
-                    or storage_rotation_target(str(state["transactionId"]))
-                ),
+                expected_uuid=str(state["filesystemUuid"]),
                 transaction_id=state["transactionId"],
-                expected_rootfs_uuid=(
-                    str(state["rootfsFilesystemUuid"])
-                    or storage_rotation_target(
-                        str(state["transactionId"]),
-                        rootfs=True,
-                    )
+                expected_rootfs_uuid=str(
+                    pinned_rootfs_uuid or state["rootfsFilesystemUuid"]
                 ),
             )
         elif state["source"] == "adopted":
@@ -3462,13 +3002,7 @@ cat >/dev/null
                 legacy_volume=state["legacyVolume"],
                 backup_image=state["backupImage"],
                 backup_uuid=state["backupFilesystemUuid"],
-                expected_rootfs_uuid=(
-                    str(state["rootfsFilesystemUuid"])
-                    or storage_rotation_target(
-                        str(state["transactionId"]),
-                        rootfs=True,
-                    )
-                ),
+                expected_rootfs_uuid=str(state["rootfsFilesystemUuid"]),
             )
         if not action.get("ok"):
             code = str(action.get("error") or "storage_image_invalid")
@@ -3492,6 +3026,17 @@ cat >/dev/null
             return self._storage_error(
                 "storage_identity_mismatch",
                 "legacy data image UUID changed during migration",
+                imageAction=action,
+            )
+        if (
+            state["source"] == "fresh"
+            and pinned_rootfs_uuid is not None
+            and str(action.get("rootfsFilesystemUuid") or "").lower()
+            != pinned_rootfs_uuid.lower()
+        ):
+            return self._storage_error(
+                "storage_identity_mismatch",
+                "fresh rootfs image UUID differs from the convergence journal pin",
                 imageAction=action,
             )
         try:
@@ -4830,23 +4375,77 @@ cat >/dev/null
         return str(result.get("stdout") or "")
 
     def _adb_read_file_bytes(self, device_path: str, timeout: float, max_bytes: int) -> Optional[bytes]:
+        """Read one package-manager path without text decoding or unbounded capture."""
         adb_bin = which("adb")
         if adb_bin is None:
             return None
         owned, _ = self._owned_container()
         if not owned:
             return None
+        effective_timeout = bounded_timeout(timeout)
+        deadline = time.monotonic() + (
+            timeout if effective_timeout is None else effective_timeout
+        )
+        command = [
+            adb_bin,
+            "-s",
+            self.adb_target,
+            "exec-out",
+            "cat",
+            "--",
+            device_path,
+        ]
         try:
-            proc = run(
-                [adb_bin, "-s", self.adb_target, "exec-out", "cat", "--", device_path],
-                capture_output=True,
-                timeout=timeout,
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
-        except Exception:
+        except (OSError, ValueError):
             return None
-        if proc.returncode != 0 or not proc.stdout or len(proc.stdout) > max_bytes:
+        selector = selectors.DefaultSelector()
+        payload = bytearray()
+        try:
+            if process.stdout is None:
+                raise OSError("ADB output pipe unavailable")
+            selector.register(process.stdout, selectors.EVENT_READ)
+            eof = False
+            while not eof:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                events = selector.select(remaining)
+                if not events:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                for key, _ in events:
+                    block = os.read(
+                        key.fileobj.fileno(),
+                        min(1024 * 1024, max_bytes + 1 - len(payload)),
+                    )
+                    if not block:
+                        eof = True
+                        break
+                    payload.extend(block)
+                    if len(payload) > max_bytes:
+                        raise OSError("ADB output exceeds budget")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or process.wait(timeout=remaining) != 0 or not payload:
+                return None
+            return bytes(payload)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=bounded_timeout(5))
+            except (OSError, subprocess.SubprocessError):
+                pass
             return None
-        return bytes(proc.stdout)
+        finally:
+            selector.close()
+            if process.stdout is not None:
+                process.stdout.close()
 
     def _device_file_sha256(self, device_path: str) -> Optional[str]:
         for command in (["sha256sum", device_path], ["toybox", "sha256sum", device_path]):
@@ -4872,8 +4471,7 @@ cat >/dev/null
             try:
                 proc = run(
                     [apksigner, "verify", "--verbose", "--print-certs", str(apk_path)],
-                    capture_output=True,
-                    text=True,
+                    capture=True,
                     timeout=120,
                 )
             except Exception:
@@ -4882,8 +4480,12 @@ cat >/dev/null
             return None
         history: list[str] = []
         for line in proc.stdout.splitlines():
-            if " certificate SHA-256 digest: " in line:
-                digest = line.rsplit(": ", 1)[1].strip().lower()
+            match = re.fullmatch(
+                r"Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]{64})",
+                line.strip(),
+            )
+            if match:
+                digest = match.group(1).lower()
                 if digest not in history:
                     history.append(digest)
         return history or None
@@ -4938,7 +4540,7 @@ cat >/dev/null
         record["versionName"] = version_name_match.group(1) if version_name_match else None
         record["system"] = "SYSTEM" in flags
         record["privileged"] = "PRIVILEGED" in private_flags
-        record["updatedSystemApp"] = "UPDATED_SYSTEM_APP" in private_flags
+        record["updatedSystemApp"] = "UPDATED_SYSTEM_APP" in flags
         if version_code < min_version:
             return record
         if not (record["enabled"] and record["system"] and record["privileged"]):
@@ -4949,14 +4551,26 @@ cat >/dev/null
                 return record
             record["signerSha256"] = pinned_history[0]
         else:
+            if package == "com.google.android.gms":
+                # The daemon's pinned-surface predicate accepts only the exact
+                # factory GmsCore install; an updated GmsCore wedges activation
+                # after journaling, so the gate rejects it while the surface is
+                # still observational. Legitimate Play Store self-updates keep
+                # the update-tolerant path below.
+                return record
             if not record["updatedSystemApp"] or not code_path.startswith("/data/app/"):
                 return record
             apk_bytes = self._adb_read_file_bytes(code_path, timeout=120, max_bytes=512 * 1024 * 1024)
             if apk_bytes is None:
                 return record
             history = self._apk_signer_history(apk_bytes)
-            if history != pinned_history:
+            if history is None or len(history) != 1:
                 return record
+            # Android sets UPDATED_SYSTEM_APP only after validating this APK's
+            # signing lineage against the pinned factory package.  The current
+            # signer may therefore differ after a legitimate v3 key rotation;
+            # apksigner proves the update itself and PackageManager proves its
+            # compatibility with the immutable, content-verified factory APK.
             record["signerSha256"] = history[0]
         record["ok"] = True
         record["code"] = None
@@ -5098,13 +4712,19 @@ cat >/dev/null
             return None
         return pid, start_ticks
 
-    def _microg_process_stability(self, components: Mapping[str, Any], deadline: float) -> dict[str, Any]:
+    def _microg_process_stability(
+        self,
+        components: Mapping[str, Any],
+        deadline: float,
+        *,
+        gms_process: str = "com.google.android.gms",
+    ) -> dict[str, Any]:
         unstable = {"ok": False, "code": "google_services_process_unstable"}
-        first = self._microg_process_identity("com.google.android.gms:persistent")
+        first = self._microg_process_identity(gms_process)
         if first is None:
             return {**unstable, "detail": "gmsCorePersistentMissing"}
         time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
-        second = self._microg_process_identity("com.google.android.gms:persistent")
+        second = self._microg_process_identity(gms_process)
         if second is None or second != first:
             return {**unstable, "detail": "gmsCorePersistentRestarted"}
         history = self._microg_exit_history(
@@ -5134,6 +4754,60 @@ cat >/dev/null
                 store_state = "failed"
                 return {**unstable, "detail": "playStoreDormantInvalid"}
         return {"ok": True, "code": None, "detail": None, "playStoreState": store_state}
+
+    def _google_live_runtime_image(
+        self, spec: Optional[ReleaseSpec]
+    ) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:
+        container, _ = self._inspect_docker_object(
+            "container", self.lease.container_name
+        )
+        if (
+            not isinstance(container, dict)
+            or not self._container_has_lease_owner(container)
+        ):
+            return None
+        image_id = container.get("Image")
+        if not isinstance(image_id, str) or not image_id.startswith("sha256:"):
+            return None
+        image, _ = self._inspect_docker_object("image", image_id)
+        config = image.get("Config") if isinstance(image, dict) else None
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        if (
+            not isinstance(image, dict)
+            or image.get("Id") != image_id
+            or not isinstance(labels, dict)
+            or labels.get(_RUNTIME_SCHEMA_LABEL) != "1"
+        ):
+            return None
+        input_digest = labels.get(_RUNTIME_INPUT_LABEL)
+        boot_input_digest = labels.get(_RUNTIME_BOOT_INPUT_LABEL)
+        if (
+            not isinstance(input_digest, str)
+            or _SHA256_PATTERN.fullmatch(input_digest) is None
+            or not isinstance(boot_input_digest, str)
+            or _SHA256_PATTERN.fullmatch(boot_input_digest) is None
+        ):
+            return None
+        google_labels_match = (
+            all(labels.get(key) == value for key, value in spec.labels.items())
+            if spec is not None
+            else not any(key in labels for key in self._google_label_values())
+        )
+        if not google_labels_match:
+            return None
+        return (
+            {
+                "imageId": image_id,
+                "derivedTag": image_id,
+                "inputSha256": input_digest,
+                "bootInputSha256": boot_input_digest,
+            },
+            image,
+        )
+
+    def _google_signature_runtime_image_matches(self, spec: ReleaseSpec) -> bool:
+        return self._google_live_runtime_image(spec) is not None
+
 
     def _google_services_gate_microg(self, spec: ReleaseSpec) -> dict[str, Any]:
         deadline = time.monotonic() + 120.0
@@ -5179,21 +4853,7 @@ cat >/dev/null
             and components.get("playStoreSeed", {}).get("ok") is True
         )
         if signature_ok:
-            desired: dict[str, Any] = {}
-            try:
-                desired = self.selected_runtime_image(spec=spec)
-            except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError):
-                desired = {}
-            image, _ = self._inspect_docker_object("image", str(desired.get("derivedTag") or ""))
-            config = image.get("Config") if isinstance(image, dict) else None
-            labels = config.get("Labels") if isinstance(config, dict) else None
-            labels = labels if isinstance(labels, dict) else {}
-            signature_ok = bool(
-                desired.get("imageId")
-                and isinstance(image, dict)
-                and image.get("Id") == desired.get("imageId")
-                and all(labels.get(key) == value for key, value in spec.labels.items())
-            )
+            signature_ok = self._google_signature_runtime_image_matches(spec)
         checks["signaturePolicy"] = {
             "ok": signature_ok,
             "code": None if signature_ok else "google_services_signature_policy_mismatch",
@@ -5262,7 +4922,7 @@ cat >/dev/null
         }
 
         if components_ok:
-            stability = self._microg_process_stability(components, deadline)
+            stability = self._microg_process_stability(components, deadline, gms_process="com.google.android.gms")
         else:
             stability = {"ok": False, "code": "google_services_component_mismatch", "detail": "componentsUnavailable"}
         checks["processStability"] = {"ok": stability.get("ok") is True, "code": stability.get("code")}
@@ -5583,6 +5243,7 @@ cat >/dev/null
         expected_container_id: Optional[str] = None,
         wait: bool = True,
         *,
+        expected_image_id: Optional[str] = None,
         allow_journaled_spec_drift: bool = False,
         expected_image_input_sha256: Optional[str] = None,
         expected_image_boot_input_sha256: Optional[str] = None,
@@ -5612,15 +5273,38 @@ cat >/dev/null
                 "ok": False,
                 "error": "convergence_state_conflict",
             }
-        selected_image_pinned = (
+        # Convergence v1 pins the exact container ID plus both image labels,
+        # while regeneration also records the image ID. A Docker container ID
+        # immutably binds its Image field, so either journal form is sufficient.
+        image_id_pinned = expected_image_id is not None
+        image_digests_pinned = (
             expected_image_input_sha256 is not None
             or expected_image_boot_input_sha256 is not None
         )
-        if selected_image_pinned and (
-            not isinstance(expected_image_input_sha256, str)
-            or _SHA256_PATTERN.fullmatch(expected_image_input_sha256) is None
-            or not isinstance(expected_image_boot_input_sha256, str)
-            or _SHA256_PATTERN.fullmatch(expected_image_boot_input_sha256) is None
+        selected_image_pinned = image_id_pinned or image_digests_pinned
+        if (
+            (selected_image_pinned and expected_container_id is None)
+            or (
+                image_id_pinned
+                and (
+                    not isinstance(expected_image_id, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_image_id)
+                    is None
+                )
+            )
+            or (
+                image_digests_pinned
+                and (
+                    not isinstance(expected_image_input_sha256, str)
+                    or _SHA256_PATTERN.fullmatch(expected_image_input_sha256)
+                    is None
+                    or not isinstance(expected_image_boot_input_sha256, str)
+                    or _SHA256_PATTERN.fullmatch(
+                        expected_image_boot_input_sha256
+                    )
+                    is None
+                )
+            )
         ):
             return {
                 "ok": False,
@@ -5632,16 +5316,21 @@ cat >/dev/null
                 return True
             if not selected_image_pinned:
                 return self._container_matches_lease(value)
-            image_identity = self._container_effective_image_identity(value)
-            observed_input = image_identity.get("containerInputSha256")
-            observed_boot = image_identity.get("containerBootInputSha256")
-            if image_identity.get("match") == "exact":
-                observed_input = image_identity.get("desiredInputSha256")
-                observed_boot = image_identity.get("desiredBootInputSha256")
+            image_id = str(value.get("Image") or "")
+            if image_id_pinned and image_id != expected_image_id:
+                return False
+            if not image_digests_pinned:
+                return self._container_matches_lease(value)
+            image, _ = self._inspect_docker_object("image", image_id)
+            config = image.get("Config") if isinstance(image, Mapping) else None
+            labels = config.get("Labels") if isinstance(config, Mapping) else None
             return bool(
-                image_identity.get("ok") is True
-                and observed_input == expected_image_input_sha256
-                and observed_boot == expected_image_boot_input_sha256
+                isinstance(labels, Mapping)
+                and labels.get(_RUNTIME_SCHEMA_LABEL) == "1"
+                and labels.get(_RUNTIME_INPUT_LABEL)
+                == expected_image_input_sha256
+                and labels.get(_RUNTIME_BOOT_INPUT_LABEL)
+                == expected_image_boot_input_sha256
                 and self._container_matches_lease(
                     value,
                     image_identity={"ok": True},
@@ -5729,6 +5418,14 @@ cat >/dev/null
                             "ok": False,
                             "error": "container_start_failed",
                         }
+        # Every create/start/recreate builds a fresh network namespace with
+        # zeroed per-net state while the staged statfs leaf persists; replay
+        # it before any readiness verdict. The kmod rejects writes until
+        # rmnet_data0 exists, which init creates asynchronously, so wait for
+        # the marker first. Verified no-op for never-rotated instances.
+        failed = self._republish_statfs_fsid_after_start(result)
+        if failed is not None:
+            return failed
         if not wait:
             return result
         deadline = time.monotonic() + 300.0
@@ -5782,6 +5479,208 @@ cat >/dev/null
                     ),
                 }
         return result
+
+    def ensure_regeneration_runtime(
+        self,
+        expected_container_id: str,
+        expected_container_epoch: str,
+        expected_image_id: str,
+        expected_image_input_sha256: str,
+        expected_image_boot_input_sha256: str,
+    ) -> dict[str, Any]:
+        """Start and verify the exact runtime pinned by a regeneration journal."""
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", expected_container_id) is None
+            or _SHA256_PATTERN.fullmatch(expected_container_epoch) is None
+            or container_epoch(expected_container_id) != expected_container_epoch
+        ):
+            return {"ok": False, "error": "device_regeneration_container_changed"}
+        started = self.start_owned_container(
+            expected_container_id,
+            wait=True,
+            expected_image_id=expected_image_id,
+            expected_image_input_sha256=expected_image_input_sha256,
+            expected_image_boot_input_sha256=expected_image_boot_input_sha256,
+        )
+        if started.get("ok") is not True:
+            return {
+                **started,
+                "ok": False,
+                "error": str(
+                    started.get("error")
+                    or "device_regeneration_runtime_unavailable"
+                ),
+            }
+        container, _ = self._owned_container_record()
+        state = container.get("State") if isinstance(container, Mapping) else None
+        if (
+            not isinstance(container, Mapping)
+            or container.get("Id") != expected_container_id
+            or not isinstance(state, Mapping)
+            or state.get("Running") is not True
+        ):
+            return {"ok": False, "error": "device_regeneration_container_changed"}
+        identity = DeviceIdentityStore(self.context).load()
+        candidates = (
+            identity.get("active") if isinstance(identity, Mapping) else None,
+            identity.get("pending") if isinstance(identity, Mapping) else None,
+        )
+        present = [candidate for candidate in candidates if isinstance(candidate, Mapping)]
+        if not present or any(
+            candidate.get("containerEpoch") != expected_container_epoch
+            for candidate in present
+        ):
+            return {"ok": False, "error": "device_regeneration_container_changed"}
+        return {
+            "ok": True,
+            "containerId": expected_container_id,
+            "containerEpoch": expected_container_epoch,
+            "imageId": expected_image_id,
+            "imageInputSha256": expected_image_input_sha256,
+            "imageBootInputSha256": expected_image_boot_input_sha256,
+            "started": started.get("alreadyRunning") is not True,
+            "statfsFsid": started.get("statfsFsid"),
+        }
+
+    def _republish_statfs_fsid_after_start(
+        self,
+        result: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Replay the staged statfs f_fsid into the container's fresh netns.
+
+        Returns ``None`` on success (``result`` annotated) or the failure
+        result to return. Never-rotated instances (leaf absent or zero)
+        short-circuit without waiting on the network interface. The kernel
+        parameter rejects writes until init's cellular watch service creates
+        ``rmnet_data0``, which happens asynchronously after ``docker start``,
+        so the marker is awaited with a bounded deadline before publishing.
+        """
+        # ``docker start`` returns once /xenoid-init runs; the ext4 data
+        # image pivots onto /data asynchronously. Never classify the staged
+        # leaf against the pre-pivot outer /data: wait for the real mount
+        # first, then read the leaf.
+        pivot_deadline = time.monotonic() + 60.0
+        while True:
+            pivoted = self.docker_exec(
+                ["sh", "-c", "grep -q ' /data ' /proc/mounts"],
+                timeout=5,
+            )
+            if pivoted.get("ok") is True:
+                break
+            if time.monotonic() >= pivot_deadline:
+                result["statfsFsid"] = {
+                    "ok": False,
+                    "code": "statfs_fsid_runtime_not_running",
+                    "error": "statfs_fsid_runtime_not_running",
+                    "published": False,
+                }
+                return {
+                    **result,
+                    "ok": False,
+                    "error": "statfs_fsid_runtime_not_running",
+                }
+            time.sleep(0.5)
+        protection = self.shared_protection_manager()
+        status = protection.statfs_fsid_status()
+        # Gate on leaf validity only: a malformed nonempty leaf fails closed,
+        # while a kernel-value hiccup must not block a never-rotated start.
+        if status.get("stagedValid") is not True:
+            code = str(status.get("error") or "statfs_fsid_unavailable")
+            result["statfsFsid"] = status
+            return {**result, "ok": False, "error": code}
+        staged = status.get("staged")
+        if not isinstance(staged, str) or int(staged, 16) == 0:
+            result["statfsFsid"] = {
+                "ok": True,
+                "published": False,
+                "reason": "absent" if staged is None else "zero",
+            }
+            return None
+        marker_deadline = time.monotonic() + 60.0
+        while True:
+            marker = self.docker_exec(
+                ["sh", "-c", "test -e /sys/class/net/rmnet_data0"],
+                timeout=5,
+            )
+            if marker.get("ok") is True:
+                break
+            if time.monotonic() >= marker_deadline:
+                result["statfsFsid"] = {
+                    "ok": False,
+                    "code": "statfs_fsid_runtime_not_running",
+                    "error": "statfs_fsid_runtime_not_running",
+                    "published": False,
+                }
+                return {
+                    **result,
+                    "ok": False,
+                    "error": "statfs_fsid_runtime_not_running",
+                }
+            time.sleep(0.5)
+        republished = protection.republish_statfs_fsid()
+        result["statfsFsid"] = republished
+        if republished.get("ok") is not True:
+            return {
+                **result,
+                "ok": False,
+                "error": str(
+                    republished.get("error") or "statfs_fsid_publish_failed"
+                ),
+            }
+        return None
+
+    def stage_drm_identity(self, device_unique_id: str) -> dict[str, Any]:
+        """Atomically stage the synthetic Widevine ID leaf and property."""
+        if re.fullmatch(r"[0-9a-f]{32}", device_unique_id) is None:
+            return {"ok": False, "error": "drm_identity_invalid"}
+        return self.docker_exec(
+            [
+                "sh",
+                "-c",
+                "set -eu; d=/data/local/tmp/xenoid-profile; "
+                "f=$d/drm_device_unique_id; t=$d/.drm_device_unique_id.new; "
+                "mkdir -p \"$d\"; umask 077; rm -f -- \"$t\"; "
+                "printf '%s\\n' "
+                + device_unique_id
+                + " > \"$t\"; chown 0:0 \"$t\"; chmod 0644 \"$t\"; sync; "
+                "mv -f \"$t\" \"$f\"; sync; setprop persist.xenoid.drm.id "
+                + device_unique_id,
+            ],
+            timeout=15,
+        )
+
+    def ensure_drm_identity(self) -> dict[str, Any]:
+        """Seed the synthetic Widevine ID on instances that have none.
+
+        The leaf in the data image is the durable store: once seeded it
+        survives container restarts, and regeneration rotates from it. A
+        missing or malformed leaf means the instance never got an ID, which
+        would report ``Widevine unsupported`` to any collector while stock
+        raven always exposes one.
+        """
+        read = self.docker_exec(
+            [
+                "sh",
+                "-c",
+                "cat /data/local/tmp/xenoid-profile/drm_device_unique_id "
+                "2>/dev/null || true",
+            ],
+            timeout=10,
+        )
+        if read.get("ok") is not True:
+            return {"ok": False, "error": "drm_identity_unavailable"}
+        value = str(read.get("stdout") or "").strip()
+        if re.fullmatch(r"[0-9a-f]{32}", value) is not None:
+            # The persistent property survives in the data image; re-staging
+            # is idempotent and covers a wiped property area.
+            staged = self.stage_drm_identity(value)
+            if staged.get("ok") is not True:
+                return {"ok": False, "error": "drm_identity_stage_failed"}
+            return {"ok": True, "seeded": False}
+        staged = self.stage_drm_identity(secrets.token_hex(16))
+        if staged.get("ok") is not True:
+            return {"ok": False, "error": "drm_identity_stage_failed"}
+        return {"ok": True, "seeded": True}
 
     def start_seed_runtime(
         self,
@@ -5867,9 +5766,8 @@ cat >/dev/null
         if quiesced.get("ok") is not True:
             return quiesced
         boot_id = boot_seed_target.get("bootId")
-        random_uuid = boot_seed_target.get("randomUuid")
-        if isinstance(boot_id, str) and isinstance(random_uuid, str):
-            seeded = self._run_boot_identity_seed(boot_id, random_uuid)
+        if isinstance(boot_id, str):
+            seeded = self._run_boot_identity_seed(boot_id)
         else:
             seeded = self._seed_boot_identity_into_image()
         if seeded.get("ok") is not True:
@@ -6113,6 +6011,16 @@ cat >/dev/null
                 "live data sentinel is unavailable",
             )
         if not isinstance(result, dict) or result.get("ok") is not True:
+            code = (
+                result.get("errorCode") or result.get("error")
+                if isinstance(result, Mapping)
+                else None
+            )
+            if code != "rootd_command_failed":
+                return self._storage_error(
+                    "storage_sentinel_unavailable",
+                    "live data sentinel is unavailable",
+                )
             return self._storage_error(
                 "storage_sentinel_mismatch",
                 "live data sentinel does not match this instance",
@@ -6290,6 +6198,22 @@ cat >/dev/null
             ),
         }
 
+    def _offline_google_identity_seeded(self) -> bool:
+        try:
+            inspected = self.daemon_client(timeout=10.0).google_identity_inspect(
+                timeout=10.0
+            )
+        except Exception:
+            return False
+        return bool(
+            inspected.get("ok") is True
+            and inspected.get("offlineSeeded") is True
+            and inspected.get("gsfAndroidIdPresent") is True
+            and isinstance(inspected.get("gsfAndroidIdSha256"), str)
+            and _SHA256_PATTERN.fullmatch(inspected["gsfAndroidIdSha256"])
+            is not None
+        )
+
     def google_services_status(
         self,
         *,
@@ -6300,20 +6224,24 @@ cat >/dev/null
         spec: Optional[ReleaseSpec] = None
         host_ready = provider == PROVIDER_NONE
         error: Optional[str] = None
+        host_error: Optional[str] = None
         try:
             spec = self.google_runtime_spec("status", require_assets=False)
             if spec is not None:
                 quick_validate_assets(self.context.project_root, spec)
                 host_ready = True
         except GoogleServicesError as exc:
-            error = exc.code
+            host_error = exc.code
+            error = host_error
 
         status = base_status(provider, release, spec)
         binding: Optional[dict[str, Any]] = None
+        binding_error: Optional[str] = None
         try:
             binding = GoogleBindingStore(self.context, self.lease).load()
         except GoogleServicesError as exc:
-            error = error or exc.code
+            binding_error = exc.code
+            error = error or binding_error
         binding_ok = (
             binding is not None
             and spec is not None
@@ -6329,6 +6257,7 @@ cat >/dev/null
 
         desired_runtime: Optional[dict[str, Any]] = None
         image: Optional[dict[str, Any]] = None
+        live_runtime_fallback = False
         try:
             desired_runtime = self.selected_runtime_image(spec=spec)
             image, _ = self._inspect_docker_object(
@@ -6336,7 +6265,15 @@ cat >/dev/null
                 str(desired_runtime["derivedTag"]),
             )
         except (GoogleServicesError, InstanceError, OSError, RuntimeError, ValueError) as exc:
-            error = error or getattr(exc, "code", "runtime_image_required")
+            live_runtime = self._google_live_runtime_image(spec)
+            if live_runtime is None:
+                error = error or getattr(exc, "code", "runtime_image_required")
+            else:
+                desired_runtime, image = live_runtime
+                live_runtime_fallback = True
+                host_ready = True
+                if host_error is not None and error == host_error:
+                    error = binding_error
         desired_image_id = (
             str(desired_runtime.get("imageId") or "")
             if desired_runtime is not None
@@ -6407,11 +6344,29 @@ cat >/dev/null
             if owned_container and isinstance(container, dict)
             else ""
         )
-        container_identity = (
-            self._container_effective_image_identity(container)
-            if owned_container and isinstance(container, dict)
-            else {"ok": False, "match": "absent"}
-        )
+        if (
+            live_runtime_fallback
+            and owned_container
+            and isinstance(container, dict)
+            and desired_runtime is not None
+        ):
+            live_image_match = container_image_id == desired_image_id
+            container_identity = {
+                "ok": live_image_match,
+                "match": "live-image" if live_image_match else "mismatch",
+                "containerImageSha256": container_image_id or None,
+                "desiredImageSha256": desired_image_id or None,
+                "containerInputSha256": desired_runtime.get("inputSha256"),
+                "desiredInputSha256": desired_runtime.get("inputSha256"),
+                "containerBootInputSha256": desired_runtime.get("bootInputSha256"),
+                "desiredBootInputSha256": desired_runtime.get("bootInputSha256"),
+            }
+        else:
+            container_identity = (
+                self._container_effective_image_identity(container)
+                if owned_container and isinstance(container, dict)
+                else {"ok": False, "match": "absent"}
+            )
 
         rootfs_source_id = ""
         volume, _ = self._inspect_docker_object(
@@ -6538,7 +6493,16 @@ cat >/dev/null
         if require_runtime and configured and not ready:
             ok = False
 
-        model = capability_model(provider, runtime_state)
+        offline_identity_seeded = bool(
+            provider == PROVIDER_MICROG
+            and running
+            and self._offline_google_identity_seeded()
+        )
+        model = _google_identity_capability_model(
+            provider,
+            runtime_state,
+            offline_identity_seeded=offline_identity_seeded,
+        )
         selected = f"./xenoid --instance {self.context.instance_name}"
         next_actions: list[str] = []
         if error == "google_services_release_retired":
@@ -6611,6 +6575,9 @@ cat >/dev/null
             "live": live,
             "effectiveComponents": effective_components,
             **model,
+            "googleIdentityMode": (
+                "offline-seeded" if offline_identity_seeded else "provider-managed"
+            ),
             "error": error,
             "nextActions": next_actions,
         }
@@ -6813,16 +6780,15 @@ cat >/dev/null
             )
 
     def _observe_pending_operations(self) -> dict[str, Any]:
+        from .convergence import ConvergenceError, ConvergenceJournal
+
         result: dict[str, Any] = {
             "convergence": None,
             "regeneration": None,
         }
         for key, path in (
             ("convergence", self.context.state_root / "convergence-v1.json"),
-            (
-                "regeneration",
-                RegenerationJournal(self.context).path,
-            ),
+            ("regeneration", RegenerationJournal(self.context).path),
         ):
             try:
                 info = path.lstat()
@@ -6835,7 +6801,15 @@ cat >/dev/null
                     or info.st_size > 256 * 1024
                 ):
                     raise OSError
-                raw = json.loads(path.read_text(encoding="ascii"))
+                if key == "regeneration":
+                    raw = RegenerationJournal(self.context).load()
+                else:
+                    raw = ConvergenceJournal(
+                        self.context.state_root,
+                        instance_id=self.context.instance_id,
+                    ).load()
+                if not isinstance(raw, Mapping):
+                    raise ValueError("pending journal disappeared")
                 result[key] = {
                     "schema": raw.get("schema"),
                     "phase": raw.get("phase"),
@@ -6844,39 +6818,30 @@ cat >/dev/null
                 }
             except FileNotFoundError:
                 pass
-            except (OSError, UnicodeError, ValueError):
+            except (OSError, UnicodeError, ValueError, IdentityError, ConvergenceError):
                 result[key] = {"error": f"{key}_journal_invalid"}
         if result["regeneration"] is None:
-            legacy_path = self.context.state_root / "device-regenerate.json"
             try:
-                info = legacy_path.lstat()
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or stat.S_ISLNK(info.st_mode)
-                    or info.st_uid != os.getuid()
-                    or info.st_nlink != 1
-                    or stat.S_IMODE(info.st_mode) != 0o600
-                ):
-                    raise OSError
-                raw = json.loads(legacy_path.read_text(encoding="ascii"))
-                if (
-                    not isinstance(raw, Mapping)
-                    or set(raw) != {"schema", "instanceId", "startedAt"}
-                    or raw.get("schema") != "dev.xenoid.device-regenerate/v1"
-                    or raw.get("instanceId") != self.context.instance_id
-                ):
-                    raise ValueError
-                result["regeneration"] = {
-                    "schema": raw["schema"],
-                    "phase": "legacy_pending",
-                    "operationId": None,
-                }
-            except FileNotFoundError:
-                pass
-            except (OSError, UnicodeError, ValueError):
-                result["regeneration"] = {
-                    "error": "regeneration_journal_invalid"
-                }
+                regeneration = RegenerationJournal(self.context).load()
+            except IdentityError as exc:
+                if exc.code == "device_regeneration_legacy_pending":
+                    result["regeneration"] = {
+                        "schema": None,
+                        "phase": "legacy_pending",
+                        "operationId": None,
+                    }
+                else:
+                    result["regeneration"] = {
+                        "error": "regeneration_journal_invalid"
+                    }
+            else:
+                if regeneration is not None:
+                    result["regeneration"] = {
+                        "schema": regeneration.get("schema"),
+                        "phase": regeneration.get("phase"),
+                        "operationId": regeneration.get("operationId")
+                        or regeneration.get("transactionId"),
+                    }
         return result
 
     def observe_convergence_inputs(self) -> dict[str, Any]:
@@ -7002,6 +6967,11 @@ cat >/dev/null
             if identity.get("initialized") is not True
             else "pending"
             if identity.get("phase") not in {None, "applied"}
+            else "drift"
+            if (
+                container_id is not None
+                and identity.get("containerEpoch") != container_epoch(container_id)
+            )
             else "matching"
         )
         try:
@@ -7696,210 +7666,141 @@ cat >/dev/null
         return False, 0
 
 
-    def regeneration_snapshot(
-        self,
-        *,
-        allow_absent: bool = False,
-    ) -> dict[str, Any]:
-        """Capture the complete immutable before-state for device regeneration."""
+    def regeneration_snapshot(self) -> dict[str, Any]:
+        """Capture the immutable before-state for one runtime regeneration."""
         self.ensure_instance_lease()
         container, error = self._owned_container_record()
-        absent = container is None and error == "instance container does not exist"
-        stopped = (
-            isinstance(container, Mapping)
-            and isinstance(container.get("State"), Mapping)
-            and container["State"].get("Running") is False
-        )
-        offline = allow_absent and (absent or stopped)
-        if offline:
-            runtime_epoch = "0" * 64
-            if stopped:
-                if not self._container_has_lease_owner(dict(container)):
-                    raise IdentityError(
-                        "device_regeneration_state_invalid",
-                        "stopped legacy runtime ownership is invalid",
-                    )
-                container_id = container.get("Id")
-                image_id = container.get("Image")
-            else:
-                container_id = "0" * 64
-                try:
-                    image_id = str(self.selected_runtime_image()["imageId"])
-                except Exception as exc:
-                    raise IdentityError(
-                        "device_regeneration_state_invalid",
-                        "selected runtime image is unavailable for legacy recovery",
-                    ) from exc
-            if (
-                not isinstance(container_id, str)
-                or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
-                or not isinstance(image_id, str)
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
-            ):
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "offline legacy runtime identity is invalid",
-                )
-        else:
-            if not isinstance(container, Mapping):
-                raise IdentityError(
-                    "device_runtime_not_running",
-                    error or "owned runtime is unavailable",
-                )
-            runtime_state = container.get("State")
-            container_id = container.get("Id")
-            image_id = container.get("Image")
-            if (
-                not isinstance(runtime_state, Mapping)
-                or runtime_state.get("Running") is not True
-                or not isinstance(container_id, str)
-                or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
-                or not isinstance(image_id, str)
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
-            ):
-                raise IdentityError(
-                    "device_runtime_not_running",
-                    "device regeneration requires one running owned runtime",
-                )
-        identity = DeviceIdentityStore(self.context).load()
-        storage = StorageStateStore(self.context, self.lease).load()
-        data_before_uuid = (
-            str(storage.get("filesystemUuid") or "")
-            if isinstance(storage, Mapping)
-            else ""
-        )
-        rootfs_before_uuid = (
-            str(storage.get("rootfsFilesystemUuid") or "")
-            if isinstance(storage, Mapping)
-            else ""
-        )
-        legacy_pending = bool(
-            allow_absent
-            and isinstance(storage, Mapping)
-            and storage.get("state") == "pending"
-            and storage.get("temporaryImage") == ""
-            and storage.get("rotationTargetUuid")
-        )
+        runtime_state = container.get("State") if isinstance(container, Mapping) else None
         if (
-            allow_absent
-            and isinstance(storage, Mapping)
-            and (
-                storage.get("state") == "committed"
-                and not rootfs_before_uuid
-                or legacy_pending
-            )
+            not isinstance(runtime_state, Mapping)
+            or runtime_state.get("Running") is not True
         ):
-            volume, _ = self._inspect_docker_object(
-                "volume",
-                self.lease.volume_name,
+            raise IdentityError(
+                "device_runtime_not_running",
+                error or "device regeneration requires one running owned runtime",
             )
-            observed_data = (
-                self._inspect_volume_image(dict(volume))
-                if isinstance(volume, Mapping)
-                else {}
+        container_id = str(container.get("Id") or "") if isinstance(container, Mapping) else ""
+        pinned_container_epoch = container_epoch(container_id) if re.fullmatch(
+            r"[0-9a-f]{64}", container_id
+        ) is not None else ""
+        if not pinned_container_epoch:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "owned runtime identity is unavailable for regeneration",
             )
-            observed_rootfs = (
-                self._inspect_volume_image(
-                    dict(volume),
-                    image_name=ROOTFS_IMAGE_NAME,
-                )
-                if isinstance(volume, Mapping)
-                else {}
-            )
-            if (
-                observed_data.get("ok") is not True
-                or observed_rootfs.get("ok") is not True
-                or legacy_pending
-                and observed_data.get("filesystemUuid")
-                not in {
-                    storage.get("filesystemUuid"),
-                    storage.get("rotationTargetUuid"),
-                }
-            ):
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "legacy storage transition is not an old-or-target state",
-                )
-            data_before_uuid = str(observed_data["filesystemUuid"])
-            rootfs_before_uuid = str(observed_rootfs["filesystemUuid"])
+        image_id = str(container.get("Image") or "") if isinstance(container, Mapping) else ""
+        image, _ = self._inspect_docker_object("image", image_id)
+        image_config = image.get("Config") if isinstance(image, Mapping) else None
+        image_labels = (
+            image_config.get("Labels") if isinstance(image_config, Mapping) else None
+        )
+        image_input = (
+            image_labels.get(_RUNTIME_INPUT_LABEL)
+            if isinstance(image_labels, Mapping)
+            else None
+        )
+        image_boot_input = (
+            image_labels.get(_RUNTIME_BOOT_INPUT_LABEL)
+            if isinstance(image_labels, Mapping)
+            else None
+        )
         if (
-            identity is None
-            or storage is None
-            or storage.get("state") != "committed"
-            and not legacy_pending
-            or not data_before_uuid
-            or not rootfs_before_uuid
+            re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+            or not isinstance(image, Mapping)
+            or image.get("Id") != image_id
+            or not isinstance(image_labels, Mapping)
+            or image_labels.get(_RUNTIME_SCHEMA_LABEL) != "1"
+            or not isinstance(image_input, str)
+            or _SHA256_PATTERN.fullmatch(image_input) is None
+            or not isinstance(image_boot_input, str)
+            or _SHA256_PATTERN.fullmatch(image_boot_input) is None
+            or not self._container_matches_lease(
+                container,
+                image_identity={"ok": True},
+            )
         ):
             raise IdentityError(
                 "device_regeneration_state_invalid",
-                "identity and dual-image storage must be valid before regeneration",
+                "owned runtime image identity is unavailable for regeneration",
+            )
+        identity = DeviceIdentityStore(self.context).load()
+        if identity is None:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "device identity must be initialized before regeneration",
+            )
+        selected_boot = identity.get("pending") or identity.get("active")
+        if not isinstance(selected_boot, Mapping) or not selected_boot.get("bootId"):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "boot-scoped identity must be initialized before regeneration",
+            )
+        if selected_boot.get("containerEpoch") != pinned_container_epoch:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "device identity belongs to a different runtime",
             )
         from .location import LocationStateStore
 
         location = LocationStateStore(self.context.state_root).load()
-        if location is None and allow_absent:
-            location_sim_epoch = ""
-            location_record: Mapping[str, Any] = {
-                "profileDigest": "0" * 64,
-            }
-        else:
-            active_location = (
-                location.get("active")
-                if isinstance(location, Mapping)
-                else None
+        active_location = location.get("active") if isinstance(location, Mapping) else None
+        if not isinstance(active_location, Mapping):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "location identity must be initialized before regeneration",
             )
-            if not isinstance(location, Mapping) or not isinstance(
-                active_location,
-                Mapping,
-            ):
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "location identity must be initialized before regeneration",
-                )
-            pending_location = location.get("pending")
-            location_record = (
-                pending_location
-                if allow_absent and isinstance(pending_location, Mapping)
-                else active_location
-            )
-            location_sim_epoch = str(location["simEpoch"])
-        if offline:
-            proxy_enabled, proxy_generation = self._offline_proxy_identity()
-            proxy = {
-                "enabled": proxy_enabled,
-                "generation": proxy_generation,
-            }
-        else:
-            try:
-                client = self.daemon_client(timeout=15.0)
-                bootstrap = client.bootstrap_status(timeout=15.0)
-                proxy = client.proxy_status(timeout=15.0)
-            except Exception as exc:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "daemon component state is unavailable for regeneration",
-                ) from exc
-            runtime_epoch = bootstrap.get("runtimeEpoch")
-            if (
-                bootstrap.get("ok") is not True
-                or not isinstance(runtime_epoch, str)
-                or re.fullmatch(r"[0-9a-f]{64}", runtime_epoch) is None
-                or proxy.get("ok") is not True
-            ):
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "daemon component state is unavailable for regeneration",
-                )
+        try:
+            client = self.daemon_client(timeout=15.0)
+            bootstrap = client.bootstrap_status(timeout=15.0)
+        except Exception as exc:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "daemon component state is unavailable for regeneration",
+            ) from exc
+        runtime_epoch = bootstrap.get("runtimeEpoch")
         if (
-            not isinstance(proxy.get("enabled"), bool)
-            or isinstance(proxy.get("generation"), bool)
-            or not isinstance(proxy.get("generation"), int)
-            or proxy["generation"] < 0
+            bootstrap.get("ok") is not True
+            or not isinstance(runtime_epoch, str)
+            or re.fullmatch(r"[0-9a-f]{64}", runtime_epoch) is None
         ):
             raise IdentityError(
                 "device_regeneration_state_invalid",
-                "proxy state is unavailable for regeneration",
+                "daemon component state is unavailable for regeneration",
             )
+
+        def shell_read(command: str) -> str:
+            result = self.docker_exec(["sh", "-c", command], timeout=10)
+            if result.get("ok") is not True:
+                raise IdentityError(
+                    "device_regeneration_state_invalid",
+                    "runtime identity surface is unreadable for regeneration",
+                )
+            return str(result.get("stdout", "")).strip()
+
+        self.assert_regeneration_single_user()
+        fsid = shell_read(
+            "cat /data/local/tmp/xenoid-profile/statfs_fsid 2>/dev/null || true"
+        )
+        if re.fullmatch(r"[0-9a-f]{16}", fsid) is None:
+            fsid = "0" * 16
+        bluetooth = shell_read("settings get secure bluetooth_address")
+        bluetooth_valid = shell_read("settings get secure bluetooth_addr_valid")
+        if (
+            bluetooth_valid != "1"
+            or re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", bluetooth) is None
+        ):
+            bluetooth = "02:00:00:00:00:00"
+        drm_id = shell_read(
+            "cat /data/local/tmp/xenoid-profile/drm_device_unique_id 2>/dev/null || true"
+        )
+        if re.fullmatch(r"[0-9a-f]{32}", drm_id) is None:
+            drm_id = "0" * 32
+        device_name = shell_read("settings get global device_name")
+        if not device_name or device_name == "null":
+            device_name = "Pixel 6 Pro"
+        hostname = shell_read("getprop net.hostname")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", hostname) is None:
+            hostname = "localhost"
         try:
             binding = GoogleBindingStore(self.context, self.lease).load()
             if binding is None:
@@ -7925,183 +7826,112 @@ cat >/dev/null
                 "device_regeneration_state_invalid",
                 "Google binding state is unavailable for regeneration",
             ) from exc
+        if self.cfg.google_services_provider == PROVIDER_NONE:
+            advertising_id_digest = ""
+            gsf_android_id_digest = ""
+        else:
+            # The pre-journal baseline must be strictly non-repairing: inspect
+            # never binds/starts GMS, clears LAT, or publishes durable state.
+            google_identity = client.google_identity_inspect(timeout=60.0)
+            advertising_id_digest = google_identity.get("advertisingIdSha256")
+            gsf_android_id_digest = google_identity.get("gsfAndroidIdSha256")
+            if (
+                google_identity.get("ok") is not True
+                or not isinstance(advertising_id_digest, str)
+                or _SHA256_PATTERN.fullmatch(advertising_id_digest) is None
+                or gsf_android_id_digest is not None
+                and (
+                    not isinstance(gsf_android_id_digest, str)
+                    or _SHA256_PATTERN.fullmatch(gsf_android_id_digest) is None
+                )
+            ):
+                inspect_error = google_identity.get("error")
+                code = (
+                    inspect_error
+                    if google_identity.get("ok") is not True
+                    and isinstance(inspect_error, str)
+                    and inspect_error.startswith("google_identity_")
+                    and re.fullmatch(r"[a-z][a-z0-9_]*", inspect_error) is not None
+                    else "device_regeneration_state_invalid"
+                )
+                raise IdentityError(
+                    code,
+                    "app-visible Google identity is unavailable for regeneration",
+                )
+            if gsf_android_id_digest is None:
+                gsf_android_id_digest = ""
+        # Pin the exact shared-protection deployment the verified preflight
+        # proved: a resume after an engine reboot must restore this digest,
+        # never whatever the then-current checkout would compute.
+        protection = self.shared_protection_status()
+        protection_engine_id = protection.get("engineId")
+        protection_digest = protection.get("expectedDigest")
+        if (
+            protection.get("ok") is not True
+            or not isinstance(protection_engine_id, str)
+            or re.fullmatch(r"[0-9A-Za-z:._-]{4,128}", protection_engine_id)
+            is None
+            or not isinstance(protection_digest, str)
+            or _SHA256_PATTERN.fullmatch(protection_digest) is None
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "shared protection state is unavailable for regeneration",
+            )
         return {
-            "containerId": container_id,
             "imageId": image_id,
+            "imageInputSha256": image_input,
+            "imageBootInputSha256": image_boot_input,
+            "containerId": container_id,
+            "containerEpoch": pinned_container_epoch,
             "runtimeEpoch": runtime_epoch,
             "stableDigest": stable_identity_digest(identity["stable"]),
-            "networkEpoch": self.lease.network_epoch,
-            "simEpoch": location_sim_epoch,
-            "dataFilesystemUuid": data_before_uuid,
-            "rootfsFilesystemUuid": rootfs_before_uuid,
-            "locationDigest": str(location_record["profileDigest"]),
-            "proxyEnabled": bool(proxy["enabled"]),
-            "proxyGeneration": int(proxy["generation"]),
+            "simEpoch": str(location["simEpoch"]),
+            "locationDigest": str(active_location["profileDigest"]),
+            "bootId": str(selected_boot["bootId"]),
+            "statfsFsid": fsid,
+            "bluetoothAddress": bluetooth,
+            "deviceName": device_name,
+            "hostname": hostname,
             "googleBindingDigest": self._regeneration_digest(binding_identity),
+            "drmDeviceUniqueId": drm_id,
+            "advertisingIdDigest": advertising_id_digest,
+            "gsfAndroidIdDigest": gsf_android_id_digest,
+            "protectionEngineId": protection_engine_id,
+            "protectionExpectedDigest": protection_digest,
         }
 
-    @staticmethod
-    def _google_marker_path(package: str, root: str, transaction_id: str) -> str:
-        base = "/data/user/0" if root == "ce" else "/data/user_de/0"
-        return f"{base}/{package}/.xenoid-regenerate-{transaction_id}"
+    def assert_regeneration_single_user(self) -> None:
+        """Fail closed when the runtime has any secondary Android user.
 
-    def _require_google_wipe_capability(
-        self,
-        package: str,
-        transaction_id: str,
-        capability: Any,
-    ) -> dict[str, Any]:
-        if (
-            package not in GOOGLE_CLEAR_PACKAGES
-            or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None
-        ):
+        Per-user state keeps the pre-rotation identity, so regeneration is
+        only defined for a single-user device. The guard runs at snapshot
+        time and again on every resume, before any rehydration mutates
+        user-0 identity surfaces.
+        """
+        read = self.docker_exec(
+            [
+                "sh",
+                "-c",
+                "for d in /data/system/users/*; do "
+                "[ -d \"$d\" ] || continue; u=${d##*/}; "
+                "case \"$u\" in ''|*[!0-9]*) continue;; esac; "
+                "[ \"$u\" = 0 ] || echo \"$u\"; done",
+            ],
+            timeout=10,
+        )
+        if read.get("ok") is not True:
             raise IdentityError(
                 "device_regeneration_state_invalid",
-                "invalid Google wipe target",
+                "runtime user inventory is unreadable for regeneration",
             )
-        state = RegenerationJournal(self.context).require_capability(capability)
-        if state["transactionId"] != transaction_id:
+        if str(read.get("stdout", "")).strip():
             raise IdentityError(
-                "device_regeneration_state_invalid",
-                "Google wipe transaction does not match regeneration",
+                "device_regeneration_multi_user_unsupported",
+                "device regeneration requires a single Android user",
             )
-        return state
 
-    def prepare_google_package_clear(
-        self,
-        package: str,
-        transaction_id: str,
-        capability: Any,
-    ) -> dict[str, Any]:
-        """Force-stop one allowlisted package and arm root-owned CE/DE markers."""
-        try:
-            self._require_google_wipe_capability(
-                package,
-                transaction_id,
-                capability,
-            )
-        except IdentityError as exc:
-            return exc.as_dict()
-        stopped = self.adb(
-            ["shell", "am", "force-stop", package],
-            timeout=30,
-        )
-        if stopped.get("ok") is not True:
-            return {"ok": False, "error": "google_package_force_stop_failed"}
-        clauses: list[str] = ["set -eu"]
-        for root in GOOGLE_MARKER_ROOTS:
-            marker = self._google_marker_path(package, root, transaction_id)
-            parent = marker.rsplit("/", 1)[0]
-            clauses.append(
-                "if [ -d "
-                + shlex.quote(parent)
-                + " ] && [ ! -L "
-                + shlex.quote(parent)
-                + " ]; then umask 077; : > "
-                + shlex.quote(marker)
-                + "; chown 0:0 "
-                + shlex.quote(marker)
-                + "; chmod 0600 "
-                + shlex.quote(marker)
-                + "; sync -f "
-                + shlex.quote(marker)
-                + "; sync -f "
-                + shlex.quote(parent)
-                + "; printf '%s\\n' "
-                + shlex.quote(root)
-                + "; fi"
-            )
-        try:
-            result = self.daemon_client(timeout=30.0).root_exec("; ".join(clauses))
-        except Exception:
-            return {"ok": False, "error": "google_marker_prepare_failed"}
-        roots = [
-            line.strip()
-            for line in str(result.get("stdout") or "").splitlines()
-            if line.strip()
-        ]
-        if result.get("ok") is not True or roots != [
-            root for root in GOOGLE_MARKER_ROOTS if root in roots
-        ]:
-            return {"ok": False, "error": "google_marker_prepare_failed"}
-        return {"ok": True, "roots": roots}
 
-    def google_package_markers(
-        self,
-        package: str,
-        transaction_id: str,
-        roots: list[str],
-        capability: Any,
-    ) -> dict[str, Any]:
-        """Observe only the exact root-owned markers recorded in the journal."""
-        try:
-            self._require_google_wipe_capability(
-                package,
-                transaction_id,
-                capability,
-            )
-        except IdentityError as exc:
-            return exc.as_dict()
-        if roots != [root for root in GOOGLE_MARKER_ROOTS if root in roots]:
-            return {"ok": False, "error": "device_regeneration_state_invalid"}
-        clauses: list[str] = ["set -eu"]
-        for root in roots:
-            marker = self._google_marker_path(package, root, transaction_id)
-            clauses.append(
-                "if [ -e "
-                + shlex.quote(marker)
-                + " ]; then [ -f "
-                + shlex.quote(marker)
-                + " ] && [ ! -L "
-                + shlex.quote(marker)
-                + " ] && [ \"$(stat -c '%u:%g:%a' -- "
-                + shlex.quote(marker)
-                + ")\" = 0:0:600 ]; printf '%s\\n' "
-                + shlex.quote(root)
-                + "; fi"
-            )
-        try:
-            result = self.daemon_client(timeout=30.0).root_exec("; ".join(clauses))
-        except Exception:
-            return {"ok": False, "error": "google_marker_check_failed"}
-        present = [
-            line.strip()
-            for line in str(result.get("stdout") or "").splitlines()
-            if line.strip()
-        ]
-        if result.get("ok") is not True or present != [
-            root for root in roots if root in present
-        ]:
-            return {"ok": False, "error": "google_marker_check_failed"}
-        return {"ok": True, "present": present}
-
-    def clear_google_package(
-        self,
-        package: str,
-        transaction_id: str,
-        capability: Any,
-    ) -> dict[str, Any]:
-        try:
-            self._require_google_wipe_capability(
-                package,
-                transaction_id,
-                capability,
-            )
-        except IdentityError as exc:
-            return exc.as_dict()
-        stopped = self.adb(["shell", "am", "force-stop", package], timeout=30)
-        if stopped.get("ok") is not True:
-            return {"ok": False, "error": "google_package_force_stop_failed"}
-        cleared = self.adb(
-            ["shell", "pm", "clear", "--user", "0", package],
-            timeout=60,
-        )
-        if (
-            cleared.get("ok") is not True
-            or str(cleared.get("stdout") or "").strip() != "Success"
-        ):
-            return {"ok": False, "error": "google_package_clear_failed"}
-        return {"ok": True}
 
     def status(self) -> dict[str, Any]:
         """Strictly observational status with one actionable recommendation."""
@@ -8128,16 +7958,25 @@ cat >/dev/null
         drift: list[str] = []
         recommended = "no-op"
         if isinstance(pending.get("regeneration"), Mapping):
-            recommended = (
-                "legacy-regeneration-recovery"
-                if pending["regeneration"].get("schema")
-                == "dev.xenoid.device-regenerate/v1"
-                else "resume"
-            )
-            drift.append("device_regeneration_pending")
+            regeneration = pending["regeneration"]
+            if regeneration.get("error") is not None:
+                recommended = "resource-conflict"
+                drift.append("regeneration_journal_invalid")
+            else:
+                recommended = (
+                    "legacy-regeneration-recovery"
+                    if regeneration.get("phase") == "legacy_pending"
+                    else "resume"
+                )
+                drift.append("device_regeneration_pending")
         elif isinstance(pending.get("convergence"), Mapping):
-            recommended = "resume"
-            drift.append("convergence_pending")
+            convergence = pending["convergence"]
+            if convergence.get("error") is not None:
+                recommended = "resource-conflict"
+                drift.append("convergence_journal_invalid")
+            else:
+                recommended = "resume"
+                drift.append("convergence_pending")
         elif observation.get("legacyTokenMigrationPending") is True:
             recommended = "resume"
             drift.append("legacy_token_migration_pending")
@@ -8899,11 +8738,14 @@ cat >/dev/null
             allowed_paths=frozenset({_ROOTD_REMOTE_PATH}),
             deadline=deadline,
         )
+        # Container replacement can preserve process.json while reusing its
+        # PID for another process. Remove only the stale record; the separate
+        # port-inode check below still rejects any live listener.
         if (
             identity is None
             or identity["startTime"] != document["startTime"]
         ):
-            return None, "invalid"
+            return None, "stale"
         return identity, "valid"
 
     def _rootd_authentication(
@@ -9608,6 +9450,67 @@ cat >/dev/null
         ).encode("ascii")
         return hashlib.sha256(material).hexdigest()
 
+    def _userspace_runtime_epoch(
+        self,
+        *,
+        deadline: Optional[float] = None,
+    ) -> Optional[str]:
+        """Epoch of the Android userspace (system_server PID + start time).
+
+        Unlike the daemon epoch this changes only when zygote/system_server
+        restarts, so it is the regeneration soft-reboot proof: a START_STICKY
+        daemon-only restart must not count as an observed userspace restart.
+        """
+
+        def remaining(cap: float = 5.0) -> float:
+            if deadline is None:
+                return cap
+            return min(cap, max(0.0, deadline - time.monotonic()))
+
+        ownership_timeout = remaining()
+        if ownership_timeout <= 0:
+            return None
+        container, _ = self._owned_container_record(timeout=ownership_timeout)
+        container_id = container.get("Id") if isinstance(container, dict) else None
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        ):
+            return None
+
+        def output(args: list[str], limit: int) -> Optional[str]:
+            if remaining() <= 0:
+                return None
+            return self._rootd_output(args, limit=limit, deadline=deadline)
+
+        pids = output(["pidof", "system_server"], 256)
+        if pids is None:
+            return None
+        values = pids.split()
+        if len(values) != 1 or not values[0].isdigit():
+            return None
+        pid = int(values[0])
+        before = output(["cat", f"/proc/{pid}/stat"], 4096)
+        boot_id = output(["cat", "/proc/sys/kernel/random/boot_id"], 128)
+        after = output(["cat", f"/proc/{pid}/stat"], 4096)
+        start_time = self._proc_start_time(before or "")
+        if (
+            before is None
+            or self._proc_start_time(after or "") != start_time
+            or start_time is None
+            or boot_id is None
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                boot_id,
+            ) is None
+        ):
+            return None
+        material = (
+            "dev.xenoid.userspace-runtime/v1\n"
+            f"{container_id}\n{pid}\n{start_time}\n{boot_id}\n"
+        ).encode("ascii")
+        return hashlib.sha256(material).hexdigest()
+
     @staticmethod
     def _bootstrap_terminal_result(status: Mapping[str, Any]) -> dict[str, Any]:
         components = status.get("components")
@@ -9770,6 +9673,369 @@ cat >/dev/null
             "generation": generation,
         }
 
+    def _rootd_exec(
+        self,
+        command: str,
+        token: str,
+        *,
+        deadline: Optional[float] = None,
+        timeout_ms: int = 30000,
+    ) -> Optional[dict[str, Any]]:
+        """Run one command through the token-gated rootd /exec endpoint.
+
+        Host-side transport is ``docker exec toybox nc`` so this never depends
+        on the daemon HTTP API, which is unreachable mid soft-reboot.
+        """
+        body = command.encode("utf-8")
+        if (
+            not body
+            or len(body) > 4096
+            or re.fullmatch(r"[0-9a-f]{32}", token) is None
+        ):
+            return None
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            return None
+        container, _ = self._owned_container_record(
+            timeout=5.0 if deadline is None else max(0.0, deadline - time.monotonic())
+        )
+        container_id = container.get("Id") if isinstance(container, dict) else None
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        ):
+            return None
+        timeout_ms = max(100, min(timeout_ms, 230000))
+        request_id = secrets.token_hex(16)
+        request = bytearray(
+            (
+                "POST /exec HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                f"X-Xenoid-Token: {token}\r\n"
+                f"X-Xenoid-Request-Id: {request_id}\r\n"
+                f"X-Xenoid-Timeout-Ms: {timeout_ms}\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            + body
+        )
+        probe_timeout = 5.0 + timeout_ms / 1000.0
+        if deadline is not None:
+            probe_timeout = min(probe_timeout, max(0.0, deadline - time.monotonic()))
+        if probe_timeout <= 0:
+            for index in range(len(request)):
+                request[index] = 0
+            return None
+        process: Optional[subprocess.Popen[bytes]] = None
+        try:
+            process = subprocess.Popen(
+                [
+                    *self.docker_base_cmd(),
+                    "exec",
+                    "-i",
+                    container_id,
+                    "/system/bin/toybox",
+                    "nc",
+                    "127.0.0.1",
+                    str(self.lease.rootd_port),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=self._rootd_engine_env(),
+                close_fds=True,
+            )
+            # toybox nc exits on stdin EOF without waiting for the peer, so
+            # hold stdin open and read until rootd closes (Connection: close).
+            assert process.stdin is not None and process.stdout is not None
+            process.stdin.write(request)
+            process.stdin.flush()
+            selector = selectors.DefaultSelector()
+            chunks: list[bytes] = []
+            received = 0
+            read_deadline = time.monotonic() + probe_timeout
+            try:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = read_deadline - time.monotonic()
+                    if remaining <= 0 or received > 128 * 1024:
+                        break
+                    events = selector.select(min(1.0, remaining))
+                    if not events:
+                        if process.poll() is not None:
+                            break
+                        continue
+                    chunk = process.stdout.read1(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    received += len(chunk)
+            finally:
+                selector.close()
+            response = b"".join(chunks)
+        except (OSError, subprocess.SubprocessError):
+            if process is not None:
+                try:
+                    process.kill()
+                    process.wait(timeout=1)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            return None
+        finally:
+            for index in range(len(request)):
+                request[index] = 0
+            if process is not None:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                    process.wait(timeout=2)
+                except (OSError, subprocess.SubprocessError):
+                    try:
+                        process.kill()
+                        process.wait(timeout=1)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+        if process.returncode not in (0, None) or not response or len(response) > 128 * 1024:
+            return None
+        header, separator, response_body = response.partition(b"\r\n\r\n")
+        if not separator or not header.startswith(b"HTTP/1.1 200 "):
+            return None
+        try:
+            parsed = json.loads(response_body.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(parsed, dict)
+            or parsed.get("requestId") != request_id
+            or not isinstance(parsed.get("ok"), bool)
+        ):
+            return None
+        return parsed
+
+    def regeneration_restart_receipt(self, transaction_id: str) -> dict[str, Any]:
+        if re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        result = self.docker_exec(
+            ["cat", _REGENERATION_RESTART_RECEIPT],
+            timeout=10,
+        )
+        value = str(result.get("stdout") or "").strip()
+        return {
+            "ok": result.get("ok") is True and value == transaction_id,
+            "transactionId": value if re.fullmatch(r"[0-9a-f]{32}", value) else None,
+        }
+
+    def clear_regeneration_restart_receipt(self, transaction_id: str) -> dict[str, Any]:
+        observed = self.regeneration_restart_receipt(transaction_id)
+        if observed.get("ok") is not True:
+            return {"ok": True, "removed": False}
+        removed = self.docker_exec(
+            ["rm", "-f", _REGENERATION_RESTART_RECEIPT],
+            timeout=10,
+        )
+        return {
+            "ok": removed.get("ok") is True,
+            "removed": removed.get("ok") is True,
+        }
+
+    def soft_reboot(
+        self,
+        timeout: float = _SOFT_REBOOT_TIMEOUT_SECONDS,
+        *,
+        require_health: bool = True,
+        reset_ssaid: bool = False,
+        userspace_restart_observed: bool = False,
+        restart_receipt: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Restart Android userspace (rild, zygote, then keystore2) in place.
+        Host-driven through rootd because the zygote restart kills the daemon
+        itself. Readiness is observed as a genuine ``sys.boot_completed``
+        clear -> set transition. For identity regeneration, the SSAID store is
+        deleted in the same rootd request immediately before the zygote
+        restart. A resumed caller that already observed a new userspace epoch
+        can skip that restart while still completing the delayed keystore2 and
+        control-plane reconciliation. Only after the replacement
+        system_server is ready do we restart keystore2, so it binds the new
+        PackageManager instead of retaining a dead handle to the old one.
+        """
+        requested_timeout = max(0.0, min(timeout, _SOFT_REBOOT_TIMEOUT_SECONDS))
+        parent_timeout = bounded_timeout(requested_timeout)
+        effective_timeout = requested_timeout if parent_timeout is None else parent_timeout
+        deadline = time.monotonic() + effective_timeout
+
+        def remaining(cap: float = 5.0) -> float:
+            return min(cap, max(0.0, deadline - time.monotonic()))
+
+        def failure(code: str, **extra: Any) -> dict[str, Any]:
+            return {"ok": False, "code": code, "error": code, **extra}
+        if restart_receipt is not None and re.fullmatch(
+            r"[0-9a-f]{32}", restart_receipt
+        ) is None:
+            return failure("device_regeneration_state_invalid")
+
+        client = self.daemon_client(timeout=remaining(10.0))
+        rootd = self.ensure_rootd_root(remaining(60.0), client)
+        if rootd.get("ok") is not True:
+            code = rootd.get("code", "rootd_unavailable")
+            return failure(code if isinstance(code, str) else "rootd_unavailable")
+        token = client.read_private_token(force=True, timeout=remaining(5.0))
+        if token is None:
+            return failure("daemon_token_unavailable")
+
+        def exec_checked(command: str) -> Optional[dict[str, Any]]:
+            result = self._rootd_exec(command, token, deadline=deadline)
+            if (
+                result is None
+                or result.get("ok") is not True
+                or result.get("exitCode") != 0
+            ):
+                return None
+            return result
+
+
+        if userspace_restart_observed:
+            if restart_receipt is not None and self.regeneration_restart_receipt(
+                restart_receipt
+            ).get("ok") is not True:
+                return failure("soft_reboot_receipt_missing")
+            booted = self._rootd_output(
+                ["getprop", "sys.boot_completed"],
+                limit=32,
+                deadline=deadline,
+            ) == "1"
+            if not booted:
+                return failure("soft_reboot_transition_missing")
+        else:
+            if remaining() <= 0:
+                return failure("soft_reboot_timeout")
+            restart_commands = ["set -e", 'setprop sys.boot_completed ""']
+            if restart_receipt is not None:
+                restart_commands.extend(
+                    (
+                        "umask 077",
+                        "rm -f -- " + _REGENERATION_RESTART_RECEIPT,
+                        "rm -f -- " + _REGENERATION_RESTART_RECEIPT + ".new",
+                    )
+                )
+            if reset_ssaid:
+                restart_commands.append(
+                    "for d in /data/system/users/*; do "
+                    "[ -d \"$d\" ] || continue; u=${d##*/}; "
+                    "case \"$u\" in ''|*[!0-9]*) continue;; esac; "
+                    "[ \"$u\" = 0 ] || exit 73; done; "
+                    "rm -f -- /data/system/users/0/settings_ssaid.xml"
+                )
+            if restart_receipt is not None:
+                restart_commands.extend(
+                    (
+                        "printf '%s\\n' "
+                        + shlex.quote(restart_receipt)
+                        + " > "
+                        + _REGENERATION_RESTART_RECEIPT
+                        + ".new",
+                        "chmod 600 " + _REGENERATION_RESTART_RECEIPT + ".new",
+                        "mv -f "
+                        + _REGENERATION_RESTART_RECEIPT
+                        + ".new "
+                        + _REGENERATION_RESTART_RECEIPT,
+                        "sync",
+                    )
+                )
+            restart_commands.extend(
+                (
+                    "setprop ctl.restart vendor.ril-daemon",
+                    "setprop ctl.restart zygote",
+                )
+            )
+            if exec_checked(";".join(restart_commands)) is None:
+                return failure("soft_reboot_exec_failed", service="zygote")
+
+            booted = False
+            while time.monotonic() < deadline:
+                value = self._rootd_output(
+                    ["getprop", "sys.boot_completed"],
+                    limit=32,
+                    deadline=deadline,
+                )
+                if value == "1":
+                    booted = True
+                    break
+                time.sleep(min(1.0, remaining()))
+            if not booted:
+                return failure("soft_reboot_timeout")
+        if exec_checked("setprop ctl.restart keystore2") is None:
+            return failure("soft_reboot_exec_failed", service="keystore2")
+        keystore_ready = False
+        while time.monotonic() < deadline:
+            service_state = self._rootd_output(
+                ["getprop", "init.svc.keystore2"],
+                limit=32,
+                deadline=deadline,
+            )
+            if service_state == "running":
+                checked = self._rootd_exec(
+                    "service check android.system.keystore2.IKeystoreService/default >/dev/null",
+                    token,
+                    deadline=deadline,
+                )
+                if (
+                    checked is not None
+                    and checked.get("ok") is True
+                    and checked.get("exitCode") == 0
+                ):
+                    keystore_ready = True
+                    break
+            time.sleep(min(0.25, remaining()))
+        if not keystore_ready:
+            return failure("soft_reboot_keystore_timeout")
+
+        # The daemon returns via its BOOT_COMPLETED receiver but stays at
+        # transport_ready until the host re-runs the bootstrap sequence; that
+        # sequence is the existing readiness probe for the control plane.
+        reinstated = False
+        attempts = 0
+        while time.monotonic() < deadline and attempts < 2:
+            attempts += 1
+            bootstrap = self.reconcile_bootstrap(remaining(120.0))
+            if bootstrap.get("controlReady") is True:
+                proxy = self.reconcile_proxy_desired()
+                if proxy.get("ok") is not True:
+                    code = proxy.get("error", "proxy_reconcile_failed")
+                    return failure(
+                        code if isinstance(code, str) else "proxy_reconcile_failed"
+                    )
+                if not require_health:
+                    # A regeneration stage can legitimately leave a daemon
+                    # subsystem (location) pending restart; the caller owns
+                    # completing that promotion before its own health gate.
+                    return {
+                        "ok": True,
+                        "healthDeferred": True,
+                        "daemonReinstated": reinstated,
+                        "port": self.lease.rootd_port,
+                    }
+                health = client.health(timeout=remaining(10.0))
+                if isinstance(health, dict) and health.get("ok") is True:
+                    return {
+                        "ok": True,
+                        "daemonReinstated": reinstated,
+                        "port": self.lease.rootd_port,
+                    }
+            if reinstated or remaining() <= 0:
+                break
+            started = self._rootd_exec(
+                "am startservice --user 0 -n dev.xenoid.daemon/.XenoidDaemonService",
+                token,
+                deadline=deadline,
+            )
+            if (
+                started is not None
+                and started.get("ok") is True
+                and started.get("exitCode") == 0
+            ):
+                reinstated = True
+        return failure("soft_reboot_daemon_timeout", daemonReinstated=reinstated)
+
     @staticmethod
     def _local_deploy_identity(
         path: Path,
@@ -9900,7 +10166,10 @@ cat >/dev/null
 
     def ensure_daemon_runtime_permissions(self) -> dict[str, Any]:
         granted: list[str] = []
-        for permission in _DAEMON_RUNTIME_PERMISSIONS:
+        permissions = list(_DAEMON_RUNTIME_PERMISSIONS)
+        if self.cfg.google_services_provider == PROVIDER_MICROG:
+            permissions.append("org.microg.gms.EXTENDED_ACCESS")
+        for permission in permissions:
             result = self.adb(
                 [
                     "shell",
@@ -11082,13 +11351,13 @@ cat >/dev/null
     ) -> dict[str, Any]:
         name = self._convergence_action_name(action)
         try:
+            if name in {"none", "reuse", "inspect", "matching"}:
+                status = self.google_services_status(require_runtime=True)
+                return {**status, "skipped": True}
             spec = self.google_runtime_spec(
                 "convergence-google",
                 require_assets=True,
             )
-            if name in {"none", "reuse", "inspect", "matching"}:
-                status = self.google_services_status(require_runtime=True)
-                return {**status, "skipped": True}
             try:
                 preflight = self._google_binding_preflight(spec)
                 binding = self._begin_google_binding(spec, preflight)
@@ -11132,7 +11401,6 @@ cat >/dev/null
         expected_digest: Optional[str] = None,
     ) -> dict[str, Any]:
         return self.shared_protection_manager().ensure(expected_digest)
-
     def reconcile_protection(
         self,
         action: Any,
@@ -11140,7 +11408,11 @@ cat >/dev/null
     ) -> dict[str, Any]:
         name = self._convergence_action_name(action)
         if name in {"maintain", "maintenance", "drift", "reconcile"}:
-            return self.maintain_shared_protection(expected_digest)
+            result = dict(self.maintain_shared_protection(expected_digest))
+            if result.get("ok") is not True:
+                return result
+            failed = self._republish_statfs_fsid_after_start(result)
+            return failed if failed is not None else result
         observed = self.observe_shared_protection()
         if expected_digest is not None and (
             _SHA256_PATTERN.fullmatch(expected_digest) is None

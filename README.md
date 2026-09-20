@@ -112,7 +112,7 @@ Without `--instance`, Xenoid selects `default`.
 ./xenoid device regenerate
 ```
 
-`device regenerate` rotates device, network, SIM, boot, storage, and application identity targets while preserving user data and installed applications.
+`device regenerate` rotates device, SIM, boot, storage, Google, and application identity in place — one soft reboot, no container recreation — while preserving user data and installed applications. It accepts `--dry-run`, not `--skip-build`; `up --skip-build` remains available. Completed microG regeneration uses `googleIdentityMode=offline-seeded`, so FCM registration and delivery are unavailable.
 
 ### Global Proxy
 
@@ -161,8 +161,8 @@ New instances default to `microg` release `microg-0.3.15.250932-phonesky-30.4.17
 
 ./xenoid build all
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.1.0
-./xenoid verify-release dist/release/xenoid-0.1.0.tar.gz
+./xenoid package-release --version 0.9.2
+./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
 ```
 
 Detailed contracts:

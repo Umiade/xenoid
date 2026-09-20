@@ -28,6 +28,7 @@ KEYBOX_MUTATION_TIMEOUT_SECONDS = 180.0
 
 DAEMON_TRANSPORT_SCHEMA = "dev.xenoid.daemon-transport/v1"
 DAEMON_BOOTSTRAP_SCHEMA = "dev.xenoid.daemon-bootstrap/v1"
+GOOGLE_IDENTITY_SCHEMA = "dev.xenoid.google-identity/v1"
 DAEMON_TOKEN_PATH = "/data/data/dev.xenoid.daemon/files/daemon.token"
 DAEMON_APP_DATA_PATH = "/data/data/dev.xenoid.daemon"
 BOOTSTRAP_POLL_TIMEOUT_SECONDS = 240.0
@@ -184,6 +185,48 @@ def _proxy_failure(code: str, http_status: Optional[int] = None) -> dict[str, An
     if http_status is not None:
         result["httpStatus"] = http_status
     return result
+
+def _google_identity_failure(code: str) -> dict[str, Any]:
+    safe = code if _SAFE_CODE_PATTERN.fullmatch(code) else "daemon_response_invalid"
+    return {"ok": False, "schema": GOOGLE_IDENTITY_SCHEMA, "error": safe}
+
+
+def _validated_google_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return _google_identity_failure("daemon_response_invalid")
+    if value.get("ok") is not True:
+        error = value.get("error")
+        return _google_identity_failure(
+            error if isinstance(error, str) else "daemon_response_invalid"
+        )
+    if (
+        set(value)
+        != {
+            "ok",
+            "schema",
+            "advertisingIdSha256",
+            "gsfAndroidIdPresent",
+            "gsfAndroidIdSha256",
+            "offlineSeeded",
+        }
+        or value.get("schema") != GOOGLE_IDENTITY_SCHEMA
+        or not isinstance(value.get("advertisingIdSha256"), str)
+        or _KEYBOX_SHA256.fullmatch(value["advertisingIdSha256"]) is None
+        or not isinstance(value.get("gsfAndroidIdPresent"), bool)
+        or not isinstance(value.get("offlineSeeded"), bool)
+    ):
+        return _google_identity_failure("daemon_response_invalid")
+    if value["offlineSeeded"] is True and value["gsfAndroidIdPresent"] is not True:
+        # offlineSeeded is emitted only after strict marker/provider equality,
+        # which requires a present GSF id; anything else is daemon corruption.
+        return _google_identity_failure("daemon_response_invalid")
+    gsf_digest = value.get("gsfAndroidIdSha256")
+    if value["gsfAndroidIdPresent"]:
+        if not isinstance(gsf_digest, str) or _KEYBOX_SHA256.fullmatch(gsf_digest) is None:
+            return _google_identity_failure("daemon_response_invalid")
+    elif gsf_digest is not None:
+        return _google_identity_failure("daemon_response_invalid")
+    return value
 
 
 def _proxy_error_from_response(value: Any) -> str:
@@ -1536,6 +1579,41 @@ class DaemonClient:
 
     def root_exec(self, command: str) -> dict[str, Any]:
         return self.request("POST", "/root/exec", {"command": command})
+
+    def google_identity_status(
+        self, timeout: Optional[float] = None
+    ) -> dict[str, Any]:
+        return _validated_google_identity(
+            self.request("GET", "/google-identity/status", timeout=timeout)
+        )
+
+    def google_identity_inspect(
+        self, timeout: Optional[float] = None
+    ) -> dict[str, Any]:
+        """Strictly passive identity read for pre-journal baselines.
+
+        Unlike ``/google-identity/status`` this endpoint never binds or
+        starts GMS, never clears LAT, and never publishes durable state; it
+        fails with ``google_identity_service_unavailable`` when no live
+        advertising binder is connected.
+        """
+        return _validated_google_identity(
+            self.request("GET", "/google-identity/inspect", timeout=timeout)
+        )
+
+    def google_identity_activate(
+        self, gsf_android_id: str, timeout: Optional[float] = None
+    ) -> dict[str, Any]:
+        if re.fullmatch(r"[1-9][0-9]{0,18}", gsf_android_id) is None:
+            return _google_identity_failure("invalid_request")
+        return _validated_google_identity(
+            self.request(
+                "POST",
+                "/google-identity/activate",
+                {"gsfAndroidId": gsf_android_id},
+                timeout=timeout,
+            )
+        )
 
     def frida_start(self, port: int = 27042) -> dict[str, Any]:
         return self.request("POST", "/frida/start", {"port": port}, timeout=90)

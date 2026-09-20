@@ -27,7 +27,7 @@ Each instance is a logical device with three persistent components:
 2. **Private control state** at `~/.xenoid/instances/<UUID>/` (operator state);
 3. **Android user data** in a Docker engine named volume (`xenoid-data-<tag>`), containing a grow-only sparse ext4 backing image (`xenoid-data.img`) that is bind-mounted as the container's `/data`.
 
-`stop` installs/verifies proxy quarantine, syncs, and stops the owned container without removing it. The immutable container ID and data volume survive, so `stop -> up` starts the same container. Explicit recreate and regenerate may change the ID but preserve the data volume. External volume deletion/prune or loss of private host state fails closed rather than creating an empty disk.
+`stop` installs/verifies proxy quarantine, syncs, and stops the owned container without removing it. The immutable container ID and data volume survive, so `stop -> up` starts the same container. Only explicit recreate may change the ID; `device regenerate` keeps the same container and rotates identity in place. External volume deletion/prune or loss of private host state fails closed rather than creating an empty disk.
 
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
 
@@ -49,7 +49,7 @@ Artifact builds use content-addressed records plus output-directory locks: disjo
 ./xenoid --instance phone-a stop
 ```
 
-Device identity is generated once per instance. `device regenerate` publishes all stable/network/SIM/data/rootfs targets once in a v2 journal, then recreates and converges through the shared executor; for any configured non-`none` Google provider, fresh pre-Google acceptance gates clearing exactly `com.google.android.gms`, `com.google.android.gsf`, and `com.android.vending`. Plain `up` resumes a validated v2 transaction. A v1-only journal blocks until the operator explicitly runs `device regenerate --restart-legacy-transaction`.
+Device identity is generated once per instance. `device regenerate` publishes its stable, SIM, boot, storage, DRM, and Google-binding targets once in a `dev.xenoid.device-regenerate/v3` journal, commits them without stopping or recreating the container, and runs one host-driven soft reboot. The transaction deterministically fixes the exact offline-seeded GSF Android ID. GAID is an opaque microG-generated postcondition rather than a journal target: acceptance requires only a nonzero app-facing value different from the pre-transaction value, and later GmsCore recreation may rekey it. Plain `up` resumes a validated v3 transaction; legacy v1/v2 journals fail with `device_regeneration_legacy_pending`.
 
 ## Linux ARM
 
@@ -172,7 +172,11 @@ The image applies `restricted-spoofing` only to the official microG `com.google.
 
 No Google SetupWizard is installed. `ro.setupwizard.mode` remains unchanged and AOSP `Provision` remains installed. Product policy enables the required account, background-service, messaging, location, and Store integration without granting a general signature-spoofing permission.
 
-Status v2 reports `implementation=microg`, `signatureModel=restricted-spoofing`, `storeImplementation=google-play`, exact factory/effective components, immutable binding and image/rootfs identity, live checks, and capability state. Ordinary `up` requires minimal live health for runtime-tier `googlePlayServices`, `accountAuth`, `cloudMessaging`, `fusedLocation`, and `playStore`; it does not run cloud/API tests. Full release-tier `fcmDelivery`, `fusedLocationBehavior`, `maps`, `auth`, and `playStoreOperations` are claimed only by the packaged release attestation, and Maps uses `microg-mapbox-maplibre`. `playIntegrity`, `deviceCertification`, `drm`, and `antiCheat` are always `unsupported`.
+Status v2 reports `implementation=microg`, `signatureModel=restricted-spoofing`, `storeImplementation=google-play`, exact factory/effective components, immutable binding and image/rootfs identity, live checks, capability state, and `googleIdentityMode`. In `provider-managed` mode, ordinary `up` requires runtime-tier `googlePlayServices`, `accountAuth`, `cloudMessaging`, `fusedLocation`, and `playStore`; it does not run cloud/API tests. In regeneration's `offline-seeded` mode, `cloudMessaging` is removed from the required set and reported `unsupported` with `offline-checkin-disabled` evidence because check-in stays disabled. Full release-tier `fcmDelivery`, `fusedLocationBehavior`, `maps`, `auth`, and `playStoreOperations` are claimed only by the packaged release attestation, and Maps uses `microg-mapbox-maplibre`. `playIntegrity`, `deviceCertification`, `drm`, and `antiCheat` are always `unsupported`.
+
+Known issue — regeneration disables FCM: on an `offline-seeded` instance, FCM registration and delivery are unavailable. This is intentional; `up` accepts that mode without requiring `cloudMessaging`.
+
+Known issue — Phonesky self-update: the Play Store may self-update the pinned Phonesky seed (30.4.17) to a newer release on its own schedule, independently of `device regenerate` — regeneration neither clears nor launches Phonesky and does not initiate the update. The update is signed by a different Google certificate than the pinned seed's lineage, so component verification rejects it and the next `up` fails with `google_services_runtime_not_ready`. Recovery is `./xenoid adb shell pm uninstall com.android.vending`, which rolls the Store back to the verified factory seed.
 
 Focused smoke commands are explicit validation operations. They do not call doctor from inside the runtime transaction, and production convergence/regeneration never calls them:
 
@@ -369,9 +373,11 @@ python -m pip install frida-tools
 
 The production template is Android 13 Pixel 6 Pro `raven`, model `G8V0U`, build `TP1A.221005.002`/`9012097`, shipping API 31. Profile application converges SettingsProvider, partition/property-area identity, display/input, native sensor and camera HAL inputs, battery, memory/storage, and reboot-persistent data. Recollect the complete profile after a change.
 
-`device regenerate` creates a private `dev.xenoid.device-regenerate/v2` transaction and generates every stable/network/SIM/data/rootfs target exactly once before mutation. It quarantines, removes the owned container, commits each fixed target idempotently, and invokes the convergence executor directly. For any configured non-`none` Google provider, fresh pre-Google acceptance gates clearing exactly `com.google.android.gms`, `com.google.android.gsf`, and `com.android.vending`; fresh final acceptance gates journal deletion. User data, installed apps, keystore state, proxy/Keybox semantics, and location country/carrier are preserved.
+`device regenerate` creates a private `dev.xenoid.device-regenerate/v3` transaction and fixes every stable, SIM, boot, storage, DRM, and Google-binding target before mutation. It never quarantines, stops, removes, or recreates the owned container: those targets are committed against the live runtime, per-app SSAID is reset by deleting `settings_ssaid.xml`, and one host-driven soft reboot (`rild` + `zygote`, followed by `keystore2` after the replacement `system_server` is ready) activates boot-scoped factors. Once the replacement daemon is healthy, the exact positive decimal GSF Android ID is deterministically derived from the transaction and committed Google binding and published offline while GmsCore is force-stopped; microG check-in is disabled atomically, the target is written to `checkin.xml`, `gservices.db`, and the staged profile, and `CheckinService` is never started. GAID is not fixed or stored as a journal target. `IAdvertisingIdService.resetAdvertisingId` resets microG's opaque in-memory value and acceptance requires only that the app-facing GAID is nonzero and differs from its pre-transaction observation. Its SHA-256 digest is evidence only; because the pinned `MemoryAdvertisingIdConfiguration` has no setter, later microG service/process recreation may rekey GAID again. Provider `none` skips Google rotation and a configured non-microG provider fails unsupported. Fail-closed read-back requires the exact GSF target and the GAID postconditions before journal deletion. User data, installed apps, keystore state, proxy/Keybox semantics, and location country/carrier are preserved.
 
-An interrupted v2 transaction is resumable by either `device regenerate` or plain `up`; both reuse recorded targets and completed phases. A legacy v1 journal lacks the values required for exactly-once recovery, so ordinary `up` fails `device_regeneration_legacy_pending`. The only destructive escape is `./xenoid device regenerate --restart-legacy-transaction`, which records a digest of the v1 evidence and atomically publishes a complete v2 target before mutation; factors already changed by v1 may rotate once more.
+Because regeneration seeds the GSF Android ID offline with microG check-in disabled (`CheckinService` never starts and the seeded security token is never refreshed), FCM registration and delivery are unavailable on a regenerated instance: Google status reports `cloudMessaging` as `unsupported` with `offline-checkin-disabled` evidence and drops it from that instance's required runtime capabilities.
+
+An interrupted v3 transaction is resumable by either `device regenerate` or plain `up`; both reuse recorded targets and completed phases, and `up` returns the canonical top-level `dev.xenoid.device-regenerate/v3` result rather than fabricating a convergence wrapper. Without a pending regeneration, `up` returns `dev.xenoid.convergence/v1`. Legacy v1/v2 journals are not resumable: ordinary `up` fails `device_regeneration_legacy_pending`, and the recovery is to delete the recorded legacy journal files under the instance state directory and rerun `./xenoid device regenerate`.
 
 ## Applications, input, and automation
 
@@ -405,8 +411,8 @@ A matching module/link/map inventory is reused across instances. eBPF replacemen
 ./xenoid build all
 ./xenoid build all --force
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.1.0
-./xenoid verify-release dist/release/xenoid-0.1.0.tar.gz
+./xenoid package-release --version 0.9.2
+./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
 ```
 
 Normal builds reuse content-addressed artifact records; `--force` rebuilds and rejects nondeterministic output for an unchanged input/tool identity. Release packaging runs the non-recursive release gate profile fresh, stages validated immutable objects, creates canonical OTA/package archives with fixed `SOURCE_DATE_EPOCH`, and requires `verify-release` on the candidate before publication. A selectable microG provider requires the fresh `release-google` profile and packages only its normalized `evidence/google-services-release.json`; ordinary offline evidence never claims live Google capability.

@@ -73,6 +73,7 @@ GOOGLE_STATUS_KEYS = {
     "live",
     "requiredCapabilities",
     "capabilities",
+    "googleIdentityMode",
     "error",
     "nextActions",
 }
@@ -221,6 +222,7 @@ def microg_status_v2() -> dict[str, Any]:
             "playStore",
         ],
         "capabilities": capabilities,
+        "googleIdentityMode": "provider-managed",
         "error": None,
         "nextActions": [],
     }

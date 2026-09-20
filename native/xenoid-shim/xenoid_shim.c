@@ -202,6 +202,54 @@ static char *fake_boot_id(void) {
   return cached_boot_id ? strdup(cached_boot_id) : load_boot_id();
 }
 
+/* Staged /data filesystem identity shared with the kmod and zygote layers.
+   Absent or invalid staged content means pass the real fsid through, matching
+   the kmod's zero/zero default. Loaded once per process; regeneration takes
+   effect through the soft reboot that follows it. */
+static pthread_once_t statfs_fsid_once = PTHREAD_ONCE_INIT;
+static uint64_t statfs_fsid_value;
+static int statfs_fsid_hex_nibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+static void initialize_statfs_fsid(void) {
+  open_t real_open = (open_t)dlsym(RTLD_NEXT, "open");
+  read_t real_read = (read_t)dlsym(RTLD_NEXT, "read");
+  if (!real_open || !real_read) return;
+  char path[512];
+  join_profile_path(path, sizeof(path), "statfs_fsid");
+  int fd = real_open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  char text[18];
+  ssize_t size = real_read(fd, text, sizeof(text));
+  close(fd);
+  if (size != 17 || text[16] != '\n') return;
+  unsigned int v[2] = {0, 0};
+  int ok = 1;
+  for (int half = 0; half < 2 && ok; ++half) {
+    for (int i = 0; i < 8; ++i) {
+      int nibble = statfs_fsid_hex_nibble(text[half * 8 + i]);
+      if (nibble < 0) { ok = 0; break; }
+      v[half] = (v[half] << 4) | (unsigned int)nibble;
+    }
+  }
+  if (ok)
+    statfs_fsid_value = ((uint64_t)v[0] << 32) | (uint64_t)v[1];
+}
+static uint64_t load_statfs_fsid(void) {
+  pthread_once(&statfs_fsid_once, initialize_statfs_fsid);
+  return statfs_fsid_value;
+}
+#define XENOID_SHAPE_STATFS_FSID(buf) do { \
+  uint64_t fsid = load_statfs_fsid(); \
+  if (fsid) { \
+    (buf)->f_fsid.__val[0] = (int)(uint32_t)(fsid >> 32); \
+    (buf)->f_fsid.__val[1] = (int)(uint32_t)fsid; \
+  } \
+} while(0)
+
 static int line_hidden(const char *l) {
   static const char *tcp_ports[]={":15B3",":69A2",":69A3",":494D",":494E",":494F",":90ED",":9999",NULL};
   static const char *markers[]={"xenoid","libxenoid","shim",".fs64",".netd-helper","frida","gum-js-loop","gmain","gdbus","magisk","zygisk","xposed","lsposed","/su","/system/xbin/su","docker","containerd","overlayfs","upperdir=","workdir=","lowerdir=","/var/lib/","xenoid-overlay","xenoid-data","virtio","xen","vbox","vmw","/data/local/tmp","/data/asan","asan.","OpenStack","KVM","QEMU","PCI Bus","PCI-MSIX","virtio-pci","xen_","amd_","epyc","jdwp","libadbconnection","@jdwp",NULL};
@@ -820,6 +868,7 @@ static unsigned long long scale_data_statfs_value(
     (buf)->f_ffree=scale_data_statfs_value(real_ffree,real_blocks); \
     (buf)->f_namelen=XENOID_DATA_NAME_MAX; \
     (buf)->f_flags=XENOID_DATA_STATFS_FLAGS; \
+    XENOID_SHAPE_STATFS_FSID(buf); \
   } \
 } while(0)
 int statfs(const char *path, struct statfs *buf) {

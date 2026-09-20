@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
@@ -22,6 +23,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from xenoid.config import InstanceError, initialize_instance, new_instance_config  # noqa: E402
 from xenoid import google_services as gs  # noqa: E402
+from xenoid import backend as backend_module  # noqa: E402
+from xenoid import cli as xenoid_cli  # noqa: E402
+from xenoid import daemon_client as daemon_client_module  # noqa: E402
 
 
 INSTANCE_ID = "11111111-2222-4333-8444-555555555555"
@@ -697,6 +701,13 @@ def test_binding_transitions() -> None:
     pending = {**identity, "state": "pending", "source": "explicit"}
     committed = {**identity, "state": "committed", "source": "explicit"}
     assert gs.binding_matches(pending, spec)
+    store = object.__new__(gs.GoogleBindingStore)
+    store.context = SimpleNamespace(instance_id=INSTANCE_ID)
+    store.load = lambda: committed
+    first_gsf = store.regeneration_gsf_android_id("1" * 32)
+    assert first_gsf == store.regeneration_gsf_android_id("1" * 32)
+    assert first_gsf != store.regeneration_gsf_android_id("2" * 32)
+    assert first_gsf.isdigit() and 0 < int(first_gsf) <= (1 << 63) - 1
     assert gs.transition_decision(
         spec,
         None,
@@ -985,10 +996,811 @@ def test_release_acceptance_identity_bindings() -> None:
     expect_mismatch(lambda: smoke.__setitem__("noOpPasses", smoke["noOpPasses"][:1]))
 
 
+
+def test_google_identity_response_contract() -> None:
+    digest = hashlib.sha256(b"identity").hexdigest()
+    good = {
+        "ok": True,
+        "schema": daemon_client_module.GOOGLE_IDENTITY_SCHEMA,
+        "advertisingIdSha256": digest,
+        "gsfAndroidIdPresent": True,
+        "gsfAndroidIdSha256": digest,
+        "offlineSeeded": True,
+    }
+    assert daemon_client_module._validated_google_identity(good) == good
+    absent = {
+        **good,
+        "gsfAndroidIdPresent": False,
+        "gsfAndroidIdSha256": None,
+        "offlineSeeded": False,
+    }
+    assert daemon_client_module._validated_google_identity(absent) == absent
+    malformed = {**good, "advertisingIdSha256": "not-a-digest"}
+    assert daemon_client_module._validated_google_identity(malformed)["error"] == (
+        "daemon_response_invalid"
+    )
+    malformed_seed = {**good, "offlineSeeded": "true"}
+    assert daemon_client_module._validated_google_identity(malformed_seed)["error"] == (
+        "daemon_response_invalid"
+    )
+    inconsistent_seed = {
+        **good,
+        "gsfAndroidIdPresent": False,
+        "gsfAndroidIdSha256": None,
+    }
+    assert daemon_client_module._validated_google_identity(inconsistent_seed)["error"] == (
+        "daemon_response_invalid"
+    )
+    unsafe = {
+        "ok": False,
+        "schema": daemon_client_module.GOOGLE_IDENTITY_SCHEMA,
+        "error": "secret: leaked",
+    }
+    assert daemon_client_module._validated_google_identity(unsafe)["error"] == (
+        "daemon_response_invalid"
+    )
+
+def test_runtime_google_identity_rotation_contract() -> None:
+    target = "123456789012345678"
+    old_ad = hashlib.sha256(b"old-ad").hexdigest()
+    new_ad = hashlib.sha256(b"new-ad").hexdigest()
+    empty_ad = hashlib.sha256(
+        b"00000000-0000-0000-0000-000000000000"
+    ).hexdigest()
+    old_gsf = hashlib.sha256(b"old-gsf").hexdigest()
+    new_gsf = hashlib.sha256(target.encode("ascii")).hexdigest()
+    response = {
+        "ok": True,
+        "advertisingIdSha256": new_ad,
+        "gsfAndroidIdSha256": new_gsf,
+        "offlineSeeded": True,
+    }
+    current = {
+        "response": {
+            "ok": True,
+            "advertisingIdSha256": old_ad,
+            "gsfAndroidIdSha256": old_gsf,
+            "offlineSeeded": False,
+        }
+    }
+    seeded_marker = {"present": False}
+    activated: list[str] = []
+    healed: list[float] = []
+
+    def activate(value: str, timeout: float) -> dict[str, Any]:
+        activated.append(value)
+        current["response"] = dict(response)
+        seeded_marker["present"] = True
+        return dict(response)
+
+    def status(timeout: float) -> dict[str, Any]:
+        healed.append(timeout)
+        return {
+            **current["response"],
+            "offlineSeeded": seeded_marker["present"],
+        }
+
+    client = SimpleNamespace(
+        google_identity_status=status,
+        google_identity_activate=activate,
+        google_identity_inspect=lambda timeout: {
+            **current["response"],
+            "offlineSeeded": seeded_marker["present"],
+        },
+    )
+    manager = SimpleNamespace(
+        cfg=SimpleNamespace(google_services_provider=gs.PROVIDER_MICROG),
+        context=object(),
+        lease=object(),
+        daemon_client=lambda timeout: client,
+        _offline_google_identity_seeded=lambda: seeded_marker["present"],
+    )
+    state = {
+        "transactionId": "3" * 32,
+        "before": {
+            "advertisingIdDigest": old_ad,
+            "gsfAndroidIdDigest": old_gsf,
+        },
+    }
+    binding = {"state": "committed"}
+    store = SimpleNamespace(
+        load=lambda: dict(binding),
+        regeneration_gsf_android_id=lambda transaction: target,
+    )
+    with (
+        mock.patch.object(xenoid_cli, "GoogleBindingStore", return_value=store),
+        mock.patch.object(
+            xenoid_cli, "resolve_google_runtime_spec", return_value=object()
+        ),
+        mock.patch.object(xenoid_cli, "binding_matches", return_value=True) as matches,
+    ):
+        preflight = xenoid_cli._regeneration_google_preflight(
+            manager, state["transactionId"]
+        )
+        rotated = xenoid_cli._regeneration_google_identity(
+            manager, state, activate=True
+        )
+        observed = xenoid_cli._regeneration_google_identity(
+            manager, state, activate=False
+        )
+        resumed = xenoid_cli._regeneration_google_identity(
+            manager, state, activate=True
+        )
+
+        # Crash after provider DB commit but before marker replacement: matching
+        # digests are not durable proof.  Passive inspection rejects; activation
+        # must run again and idempotently republish/read back the marker.
+        current["response"] = dict(response)
+        seeded_marker["present"] = False
+        unpublished = xenoid_cli._regeneration_google_identity(
+            manager, state, activate=False
+        )
+        republished = xenoid_cli._regeneration_google_identity(
+            manager, state, activate=True
+        )
+
+        current["response"]["advertisingIdSha256"] = empty_ad
+        limited = xenoid_cli._regeneration_google_identity(
+            manager, state, activate=False
+        )
+        current["response"]["advertisingIdSha256"] = old_ad
+        unchanged = xenoid_cli._regeneration_google_identity(
+            manager, state, activate=False
+        )
+
+        binding["state"] = "pending"
+        pending_preflight = xenoid_cli._regeneration_google_preflight(
+            manager, state["transactionId"]
+        )
+        binding["state"] = "committed"
+        matches.return_value = False
+        incompatible_preflight = xenoid_cli._regeneration_google_preflight(
+            manager, state["transactionId"]
+        )
+
+    assert preflight == {"ok": True}
+    assert healed == [60.0]
+    assert activated == [target, target]
+    assert rotated["ok"] is True and observed["ok"] is True and resumed["ok"] is True
+    assert republished["ok"] is True
+    assert unpublished == {
+        "ok": False,
+        "error": "google_identity_rotation_unverified",
+    }
+    assert target not in json.dumps(rotated)
+    for rejected in (limited, unchanged):
+        assert rejected == {
+            "ok": False,
+            "error": "google_identity_rotation_unverified",
+        }
+    assert pending_preflight == {
+        "ok": False,
+        "error": "google_services_runtime_not_ready",
+    }
+    assert incompatible_preflight == {
+        "ok": False,
+        "error": "google_services_new_instance_required",
+    }
+
+    manager.cfg.google_services_provider = gs.PROVIDER_NONE
+    skipped = xenoid_cli._regeneration_google_identity(
+        manager, state, activate=True
+    )
+    assert skipped["ok"] is True and skipped["skipped"] is True
+    skipped_preflight = xenoid_cli._regeneration_google_preflight(
+        manager, state["transactionId"]
+    )
+    assert skipped_preflight["ok"] is True and skipped_preflight["skipped"] is True
+
+    manager.cfg.google_services_provider = gs.PROVIDER_MINDTHEGAPPS
+    unsupported = xenoid_cli._regeneration_google_identity(
+        manager, state, activate=True
+    )
+    assert unsupported == {
+        "ok": False,
+        "error": "google_identity_rotation_unsupported",
+    }
+    unsupported_preflight = xenoid_cli._regeneration_google_preflight(
+        manager, state["transactionId"]
+    )
+    assert unsupported_preflight == unsupported
+
+
+def test_offline_identity_downgrades_cloud_messaging() -> None:
+    online = backend_module._google_identity_capability_model(
+        gs.PROVIDER_MICROG,
+        "ready",
+        offline_identity_seeded=False,
+    )
+    offline = backend_module._google_identity_capability_model(
+        gs.PROVIDER_MICROG,
+        "ready",
+        offline_identity_seeded=True,
+    )
+    assert "cloudMessaging" in online["requiredCapabilities"]
+    assert "cloudMessaging" not in offline["requiredCapabilities"]
+    assert offline["capabilities"]["cloudMessaging"] == {
+        "scope": "runtime-release",
+        "runtimeState": "unsupported",
+        "releaseState": "unsupported",
+        "evidence": "offline-checkin-disabled",
+    }
+
+    manager = object.__new__(backend_module.RuntimeManager)
+    observed_processes: list[str] = []
+
+    def process_identity(process: str) -> tuple[int, int]:
+        observed_processes.append(process)
+        return (123, 456)
+
+    manager._microg_process_identity = process_identity
+    manager._microg_exit_history = lambda packages, deadline: {
+        "ok": True,
+        "code": None,
+        "detail": None,
+    }
+    stability = manager._microg_process_stability({}, 0.0)
+    assert stability["ok"] is True
+    assert observed_processes[:2] == [
+        "com.google.android.gms",
+        "com.google.android.gms",
+    ]
+
+
+def _java_string_literal_bytes(source: str) -> int:
+    tokens = re.findall(r'"(?:\\.|[^"\\])*"', source)
+    return sum(len(json.loads(token).encode("utf-8")) for token in tokens)
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def test_microg_identity_seed_is_offline() -> None:
+    root_source = (
+        ROOT
+        / "daemon/app/src/main/java/dev/xenoid/daemon/RootHelper.java"
+    ).read_text(encoding="utf-8")
+    method = root_source.split(
+        "static Map<String,Object> seedGoogleIdentity", 1
+    )[1].split("private static Map<String,Object> execRootd", 1)[0]
+    manager_source = (
+        ROOT
+        / "daemon/app/src/main/java/dev/xenoid/daemon/GoogleIdentityManager.java"
+    ).read_text(encoding="utf-8")
+    service_source = (
+        ROOT
+        / "daemon/app/src/main/java/dev/xenoid/daemon/XenoidDaemonService.java"
+    ).read_text(encoding="utf-8")
+
+
+    # The activation guard proves the exact immutable factory asset, not merely
+    # that some package named com.google.android.gms happens to live under /system.
+    pinned = gs.load_release_spec(ROOT, gs.MICROG_PLAY_RELEASE).component("gmsCore")
+    assert str(pinned["runtimePath"]) in root_source
+    assert str(pinned["sha256"]) in root_source
+    assert r"[ \"$pa\" = 'package:" in root_source
+    assert "UPDATED_SYSTEM_APP" in root_source
+    assert "sha256sum $pa" in root_source
+    assert method.index("pinnedSurfacePredicate()") < method.index(
+        '+ "precheck;"'
+    ) < method.index("am force-stop com.google.android.gms")
+    assert method.count("am force-stop com.google.android.gms") == 1
+
+    # All relevant paths are classified before force-stop.  Database/main/backup/
+    # sidecar files must be non-symlink regular nlink==1 files owned only by the
+    # package uid or root (root permits crash-created SQLite recovery state).
+    pre_force = method[: method.index("am force-stop com.google.android.gms")]
+    assert "/data/local/tmp/xenoid-profile" in pre_force
+    assert r'stat -c %u:%g:%a $x)\" = 0:0:700' in pre_force
+    for suffix in ("$b", "$b-journal", "$b-wal", "$b-shm"):
+        assert suffix in pre_force
+    for path in ("$q", "$qb", "$c", "$cb", "$qt", "$ct", "$m", "$t"):
+        assert path in pre_force
+    assert 'String command = "set -eu;umask 077;"' in method
+    assert r'[ ! -L \"$1\" ]&&[ -f \"$1\" ]' in pre_force
+    assert r'stat -c %h \"$1\"' in pre_force
+    assert r'\"$o\" = \"$u:$g\"' in pre_force and r'\"$o\" = 0:0' in pre_force
+    assert r'stat -c %h:%u:%g:%a $f)\" = 1:0:0:600' in pre_force
+    marker_probe = root_source.split(
+        "static Map<String,Object> offlineGoogleIdentitySeeded", 1
+    )[1].split("static Map<String,Object> seedGoogleIdentity", 1)[0]
+    assert "Long.parseLong(lines[1])" in marker_probe
+    assert "google_identity_seed_state_invalid" in marker_probe
+
+    # A killed root sqlite transaction may leave root-owned sidecars.  Resume first
+    # asks sqlite to recover the hot journal, then removes inert sidecars and runs
+    # the idempotent seed transaction; it never unlinks a hot journal first.
+    recover = method.index(
+        "/system/bin/sqlite3 $b 'PRAGMA wal_checkpoint(TRUNCATE);PRAGMA user_version;'"
+    )
+    cleanup = method.index("rm -f $b-journal $b-wal $b-shm", recover)
+    transaction = method.index("/system/bin/sqlite3 $b ", cleanup)
+    assert recover < cleanup < transaction
+    assert method.index("BEGIN IMMEDIATE") < method.index("COMMIT;")
+    assert "CREATE TABLE IF NOT EXISTS main" in method
+    assert "PRAGMA user_version=3" in method
+    assert "DELETE FROM overrides WHERE name='android_id'" in method
+    assert "PRAGMA wal_checkpoint(TRUNCATE)" in method
+
+    # Android treats .bak as authoritative.  Generate the new disabled prefs from
+    # the backup when present, then publish a target-valued backup before replacing
+    # the main file.  At every crash point restoration yields the new target; only
+    # after the main and directory are durable is the target backup removed.
+    assert "r=$q;[ ! -f $qb ]||r=$qb" in method
+    put = method.split('put(){', 1)[1].split('};"', 1)[0]
+    assert put.index("sync -f $a") < put.index("cp -p $a $k")
+    assert put.index("mv -f $k $n.bak") < put.index(
+        "sync -f $s"
+    ) < put.index("mv -f $a $n") < put.index("sync -f $n")
+    assert put.index("sync -f $n") < put.index("rm -f $n.bak") < put.rindex(
+        "sync -f $s"
+    )
+    assert method.index("put $qt $q $ct") < method.index("put $ct $c $qt")
+    assert "checkin_enable_service" in method
+    assert "value=\\\"false\\\"" in method
+    assert all(
+        forbidden not in method
+        for forbidden in (
+            "CheckinService",
+            "PushRegisterService",
+            "checkin.googleapis.com",
+            "curl ",
+            "wget ",
+        )
+    )
+
+    # Durable completion is the exact GSF marker at this protected location.  It
+    # is staged root:root 0600, fsynced, atomically renamed, directory-fsynced, and
+    # content/mode read back.  Re-running activate republishes it unconditionally.
+    assert "m=$x/gsf_android_id;t=$m.tmp" in method
+    assert method.index("chown 0:0 $t;chmod 600 $t") < method.index(
+        "sync -f $t"
+    ) < method.index("mv -f $t $m;sync -f $x")
+    assert r'stat -c %h:%u:%g:%a $m)\" = 1:0:0:600' in method
+    assert '$(cat $m)' in method
+
+    # The generated rootd request must remain under MAX_COMMAND_BYTES=4096 even at
+    # the maximum 19-digit target.  This computes its exact runtime length from the
+    # Java literal fragments plus the dynamic concatenations.
+    worst_gsf = "9" * 19
+    checkin = (
+        "<?xml version='1.0' encoding='utf-8'?><map>"
+        f'<long name="androidId" value="{worst_gsf}" />'
+        '<string name="digest">1-929a0dca0eee55513280171a8585da7dcd3700f8</string>'
+        '<long name="lastCheckin" value="0" />'
+        '<long name="securityToken" value="0" />'
+        '<string name="versionInfo"></string>'
+        '<string name="deviceDataVersionInfo"></string></map>'
+    )
+    sql = (
+        "BEGIN IMMEDIATE;"
+        "CREATE TABLE IF NOT EXISTS main (name TEXT PRIMARY KEY, value TEXT);"
+        "CREATE TABLE IF NOT EXISTS overrides (name TEXT PRIMARY KEY, value TEXT);"
+        "CREATE TABLE IF NOT EXISTS saved_system (name TEXT PRIMARY KEY, value TEXT);"
+        "CREATE TABLE IF NOT EXISTS saved_secure (name TEXT PRIMARY KEY, value TEXT);"
+        "PRAGMA user_version=3;"
+        "DELETE FROM overrides WHERE name='android_id';"
+        "INSERT OR REPLACE INTO main(name,value) VALUES('android_id','"
+        f"{worst_gsf}');COMMIT;PRAGMA wal_checkpoint(TRUNCATE);"
+    )
+    command_expression = method.split("String command = ", 1)[1].split(
+        "return execRootd(command", 1
+    )[0]
+    literal_bytes = _java_string_literal_bytes(command_expression)
+    predicate = root_source.split(
+        "private static String pinnedSurfacePredicate()", 1
+    )[1].split("private static boolean rootdTransportFailure", 1)[0]
+    # Two path interpolations and one digest interpolation are the predicate's
+    # only non-literal pieces.
+    predicate_bytes = _java_string_literal_bytes(predicate)
+    predicate_bytes += 2 * len(str(pinned["runtimePath"]).encode("utf-8"))
+    predicate_bytes += len(str(pinned["sha256"]).encode("ascii"))
+    command_bytes = literal_bytes + predicate_bytes
+    command_bytes += len(_shell_quote(checkin).encode("utf-8"))
+    command_bytes += len(_shell_quote(sql).encode("utf-8"))
+    command_bytes += command_expression.count("shellQuote(gsfAndroidId)") * len(
+        _shell_quote(worst_gsf).encode("ascii")
+    )
+    assert command_bytes <= 4096, command_bytes
+
+    # GAID is an opaque live microG postcondition, not a pretend persisted target:
+    # upstream exposes no exact setter.  Every offline-seeded status/construction/
+    # rebind clears the global limit and rejects zero.  GSF remains exact by marker.
+    assert "MemoryAdvertisingIdConfiguration" in manager_source
+    assert "no exact-ID setter" in manager_source
+    assert "/gaid" not in manager_source.lower()
+    assert "private final Object opLock" in manager_source
+    assert manager_source.count("synchronized (opLock)") == 3
+    assert "newSingleThreadExecutor" in manager_source
+    assert "BinderConnection implements ServiceConnection, IBinder.DeathRecipient" in manager_source
+    assert "bindGeneration != generation" in manager_source
+    assert "compareAndSet(false, true)" in manager_source
+    assert "MAX_COMMAND_BYTES = 4096" in root_source
+    assert "activeConnection = null" in manager_source
+    observe = manager_source.split(
+        "private Map<String, Object> observe", 1
+    )[1].split("private void scheduleHeal", 1)[0]
+    assert observe.index("googleProviderSurface") < observe.index(
+        "awaitAdvertisingBinder"
+    ) < observe.index("setAdTrackingLimitedGlobally(binder, false)")
+    inspect = manager_source.split("Map<String, Object> inspect()", 1)[1].split(
+        "Map<String, Object> activate", 1
+    )[0]
+    assert "advertisingBinder" in inspect
+    assert "isBinderAlive()" in inspect and "pingBinder()" in inspect
+    assert "RootHelper.offlineGoogleIdentitySeeded()" in inspect
+    assert "RootHelper.googleProviderSurface()" in inspect
+    assert "seededGsf.equals(gsfAndroidId)" in inspect
+    for forbidden in (
+        "awaitAdvertisingBinder",
+        "bindService",
+        "seedGoogleIdentity",
+        "resetAdvertisingId",
+        "setAdTrackingLimitedGlobally",
+        "invalidateGoogleServicesCaches",
+    ):
+        assert forbidden not in inspect
+    assert "seededGsf.equals(gsfAndroidId)" in manager_source
+    assert "notifyChange(GSERVICES, null)" in manager_source
+    assert "com.google.gservices.intent.action.GSERVICES_CHANGED" in manager_source
+    assert 'result.put("offlineSeeded", offlineSeeded)' in manager_source
+    activate_source = manager_source.split("Map<String, Object> activate", 1)[1].split(
+        "private boolean invalidateGoogleServicesCaches", 1
+    )[0]
+    assert activate_source.index("googleProviderSurface()") < activate_source.index(
+        "disconnect();"
+    ) < activate_source.index("seedGoogleIdentity(gsfAndroidId)")
+    assert "RootHelper.ensureGoogleRuntime()" not in manager_source
+
+    # Daemon recreation constructs a fresh manager (which schedules serialized
+    # heal), service teardown closes the binder registration, and activate accepts
+    # only the single strict SimpleJson-compatible string field.
+    assert "googleIdentityManager = new GoogleIdentityManager(this)" in service_source
+    assert "if (googleIdentity != null) googleIdentity.close()" in service_source
+    route = service_source.split("private Map<String, Object> routeGoogleIdentity", 1)[1]
+    assert 'request.keySet().equals(Collections.singleton("gsfAndroidId"))' in route
+    assert 'request.get("gsfAndroidId") instanceof String' in route
+    assert '"schema", GoogleIdentityManager.SCHEMA' in route
+    assert '"/google-identity/inspect".equals(path)' in route
+    assert "return manager.inspect()" in route
+    assert '"error", "google_identity_unavailable"' in route
+
+
+
+
+def test_apk_signer_history_uses_bounded_runner() -> None:
+    observed: dict[str, Any] = {}
+
+    def runner(
+        command: list[str],
+        *,
+        capture: bool,
+        timeout: float,
+    ) -> SimpleNamespace:
+        observed.update(command=command, capture=capture, timeout=timeout)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "Signer #1 certificate SHA-256 digest: "
+                + "a" * 64
+                + "\nSource Stamp Signer certificate SHA-256 digest: "
+                + "c" * 64
+                + "\n"
+            ),
+        )
+
+    manager = object.__new__(backend_module.RuntimeManager)
+    with (
+        mock.patch.object(backend_module, "which", return_value="/apksigner"),
+        mock.patch.object(backend_module, "run", side_effect=runner),
+    ):
+        history = manager._apk_signer_history(b"apk")
+    assert history == ["a" * 64]
+    assert observed["capture"] is True
+    assert observed["timeout"] == 120
+
+def test_updated_system_component_uses_public_flag() -> None:
+    spec = gs.load_release_spec(ROOT, gs.MICROG_PLAY_RELEASE)
+    component = next(
+        item for item in spec.components if item["id"] == "playStoreSeed"
+    )
+    pinned_history = list(component["signingCertificateHistorySha256"])
+    manager = object.__new__(backend_module.RuntimeManager)
+
+    def adb_shell(args: list[str], *, timeout: float) -> str:
+        if args[:2] == ["pm", "path"]:
+            return "package:/data/app/com.android.vending/base.apk\n"
+        if args[:4] == ["pm", "list", "packages", "-e"]:
+            return "package:com.android.vending\n"
+        if args[:2] == ["dumpsys", "package"]:
+            return (
+                f"  versionCode={int(component['versionCode']) + 1} minSdk=21 targetSdk=33\n"
+                "  versionName=updated\n"
+                "  flags=[ SYSTEM HAS_CODE UPDATED_SYSTEM_APP ]\n"
+                "  privateFlags=[ PRIVILEGED PRODUCT ]\n"
+            )
+        raise AssertionError(args)
+
+    rotated_signer = "b" * 64
+    manager._adb_shell_text = adb_shell
+    manager._adb_read_file_bytes = lambda *args, **kwargs: b"signed-apk"
+    manager._apk_signer_history = lambda apk: [rotated_signer]
+    record = manager._microg_component_record(spec, component)
+    assert record["ok"] is True
+    assert record["updatedSystemApp"] is True
+    assert record["signerSha256"] == rotated_signer
+    assert record["signerSha256"] != pinned_history[0]
+
+def test_google_signature_policy_uses_live_image() -> None:
+    image_id = "sha256:" + "1" * 64
+    records: dict[tuple[str, str], dict[str, Any]] = {
+        ("container", "xenoid-android-test"): {"Image": image_id},
+        ("image", image_id): {
+            "Id": image_id,
+            "Config": {
+                "Labels": {
+                    "dev.xenoid.runtime_schema": "1",
+                    "dev.xenoid.runtime_input_sha256": "2" * 64,
+                    "dev.xenoid.runtime_boot_input_sha256": "3" * 64,
+                    "google.provider": "microg",
+                }
+            },
+        },
+    }
+    calls: list[tuple[str, str]] = []
+
+    def inspect(kind: str, name: str) -> tuple[dict[str, Any], None]:
+        calls.append((kind, name))
+        return records.get((kind, name), {}), None
+
+    manager = SimpleNamespace(
+        lease=SimpleNamespace(container_name="xenoid-android-test"),
+        _inspect_docker_object=inspect,
+        _container_has_lease_owner=lambda container: bool(container),
+        _google_label_values=lambda: ("google.provider",),
+    )
+    manager._google_live_runtime_image = lambda value: (
+        xenoid_cli.RuntimeManager._google_live_runtime_image(manager, value)
+    )
+    spec = SimpleNamespace(labels={"google.provider": "microg"})
+    matcher = xenoid_cli.RuntimeManager._google_signature_runtime_image_matches
+    assert matcher(manager, spec) is True
+    assert calls == [
+        ("container", "xenoid-android-test"),
+        ("image", image_id),
+    ]
+    records[("image", image_id)]["Config"]["Labels"]["google.provider"] = "other"
+    assert matcher(manager, spec) is False
+
+
+def test_google_status_accepts_verified_live_image_without_source_assets() -> None:
+    spec = gs.load_release_spec(ROOT, gs.MICROG_PLAY_RELEASE)
+    image_id = "sha256:" + "1" * 64
+    rootfs_id = "sha256:" + "4" * 64
+    input_digest = "2" * 64
+    boot_digest = "3" * 64
+    image_labels = {
+        backend_module._RUNTIME_SCHEMA_LABEL: "1",
+        backend_module._RUNTIME_INPUT_LABEL: input_digest,
+        backend_module._RUNTIME_BOOT_INPUT_LABEL: boot_digest,
+        **spec.labels,
+    }
+    runtime_image = {
+        "Id": image_id,
+        "Config": {"Labels": image_labels},
+    }
+    container = {
+        "Id": "5" * 64,
+        "Image": image_id,
+        "State": {"Running": True},
+        "Config": {"Cmd": ["boot"], "Labels": {}},
+    }
+    rootfs_image = {
+        "Id": rootfs_id,
+        "Config": {"Labels": image_labels},
+    }
+
+    def selected_runtime_image(**_kwargs: Any) -> dict[str, Any]:
+        raise gs.GoogleServicesError(
+            "google_services_assets_missing",
+            "source assets unavailable",
+        )
+
+    def inspect(kind: str, name: str) -> tuple[dict[str, Any], None]:
+        if kind == "container":
+            return container, None
+        if kind == "volume":
+            return {"Mountpoint": "/volume"}, None
+        if kind == "image" and name == rootfs_id:
+            return rootfs_image, None
+        return {}, None
+
+    manager = SimpleNamespace(
+        cfg=SimpleNamespace(
+            google_services_provider=gs.PROVIDER_MICROG,
+            google_services_release=gs.MICROG_PLAY_RELEASE,
+        ),
+        context=SimpleNamespace(project_root=ROOT, instance_name="test"),
+        lease=SimpleNamespace(
+            container_name="xenoid-android-test",
+            volume_name="xenoid-data-test",
+        ),
+        google_runtime_spec=lambda *_args, **_kwargs: spec,
+        selected_runtime_image=selected_runtime_image,
+        _google_live_runtime_image=lambda _spec: (
+            {
+                "imageId": image_id,
+                "derivedTag": image_id,
+                "inputSha256": input_digest,
+                "bootInputSha256": boot_digest,
+            },
+            runtime_image,
+        ),
+        _inspect_docker_object=inspect,
+        _container_has_lease_owner=lambda _container: True,
+        _managed_container_labels_match=lambda _labels: True,
+        _android_boot_command=lambda: ["boot"],
+        _volume_matches_lease=lambda _volume: True,
+        _engine_host_shell=lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=rootfs_id + "\n",
+        ),
+        google_services_bootstrap_gate=lambda _spec: {
+            "ok": True,
+            "error": None,
+            "checks": {},
+            "components": {},
+        },
+        _offline_google_identity_seeded=lambda: False,
+    )
+    binding = {"state": "committed"}
+    with (
+        mock.patch.object(
+            backend_module,
+            "quick_validate_assets",
+            side_effect=gs.GoogleServicesError(
+                "google_services_assets_missing",
+                "source assets unavailable",
+            ),
+        ),
+        mock.patch.object(
+            backend_module,
+            "GoogleBindingStore",
+            return_value=SimpleNamespace(load=lambda: binding),
+        ),
+        mock.patch.object(backend_module, "binding_matches", return_value=True),
+        mock.patch.object(backend_module, "public_binding", return_value=binding),
+    ):
+        status = backend_module.RuntimeManager.google_services_status(
+            manager,
+            require_runtime=True,
+        )
+    assert status["ok"] is True
+    assert status["ready"] is True
+    assert status["hostReady"] is True
+    assert status["error"] is None
+    assert status["runtimeIdentity"]["imageMatch"] == "live-image"
+
+
+def test_regeneration_snapshot_uses_passive_inspect_only() -> None:
+    digest_ad = hashlib.sha256(b"ad").hexdigest()
+    digest_gsf = hashlib.sha256(b"gsf").hexdigest()
+    container_id = "1" * 64
+    image_id = "sha256:" + "2" * 64
+    image_input = "3" * 64
+    image_boot_input = "4" * 64
+    container_identity_epoch = backend_module.container_epoch(container_id)
+    manager = object.__new__(backend_module.RuntimeManager)
+    manager.context = SimpleNamespace(
+        state_root=Path("/nonexistent"), instance_id=INSTANCE_ID
+    )
+    manager.lease = object()
+    manager.cfg = SimpleNamespace(google_services_provider=gs.PROVIDER_MICROG)
+    manager.ensure_instance_lease = lambda: None
+    manager._owned_container_record = lambda: (
+        {"Id": container_id, "Image": image_id, "State": {"Running": True}},
+        None,
+    )
+    manager._inspect_docker_object = lambda kind, name: (
+        {
+            "Id": image_id,
+            "Config": {
+                "Labels": {
+                    backend_module._RUNTIME_SCHEMA_LABEL: "1",
+                    backend_module._RUNTIME_INPUT_LABEL: image_input,
+                    backend_module._RUNTIME_BOOT_INPUT_LABEL: image_boot_input,
+                }
+            },
+        },
+        None,
+    )
+    manager._container_matches_lease = lambda *args, **kwargs: True
+    manager.docker_exec = lambda *args, **kwargs: {"ok": True, "stdout": ""}
+    manager.shared_protection_status = lambda: {
+        "ok": True,
+        "engineId": "AA:BB:CC:DD",
+        "expectedDigest": "5" * 64,
+    }
+    manager._regeneration_digest = lambda value: "d" * 64
+    observed: list[tuple[str, Any]] = []
+
+    class PassiveClient:
+        def bootstrap_status(self, timeout: float) -> dict[str, Any]:
+            observed.append(("bootstrap", timeout))
+            return {"ok": True, "runtimeEpoch": "c" * 64}
+
+        def google_identity_inspect(self, timeout: float) -> dict[str, Any]:
+            observed.append(("inspect", timeout))
+            return {
+                "ok": True,
+                "schema": daemon_client_module.GOOGLE_IDENTITY_SCHEMA,
+                "advertisingIdSha256": digest_ad,
+                "gsfAndroidIdPresent": True,
+                "gsfAndroidIdSha256": digest_gsf,
+                "offlineSeeded": True,
+            }
+
+        def google_identity_status(self, timeout: float) -> dict[str, Any]:
+            raise AssertionError("snapshot must not call the repairing status path")
+
+        def google_identity_activate(self, value: str, timeout: float) -> dict[str, Any]:
+            raise AssertionError("snapshot must never activate or publish")
+
+    manager.daemon_client = lambda timeout: PassiveClient()
+    binding = {
+        "provider": gs.PROVIDER_MICROG,
+        "release": gs.MICROG_PLAY_RELEASE,
+        "specSha256": "e" * 64,
+        "dataCompatibilitySha256": "f" * 64,
+    }
+    import xenoid.location as location_module
+
+    with (
+        mock.patch.object(
+            backend_module,
+            "stable_identity_digest",
+            return_value="s" * 64,
+        ),
+        mock.patch.object(
+            backend_module,
+            "DeviceIdentityStore",
+            return_value=SimpleNamespace(
+                load=lambda: {
+                    "stable": {},
+                    "active": {
+                        "bootId": "boot-1",
+                        "containerEpoch": container_identity_epoch,
+                    },
+                }
+            ),
+        ),
+        mock.patch.object(
+            location_module,
+            "LocationStateStore",
+            return_value=SimpleNamespace(
+                load=lambda: {
+                    "simEpoch": 1,
+                    "active": {"profileDigest": "0" * 64, "simEpoch": 1},
+                }
+            ),
+        ),
+        mock.patch.object(
+            backend_module,
+            "GoogleBindingStore",
+            return_value=SimpleNamespace(load=lambda: dict(binding)),
+        ),
+    ):
+        snapshot = manager.regeneration_snapshot()
+    assert observed == [("bootstrap", 15.0), ("inspect", 60.0)]
+    assert snapshot["advertisingIdDigest"] == digest_ad
+    assert snapshot["gsfAndroidIdDigest"] == digest_gsf
+    assert snapshot["protectionEngineId"] == "AA:BB:CC:DD"
+    assert snapshot["protectionExpectedDigest"] == "5" * 64
+
+
 def main() -> int:
     test_registry_and_metadata()
-    test_release_acceptance_identity_bindings()
-    test_v2_metadata_exact_keys()
     test_config_pairs_and_retired_resolution()
     test_initialize_defaults_and_explicit_disable()
     test_archive_path_rules()
@@ -999,6 +1811,14 @@ def main() -> int:
     test_v2_quick_asset_validation()
     test_import_microg_filename_validation()
     test_binding_transitions()
+    test_runtime_google_identity_rotation_contract()
+    test_offline_identity_downgrades_cloud_messaging()
+    test_regeneration_snapshot_uses_passive_inspect_only()
+    test_microg_identity_seed_is_offline()
+    test_apk_signer_history_uses_bounded_runner()
+    test_updated_system_component_uses_public_flag()
+    test_google_signature_policy_uses_live_image()
+    test_google_identity_response_contract()
     test_canonical_v2_runtime_context_copy()
     print("google services synthetic tests passed")
     return 0

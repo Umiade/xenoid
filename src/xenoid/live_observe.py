@@ -459,8 +459,10 @@ class LiveAcceptance:
             "observations.storageSentinel",
             "runtime.storageSentinel",
         )
-        if isinstance(sentinel_value, Mapping):
+        sentinel_error: Any = None
+        if isinstance(sentinel_value, Mapping) and sentinel_value.get("skipped") is not True:
             sentinel_ok = sentinel_value.get("ok") is True
+            sentinel_error = sentinel_value.get("errorCode") or sentinel_value.get("error")
         elif isinstance(sentinel_value, bool):
             sentinel_ok = sentinel_value
         else:
@@ -471,10 +473,14 @@ class LiveAcceptance:
                 fixed_kwargs={"create": False},
             )
             sentinel_ok = _at(sentinel, "ok") is True
+            sentinel_error = _first(
+                _at(sentinel, "errorCode"),
+                _at(sentinel, "error"),
+            )
         checks.add(
             "storageSentinel",
             sentinel_ok,
-            "storage_sentinel_mismatch",
+            _safe_code(sentinel_error, "storage_sentinel_mismatch"),
         )
 
         identity = _mapping_at(

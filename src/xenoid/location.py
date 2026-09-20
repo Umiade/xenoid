@@ -26,6 +26,7 @@ from typing import Any, Mapping, Optional
 
 from .cellular import (
     CellularError,
+    carrier_pin,
     dataset_countries,
     dataset_version,
     generate_cellular_profile,
@@ -43,7 +44,6 @@ LEGACY_STATE_FILENAME = "regional-identity.json"
 _SEED_DOMAIN = "xenoid-location-profile/v1:"
 _SEED_DOMAIN_EPOCH = "xenoid-location-profile/v2:"
 _EPOCH_DOMAIN = "xenoid-location-epoch/v1:"
-_REGENERATION_SEED_DOMAIN = b"xenoid-location-regeneration/v1\0"
 _COUNTRY = re.compile(r"^[A-Z]{2}$", re.ASCII)
 _EPOCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$", re.ASCII)
 _SIM_EPOCH = re.compile(r"^[0-9a-f]{32}$", re.ASCII)
@@ -151,35 +151,6 @@ def _derive_seed(master_seed: bytes, country: str, sim_epoch: str = "") -> bytes
         master_seed, (_SEED_DOMAIN + country).encode("ascii"), hashlib.sha256,
     ).digest()
 
-def missing_regeneration_target(
-    instance_id: str,
-    transaction_id: str,
-    sim_epoch: str,
-) -> dict[str, Any]:
-    if (
-        not isinstance(instance_id, str)
-        or not instance_id
-        or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None
-        or _SIM_EPOCH.fullmatch(sim_epoch) is None
-    ):
-        raise LocationError("device_regeneration_state_invalid")
-    master_seed = hashlib.sha256(
-        _REGENERATION_SEED_DOMAIN
-        + transaction_id.encode("ascii")
-        + b"\0"
-        + instance_id.encode("ascii")
-    ).digest()
-    profile = generate_cellular_profile(
-        DEFAULT_COUNTRY,
-        _derive_seed(master_seed, DEFAULT_COUNTRY, sim_epoch),
-    )
-    return {
-        "masterSeed": master_seed,
-        "country": DEFAULT_COUNTRY,
-        "simEpoch": sim_epoch,
-        "profile": profile,
-        "profileDigest": profile["identityDigest"],
-    }
 
 
 class LocationStateStore:
@@ -419,165 +390,6 @@ class LocationStateStore:
         self.save(state)
         return self._validate_state(state), True
 
-    def initialize_regeneration_target(
-        self,
-        instance_id: str,
-        transaction_id: str,
-        sim_epoch: str,
-        expected_digest: str,
-    ) -> dict[str, Any]:
-        target = missing_regeneration_target(instance_id, transaction_id, sim_epoch)
-        if target["profileDigest"] != expected_digest:
-            raise LocationError("device_regeneration_state_invalid")
-        journal_path = self.root / "device-regenerate-v2.json"
-        try:
-            info = journal_path.lstat()
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != os.getuid()
-                or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) != 0o600
-            ):
-                raise LocationError("device_regeneration_state_invalid")
-            journal = json.loads(journal_path.read_text(encoding="ascii"))
-            journal_target = (
-                journal.get("target") if isinstance(journal, dict) else None
-            )
-            authorized = bool(
-                isinstance(journal, dict)
-                and journal.get("schema")
-                == "dev.xenoid.device-regenerate/v2"
-                and journal.get("instanceId") == instance_id
-                and journal.get("transactionId") == transaction_id
-                and isinstance(journal_target, dict)
-                and journal_target.get("simEpoch") == sim_epoch
-                and journal_target.get("locationProfileDigest")
-                == expected_digest
-            )
-        except FileNotFoundError:
-            convergence_path = self.root / "convergence-v1.json"
-            legacy_path = self.root / "device-regenerate.json"
-            try:
-                convergence_info = convergence_path.lstat()
-                legacy_info = legacy_path.lstat()
-                if (
-                    not stat.S_ISREG(convergence_info.st_mode)
-                    or stat.S_ISLNK(convergence_info.st_mode)
-                    or convergence_info.st_uid != os.getuid()
-                    or convergence_info.st_nlink != 1
-                    or stat.S_IMODE(convergence_info.st_mode) != 0o600
-                    or not 0 < convergence_info.st_size <= 256 * 1024
-                    or not 0 < legacy_info.st_size <= 64 * 1024
-                    or not stat.S_ISREG(legacy_info.st_mode)
-                    or stat.S_ISLNK(legacy_info.st_mode)
-                    or legacy_info.st_uid != os.getuid()
-                    or legacy_info.st_nlink != 1
-                    or stat.S_IMODE(legacy_info.st_mode) != 0o600
-                ):
-                    raise LocationError("device_regeneration_state_invalid")
-                convergence_bytes = convergence_path.read_bytes()
-                convergence = json.loads(convergence_bytes)
-                if convergence_bytes != (
-                    json.dumps(
-                        convergence,
-                        ensure_ascii=True,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                ).encode("ascii"):
-                    raise LocationError("device_regeneration_state_invalid")
-                legacy_bytes = legacy_path.read_bytes()
-                legacy_digest = hashlib.sha256(legacy_bytes).hexdigest()
-            except LocationError:
-                raise
-            except (OSError, ValueError, UnicodeError) as exc:
-                raise LocationError(
-                    "device_regeneration_state_invalid"
-                ) from exc
-            compatibility_plan = (
-                convergence.get("plan")
-                if isinstance(convergence, dict)
-                else None
-            )
-            authorized = bool(
-                isinstance(convergence, dict)
-                and convergence.get("schema")
-                == "dev.xenoid.convergence-journal/v1"
-                and convergence.get("instanceId") == instance_id
-                and convergence.get("regenerationTransactionId")
-                == transaction_id
-                and convergence.get("operationId")
-                == legacy_digest[:32]
-                and convergence.get("phase")
-                in {
-                    "planned", "quarantined", "image_ensured",
-                    "seed_runtime_started", "seed_initialized",
-                    "container_removed", "storage_converged",
-                    "container_created", "runtime_started",
-                    "live_resolved", "components_deployed",
-                    "control_ready", "identity_converged",
-                    "location_converged", "keybox_converged",
-                    "camera_converged", "google_converged",
-                    "proxy_converged", "protection_converged",
-                    "accepted",
-                }
-                and isinstance(compatibility_plan, dict)
-                and compatibility_plan.get("bootSeedAction")
-                == "initialize_replace"
-                and compatibility_plan.get("locationAction") == "converge"
-            )
-        except LocationError:
-            raise
-        except (OSError, ValueError, UnicodeError) as exc:
-            raise LocationError("device_regeneration_state_invalid") from exc
-        if not authorized:
-            raise LocationError("device_regeneration_state_invalid")
-        existing = self.load()
-        if existing is not None:
-            pending = existing.get("pending")
-            if (
-                existing.get("instanceId") != instance_id
-                or existing.get("simEpoch") != sim_epoch
-                or base64.b64decode(existing["masterSeed"], validate=True)
-                != target["masterSeed"]
-                or not isinstance(pending, Mapping)
-                or pending.get("phase") != "new"
-                or pending.get("profileDigest") != expected_digest
-            ):
-                raise LocationError("device_regeneration_state_invalid")
-            return existing
-        now = int(time.time())
-        entry = {
-            "country": target["country"],
-            "profile": target["profile"],
-            "profileDigest": expected_digest,
-            "datasetVersion": dataset_version(),
-            "createdAt": now,
-            "simEpoch": sim_epoch,
-        }
-        state = {
-            "schema": LOCATION_SCHEMA,
-            "instanceId": instance_id,
-            "masterSeed": base64.b64encode(target["masterSeed"]).decode("ascii"),
-            "desiredCountry": target["country"],
-            "simEpoch": sim_epoch,
-            "profiles": {target["country"]: entry},
-            "active": None,
-            "pending": {
-                "country": target["country"],
-                "profileDigest": expected_digest,
-                "phase": "new",
-                "stagedRuntimeEpoch": "",
-                "restartFromEpoch": "",
-                "restartCompletedEpoch": "",
-                "createdAt": now,
-            },
-            "updatedAt": now,
-        }
-        self.save(state)
-        return self._validate_state(state)
 
 
     def set_desired(self, country: str) -> tuple[dict[str, Any], bool]:
@@ -629,7 +441,17 @@ class LocationStateStore:
         return self._write(state), True
 
     def regeneration_target(self, sim_epoch: str) -> dict[str, Any]:
-        """Derive, without mutation, the profile pinned by a regeneration."""
+        """Derive, without mutation, the profile pinned by a regeneration.
+
+        The desired country's current profile entry pins the carrier
+        identity — name, PLMN, APN, and band matrix — into the target, so a
+        multi-carrier country keeps its active carrier and operator across a
+        regeneration while the SIM subscriber digits and the LTE cell fields
+        re-derive from the new SIM epoch.  The entry is schema-validated
+        against the pinned dataset and pinning is idempotent, so the
+        prepare-time derivation and any crash-resume re-derivation agree
+        byte for byte.
+        """
         if not isinstance(sim_epoch, str) or _SIM_EPOCH.fullmatch(sim_epoch) is None:
             raise LocationError("device_regeneration_state_invalid")
         state = self.load()
@@ -637,9 +459,12 @@ class LocationStateStore:
             raise LocationError("location_state_missing")
         master_seed = base64.b64decode(state["masterSeed"], validate=True)
         target = state["desiredCountry"]
+        entry = state["profiles"].get(target)
+        pin = carrier_pin(entry["profile"]) if entry is not None else None
         profile = generate_cellular_profile(
             target,
             _derive_seed(master_seed, target, sim_epoch),
+            pin=pin,
         )
         return {
             "simEpoch": sim_epoch,
@@ -653,17 +478,35 @@ class LocationStateStore:
         *,
         sim_epoch: str,
         expected_epoch: Optional[str] = None,
+        expected_profile_digest: Optional[str] = None,
     ) -> dict[str, Any]:
         """Converge the SIM identity to one journal-pinned epoch.
 
         Retrying the same target preserves the existing ``new -> staged ->
         armed -> restarted`` transaction.  A caller-provided before epoch makes
-        any third state a hard regeneration conflict.
+        any third state a hard regeneration conflict.  A caller-provided
+        profile digest pins the exact derivation the journal recorded, so a
+        checkout or dataset change mid-transaction fails closed instead of
+        writing a profile the journal never fixed.
         """
         target_info = self.regeneration_target(sim_epoch)
         state = self.load()
         if state is None:
             raise LocationError("location_state_missing")
+        if expected_profile_digest is not None:
+            target = target_info["country"]
+            if state["simEpoch"] == sim_epoch:
+                # Already rotated by an earlier attempt: the stored profile
+                # must be the journaled one, never re-derived.
+                stored = state["profiles"].get(target)
+                if (
+                    stored is None
+                    or stored.get("profileDigest") != expected_profile_digest
+                ):
+                    raise LocationError("device_regeneration_inputs_changed")
+                return state
+            if target_info["profileDigest"] != expected_profile_digest:
+                raise LocationError("device_regeneration_inputs_changed")
         if state["simEpoch"] == sim_epoch:
             return state
         if expected_epoch is not None and state["simEpoch"] != expected_epoch:
@@ -714,6 +557,10 @@ class LocationStateStore:
         if not epoch:
             raise LocationError("location_state_invalid")
         pending = dict(state["pending"])
+        if pending["phase"] in ("armed", "restarted"):
+            if pending["stagedRuntimeEpoch"] == epoch:
+                return state
+            raise LocationError("location_phase_invalid")
         if pending["phase"] not in ("new", "staged"):
             raise LocationError("location_phase_invalid")
         if pending["phase"] == "staged" and pending["stagedRuntimeEpoch"] != epoch:
@@ -728,10 +575,35 @@ class LocationStateStore:
         if state is None or state["pending"] is None:
             raise LocationError("location_pending_missing")
         pending = dict(state["pending"])
+        if pending["phase"] in ("armed", "restarted"):
+            return state
         if pending["phase"] != "staged":
             raise LocationError("location_phase_invalid")
         pending["restartFromEpoch"] = pending["stagedRuntimeEpoch"]
         pending["phase"] = "armed"
+        state = dict(state, pending=pending)
+        return self._write(state)
+
+    def restage(self, runtime_epoch: str) -> dict[str, Any]:
+        """Rewind an armed transaction to ``staged`` against a new epoch.
+
+        The staging runtime epoch changed without any userspace restart
+        (START_STICKY daemon-only restart) before the armed transaction was
+        consumed, so the arm proof is meaningless; the caller re-stages the
+        profile against the live daemon and re-arms.
+        """
+        state = self.load()
+        if state is None or state["pending"] is None:
+            raise LocationError("location_pending_missing")
+        epoch = _epoch_text(runtime_epoch)
+        if not epoch:
+            raise LocationError("location_state_invalid")
+        pending = dict(state["pending"])
+        if pending["phase"] != "armed":
+            raise LocationError("location_phase_invalid")
+        pending["phase"] = "staged"
+        pending["stagedRuntimeEpoch"] = epoch
+        pending["restartFromEpoch"] = ""
         state = dict(state, pending=pending)
         return self._write(state)
 
@@ -741,6 +613,10 @@ class LocationStateStore:
             raise LocationError("location_pending_missing")
         epoch = _epoch_text(runtime_epoch)
         pending = dict(state["pending"])
+        if pending["phase"] == "restarted":
+            if pending["restartCompletedEpoch"] == epoch:
+                return state
+            raise LocationError("location_phase_invalid")
         if pending["phase"] != "armed":
             raise LocationError("location_phase_invalid")
         if not epoch or epoch == pending["restartFromEpoch"]:
@@ -918,7 +794,6 @@ __all__ = [
     "LocationStateStore",
     "convergence_action",
     "location_runtime_epoch",
-    "missing_regeneration_target",
     "masked_android_status",
     "normalize_country",
     "public_summary",

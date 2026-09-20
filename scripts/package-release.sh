@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-dev}"
+TREE_VERSION="$(PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'from xenoid import __version__; print(__version__)')"
+VERSION="${1:-$TREE_VERSION}"
 if [[ ${#VERSION} -gt 64 || ! "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "release_version_invalid" >&2
+  exit 64
+fi
+if [[ "$VERSION" != "$TREE_VERSION" ]]; then
+  echo "release_version_mismatch" >&2
+  exit 64
+fi
+SOURCE_COMMIT="$(git -C "$ROOT" rev-parse --verify 'HEAD^{commit}')" || {
+  echo "release_source_commit_unavailable" >&2
+  exit 64
+}
+TAG_COMMIT="$(git -C "$ROOT" rev-parse --verify "refs/tags/xenoid-$VERSION^{commit}")" || {
+  echo "release_tag_missing" >&2
+  exit 64
+}
+if [[ "$TAG_COMMIT" != "$SOURCE_COMMIT" ]]; then
+  echo "release_tag_commit_mismatch" >&2
+  exit 64
+fi
+if [[ -n "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]]; then
+  echo "release_source_dirty" >&2
   exit 64
 fi
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
@@ -177,7 +198,8 @@ XENOID_ARTIFACT_ROOT="$ARTIFACT_STAGE" XENOID_OTA_OUTPUT_ROOT="$STAGE/ota" \
 OTA_BUNDLE="$STAGE/ota/xenoid-$VERSION.tar.gz"
 
 ROOT="$ROOT" REL="$REL" ARTIFACT_STAGE="$ARTIFACT_STAGE" \
-OTA_BUNDLE="$OTA_BUNDLE" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" python3 - <<'PY'
+  OTA_BUNDLE="$OTA_BUNDLE" RELEASE_VERSION="$VERSION" SOURCE_COMMIT="$SOURCE_COMMIT" \
+  SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" python3 - <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -196,10 +218,16 @@ root = Path(os.environ["ROOT"])
 release = Path(os.environ["REL"])
 artifact_root = Path(os.environ["ARTIFACT_STAGE"])
 epoch = int(os.environ["SOURCE_DATE_EPOCH"], 10)
+version = os.environ["RELEASE_VERSION"]
+source_commit = os.environ["SOURCE_COMMIT"]
+if release.name != "xenoid-" + version:
+    raise SystemExit("release_version_mismatch")
 
 allowed_files = {
     ".gitignore",
     "AGENTS.md",
+    "CHANGELOG.md",
+    "CHANGELOG_CN.md",
     "LICENSE",
     "NOTICE",
     "README.md",
@@ -460,6 +488,8 @@ for path in sorted(
     )
 manifest = {
     "schema": "dev.xenoid.release/v1",
+    "version": version,
+    "sourceCommit": source_commit,
     "sourceDateEpoch": epoch,
     "gateEvidenceSha256": hashlib.sha256(gate_bytes).hexdigest(),
     "files": files,

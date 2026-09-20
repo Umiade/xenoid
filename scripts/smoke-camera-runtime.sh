@@ -851,9 +851,11 @@ if [[ "$MODE" == full && "$SOURCE_FREE" != 1 && "$DESTRUCTIVE" != 1 ]]; then
   die destructive-guard
 fi
 
-if "$ADB_BIN" -s "$ADB_TARGET" shell pm path "$PACKAGE" >/dev/null 2>&1; then
-  die probe-package-collision
-fi
+# A leftover from a crashed earlier run carries a rotated local debug
+# signature and would collide with the reinstall; remove it first, matching
+# the persistence/cellular smoke convention. The package exists only as
+# test tooling, never as user state.
+"$ADB_BIN" -s "$ADB_TARGET" uninstall "$PACKAGE" >/dev/null 2>&1 || true
 "$ROOT/tests/camera-runtime-probe/build.sh" > "$TMP/build.out" || die probe-build
 APK="$ROOT/dist/camera-runtime-probe/camera-runtime-probe.apk"
 [[ -s "$APK" ]] || die probe-build

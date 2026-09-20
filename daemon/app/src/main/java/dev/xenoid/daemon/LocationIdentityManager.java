@@ -262,7 +262,9 @@ final class LocationIdentityManager {
         bootstrapError = null;
         Map<String, Object> result = publicState(state);
         result.put("ok", true);
-        result.put("recreateRequired", true);
+        // SIM identity applies via rild restart; no container recreate required.
+        result.put("recreateRequired", false);
+        result.put("radioRestartRequired", true);
         return result;
     }
 

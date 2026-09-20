@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 import sys
 sys.path.insert(0, str(ROOT / "src"))
 
-from xenoid import convergence, live_observe  # noqa: E402
+from xenoid import backend, cli, convergence, live_observe  # noqa: E402
 from xenoid.google_services import capability_model  # noqa: E402
 from xenoid.backend import RuntimeManager  # noqa: E402
 from xenoid.google_services import GoogleServicesError  # noqa: E402
@@ -73,6 +73,7 @@ GOOGLE_STATUS_KEYS = {
     "live",
     "requiredCapabilities",
     "capabilities",
+    "googleIdentityMode",
     "error",
     "nextActions",
 }
@@ -286,6 +287,7 @@ def microg_google_status() -> dict[str, Any]:
             "error": None,
         },
         **model,
+        "googleIdentityMode": "provider-managed",
         "error": None,
         "nextActions": [],
     }
@@ -776,6 +778,304 @@ def expect_error(function: Callable[[], Any], code: str | None = None) -> Any:
         return exc
     raise ContractFailure("expected ConvergenceError")
 
+@case("regenerationPreflightRequiresNoOpPlan")
+def regeneration_preflight_requires_no_op_plan() -> None:
+    plan = planner_for(healthy_snapshot(), skip_build=True)
+    require(
+        cli._regeneration_plan_is_runtime_only(plan),
+        "healthy no-op plan rejected by regeneration preflight",
+    )
+    mutations = {
+        "image_action": "ensure-desired",
+        "runtime_action": "recreate",
+        "boot_seed_action": "initialize_replace",
+        "daemon_action": "install",
+        "deploy_components": {"rootd": "deploy"},
+        "identity_action": "converge",
+        "location_action": "converge",
+        "proxy_action": "reconcile",
+        "keybox_action": "reconcile",
+        "camera_action": "reconcile",
+        "google_action": "reconcile",
+        "protection_action": "maintenance",
+    }
+    plan_fields = {
+        field.name: getattr(plan, field.name)
+        for field in dataclasses.fields(plan)
+    }
+    for field, value in mutations.items():
+        require(
+            not cli._regeneration_plan_is_runtime_only(
+                SimpleNamespace(**{**plan_fields, field: value})
+            ),
+            f"regeneration preflight accepted mutating {field}",
+        )
+    state = {"transactionId": "a" * 32}
+    direct = cli._regeneration_success_result(
+        state,
+        resumed=False,
+        google_identity={"ok": True, "provider": "microg"},
+    )
+    recovered = cli._regeneration_success_result(
+        state,
+        resumed=True,
+        cleaned=True,
+    )
+    canonical_keys = {
+        "schema", "transactionId", "resumed", "phase", "runtimeOnly",
+        "containerRecreated", "ok", "regeneration",
+    }
+    require(canonical_keys <= set(direct), "direct success envelope incomplete")
+    require(canonical_keys <= set(recovered), "resumed success envelope incomplete")
+    require(
+        direct["schema"] == recovered["schema"]
+        == "dev.xenoid.device-regenerate/v3"
+        and direct["regeneration"]["schema"] == direct["schema"]
+        and recovered["regeneration"]["schema"] == recovered["schema"],
+        "success paths disagree on the canonical v3 schema",
+    )
+
+@case("pendingRegenerationDryRunShowsRemainingWork")
+def pending_regeneration_dry_run_shows_remaining_work() -> None:
+    state = {"phase": "radio_committed", "transactionId": "a" * 32}
+    preview = cli._regeneration_dry_run_result(state)
+    require(
+        preview.get("schema") == "dev.xenoid.device-regenerate/v3"
+        and preview.get("dryRun") is True
+        and preview.get("resumed") is True
+        and preview.get("runtimeOnly") is True
+        and preview.get("containerRecreated") is False,
+        "pending regeneration preview used the ordinary convergence contract",
+    )
+    start = cli.REGENERATION_PHASES.index("radio_committed") + 1
+    require(
+        preview.get("actions") == list(cli.REGENERATION_PHASES[start:]),
+        "pending regeneration preview did not report remaining journal work",
+    )
+
+
+@case("regenerationRuntimePreflightIsOneDryRunOnly")
+def regeneration_runtime_preflight_is_one_dry_run_only() -> None:
+    plan = planner_for(healthy_snapshot(), skip_build=True)
+    calls: list[dict[str, Any]] = []
+
+    class Executor:
+        def __init__(self, manager: Any) -> None:
+            del manager
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            calls.append(dict(kwargs))
+            return {
+                "ok": True,
+                "dryRun": True,
+                "plan": plan.to_dict(),
+                "initialPlanDigest": plan.plan_digest,
+            }
+
+    with mock.patch.object(cli, "ConvergenceExecutor", Executor):
+        result = cli._regeneration_runtime_preflight(object())
+    require(result["ok"] is True, "verified no-op dry-run plan was rejected")
+    require(
+        calls == [{"skip_build": True, "dry_run": True}],
+        "regeneration preflight executed convergence or an auto follow-up",
+    )
+
+
+@case("regenerationPrejournalFailuresAreCanonical")
+def regeneration_prejournal_failures_are_canonical() -> None:
+    failed = cli._regeneration_preflight_failure("synthetic_preflight_failure")
+    require(
+        failed == {
+            "schema": "dev.xenoid.device-regenerate/v3",
+            "ok": False,
+            "resumed": False,
+            "phase": "preflight",
+            "runtimeOnly": True,
+            "containerRecreated": False,
+            "error": "synthetic_preflight_failure",
+        },
+        "pre-journal failure pretended a prepared journal exists",
+    )
+
+
+
+@case("legacyRegenerationMarkersAreReadOnlyRecoveryStatus")
+def legacy_regeneration_markers_are_read_only_recovery_status() -> None:
+    shapes: list[tuple[str | None, bytes, str]] = [
+        (None, b"", "no-op"),
+        ("device-regenerate.json", b"{}\n", "legacy-regeneration-recovery"),
+        ("device-regenerate-v2.json", b"{}\n", "legacy-regeneration-recovery"),
+        ("device-regenerate-v1.evidence", b"{}\n", "legacy-regeneration-recovery"),
+        ("device-regenerate-v1.corrupt", b"{not-json", "legacy-regeneration-recovery"),
+        (
+            "device-regenerate-v3.json",
+            json.dumps(
+                {
+                    "schema": "dev.xenoid.device-regenerate/v3",
+                    "phase": "prepared",
+                    "transactionId": "a" * 32,
+                },
+                sort_keys=True,
+            ).encode("ascii") + b"\n",
+            "resource-conflict",
+        ),
+    ]
+    for filename, payload, expected in shapes:
+        with tempfile.TemporaryDirectory(prefix="xenoid-legacy-status-") as directory:
+            root = Path(directory) / "state"
+            root.mkdir(mode=0o700)
+            if filename is not None:
+                marker = root / filename
+                marker.write_bytes(payload)
+                marker.chmod(0o600)
+            manager = object.__new__(RuntimeManager)
+            manager.context = SimpleNamespace(
+                state_root=root,
+                instance_id=INSTANCE_ID,
+                public_dict=lambda: {},
+            )
+            manager.lease = SimpleNamespace(
+                container_name="xenoid-test",
+                volume_name="xenoid-test-data",
+                host_adb_port=5555,
+                host_daemon_port=42871,
+            )
+            manager.ensure_instance_lease = lambda: None
+            pending = manager._observe_pending_operations()
+            observation = healthy_snapshot()
+            observation.update(
+                {"pending": pending, "storage": {}, "schema": "dev.xenoid.convergence-observation/v1"}
+            )
+            manager.observe_convergence = lambda skip_build=False: copy.deepcopy(observation)
+            before = {
+                path.name: path.read_bytes()
+                for path in root.iterdir()
+                if path.is_file()
+            }
+            with mock.patch.object(backend, "which", return_value="/usr/bin/docker"):
+                status = manager.status()
+            after = {
+                path.name: path.read_bytes()
+                for path in root.iterdir()
+                if path.is_file()
+            }
+            require(
+                status["recommendedAction"] == expected,
+                f"{filename or 'clean'} recommended {status['recommendedAction']}",
+            )
+            if expected == "resource-conflict":
+                require(status["ok"] is False, "invalid journal status reported healthy")
+            require(before == after, f"status mutated state tree for {filename or 'clean'}")
+
+
+@case("upDryRunDoesNotStartEngine")
+def up_dry_run_does_not_start_engine() -> None:
+    emitted: list[dict[str, Any]] = []
+    manager = SimpleNamespace(
+        engine_reachable=lambda: False,
+        ensure_engine_started=lambda: (_ for _ in ()).throw(
+            AssertionError("dry-run started the engine")
+        ),
+    )
+    with mock.patch.object(cli, "runtime", return_value=manager), mock.patch.object(
+        cli, "print_json", side_effect=emitted.append
+    ):
+        code = cli.cmd_up(SimpleNamespace(dry_run=True))
+    require(code == 1, "unreachable engine dry-run should fail")
+    require(emitted and emitted[-1].get("dryRun") is True, "dry-run marker missing")
+
+@case("upResumesRegenerationBeforeGoogleAssetAcquisition")
+def up_resumes_regeneration_before_google_asset_acquisition() -> None:
+    args = SimpleNamespace(
+        context=SimpleNamespace(instance_id=INSTANCE_ID),
+        config=SimpleNamespace(google_services_provider="microg"),
+        dry_run=False,
+        skip_build=False,
+    )
+    pending = {"transactionId": "a" * 32, "phase": "google_reset"}
+    expected = {"ok": True, "schema": "dev.xenoid.device-regenerate/v3"}
+    manager = SimpleNamespace(ensure_engine_started=lambda: {"ok": True})
+    with mock.patch.object(cli, "runtime", return_value=manager), \
+         mock.patch.object(cli, "RegenerationJournal") as journal_type, \
+         mock.patch.object(cli, "_execute_device_regeneration", return_value=expected) as resume, \
+         mock.patch.object(
+             cli,
+             "_prepare_google_assets_for_up",
+             side_effect=AssertionError("asset acquisition ran before resume"),
+         ), \
+         mock.patch.object(cli, "print_json"), \
+         mock.patch.object(cli, "cli_operation_lock", return_value=contextlib.nullcontext()):
+        journal_type.return_value.load.return_value = pending
+        code = cli.cmd_up(args)
+    require(code == 0 and resume.call_count == 1, "up did not resume pending v3 regeneration")
+
+
+@case("corruptRegenerationJournalUsesCanonicalEnvelope")
+def corrupt_regeneration_journal_uses_canonical_envelope() -> None:
+    context = SimpleNamespace(instance_id=INSTANCE_ID)
+    args = SimpleNamespace(
+        context=context,
+        config=SimpleNamespace(google_services_provider="microg"),
+        dry_run=False,
+        skip_build=False,
+        _operation_lock_held=True,
+    )
+    manager = SimpleNamespace(
+        ensure_engine_started=lambda: {"ok": True, "started": False},
+    )
+    invalid = cli.IdentityError(
+        "device_regeneration_state_invalid",
+        "invalid regeneration journal",
+    )
+    expected = {
+        "schema": "dev.xenoid.device-regenerate/v3",
+        "ok": False,
+        "runtimeOnly": True,
+        "containerRecreated": False,
+        "error": "device_regeneration_state_invalid",
+        "resumed": False,
+        "phase": "preflight",
+    }
+    emitted: list[dict[str, Any]] = []
+    with mock.patch.object(cli, "runtime", return_value=manager), \
+         mock.patch.object(cli, "RegenerationJournal") as journal_type, \
+         mock.patch.object(cli, "print_json", side_effect=emitted.append), \
+         mock.patch.object(cli, "cli_operation_lock", return_value=contextlib.nullcontext()):
+        journal_type.return_value.load.side_effect = invalid
+        code = cli.cmd_up(args)
+    require(code == 1 and emitted == [expected], "up corrupt journal envelope changed")
+
+    emitted.clear()
+    with mock.patch.object(cli, "RegenerationJournal") as journal_type, \
+         mock.patch.object(cli, "print_json", side_effect=emitted.append):
+        journal_type.return_value.load.side_effect = invalid
+        code = cli.cmd_device_regenerate(
+            SimpleNamespace(context=context, dry_run=True)
+        )
+    require(
+        code == 1 and emitted == [expected],
+        "device regenerate dry-run corrupt journal envelope changed",
+    )
+
+
+@case("googleRuntimePostconditionRequiresOfflineSeededMode")
+def google_runtime_postcondition_requires_offline_seeded_mode() -> None:
+    status = {"ok": True, "googleIdentityMode": "provider-managed"}
+    manager = SimpleNamespace(
+        cfg=SimpleNamespace(google_services_provider="microg"),
+        reconcile_google=lambda action: dict(status),
+    )
+    rejected = cli._regeneration_google_runtime_postcondition(manager)
+    require(
+        rejected["ok"] is False
+        and rejected["error"] == "google_identity_not_offline_seeded",
+        "ready provider-managed Google runtime passed regeneration postcondition",
+    )
+    status["googleIdentityMode"] = "offline-seeded"
+    require(
+        cli._regeneration_google_runtime_postcondition(manager)["ok"] is True,
+        "offline-seeded Google runtime failed regeneration postcondition",
+    )
 
 @case("googleStatusV2AndBindingAcceptance")
 def google_status_v2_and_binding_acceptance() -> None:
@@ -1224,6 +1524,22 @@ def dry_run_is_read_only_and_explicit() -> None:
         require(not (manager.context.state_root / "convergence-v1.json").exists(), "dry-run wrote journal")
         require(progress and progress[0]["phase"] == "inspecting", "pre-hash inspecting event missing")
 
+    with manager_fixture(healthy_snapshot()) as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect(skip_build=True)
+        journal = convergence.ConvergenceJournal.for_manager(manager)
+        _create_journal(journal, plan)
+        before = journal.path.read_bytes()
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=FakeAcceptance(manager),
+            artifact_builder=FakeArtifacts(manager),
+        ).run(dry_run=True, skip_build=True)
+        require(result["ok"] is True, "dry-run could not inspect retained journal")
+        require(
+            journal.path.read_bytes() == before,
+            "dry-run adopted, rewrote, or cleared the convergence journal",
+        )
+
 
 
 def _create_journal(journal: Any, plan: Any) -> dict[str, Any]:
@@ -1602,12 +1918,27 @@ def mutation_crash_after_engine_boundary_resumes() -> None:
             and manager.snapshot["runtime"]["containerId"] == NEW_CONTAINER,
             "create crash fixture did not retain the stopped after-state",
         )
+        calls_before_resume = len(manager.calls)
         resumed = convergence.ConvergenceExecutor(
             manager,
             live_acceptance=FakeAcceptance(manager),
             artifact_builder=FakeArtifacts(manager),
         ).run()
         require(resumed["ok"] is True, "stopped create after-state was not adopted")
+        require(
+            manager.snapshot["runtime"]["containerId"] == NEW_CONTAINER,
+            "stopped create resume replaced the pinned container",
+        )
+        # Adoption means the pinned stopped container is never destroyed: the
+        # resumed run may complete the interrupted create phase for the same
+        # planned container, but a remove or seed-start would be a recreate
+        # that discards the journaled after-state.
+        replayed = [
+            name
+            for name, _ in manager.calls[calls_before_resume:]
+            if name in {"remove", "seed-start"}
+        ]
+        require(not replayed, "stopped create resume replayed a mutation")
         require(
             not (manager.context.state_root / "convergence-v1.json").exists(),
             "accepted create resume retained its journal",
@@ -1946,6 +2277,49 @@ def deadline_cancellation_progress_heartbeat_and_redaction() -> None:
     source = (ROOT / "src/xenoid/convergence.py").read_text(encoding="utf-8")
     require("5.0" in source and "heartbeat" in source.lower(), "five-second heartbeat owner missing")
     require("thread" in source.lower(), "long operations cannot emit concurrent heartbeat")
+
+
+@case("journaledStartPinsContainerAndImageDigests")
+def journaled_start_pins_container_and_image_digests() -> None:
+    labels = {
+        backend._RUNTIME_SCHEMA_LABEL: "1",
+        backend._RUNTIME_INPUT_LABEL: INPUT_DIGEST,
+        backend._RUNTIME_BOOT_INPUT_LABEL: BOOT_DIGEST,
+    }
+    container = {
+        "Id": NEW_CONTAINER,
+        "Image": IMAGE_ID,
+        "State": {"Running": True},
+    }
+    image = {"Config": {"Labels": labels}}
+    manager = SimpleNamespace(
+        ensure_instance_lease=lambda: None,
+        _owned_container_record=lambda: (container, None),
+        _container_matches_lease=lambda *_args, **_kwargs: True,
+        _inspect_docker_object=lambda kind, name: (image, None),
+        _republish_statfs_fsid_after_start=lambda _result: None,
+    )
+    started = RuntimeManager.start_owned_container(
+        manager,
+        expected_container_id=NEW_CONTAINER,
+        expected_image_input_sha256=INPUT_DIGEST,
+        expected_image_boot_input_sha256=BOOT_DIGEST,
+        wait=False,
+    )
+    require(started.get("ok") is True, "journaled start rejected pinned image digests")
+
+    labels[backend._RUNTIME_INPUT_LABEL] = "9" * 64
+    rejected = RuntimeManager.start_owned_container(
+        manager,
+        expected_container_id=NEW_CONTAINER,
+        expected_image_input_sha256=INPUT_DIGEST,
+        expected_image_boot_input_sha256=BOOT_DIGEST,
+        wait=False,
+    )
+    require(
+        rejected.get("error") == "runtime_spec_mismatch",
+        "journaled start accepted mismatched image labels",
+    )
 
 
 @case("directCallersAndRemovedShellAliases")

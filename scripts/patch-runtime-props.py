@@ -110,6 +110,9 @@ def generated_partition_lines(build: dict[str, Any]) -> dict[str, list[str]]:
         "ro.bootmode=normal",
         "ro.telephony.default_network=9",
         "ro.telephony.sim.count=1",
+        # Present in every stock raven build.prop; redroid's build system
+        # does not emit it, and its absence is itself a platform anomaly.
+        "ro.build.selinux=1",
     ]
     generated["vendor_build.prop"] += [
         f"ro.hardware={build['hardware']}",

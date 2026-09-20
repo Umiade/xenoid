@@ -35,7 +35,7 @@ for k in forbidden_global_rewrites:
 required_files=[
  'build_system_prop','system_prop','dalvik_config_prop','dalvik_prop','exported_dalvik_prop','bionic_prop','runtime_prop',
  'bootloader_prop','bootloader_boot_reason_prop','vendor_security_patch_level_prop','vendor_default_prop','exported_default_prop',
- 'usb_control_prop','adbd_config_prop'
+ 'usb_control_prop','adbd_config_prop','serialno_prop',
 ]
 for f in required_files:
     if f not in src:
@@ -43,5 +43,8 @@ for f in required_files:
 for needle in ['ro.boot.redroid_', 'ro.kernel.redroid.', 'ro.boot.use_redroid_c2', 'init.svc.redroid_net']:
     if needle not in src:
         missing.append('redroid:'+needle)
+for needle in ['!strcmp(full,"ro.serialno")','!strcmp(full,"ro.boot.serialno")','return g_serial','"ids"']:
+    if needle not in src:
+        missing.append('serial:'+needle)
 print({'ok': not missing, 'missing': missing})
 sys.exit(0 if not missing else 1)

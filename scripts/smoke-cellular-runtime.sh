@@ -43,6 +43,10 @@ if any(not profile.get(key) for key in required):
 PY
 APK="$(tests/cellular-runtime-probe/build.sh)"
 "$ADB_BIN" connect "$ADB_TARGET" >/dev/null
+# The probe is signed with a local debug key that rotates between checkouts,
+# so a previous run's install can block -r with INSTALL_FAILED_UPDATE_INCOMPATIBLE;
+# drop it first, matching the persistence smoke convention.
+"$ADB_BIN" -s "$ADB_TARGET" uninstall "$PACKAGE" >/dev/null 2>&1 || true
 "$ADB_BIN" -s "$ADB_TARGET" install -r "$APK" >/dev/null
 INSTALLED=true
 for permission in android.permission.READ_PHONE_STATE android.permission.READ_PHONE_NUMBERS android.permission.ACCESS_COARSE_LOCATION android.permission.ACCESS_FINE_LOCATION; do

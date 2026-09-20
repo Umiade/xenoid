@@ -629,6 +629,9 @@ class IdentityRuntimeStub:
     def collect_persisted_device_identity(self) -> dict[str, Any]:
         return dict(self.candidates)
 
+    def ensure_drm_identity(self) -> dict[str, Any]:
+        return {"ok": True, "seeded": False}
+
 
 class FingerprintClientStub:
     def __init__(self, succeed: bool = True):
@@ -666,6 +669,7 @@ def generated_imei_uses_raven_tac() -> None:
         rotated = device_identity.DeviceIdentityStore(context).rotate_stable()
         require(rotated["stable"]["imei"].startswith(device_identity._IMEI_TAC))
         require(rotated["stable"]["imei"] != imei)
+        require(rotated["stable"]["imeisv"] != identity["stable"]["imeisv"])
 
 
 @contract_case("legacyIdentityAdoptsPersistedValues")
@@ -693,7 +697,6 @@ def legacy_identity_adopts_persisted_values() -> None:
         require(effective["ids"]["serial"] == candidates["serial"])
         require(effective["ids"]["imei"] == candidates["imei"])
         require(effective["usb"]["serial"] == candidates["serial"])
-        require(effective["ids"]["boot_id"] != effective["ids"]["random_uuid"])
 
 
 @contract_case("identityRetryReusesPendingEpoch")
@@ -727,7 +730,6 @@ def new_container_rotates_only_boot_identity() -> None:
         for key in ("android_id", "serial", "imei", "imeisv"):
             require(first[key] == second[key])
         require(first["boot_id"] != second["boot_id"])
-        require(first["random_uuid"] != second["random_uuid"])
 
 
 @contract_case("explicitRotationUpdatesStableOwner")
@@ -745,7 +747,7 @@ def explicit_rotation_updates_stable_owner() -> None:
             {},
             rotate_stable=True,
         )["ok"] is True)
-        for key in ("android_id", "serial", "imei"):
+        for key in ("android_id", "serial", "imei", "imeisv"):
             require(first_client.profiles[0]["ids"][key] != second_client.profiles[0]["ids"][key])
 
 
@@ -761,7 +763,7 @@ def seeded_boot_binds_to_next_epoch() -> None:
         require(result["ok"] is True)
         ids = client.profiles[0]["ids"]
         require(ids["boot_id"] == seeded["bootId"])
-        require(ids["random_uuid"] == seeded["randomUuid"])
+        require(set(seeded) == {"containerEpoch", "bootId", "phase", "createdAt"})
         final = store.load()
         require(final is not None and final["pending"] is None)
         require(final["active"] is not None)
@@ -916,11 +918,12 @@ def live_sentinel_binds_instance_and_filesystem() -> None:
         runtime = FakeRuntime(context, cfg, lease)
         require(runtime.ensure_instance_storage()["ok"] is True)
         commands: list[str] = []
+        response: dict[str, Any] = {"ok": True}
 
         class RootClient:
             def root_exec(self, command: str) -> dict[str, Any]:
                 commands.append(command)
-                return {"ok": True}
+                return dict(response)
 
         runtime.daemon_client = lambda timeout=10.0: RootClient()  # type: ignore[method-assign]
         created = runtime.data_sentinel(create=True)
@@ -932,449 +935,13 @@ def live_sentinel_binds_instance_and_filesystem() -> None:
         require(context.instance_id in commands[0] and FS_A in commands[0])
         require(".storage-sentinel.new" in commands[0])
         require(".storage-sentinel.new" not in commands[1])
-
-
-def fake_identity_rotation(runtime: FakeRuntime):
-    def _impl(
-        expected_uuid: str,
-        *,
-        target_uuid: str,
-        expected_rootfs_uuid: str,
-        expected_rootfs_source_sha256: str,
-        expected_rootfs_size_bytes: int,
-        target_rootfs_uuid: str,
-    ) -> dict[str, Any]:
-        key = (runtime.lease.volume_name, storage.DATA_IMAGE_NAME)
-        rootfs_key = (runtime.lease.volume_name, storage.ROOTFS_IMAGE_NAME)
-        current = runtime.images[key]
-        rootfs = runtime.images[rootfs_key]
-        if (
-            expected_rootfs_source_sha256 != ROOTFS_SOURCE
-            or expected_rootfs_size_bytes != rootfs["logicalSizeBytes"]
-        ):
-            return {"ok": False, "error": "storage_identity_mismatch"}
-        rotated = (
-            current["filesystemUuid"] == expected_uuid
-            or rootfs["filesystemUuid"] == expected_rootfs_uuid
-        )
-        if current["filesystemUuid"] == expected_uuid:
-            runtime.images[key] = image_record(
-                target_uuid,
-                payload=str(current.get("payload", "")),
-            )
-        elif current["filesystemUuid"] != target_uuid:
-            return {"ok": False, "error": "storage_identity_mismatch"}
-        if rootfs["filesystemUuid"] == expected_rootfs_uuid:
-            runtime.images[rootfs_key] = image_record(
-                target_rootfs_uuid,
-                logical_size=int(rootfs["logicalSizeBytes"]),
-            )
-        elif rootfs["filesystemUuid"] != target_rootfs_uuid:
-            return {"ok": False, "error": "storage_identity_mismatch"}
-        current = runtime.images[key]
-        rootfs = runtime.images[rootfs_key]
-        return {
-            "ok": True,
-            **current,
-            "rootfsFilesystemUuid": rootfs["filesystemUuid"],
-            "rootfsSourceSha256": ROOTFS_SOURCE,
-            "rootfsSizeBytes": rootfs["logicalSizeBytes"],
-            "rotated": rotated,
-        }
-
-    return _impl
-
-
-@contract_case("storageRotationTargetIsDeterministic")
-def storage_rotation_target_is_deterministic() -> None:
-    first = storage.storage_rotation_target("4" * 32)
-    require(first == storage.storage_rotation_target("4" * 32))
-    require(first != storage.storage_rotation_target("4" * 32, rootfs=True))
-    require(first != storage.storage_rotation_target("5" * 32))
-    require(storage._UUID.fullmatch(first) is not None)
-
-
-@contract_case("storageIdentityRotationCommitsNewUuid")
-def storage_identity_rotation_commits_new_uuid() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        committed_before = storage.StorageStateStore(context, lease).load()
-        require(committed_before is not None)
-        transaction = "4" * 32
-        data_target = storage.storage_rotation_target(transaction)
-        rootfs_target = storage.storage_rotation_target(transaction, rootfs=True)
-        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
-        result = runtime.rotate_storage_identity(
-            transaction_id=transaction,
-            data_target_uuid=data_target,
-            rootfs_target_uuid=rootfs_target,
-            expected_data_uuid=str(committed_before["filesystemUuid"]),
-            expected_rootfs_uuid=str(committed_before["rootfsFilesystemUuid"]),
-        )
-        require(result["ok"] is True)
-        require(result["rotated"] is True)
-        require(result["filesystemUuid"] != FS_A)
-        require(result["previousFilesystemUuid"] == FS_A)
-        committed = storage.StorageStateStore(context, lease).load()
-        require(committed is not None and committed["state"] == "committed")
-        require(committed["rootfsFilesystemUuid"] == rootfs_target)
-        require(committed["filesystemUuid"] == result["filesystemUuid"])
-        require(committed["source"] == "fresh")
-        followup = FakeRuntime(context, cfg, lease)
-        transfer_engine_state(runtime, followup)
-        require(followup.ensure_instance_storage()["ok"] is True)
-        require(followup.actions == ["preserve"])
-
-
-@contract_case("storageIdentityRotationRequiresStoppedContainer")
-def storage_identity_rotation_requires_stopped_container() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        committed_before = storage.StorageStateStore(context, lease).load()
-        require(committed_before is not None)
-        runtime.containers[lease.container_name] = owned_container_record(runtime)
-        result = runtime.rotate_storage_identity(
-            transaction_id="4" * 32,
-            data_target_uuid=storage.storage_rotation_target("4" * 32),
-            rootfs_target_uuid=storage.storage_rotation_target("4" * 32, rootfs=True),
-            expected_data_uuid=str(committed_before["filesystemUuid"]),
-            expected_rootfs_uuid=str(committed_before["rootfsFilesystemUuid"]),
-        )
-        require(result["ok"] is False)
-        require(result["error"] == "storage_rotation_requires_stop")
-        committed = storage.StorageStateStore(context, lease).load()
-        require(committed is not None and committed["state"] == "committed")
-        require(committed["filesystemUuid"] == FS_A)
-
-
-@contract_case("storageIdentityRotationResumesAfterCrash")
-def storage_identity_rotation_resumes_after_crash() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        store = storage.StorageStateStore(context, lease)
-        committed = store.load()
-        require(committed is not None)
-        target = storage.storage_rotation_target("4" * 32)
-        pending = store.pending(
-            "fresh",
-            transaction_id="4" * 32,
-            filesystem_uuid=FS_A,
-            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
-            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
-            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
-            rootfs_image=str(committed["rootfsImage"]),
-            rootfs_filesystem_uuid=str(committed["rootfsFilesystemUuid"]),
-            rootfs_source_sha256=str(committed["rootfsSourceSha256"]),
-            observed_rootfs_size_bytes=int(committed["observedRootfsSizeBytes"]),
-            growth=True,
-            rotation_target_uuid=target,
-            rotation_target_rootfs_uuid=storage.storage_rotation_target(
-                "4" * 32,
-                rootfs=True,
-            ),
-        )
-        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(target)
-        runtime.images[
-            (lease.volume_name, storage.ROOTFS_IMAGE_NAME)
-        ] = image_record(
-            storage.storage_rotation_target("4" * 32, rootfs=True),
-            logical_size=3 * 1024 * 1024 * 1024,
-        )
-        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
-        result = runtime.rotate_storage_identity(
-            transaction_id="4" * 32,
-            data_target_uuid=target,
-            rootfs_target_uuid=storage.storage_rotation_target("4" * 32, rootfs=True),
-            expected_data_uuid=FS_A,
-            expected_rootfs_uuid=str(committed["rootfsFilesystemUuid"]),
-        )
-        require(result["ok"] is True)
-        require(result["rotated"] is False)
-        require(result["filesystemUuid"] == target)
-        require(result["previousFilesystemUuid"] == pending["filesystemUuid"])
-        final = store.load()
-        require(final is not None and final["state"] == "committed")
-        require(final["filesystemUuid"] == target)
-        require(final["rotationTargetUuid"] == "")
-        require(
-            final["rootfsFilesystemUuid"]
-            == storage.storage_rotation_target("4" * 32, rootfs=True)
-        )
-        require(final["rotationTargetRootfsUuid"] == "")
-
-@contract_case("committedBackupIsCleanedBeforeNewRotation")
-def committed_backup_is_cleaned_before_new_rotation() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        store = storage.StorageStateStore(context, lease)
-        committed = store.load()
-        require(committed is not None)
-        old_transaction = str(committed["transactionId"])
-        old_backup = storage.backup_rootfs_image_name(old_transaction)
-        runtime.images[(lease.volume_name, old_backup)] = image_record(
-            ROOTFS_B,
-            logical_size=3 * 1024 * 1024 * 1024,
-        )
-        committed = store.save(
-            {
-                **committed,
-                "backupRootfsImage": old_backup,
-                "backupRootfsFilesystemUuid": ROOTFS_B,
-                "backupRootfsSizeBytes": 3 * 1024 * 1024 * 1024,
-            }
-        )
-        transaction = "4" * 32
-        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
-        result = runtime.rotate_storage_identity(
-            transaction_id=transaction,
-            data_target_uuid=storage.storage_rotation_target(transaction),
-            rootfs_target_uuid=storage.storage_rotation_target(
-                transaction,
-                rootfs=True,
-            ),
-            expected_data_uuid=str(committed["filesystemUuid"]),
-            expected_rootfs_uuid=str(committed["rootfsFilesystemUuid"]),
-        )
-        require(result["ok"] is True)
-        final = store.load()
-        require(final is not None and final["state"] == "committed")
-        require(final["backupRootfsImage"] == "")
-
-
-@contract_case("legacyPendingBackupIsCleanedBeforeV2Rotation")
-def legacy_pending_backup_is_cleaned_before_v2_rotation() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        store = storage.StorageStateStore(context, lease)
-        committed = store.load()
-        require(committed is not None)
-        legacy_tx = "5" * 32
-        v4_only = {
-            "rootfsImage",
-            "rootfsFilesystemUuid",
-            "rootfsSourceSha256",
-            "observedRootfsSizeBytes",
-            "backupRootfsImage",
-            "backupRootfsFilesystemUuid",
-            "backupRootfsSizeBytes",
-            "rotationTargetRootfsUuid",
-        }
-        legacy_pending = {
-            key: value
-            for key, value in committed.items()
-            if key not in v4_only
-        }
-        legacy_pending.update(
-            {
-                "schema": "dev.xenoid.instance-storage/v3",
-                "state": "pending",
-                "transactionId": legacy_tx,
-                "temporaryImage": "",
-                "rotationTargetUuid": storage.storage_rotation_target(
-                    legacy_tx
-                ),
-            }
-        )
-        path = context.state_root / storage.STATE_FILENAME
-        path.write_text(json.dumps(legacy_pending, sort_keys=True) + "\n")
-        path.chmod(0o600)
-        legacy_journal = context.state_root / "device-regenerate.json"
-        legacy_payload = (
-            json.dumps(
-                {
-                    "schema": "dev.xenoid.device-regenerate/v1",
-                    "instanceId": context.instance_id,
-                    "startedAt": 1,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("ascii")
-        legacy_journal.write_bytes(legacy_payload)
-        legacy_journal.chmod(0o600)
-        journal, _, regeneration = prepare_regeneration_journal(
-            context,
-            legacy_evidence_sha256=hashlib.sha256(
-                legacy_payload
-            ).hexdigest(),
-        )
-        journal.finish_legacy_evidence()
-        original_action = runtime._run_storage_image_action
-
-        def migrated_action(*args: Any, **kwargs: Any) -> dict[str, Any]:
-            result = original_action(*args, **kwargs)
-            if result.get("ok") is True:
-                old_backup = storage.backup_rootfs_image_name(legacy_tx)
-                runtime.images[
-                    (lease.volume_name, old_backup)
-                ] = image_record(
-                    ROOTFS_B,
-                    logical_size=3 * 1024 * 1024 * 1024,
-                )
-                result.update(
-                    {
-                        "backupRootfsImage": old_backup,
-                        "backupRootfsFilesystemUuid": ROOTFS_B,
-                        "backupRootfsSizeBytes": 3 * 1024 * 1024 * 1024,
-                    }
-                )
-            return result
-
-        runtime._run_storage_image_action = migrated_action  # type: ignore[method-assign]
-        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
-        target = regeneration["target"]
-        result = runtime.rotate_storage_identity(
-            transaction_id=str(target["storageTransactionId"]),
-            data_target_uuid=str(target["dataFilesystemUuid"]),
-            rootfs_target_uuid=str(target["rootfsFilesystemUuid"]),
-            expected_data_uuid=str(committed["filesystemUuid"]),
-            expected_rootfs_uuid=str(committed["rootfsFilesystemUuid"]),
-            regeneration_capability={
-                "transactionId": regeneration["transactionId"]
-            },
-        )
-        require(result["ok"] is True)
-        final = store.load()
-        require(final is not None and final["state"] == "committed")
-        require(final["backupRootfsImage"] == "")
-
-
-
-
-@contract_case("storageIdentityRotationRejectsReplacedImage")
-def storage_identity_rotation_rejects_replaced_image() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        store = storage.StorageStateStore(context, lease)
-        committed = store.load()
-        require(committed is not None)
-        store.pending(
-            "fresh",
-            transaction_id="4" * 32,
-            filesystem_uuid=FS_A,
-            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
-            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
-            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
-            rootfs_image=str(committed["rootfsImage"]),
-            rootfs_filesystem_uuid=str(committed["rootfsFilesystemUuid"]),
-            rootfs_source_sha256=str(committed["rootfsSourceSha256"]),
-            observed_rootfs_size_bytes=int(committed["observedRootfsSizeBytes"]),
-            growth=True,
-            rotation_target_uuid=storage.storage_rotation_target("4" * 32),
-            rotation_target_rootfs_uuid=storage.storage_rotation_target(
-                "4" * 32,
-                rootfs=True,
-            ),
-        )
-        # The image is neither the pending expectation nor the rotation target:
-        # a replaced/tampered image must fail closed instead of being adopted.
-        runtime.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(FS_B)
-        runtime._run_storage_identity_rotation = fake_identity_rotation(runtime)  # type: ignore[method-assign]
-        result = runtime.rotate_storage_identity(
-            transaction_id="4" * 32,
-            data_target_uuid=storage.storage_rotation_target("4" * 32),
-            rootfs_target_uuid=storage.storage_rotation_target("4" * 32, rootfs=True),
-            expected_data_uuid=FS_A,
-            expected_rootfs_uuid=str(committed["rootfsFilesystemUuid"]),
-        )
-        require(result["ok"] is False)
-        require(result["error"] == "storage_identity_mismatch")
-        state = store.load()
-        require(state is not None and state["state"] == "pending")
-        require(state["transactionId"] == "4" * 32)
-        require(state["filesystemUuid"] == FS_A)
-
-
-@contract_case("upFailsClosedAcrossBothRotationWindows")
-def up_fails_closed_across_both_rotation_windows() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        store = storage.StorageStateStore(context, lease)
-        committed = store.load()
-        require(committed is not None)
-        target = storage.storage_rotation_target("4" * 32)
-        store.pending(
-            "fresh",
-            transaction_id="4" * 32,
-            filesystem_uuid=FS_A,
-            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
-            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
-            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
-            rootfs_image=str(committed["rootfsImage"]),
-            rootfs_filesystem_uuid=str(committed["rootfsFilesystemUuid"]),
-            rootfs_source_sha256=str(committed["rootfsSourceSha256"]),
-            observed_rootfs_size_bytes=int(committed["observedRootfsSizeBytes"]),
-            growth=True,
-            rotation_target_uuid=target,
-            rotation_target_rootfs_uuid=storage.storage_rotation_target(
-                "4" * 32,
-                rootfs=True,
-            ),
-        )
-        # Pre-mutation window: image still holds the old UUID.
-        pre_mutation = FakeRuntime(context, cfg, lease)
-        transfer_engine_state(runtime, pre_mutation)
-        result = pre_mutation.ensure_instance_storage()
-        require(result["ok"] is False)
-        require(result["error"] == "storage_identity_mismatch")
-        require("device regenerate" in str(result.get("message")))
-        # Post-mutation window: image already carries the rotation target.
-        post_mutation = FakeRuntime(context, cfg, lease)
-        transfer_engine_state(runtime, post_mutation)
-        post_mutation.images[(lease.volume_name, storage.DATA_IMAGE_NAME)] = image_record(target)
-        result = post_mutation.ensure_instance_storage()
-        require(result["ok"] is False)
-        require(result["error"] == "storage_identity_mismatch")
-        require("device regenerate" in str(result.get("message")))
-        # State is untouched in both windows; the rotation can still be resumed.
-        pending = store.load()
-        require(pending is not None and pending["state"] == "pending")
-        require(pending["rotationTargetUuid"] == target)
-        require(
-            pending["rotationTargetRootfsUuid"]
-            == storage.storage_rotation_target("4" * 32, rootfs=True)
-        )
-
-
-@contract_case("plainGrowthPendingHasNoRotationMarker")
-def plain_growth_pending_has_no_rotation_marker() -> None:
-    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
-        context, cfg, lease = initialize(project, state, "phone-a")
-        runtime = FakeRuntime(context, cfg, lease)
-        require(runtime.ensure_instance_storage()["ok"] is True)
-        store = storage.StorageStateStore(context, lease)
-        committed = store.load()
-        require(committed is not None)
-        store.pending(
-            "fresh",
-            transaction_id="4" * 32,
-            filesystem_uuid=FS_A,
-            observed_logical_size_bytes=int(committed["observedLogicalSizeBytes"]),
-            observed_filesystem_size_bytes=int(committed["observedFilesystemSizeBytes"]),
-            host_allocated_bytes=int(committed["hostAllocatedBytes"]),
-            growth=True,
-        )
-        pending_runtime = FakeRuntime(context, cfg, lease)
-        transfer_engine_state(runtime, pending_runtime)
-        require(pending_runtime.ensure_instance_storage()["ok"] is True)
-        final = store.load()
-        require(final is not None and final["state"] == "committed")
-        require(final["rotationTargetUuid"] == "")
+        response.clear()
+        response.update(ok=False, errorCode="rootd_command_timeout")
+        unavailable = runtime.data_sentinel(create=False)
+        require(unavailable.get("error") == "storage_sentinel_unavailable")
+        response["errorCode"] = "rootd_command_failed"
+        mismatch = runtime.data_sentinel(create=False)
+        require(mismatch.get("error") == "storage_sentinel_mismatch")
 
 
 @contract_case("v3StorageStateMigratesWithVerifiedRootfs")
@@ -1394,7 +961,6 @@ def v3_storage_state_migrates_with_verified_rootfs() -> None:
             "backupRootfsImage",
             "backupRootfsFilesystemUuid",
             "backupRootfsSizeBytes",
-            "rotationTargetRootfsUuid",
         }
         v3 = {key: value for key, value in committed.items() if key not in v4_only}
         v3["schema"] = "dev.xenoid.instance-storage/v3"
@@ -1426,57 +992,105 @@ def v3_storage_state_migrates_with_verified_rootfs() -> None:
         require(migrated["rootfsSourceSha256"] == ROOTFS_SOURCE)
 
 
+
+@contract_case("v4PendingRotationEvidenceFailsClosedUntouched")
+def v4_pending_rotation_evidence_fails_closed_untouched() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, _, lease = initialize(project, state, "phone-a")
+        store = storage.StorageStateStore(context, lease)
+        current = store.pending("fresh", transaction_id="1" * 32)
+        data_target = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        rootfs_target = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        for already_mutated in (False, True):
+            legacy = {
+                **current,
+                "schema": storage._V4_STORAGE_SCHEMA,
+                "rotationTargetUuid": data_target,
+                "rotationTargetRootfsUuid": rootfs_target,
+            }
+            if already_mutated:
+                legacy["filesystemUuid"] = data_target
+                legacy["rootfsFilesystemUuid"] = rootfs_target
+            payload = (json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+            store.path.write_bytes(payload)
+            store.path.chmod(0o600)
+            before = store.path.read_bytes()
+            try:
+                store.load()
+            except storage.StorageError as exc:
+                require(exc.code == "storage_legacy_rotation_pending")
+            else:
+                raise ContractFailure
+            require(store.path.read_bytes() == before)
+
+
+@contract_case("ordinaryV4StorageMigratesToV5")
+def ordinary_v4_storage_migrates_to_v5() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, _, lease = initialize(project, state, "phone-a")
+        store = storage.StorageStateStore(context, lease)
+        current = store.pending("fresh", transaction_id="1" * 32)
+        legacy = {
+            **current,
+            "schema": storage._V4_STORAGE_SCHEMA,
+            "rotationTargetUuid": "",
+            "rotationTargetRootfsUuid": "",
+        }
+        store.path.write_text(json.dumps(legacy) + "\n", encoding="ascii")
+        store.path.chmod(0o600)
+        migrated = store.load()
+        require(migrated is not None and migrated["schema"] == storage.STORAGE_SCHEMA)
+        require("rotationTargetUuid" not in migrated)
+        require("rotationTargetRootfsUuid" not in migrated)
 def prepare_regeneration_journal(
     context: config.InstanceContext,
-    *,
-    legacy_evidence_sha256: str | None = None,
 ) -> tuple[
     device_identity.RegenerationJournal,
     device_identity.DeviceIdentityStore,
     dict[str, Any],
 ]:
     identity_store = device_identity.DeviceIdentityStore(context)
+    identity = identity_store.initialize()
     transaction_id = "6" * 32
-    identity = identity_store.prepare_regeneration_stable(transaction_id)
-    pending = identity["pendingStable"]
-    require(pending is not None)
-    storage_transaction = "4" * 32
+    stable_target = device_identity.generate_stable_target(identity["stable"])
     before = {
-        "containerId": "a" * 64,
-        "imageId": "sha256:" + "b" * 64,
-        "runtimeEpoch": "c" * 64,
-        "stableDigest": pending["beforeDigest"],
-        "networkEpoch": "",
-        "simEpoch": "",
-        "dataFilesystemUuid": FS_A,
-        "rootfsFilesystemUuid": ROOTFS_A,
-        "locationDigest": "d" * 64,
-        "proxyEnabled": False,
-        "proxyGeneration": 0,
-        "googleBindingDigest": "e" * 64,
+        "containerId": "c" * 64,
+        "containerEpoch": device_identity.container_epoch("c" * 64),
+        "imageId": "sha256:" + "d" * 64,
+        "imageInputSha256": "e" * 64,
+        "imageBootInputSha256": "f" * 64,
+        "runtimeEpoch": "1" * 64,
+        "stableDigest": device_identity.stable_identity_digest(identity["stable"]),
+        "simEpoch": "a" * 32,
+        "locationDigest": "3" * 64,
+        "bootId": "11111111-2222-4233-8444-555555555555",
+        "statfsFsid": "0123456789abcdef",
+        "bluetoothAddress": "F4:F5:E8:00:00:01",
+        "deviceName": "Pixel 6 Pro",
+        "hostname": "localhost",
+        "googleBindingDigest": "4" * 64,
+        "drmDeviceUniqueId": "00" * 16,
+        "advertisingIdDigest": "7" * 64,
+        "gsfAndroidIdDigest": "8" * 64,
+        "protectionEngineId": "AA:BB:CC:DD",
+        "protectionExpectedDigest": "9" * 64,
     }
     target = {
-        "stableDigest": pending["digest"],
-        "networkEpoch": "1" * 32,
-        "simEpoch": "2" * 32,
-        "storageTransactionId": storage_transaction,
-        "dataFilesystemUuid": storage.storage_rotation_target(storage_transaction),
-        "rootfsFilesystemUuid": storage.storage_rotation_target(
-            storage_transaction,
-            rootfs=True,
-        ),
-        "locationProfileDigest": "f" * 64,
-        "proxyGeneration": 0,
-        "googleBindingDigest": "e" * 64,
+        "stableDigest": device_identity.stable_identity_digest(stable_target),
+        "stable": stable_target,
+        "simEpoch": "b" * 32,
+        "locationProfileDigest": "6" * 64,
+        "bootId": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+        "statfsFsid": "fedcba9876543210",
+        "bluetoothAddress": "F4:F5:E8:00:00:02",
+        "deviceName": "Pixel 6 Pro ABC123",
+        "hostname": "android-0123456789ab",
+        "googleBindingDigest": "4" * 64,
+        "drmDeviceUniqueId": "ff" * 16,
     }
     journal = device_identity.RegenerationJournal(context)
-    state = journal.prepare(
-        transaction_id,
-        before,
-        target,
-        legacy_evidence_sha256=legacy_evidence_sha256,
-        legacy_restart=legacy_evidence_sha256 is not None,
-    )
+    state = journal.prepare(transaction_id, before, target)
+    identity_store.prepare_regeneration_stable(transaction_id, stable_target)
     return journal, identity_store, state
 
 
@@ -1500,11 +1114,18 @@ def regenerate_journal_lifecycle() -> None:
         require(journal.pending() is True)
         require(prepared["phase"] == "prepared")
         require(stat.S_IMODE(journal.path.stat().st_mode) == 0o600)
-        require(journal.path.name == "device-regenerate-v2.json")
+        require(journal.path.name == "device-regenerate-v3.json")
         payload = json.loads(journal.path.read_text())
         require(set(payload) == device_identity._REGENERATION_KEYS)
-        require(payload["schema"] == "dev.xenoid.device-regenerate/v2")
+        require(payload["schema"] == "dev.xenoid.device-regenerate/v3")
         require(payload["instanceId"] == context.instance_id)
+        with mock.patch.object(
+            device_identity,
+            "_now",
+            return_value=prepared["updatedAt"] - 60,
+        ):
+            same_phase = journal.advance("prepared")
+        require(same_phase["updatedAt"] == prepared["updatedAt"])
         try:
             journal.advance("storage_committed")
         except device_identity.IdentityError as exc:
@@ -1518,85 +1139,92 @@ def regenerate_journal_lifecycle() -> None:
         require(journal.pending() is False)
 
 
-@contract_case("legacyRegenerationPublishesEvidenceBeforeMutation")
-def legacy_regeneration_publishes_evidence_before_mutation() -> None:
+@contract_case("regenerateTargetsExistBeforeIdentityMutation")
+def regenerate_targets_exist_before_identity_mutation() -> None:
     with roots() as (project, state), fixed_uuids(ID_A, TX_A):
         context, _, _ = initialize(project, state, "phone-a")
-        legacy = context.state_root / "device-regenerate.json"
-        payload = (
-            json.dumps(
-                {
-                    "schema": "dev.xenoid.device-regenerate/v1",
-                    "instanceId": context.instance_id,
-                    "startedAt": 1,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("ascii")
-        legacy.write_bytes(payload)
-        legacy.chmod(0o600)
-        digest = hashlib.sha256(payload).hexdigest()
-        journal, identity_store, prepared = prepare_regeneration_journal(
-            context,
-            legacy_evidence_sha256=digest,
+        store = device_identity.DeviceIdentityStore(context)
+        identity = store.initialize()
+        # Seed one active epoch so journal-fixed boot staging can be replayed.
+        seed = store.seed_next_boot()
+        store.prepare_epoch("c" * 64)
+        store.mark_applied(device_identity.container_epoch("c" * 64))
+        # Simulate a deleted legacy v1/v2 journal whose pendingStable marker
+        # survives. The new journal must exist before cleanup, and a crash
+        # immediately after prepare must leave the old marker byte-identical.
+        store.prepare_regeneration_stable("7" * 32)
+        before_bytes = store.path.read_bytes()
+        stable_target = device_identity.generate_stable_target(identity["stable"])
+        before = {
+            "containerId": "c" * 64,
+            "containerEpoch": device_identity.container_epoch("c" * 64),
+            "imageId": "sha256:" + "d" * 64,
+            "imageInputSha256": "e" * 64,
+            "imageBootInputSha256": "f" * 64,
+            "runtimeEpoch": "1" * 64,
+            "stableDigest": device_identity.stable_identity_digest(identity["stable"]),
+            "simEpoch": "a" * 32,
+            "locationDigest": "3" * 64,
+            "bootId": seed["bootId"],
+            "statfsFsid": "0123456789abcdef",
+            "bluetoothAddress": "F4:F5:E8:00:00:01",
+            "deviceName": "Pixel 6 Pro",
+            "hostname": "localhost",
+            "googleBindingDigest": "4" * 64,
+            "drmDeviceUniqueId": "00" * 16,
+            "advertisingIdDigest": "7" * 64,
+            "gsfAndroidIdDigest": "8" * 64,
+            "protectionEngineId": "AA:BB:CC:DD",
+            "protectionExpectedDigest": "9" * 64,
+        }
+        target = {
+            "stableDigest": device_identity.stable_identity_digest(stable_target),
+            "stable": stable_target,
+            "simEpoch": "b" * 32,
+            "locationProfileDigest": "6" * 64,
+            "bootId": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+            "statfsFsid": "fedcba9876543210",
+            "bluetoothAddress": "F4:F5:E8:00:00:02",
+            "deviceName": "Pixel 6 Pro ABC123",
+            "hostname": "android-0123456789ab",
+            "googleBindingDigest": "4" * 64,
+            "drmDeviceUniqueId": "ff" * 16,
+        }
+        journal = device_identity.RegenerationJournal(context)
+        prepared = journal.prepare("a" * 32, before, target)
+        require(store.path.read_bytes() == before_bytes)
+        require(prepared["target"]["stable"] == stable_target)
+        require(
+            device_identity.stable_identity_digest(store.load()["stable"])
+            == prepared["before"]["stableDigest"]
         )
-        require(legacy.exists())
-        require(prepared["legacyEvidenceSha256"] == digest)
-        resumed = journal.finish_legacy_evidence()
-        evidence = (
-            context.state_root
-            / f"device-regenerate-v1.{digest}.evidence.json"
-        )
-        require(not legacy.exists() and evidence.is_file())
-        require(stat.S_IMODE(evidence.stat().st_mode) == 0o600)
-        require(resumed["transactionId"] == prepared["transactionId"])
-        committed = commit_regeneration_journal(journal)
-        identity_store.commit_regeneration_stable(committed["transactionId"])
-        identity_store.clear_regeneration_stable(committed["transactionId"])
-        journal.clear()
-        require(journal.pending() is False)
+        require(store.recover_orphaned_regeneration_stable() is True)
+        staged = store.prepare_regeneration_stable("a" * 32, prepared["target"]["stable"])
+        first_boot = store.stage_regeneration_boot(prepared["target"]["bootId"])
+        after_first_boot = store.path.read_bytes()
+        second_boot = store.stage_regeneration_boot(prepared["target"]["bootId"])
+        require(store.path.read_bytes() == after_first_boot)
+        require(staged["pendingStable"]["digest"] == prepared["target"]["stableDigest"])
+        require(first_boot["bootId"] == second_boot["bootId"] == prepared["target"]["bootId"])
 
-
-@contract_case("regenerateGoogleMarkerJournalIsCrashResumable")
-def regenerate_google_marker_journal_is_crash_resumable() -> None:
+@contract_case("regenerateGoogleIdentityJournalIsCrashResumable")
+def regenerate_google_identity_journal_is_crash_resumable() -> None:
     with roots() as (project, state), fixed_uuids(ID_A, TX_A):
         context, _, _ = initialize(project, state, "phone-a")
         journal, identity_store, current = prepare_regeneration_journal(context)
-        for phase in device_identity.REGENERATION_PHASES[1:11]:
+        for phase in device_identity.REGENERATION_PHASES[1:8]:
             current = journal.advance(phase)
-        require(current["phase"] == "google_wiping")
-        cleared: list[str] = []
-        for package in device_identity.GOOGLE_CLEAR_PACKAGES:
-            current = journal.advance(
-                "google_wiping",
-                googleActivePackage=package,
-                googleMarkerRoots=[],
-                googlePackageArmed=False,
-            )
-            current = journal.advance(
-                "google_wiping",
-                googleMarkerRoots=["ce", "de"],
-                googlePackageArmed=True,
-            )
-            require(journal.load() == current)
-            cleared.append(package)
-            current = journal.advance(
-                "google_wiping",
-                googleClearedPackages=list(cleared),
-                googleActivePackage=None,
-                googleMarkerRoots=[],
-                googlePackageArmed=False,
-            )
-        current = journal.advance("committed")
+        require(current["phase"] == "google_reset")
+        require(journal.load() == current)
+        require(not any(key.startswith("googlePackage") for key in current))
+        for phase in device_identity.REGENERATION_PHASES[8:]:
+            current = journal.advance(phase)
         identity_store.commit_regeneration_stable(current["transactionId"])
         identity_store.clear_regeneration_stable(current["transactionId"])
         journal.clear()
 
-
-@contract_case("orphanedStableTargetRejectsPostCommitDiscard")
-def orphaned_stable_target_rejects_post_commit_discard() -> None:
+@contract_case("orphanedStableTargetRecoversBeforeOrAfterCommit")
+def orphaned_stable_target_recovers_before_or_after_commit() -> None:
     with roots() as (project, state), fixed_uuids(ID_A, TX_A):
         context, _, _ = initialize(project, state, "phone-a")
         store = device_identity.DeviceIdentityStore(context)
@@ -1604,9 +1232,27 @@ def orphaned_stable_target_rejects_post_commit_discard() -> None:
         require(prepared["pendingStable"] is not None)
         require(store.recover_orphaned_regeneration_stable() is True)
         store.prepare_regeneration_stable("8" * 32)
-        store.commit_regeneration_stable("8" * 32)
+        committed = store.commit_regeneration_stable("8" * 32)
+        committed_digest = device_identity.stable_identity_digest(committed["stable"])
+        require(store.recover_orphaned_regeneration_stable() is True)
+        recovered = store.load()
+        require(recovered is not None and recovered["pendingStable"] is None)
+        require(device_identity.stable_identity_digest(recovered["stable"]) == committed_digest)
+
+
+@contract_case("regenerationTargetMustRotateEveryStableFactor")
+def regeneration_target_must_rotate_every_stable_factor() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, _, _ = initialize(project, state, "phone-a")
+        store = device_identity.DeviceIdentityStore(context)
+        current = store.load()
+        require(current is not None)
+        target = dict(current["stable"])
+        target["androidId"] = "0123456789abcdef"
+        if target["androidId"] == current["stable"]["androidId"]:
+            target["androidId"] = "fedcba9876543210"
         try:
-            store.recover_orphaned_regeneration_stable()
+            store.prepare_regeneration_stable("9" * 32, target)
         except device_identity.IdentityError as exc:
             require(exc.code == "device_regeneration_state_invalid")
         else:
@@ -1638,10 +1284,10 @@ def start_seeds_boot_identity_before_create() -> None:
     with roots() as (project, state), fixed_uuids(ID_A, TX_A):
         context, cfg, lease = initialize(project, state, "phone-a")
         runtime = FakeRuntime(context, cfg, lease)
-        captured: list[tuple[str, str]] = []
+        captured: list[str] = []
 
-        def capture(boot_id: str, random_uuid: str) -> dict[str, Any]:
-            captured.append((boot_id, random_uuid))
+        def capture(boot_id: str) -> dict[str, Any]:
+            captured.append(boot_id)
             return {"ok": True}
 
         runtime._run_boot_identity_seed = capture  # type: ignore[method-assign]
@@ -1651,14 +1297,13 @@ def start_seeds_boot_identity_before_create() -> None:
         store = device_identity.DeviceIdentityStore(context)
         pending = store.load()["pending"]
         require(pending is not None)
-        require(pending["bootId"] == captured[0][0])
-        require(pending["randomUuid"] == captured[0][1])
+        require(set(pending) == {"containerEpoch", "bootId", "phase", "createdAt"})
+        require(pending["bootId"] == captured[0])
         # The seeded values bind to the next container epoch verbatim.
         runtime_stub = IdentityRuntimeStub("c" * 64)
         client = FingerprintClientStub()
         require(device_identity.converge_instance_identity(context, runtime_stub, client, {})["ok"] is True)
-        require(client.profiles[0]["ids"]["boot_id"] == captured[0][0])
-        require(client.profiles[0]["ids"]["random_uuid"] == captured[0][1])
+        require(client.profiles[0]["ids"]["boot_id"] == captured[0])
 
 
 def main() -> int:

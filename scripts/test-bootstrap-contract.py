@@ -6,6 +6,7 @@ import hashlib
 import os
 import json
 import re
+import stat
 import sys
 import time
 import tempfile
@@ -384,6 +385,53 @@ def delayed_transport_launches_activity_once() -> None:
     require(clock.now >= 3.0, "test did not exceed the obsolete two-second wait")
     require(probe.launches == 1, "polling launched Activity more than once")
     require(probe.force_stops == 0, "bound-before-midpoint daemon was force-stopped")
+
+
+@contract_case("staleRootdRecordSurvivesPidReuseSafely")
+def stale_rootd_record_survives_pid_reuse_safely() -> None:
+    recorded_pid = 3668
+    record = json.dumps({
+        "schema": backend._ROOTD_PROCESS_SCHEMA,
+        "pid": recorded_pid,
+        "startTime": 12345,
+    })
+
+    class Probe(backend.RuntimeManager):
+        def _rootd_output(
+            self,
+            args: list[str],
+            limit: int = 0,
+            deadline: float | None = None,
+        ) -> str | None:
+            del limit, deadline
+            if args == ["test", "-e", backend._ROOTD_PROCESS_RECORD]:
+                return ""
+            if args == ["cat", backend._ROOTD_PROCESS_RECORD]:
+                return record
+            if args == ["cat", f"/proc/{recorded_pid}/stat"]:
+                return f"{recorded_pid} (unrelated) S " + "0 " * 40
+            return None
+
+        def _rootd_stat(
+            self,
+            path: str,
+            *,
+            follow: bool = False,
+            deadline: float | None = None,
+        ) -> tuple[int, int, int, int, int, int] | None:
+            del follow, deadline
+            if path == backend._ROOTD_RUN_DIRECTORY:
+                return (1, 2, 0, stat.S_IFDIR | 0o700, 1, 64)
+            if path == backend._ROOTD_PROCESS_RECORD:
+                return (1, 3, 0, stat.S_IFREG | 0o600, 1, len(record))
+            return None
+
+        def _rootd_process_identity(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            return None
+
+    owned, state = Probe._rootd_owned_process(object.__new__(Probe))
+    require(owned is None and state == "stale", "PID reuse was treated as an owned conflict")
 
 
 @contract_case("delayedPrivateTokenAndRootdFailureClasses")
@@ -939,6 +987,47 @@ def single_host_cli_mcp_bootstrap_path() -> None:
             window = text[max(0, match.start() - 180):match.end() + 180]
             require("reconcile_bootstrap" not in window, f"{label} camera timeout readiness")
     require("def daemon_ensured(" not in cli, "CLI health-first helper remains")
+
+@contract_case("regenerationRestartReceiptPrecedesReboot")
+def regeneration_restart_receipt_precedes_reboot() -> None:
+    probe = object.__new__(backend.RuntimeManager)
+    probe.lease = SimpleNamespace(rootd_port=42870)
+    client = SimpleNamespace(
+        read_private_token=lambda force, timeout: TOKEN,
+        health=lambda timeout: {"ok": True},
+    )
+    probe.daemon_client = lambda timeout: client
+    probe.ensure_rootd_root = lambda timeout, daemon: {"ok": True}
+    commands: list[str] = []
+
+    def rootd_exec(command: str, token: str, **kwargs: Any) -> dict[str, Any]:
+        commands.append(command)
+        return {"ok": True, "exitCode": 0}
+
+    probe._rootd_exec = rootd_exec
+    probe._rootd_output = lambda args, **kwargs: (
+        "running" if args[-1] == "init.svc.keystore2" else "1"
+    )
+    probe.reconcile_bootstrap = lambda timeout: {"controlReady": True}
+    probe.reconcile_proxy_desired = lambda: {"ok": True}
+    receipt = "a" * 32
+    result = probe.soft_reboot(
+        timeout=10,
+        require_health=False,
+        reset_ssaid=True,
+        restart_receipt=receipt,
+    )
+    require(result.get("ok") is True, "soft reboot probe failed")
+    reboot = commands[0]
+    ssaid_delete = reboot.index("settings_ssaid.xml")
+    receipt_write = reboot.index("printf '%s\\n'")
+    ril_restart = reboot.index("ctl.restart vendor.ril-daemon")
+    zygote_restart = reboot.index("ctl.restart zygote")
+    require(
+        ssaid_delete < receipt_write < ril_restart < zygote_restart,
+        "receipt is not durably ordered before the restart",
+    )
+
 
 
 def main() -> int:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import dataclasses
 import binascii
 import hashlib
 import getpass
@@ -20,8 +19,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .backend import RuntimeManager
-from .convergence import ConvergenceExecutor
-from .live_observe import LiveAcceptance
+from .convergence import ConvergenceExecutor, ConvergencePlan
 from .artifacts import ALL_TARGETS, TARGETS, ArtifactBuilder, ArtifactError
 from .cellular import CellularError, encode_profile_v1
 from .config import (
@@ -42,13 +40,15 @@ from .daemon_client import (
 )
 from .doctor import build_doctor_report
 from .device_identity import (
-    GOOGLE_CLEAR_PACKAGES,
     REGENERATION_PHASES,
     DeviceIdentityStore,
     IdentityError,
     RegenerationJournal,
     converge_instance_identity,
+    generate_boot_id,
+    generate_stable_target,
     identity_field_key,
+    materialize_profile,
     public_identity_state,
     stable_identity_digest,
     validate_identity_value,
@@ -57,7 +57,10 @@ from .google_services import (
     AVAILABILITY_PRODUCTION,
     MICROG_PLAY_RELEASE,
     PROVIDER_NONE,
+    PROVIDER_MICROG,
+    GoogleBindingStore,
     GoogleServicesError,
+    binding_matches,
     import_microg,
     ensure_google_services_assets,
     import_mindthegapps,
@@ -65,6 +68,7 @@ from .google_services import (
     quick_validate_assets,
     registered_releases,
     registry_public,
+    resolve_google_runtime_spec,
 )
 from .process import run_bounded
 from .location import (
@@ -74,7 +78,6 @@ from .location import (
     STAGE_SCHEMA,
     convergence_action,
     location_runtime_epoch,
-    missing_regeneration_target,
     masked_android_status,
     normalize_country,
     public_summary,
@@ -90,7 +93,6 @@ from .proxy_controller import ProxyController
 from .storage import (
     StorageError,
     StorageStateStore,
-    storage_rotation_target,
 )
 from .util import (
     bounded_timeout,
@@ -394,7 +396,11 @@ def _prepare_google_assets_for_up(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_up(args: argparse.Namespace) -> int:
     manager = runtime(args)
-    engine = manager.ensure_engine_started()
+    engine = (
+        {"ok": manager.engine_reachable(), "started": False, "error": "engine_unavailable"}
+        if bool(args.dry_run)
+        else manager.ensure_engine_started()
+    )
     if engine.get("started") is True:
         _write_up_progress(
             {
@@ -407,57 +413,56 @@ def cmd_up(args: argparse.Namespace) -> int:
             }
         )
     if engine.get("ok") is not True:
-        print_json({"command": "up", "ok": False, **engine})
+        print_json({"command": "up", "ok": False, "dryRun": bool(args.dry_run), **engine})
         return 1
-    try:
-        _prepare_google_assets_for_up(args)
-    except GoogleServicesError as exc:
-        print_json(exc.as_dict())
-        return 1
-    journal = RegenerationJournal(args.context)
-    regeneration = journal.load()
-    if regeneration is not None and not bool(args.dry_run):
+
+    def locked_body() -> tuple[Optional[dict[str, Any]], Optional[int]]:
+        # The journal load, resume execution, asset preparation, and
+        # convergence all run under the instance operation lock so a pending
+        # v3 regeneration cannot race a concurrent up/regenerate. A pending
+        # journal is resumed before any Google asset acquisition, which its
+        # own post-journal steps do not need.
+        journal = RegenerationJournal(args.context)
         try:
-            result = _execute_device_regeneration(args)
-        except (IdentityError, InstanceError, LocationError, StorageError) as exc:
-            result = {
-                "schema": "dev.xenoid.device-regenerate/v2",
-                "ok": False,
-                "error": getattr(
-                    exc,
-                    "code",
-                    "device_regeneration_state_invalid",
-                ),
-            }
-    else:
+            regeneration = journal.load()
+        except IdentityError as exc:
+            return _regeneration_exception_result(args.context, exc), None
+        if regeneration is not None:
+            if bool(args.dry_run):
+                return _regeneration_dry_run_result(regeneration), None
+            try:
+                return _execute_device_regeneration(args), None
+            except (IdentityError, InstanceError, LocationError, StorageError) as exc:
+                return _regeneration_exception_result(args.context, exc), None
+        try:
+            _prepare_google_assets_for_up(args)
+        except GoogleServicesError as exc:
+            print_json(exc.as_dict())
+            return None, 1
         capability = (
             {"transactionId": regeneration["transactionId"]}
             if regeneration is not None
             else None
         )
+        executor = ConvergenceExecutor(manager)
+        with command_timeout(_UP_TIMEOUT_SECONDS):
+            return executor.run(
+                progress=_write_up_progress,
+                skip_build=bool(args.skip_build),
+                dry_run=bool(args.dry_run),
+                regeneration_capability=capability,
+            ), None
 
-        def converge() -> dict[str, Any]:
-            executor = ConvergenceExecutor(manager)
-            with command_timeout(_UP_TIMEOUT_SECONDS):
-                return executor.run(
-                    progress=_write_up_progress,
-                    skip_build=bool(args.skip_build),
-                    dry_run=bool(args.dry_run),
-                    regeneration_capability=capability,
-                )
-
-        if args.dry_run:
-            result = converge()
-        else:
-            with cli_operation_lock(args):
-                result = converge()
+    # The journal decision and any resume must share the operation lock even
+    # for a dry run: a concurrent regeneration could otherwise prepare and
+    # crash between the unlocked load and the executor's own lock, yielding
+    # a stale convergence preview instead of the v3 resume preview.
+    with cli_operation_lock(args):
+        result, exit_code = locked_body()
+    if exit_code is not None or result is None:
+        return exit_code if exit_code is not None else 1
     print_json(result)
     return 0 if result.get("ok") else 1
-
-
-
-
-
 
 
 
@@ -570,6 +575,15 @@ def cmd_package_release(args: argparse.Namespace) -> int:
             "ok": False,
             "code": "release_version_invalid",
             "error": "release_version_invalid",
+        })
+        return 2
+    if version != __version__:
+        print_json({
+            "ok": False,
+            "code": "release_version_mismatch",
+            "error": "release_version_mismatch",
+            "requestedVersion": version,
+            "packageVersion": __version__,
         })
         return 2
     script = args.project_root / "scripts" / "package-release.sh"
@@ -2552,7 +2566,7 @@ def _regeneration_result(
     **details: Any,
 ) -> dict[str, Any]:
     return {
-        "schema": "dev.xenoid.device-regenerate/v2",
+        "schema": "dev.xenoid.device-regenerate/v3",
         "ok": ok,
         "transactionId": state.get("transactionId"),
         "phase": state.get("phase"),
@@ -2561,419 +2575,563 @@ def _regeneration_result(
     }
 
 
-def _verify_regeneration_target_state(
-    manager: RuntimeManager,
-    state: Mapping[str, Any],
-) -> dict[str, Any]:
-    current = manager.regeneration_snapshot()
-    before = state["before"]
-    target = state["target"]
-    expected = {
-        "stableDigest": target["stableDigest"],
-        "networkEpoch": target["networkEpoch"],
-        "simEpoch": target["simEpoch"],
-        "dataFilesystemUuid": target["dataFilesystemUuid"],
-        "rootfsFilesystemUuid": target["rootfsFilesystemUuid"],
-        "locationDigest": target["locationProfileDigest"],
-        **(
-            {}
-            if state.get("legacyEvidenceSha256") is not None
-            else {
-                "proxyEnabled": before["proxyEnabled"],
-                "proxyGeneration": target["proxyGeneration"],
-            }
-        ),
-        "googleBindingDigest": target["googleBindingDigest"],
-    }
-    if any(current.get(key) != value for key, value in expected.items()):
+def _regeneration_shell_read(manager: RuntimeManager, command: str) -> str:
+    result = manager.docker_exec(["sh", "-c", command], timeout=10)
+    if result.get("ok") is not True:
         raise IdentityError(
             "device_regeneration_state_invalid",
-            "a regenerated feature matches neither its recorded before nor fixed target",
+            "runtime identity surface is unreadable for regeneration verification",
         )
-    return current
+    return str(result.get("stdout", "")).strip()
 
 
-def _regeneration_acceptance(
+def _generate_bluetooth_address(before: str) -> str:
+    while True:
+        candidate = "F4:F5:E8:" + ":".join(f"{octet:02X}" for octet in secrets.token_bytes(3))
+        if candidate != before:
+            return candidate
+
+def _generate_device_name(before: str) -> str:
+    while True:
+        candidate = "Pixel 6 Pro " + secrets.token_hex(3).upper()
+        if candidate != before:
+            return candidate
+
+
+def _generate_hostname(before: str) -> str:
+    while True:
+        candidate = "android-" + secrets.token_hex(6)
+        if candidate != before:
+            return candidate
+
+
+def _verify_regeneration_target_state(
+    manager: RuntimeManager,
+    identity_store: DeviceIdentityStore,
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fail-closed live read-back of every regenerated factor."""
+    before = state["before"]
+    target = state["target"]
+    identity = identity_store.load()
+    if (
+        identity is None
+        or stable_identity_digest(identity["stable"]) != target["stableDigest"]
+    ):
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "stable identity does not match the regeneration target",
+        )
+    stable = identity["stable"]
+    live = {
+        "android_id": _regeneration_shell_read(manager, "settings get secure android_id"),
+        "serial": _regeneration_shell_read(manager, "getprop ro.serialno"),
+        "boot_serial": _regeneration_shell_read(manager, "getprop ro.boot.serialno"),
+        "imei": _regeneration_shell_read(manager, "getprop persist.xenoid.radio.imei"),
+        "imeisv": _regeneration_shell_read(manager, "getprop persist.xenoid.radio.imeisv"),
+        "boot_id": _regeneration_shell_read(
+            manager, "cat /proc/sys/kernel/random/boot_id"
+        ),
+        "device_name": _regeneration_shell_read(manager, "settings get global device_name"),
+        "bluetooth": _regeneration_shell_read(manager, "settings get secure bluetooth_address"),
+        "hostname": _regeneration_shell_read(manager, "getprop net.hostname"),
+        "statfs_fsid": _regeneration_shell_read(
+            manager, "cat /data/local/tmp/xenoid-profile/statfs_fsid 2>/dev/null || true"
+        ),
+        "drm_device_unique_id": _regeneration_shell_read(
+            manager, "cat /data/local/tmp/xenoid-profile/drm_device_unique_id 2>/dev/null || true"
+        ),
+        "ssaid_present": _regeneration_shell_read(
+            manager, "test -f /data/system/users/0/settings_ssaid.xml && echo 1 || echo 0"
+        ),
+    }
+    statfs_status = manager.shared_protection_status().get("statfsFsid")
+    if (
+        not isinstance(statfs_status, Mapping)
+        or statfs_status.get("ok") is not True
+        or statfs_status.get("running") is not True
+        or statfs_status.get("published") is not True
+        or statfs_status.get("staged") != target["statfsFsid"]
+        or statfs_status.get("kernel") != target["statfsFsid"]
+    ):
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "kernel statfs FSID diverges from the regeneration target",
+        )
+    expected = {
+        "android_id": stable["androidId"],
+        "serial": stable["serial"],
+        "boot_serial": stable["serial"],
+        "imei": stable["imei"],
+        "imeisv": stable["imeisv"],
+        "boot_id": target["bootId"],
+        "device_name": target["deviceName"],
+        "bluetooth": target["bluetoothAddress"],
+        "hostname": target["hostname"],
+        "statfs_fsid": target["statfsFsid"],
+        "drm_device_unique_id": target["drmDeviceUniqueId"],
+    }
+    diverged = [key for key, value in expected.items() if live[key] != value]
+    if diverged:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "regenerated identity diverges from its fixed target: " + ", ".join(sorted(diverged)),
+        )
+    if live["ssaid_present"] not in {"0", "1"}:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "per-app SSAID state is unreadable after regeneration",
+        )
+    snapshot = manager.regeneration_snapshot()
+    if (
+        snapshot.get("containerId") != state["before"]["containerId"]
+        or snapshot.get("containerEpoch") != state["before"]["containerEpoch"]
+        or snapshot.get("imageId") != state["before"]["imageId"]
+        or snapshot.get("imageInputSha256")
+        != state["before"]["imageInputSha256"]
+        or snapshot.get("imageBootInputSha256")
+        != state["before"]["imageBootInputSha256"]
+    ):
+        raise IdentityError(
+            "device_regeneration_container_changed",
+            "regeneration runtime no longer matches its journal",
+        )
+    if snapshot["runtimeEpoch"] == before["runtimeEpoch"]:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "runtime epoch did not change across the soft reboot",
+        )
+    if (
+        snapshot["simEpoch"] != target["simEpoch"]
+        or snapshot["locationDigest"] != target["locationProfileDigest"]
+        or snapshot["googleBindingDigest"] != target["googleBindingDigest"]
+    ):
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "SIM, location, or Google binding state diverges from the fixed target",
+        )
+    google_identity = _regeneration_google_identity(
+        manager,
+        state,
+        activate=False,
+    )
+    if google_identity.get("ok") is not True:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "app-visible Google identity diverges from the regenerated target",
+        )
+    return {"snapshot": snapshot, "googleIdentity": google_identity}
+
+
+def _regeneration_base_profile(
+    manager: RuntimeManager,
+    client: Any,
+) -> dict[str, Any]:
+    """Load the instance's fingerprint profile exactly as identity convergence does."""
+    dumped = client.profile_helper_dump()
+    raw = dumped.get("stdout") if isinstance(dumped, dict) else None
+    profile: Any = None
+    if isinstance(raw, str) and 0 < len(raw.encode("utf-8")) <= 256 * 1024:
+        try:
+            profile = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError):
+            profile = None
+    if not isinstance(profile, dict) or profile.get("schema") != "dev.xenoid.fingerprint/v1":
+        canonical = (
+            manager.context.project_root
+            / "examples"
+            / "fingerprints"
+            / "pixel-raven-android13.json"
+        )
+        try:
+            info = canonical.lstat()
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 256 * 1024:
+                raise OSError("canonical device profile is unsafe")
+            profile = json.loads(canonical.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise IdentityError(
+                "device_profile_required",
+                "identity regeneration requires the canonical Raven profile",
+            ) from exc
+    if not isinstance(profile, dict) or profile.get("schema") != "dev.xenoid.fingerprint/v1":
+        raise IdentityError(
+            "device_profile_required",
+            "identity regeneration requires the canonical Raven profile",
+        )
+    return profile
+
+def _stage_regeneration_drm(
+    manager: RuntimeManager,
+    device_unique_id: str,
+) -> dict[str, Any]:
+    return manager.stage_drm_identity(device_unique_id)
+
+
+def _rehydrate_regeneration_target(
+    manager: RuntimeManager,
+    client: Any,
+    identity_store: DeviceIdentityStore,
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    target = state["target"]
+    if _regeneration_phase_at_least(state, "props_committed"):
+        identity = identity_store.load()
+        if not isinstance(identity, Mapping):
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        boot = identity.get("pending") or identity.get("active")
+        if not isinstance(boot, Mapping):
+            return {"ok": False, "error": "device_regeneration_state_invalid"}
+        profile = _regeneration_base_profile(manager, client)
+        effective = materialize_profile(profile, identity, boot)
+        applied = client.apply_fingerprint(effective, regenerate_unique=False)
+        if not isinstance(applied, Mapping) or applied.get("ok") is not True:
+            return {"ok": False, "error": "device_identity_apply_failed"}
+        drm = _stage_regeneration_drm(manager, str(target["drmDeviceUniqueId"]))
+        if drm.get("ok") is not True:
+            return {"ok": False, "error": "drm_identity_stage_failed"}
+        hostname = client.set_fingerprint_field("net.hostname", target["hostname"])
+        if not isinstance(hostname, Mapping) or hostname.get("ok") is not True:
+            return {"ok": False, "error": "profile_field_apply_failed", "field": "net.hostname"}
+        hidden = client.hide_apply()
+        if not isinstance(hidden, Mapping) or hidden.get("ok") is not True:
+            return {"ok": False, "error": "hide_apply_failed"}
+    if _regeneration_phase_at_least(state, "settings_committed"):
+        for field, value in (
+            ("device_name", target["deviceName"]),
+            ("bluetooth_address", target["bluetoothAddress"]),
+        ):
+            applied = client.set_fingerprint_field(field, value)
+            if not isinstance(applied, Mapping) or applied.get("ok") is not True:
+                return {"ok": False, "error": "profile_field_apply_failed", "field": field}
+    if _regeneration_phase_at_least(state, "storage_identity_committed"):
+        fsid = manager.shared_protection_manager().set_statfs_fsid(
+            str(target["statfsFsid"])
+        )
+        if fsid.get("ok") is not True:
+            return {
+                "ok": False,
+                "error": str(fsid.get("error") or "statfs_fsid_param_failed"),
+            }
+    return {"ok": True}
+
+
+
+def _regeneration_google_preflight(
+    manager: RuntimeManager,
+    transaction_id: str,
+) -> dict[str, Any]:
+    """Deterministic host-only Google gate, safe to run before journaling.
+
+    Only local state is consulted: the configured provider, the committed
+    runtime binding's compatibility with the current spec, and the derived
+    GSF target. Runtime health is proven separately by the verified no-op
+    convergence plan and by the post-journal ``reconcile_google`` pass, so
+    this preflight never calls a runtime status path that could repair or
+    rekey Google identity before the journal owns the fixed targets.
+    """
+    provider = manager.cfg.google_services_provider
+    if provider == PROVIDER_NONE:
+        return {"ok": True, "skipped": True}
+    if provider != PROVIDER_MICROG:
+        return {"ok": False, "error": "google_identity_rotation_unsupported"}
+    binding_store = GoogleBindingStore(manager.context, manager.lease)
+    try:
+        binding = binding_store.load()
+        if binding is None or binding.get("state") != "committed":
+            raise GoogleServicesError(
+                "google_services_runtime_not_ready",
+                "Google runtime binding is not committed",
+            )
+        spec = resolve_google_runtime_spec(
+            manager.context,
+            manager.cfg,
+            "device-regeneration-preflight",
+            require_assets=False,
+        )
+        if not binding_matches(binding, spec):
+            raise GoogleServicesError(
+                "google_services_new_instance_required",
+                "Google runtime binding does not match the configured spec",
+            )
+        binding_store.regeneration_gsf_android_id(transaction_id)
+    except GoogleServicesError as exc:
+        return {"ok": False, "error": exc.code}
+    return {"ok": True}
+
+
+def _regeneration_google_identity(
     manager: RuntimeManager,
     state: Mapping[str, Any],
     *,
-    mode: str,
+    activate: bool,
 ) -> dict[str, Any]:
-    context = manager.acceptance_context()
-    expected = dict(context.get("expected") or {})
-    target = state["target"]
-    expected.update(
-        {
-            "dataUuid": target["dataFilesystemUuid"],
-            "rootfsUuid": target["rootfsFilesystemUuid"],
-            **(
-                {}
-                if state.get("legacyEvidenceSha256") is not None
-                else {"proxyGeneration": target["proxyGeneration"]}
+    provider = manager.cfg.google_services_provider
+    if provider == PROVIDER_NONE:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "google_services_disabled",
+        }
+    if provider != PROVIDER_MICROG:
+        return {
+            "ok": False,
+            "error": "google_identity_rotation_unsupported",
+        }
+    try:
+        gsf_android_id = GoogleBindingStore(
+            manager.context,
+            manager.lease,
+        ).regeneration_gsf_android_id(str(state["transactionId"]))
+    except GoogleServicesError as exc:
+        return {"ok": False, "error": exc.code}
+    expected_gsf_digest = hashlib.sha256(
+        gsf_android_id.encode("ascii")
+    ).hexdigest()
+    empty_advertising_digest = hashlib.sha256(
+        b"00000000-0000-0000-0000-000000000000"
+    ).hexdigest()
+    client = manager.daemon_client(timeout=30.0)
+    before = state["before"]
+
+    def verified(value: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(value, dict) or value.get("ok") is not True:
+            return None
+        advertising_digest = value.get("advertisingIdSha256")
+        gsf_digest = value.get("gsfAndroidIdSha256")
+        if (
+            not isinstance(advertising_digest, str)
+            or not isinstance(gsf_digest, str)
+            or gsf_digest != expected_gsf_digest
+            or advertising_digest == empty_advertising_digest
+            or advertising_digest == before["advertisingIdDigest"]
+            or gsf_digest == before["gsfAndroidIdDigest"]
+        ):
+            return None
+        return {
+            "ok": True,
+            "provider": PROVIDER_MICROG,
+            "rotated": True,
+            "advertisingIdSha256": advertising_digest,
+            "gsfAndroidIdSha256": gsf_digest,
+        }
+
+    def accepted(value: Any) -> Optional[dict[str, Any]]:
+        candidate = verified(value)
+        if candidate is None:
+            return None
+        # Digests alone do not prove durability: a seed that crashed between
+        # the provider write and the marker publication reads back matching
+        # but is one GMS restart away from reverting, and a stale nonempty
+        # marker passes a bare existence check. Accept only on the daemon's
+        # strict offlineSeeded proof (marker file hygiene plus marker GSF ==
+        # provider GSF); otherwise the caller runs the idempotent activate,
+        # which always republishes the marker.
+        if value.get("offlineSeeded") is not True:
+            return None
+        return candidate
+
+    if activate:
+        current = client.google_identity_inspect(timeout=60.0)
+        current_accepted = accepted(current)
+        if current_accepted is not None:
+            result = client.google_identity_status(timeout=60.0)
+        else:
+            result = client.google_identity_activate(gsf_android_id, timeout=60.0)
+    else:
+        result = client.google_identity_inspect(timeout=60.0)
+    final = accepted(result)
+    if final is not None:
+        return final
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return {
+            "ok": False,
+            "error": str(
+                result.get("error") if isinstance(result, dict) else None
+                or "google_identity_rotation_failed"
             ),
         }
-    )
-    return LiveAcceptance().observe(
-        context,
-        expected,
-        mode,
-        time.monotonic() + 300.0,
-        _write_up_progress,
-    )
-
-
-def _wipe_regeneration_google_packages(
-    manager: RuntimeManager,
-    journal: RegenerationJournal,
-    capability: Mapping[str, str],
-) -> dict[str, Any]:
-    while True:
-        state = journal.load()
-        if state is None:
-            return {"ok": False, "error": "device_regeneration_state_invalid"}
-        cleared = list(state["googleClearedPackages"])
-        if len(cleared) == len(GOOGLE_CLEAR_PACKAGES):
-            return {"ok": True, "cleared": cleared}
-        package = GOOGLE_CLEAR_PACKAGES[len(cleared)]
-        if state["googleActivePackage"] is None:
-            state = journal.advance(
-                "google_wiping",
-                googleActivePackage=package,
-                googleMarkerRoots=[],
-                googlePackageArmed=False,
-            )
-        if state["googleActivePackage"] != package:
-            return {"ok": False, "error": "device_regeneration_state_invalid"}
-        if state["googlePackageArmed"] is not True:
-            armed = manager.prepare_google_package_clear(
-                package,
-                str(state["transactionId"]),
-                capability,
-            )
-            if armed.get("ok") is not True:
-                return armed
-            state = journal.advance(
-                "google_wiping",
-                googleMarkerRoots=list(armed.get("roots") or []),
-                googlePackageArmed=True,
-            )
-        else:
-            stopped = manager.adb(
-                ["shell", "am", "force-stop", package],
-                timeout=30,
-            )
-            if stopped.get("ok") is not True:
-                return {
-                    "ok": False,
-                    "error": "google_package_force_stop_failed",
-                }
-        roots = list(state["googleMarkerRoots"])
-        markers = manager.google_package_markers(
-            package,
-            str(state["transactionId"]),
-            roots,
-            capability,
-        )
-        if markers.get("ok") is not True:
-            return markers
-        present = list(markers.get("present") or [])
-        if present or not roots:
-            cleared_result = manager.clear_google_package(
-                package,
-                str(state["transactionId"]),
-                capability,
-            )
-            if cleared_result.get("ok") is not True:
-                return cleared_result
-            markers = manager.google_package_markers(
-                package,
-                str(state["transactionId"]),
-                roots,
-                capability,
-            )
-            if markers.get("ok") is not True:
-                return markers
-            if markers.get("present"):
-                return {
-                    "ok": False,
-                    "error": "google_package_clear_unverified",
-                }
-        journal.advance(
-            "google_wiping",
-            googleClearedPackages=[*cleared, package],
-            googleActivePackage=None,
-            googleMarkerRoots=[],
-            googlePackageArmed=False,
-        )
-
-
-def _restart_legacy_regeneration(
-    args: argparse.Namespace,
-    manager: RuntimeManager,
-    identity_store: DeviceIdentityStore,
-    journal: RegenerationJournal,
-) -> dict[str, Any]:
-    try:
-        existing = journal.load()
-    except IdentityError as exc:
-        if exc.code != "device_regeneration_legacy_pending":
-            raise
-        existing = None
-    if existing is not None:
-        if existing.get("legacyEvidenceSha256") is None:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "active regeneration is not a legacy restart",
-            )
-        return journal.finish_legacy_evidence()
-    try:
-        legacy_digest = journal.legacy_source_digest()
-    except FileNotFoundError as exc:
-        raise IdentityError(
-            "device_regeneration_state_invalid",
-            "legacy regeneration journal is missing",
-        ) from exc
-    identity = identity_store.load()
-    if identity is None:
-        identity = identity_store.initialize()
-    if identity.get("pendingStable") is not None:
-        identity_store.recover_orphaned_regeneration_stable()
-    legacy_storage = manager.complete_legacy_pending_storage(legacy_digest)
-    if legacy_storage.get("ok") is not True:
-        raise IdentityError(
-            str(
-                legacy_storage.get("error")
-                or "storage_v4_migration_failed"
-            ),
-            "legacy storage completion failed",
-        )
-    compatibility_executor = ConvergenceExecutor(manager)
-    compatibility_state = compatibility_executor.journal.load()
-    retained_transaction = (
-        compatibility_state.get("regenerationTransactionId")
-        if isinstance(compatibility_state, Mapping)
-        else None
-    )
-    transaction_id = (
-        str(retained_transaction)
-        if isinstance(retained_transaction, str)
-        else secrets.token_hex(16)
-    )
-    sim_epoch = hashlib.sha256(
-        b"xenoid-legacy-location-sim/v1\0"
-        + transaction_id.encode("ascii")
-    ).hexdigest()[:32]
-    def run_compatibility() -> None:
-        compatibility = compatibility_executor.run(
-            progress=_write_up_progress,
-            skip_build=bool(getattr(args, "skip_build", False)),
-            regeneration_capability={
-                "transactionId": transaction_id,
-                "legacyEvidenceSha256": legacy_digest,
-            },
-            retain_accepted_journal=True,
-        )
-        if compatibility.get("ok") is not True:
-            raise IdentityError(
-                str(
-                    compatibility.get("error")
-                    or "legacy_proxy_compatibility_failed"
-                ),
-                "legacy proxy compatibility convergence failed",
-            )
-
-    if isinstance(compatibility_state, Mapping):
-        if (
-            compatibility_state.get("operationId") != legacy_digest[:32]
-            or compatibility_state.get("regenerationTransactionId")
-            != transaction_id
-        ):
-            raise IdentityError(
-                "convergence_state_conflict",
-                "legacy compatibility journal identity mismatch",
-            )
-    else:
-        skip_build = bool(getattr(args, "skip_build", False))
-        plan = compatibility_executor.planner.inspect(skip_build=skip_build)
-        if plan.resolution == "requires-artifacts":
-            if skip_build:
-                raise IdentityError(
-                    "artifact_records_stale",
-                    "legacy compatibility artifacts are unavailable",
-                )
-            builder = compatibility_executor.artifact_builder
-            if builder is None:
-                raise IdentityError(
-                    "artifact_builder_unavailable",
-                    "legacy compatibility artifact builder is unavailable",
-                )
-            remaining = bounded_timeout(_UP_TIMEOUT_SECONDS)
-            artifact_deadline = time.monotonic() + (
-                float(remaining)
-                if remaining is not None
-                else _UP_TIMEOUT_SECONDS
-            )
-            built = builder.ensure(
-                plan.artifact_targets,
-                force=False,
-                deadline=artifact_deadline,
-            )
-            if not isinstance(built, Mapping) or built.get("ok") is not True:
-                raise IdentityError(
-                    "artifact_ensure_failed",
-                    "legacy compatibility artifacts failed",
-                )
-            plan = compatibility_executor.planner.inspect(skip_build=True)
-        if plan.resolution != "complete":
-            raise IdentityError(
-                "artifact_resolution_incomplete",
-                "legacy compatibility plan is unresolved",
-            )
-        location_store = LocationStateStore(args.context.state_root)
-        missing_location = location_store.load() is None
-        if missing_location:
-            plan = dataclasses.replace(
-                plan,
-                image_action="ensure-desired",
-                boot_seed_action="initialize_replace",
-                location_action="converge",
-                live_observation_required=True,
-                recreate_reasons=tuple(
-                    {
-                        *plan.recreate_reasons,
-                        "legacy_location_seed",
-                    }
-                ),
-                plan_digest="",
-            )
-        observation = manager.observe_convergence(skip_build=True)
-        runtime_observation = observation.get("runtime")
-        if not isinstance(runtime_observation, Mapping):
-            raise IdentityError(
-                "convergence_observation_invalid",
-                "legacy compatibility runtime observation is invalid",
-            )
-        boot_seed_target = None
-        if plan.boot_seed_action == "initialize_replace":
-            data_uuid = runtime_observation.get("dataUuid")
-            rootfs_uuid = runtime_observation.get("rootfsUuid")
-            if not isinstance(data_uuid, str) or not isinstance(
-                rootfs_uuid,
-                str,
-            ):
-                raise IdentityError(
-                    "storage_identity_mismatch",
-                    "legacy compatibility storage pins are unavailable",
-                )
-            boot_seed_target = {
-                "transactionId": secrets.token_hex(16),
-                "dataUuid": data_uuid,
-                "rootfsUuid": rootfs_uuid,
-            }
-        compatibility_executor.journal.create(
-            plan,
-            operation_id=legacy_digest[:32],
-            regeneration_transaction_id=transaction_id,
-            observation=observation,
-            boot_seed_target=boot_seed_target,
-        )
-        compatibility_state = compatibility_executor.journal.load()
-    location_store = LocationStateStore(args.context.state_root)
-    if location_store.load() is None:
-        location_target = missing_regeneration_target(
-            args.context.instance_id,
-            transaction_id,
-            sim_epoch,
-        )
-        location_store.initialize_regeneration_target(
-            args.context.instance_id,
-            transaction_id,
-            sim_epoch,
-            location_target["profileDigest"],
-        )
-    run_compatibility()
-    compatibility_state = compatibility_executor.journal.load()
-    if (
-        not isinstance(compatibility_state, Mapping)
-        or compatibility_state.get("phase") != "accepted"
-    ):
-        raise IdentityError(
-            "legacy_proxy_compatibility_failed",
-            "legacy compatibility acceptance is not durable",
-        )
-    before = manager.regeneration_snapshot()
-    network_epoch = secrets.token_hex(16)
-    while network_epoch == before["networkEpoch"]:
-        network_epoch = secrets.token_hex(16)
-    if sim_epoch == before["simEpoch"]:
-        raise IdentityError(
-            "device_regeneration_state_invalid",
-            "derived legacy SIM target matches current epoch",
-        )
-    storage_transaction = secrets.token_hex(16)
-    data_uuid = storage_rotation_target(storage_transaction)
-    rootfs_uuid = storage_rotation_target(storage_transaction, rootfs=True)
-    while (
-        data_uuid == before["dataFilesystemUuid"]
-        or rootfs_uuid == before["rootfsFilesystemUuid"]
-    ):
-        storage_transaction = secrets.token_hex(16)
-        data_uuid = storage_rotation_target(storage_transaction)
-        rootfs_uuid = storage_rotation_target(storage_transaction, rootfs=True)
-    identity = identity_store.prepare_regeneration_stable(transaction_id)
-    pending = identity["pendingStable"]
-    if not isinstance(pending, Mapping):
-        raise IdentityError(
-            "device_regeneration_state_invalid",
-            "stable regeneration target was not persisted",
-        )
-    location_store = LocationStateStore(args.context.state_root)
-    location_target = (
-        missing_regeneration_target(
-            args.context.instance_id,
-            transaction_id,
-            sim_epoch,
-        )
-        if location_store.load() is None
-        else location_store.regeneration_target(sim_epoch)
-    )
-    target = {
-        "stableDigest": pending["digest"],
-        "networkEpoch": network_epoch,
-        "simEpoch": sim_epoch,
-        "storageTransactionId": storage_transaction,
-        "dataFilesystemUuid": data_uuid,
-        "rootfsFilesystemUuid": rootfs_uuid,
-        "locationProfileDigest": location_target["profileDigest"],
-        "proxyGeneration": before["proxyGeneration"],
-        "googleBindingDigest": before["googleBindingDigest"],
+    return {
+        "ok": False,
+        "error": "google_identity_rotation_unverified",
     }
-    state = journal.prepare(
-        transaction_id,
-        before,
-        target,
-        legacy_evidence_sha256=legacy_digest,
-        legacy_restart=True,
+
+
+
+def _regeneration_plan_is_runtime_only(plan: ConvergencePlan) -> bool:
+    """A fresh regeneration may inspect/accept, but must not converge state."""
+    return (
+        plan.resolution == "complete"
+        and plan.image_action == "reuse-selected"
+        and plan.runtime_action == "reuse"
+        and plan.boot_seed_action == "none"
+        and plan.daemon_action == "reuse"
+        and not plan.deploy_components
+        and plan.identity_action == "reuse"
+        and plan.location_action == "reuse"
+        and plan.proxy_action == "reuse"
+        and plan.keybox_action == "reuse"
+        and plan.camera_action == "reuse"
+        and plan.google_action == "reuse"
+        and plan.protection_action == "reuse"
     )
-    finished = journal.finish_legacy_evidence()
-    if finished.get("transactionId") != state["transactionId"]:
-        raise IdentityError(
-            "device_regeneration_state_invalid",
-            "legacy evidence publication did not preserve regeneration",
+
+
+def _regeneration_runtime_preflight(manager: RuntimeManager) -> dict[str, Any]:
+    """Prove the checkout and live runtime are converged before journaling.
+
+    Strictly observational: the only executor call is a dry-run inspection,
+    and acceptance is the verified runtime-only no-op plan itself. The plan
+    is never executed — there is no accept run and no auto follow-up, so a
+    fresh regeneration cannot mutate runtime, journal, or identity state
+    before ``RegenerationJournal.prepare`` owns the fixed targets.
+    """
+    executor = ConvergenceExecutor(manager)
+    inspected = executor.run(skip_build=True, dry_run=True)
+    raw_plan = inspected.get("plan") if isinstance(inspected, Mapping) else None
+    try:
+        plan = (
+            ConvergencePlan.from_dict(raw_plan)
+            if isinstance(raw_plan, Mapping)
+            else None
         )
-    if compatibility_executor.journal.exists():
-        retained = compatibility_executor.journal.load()
-        if (
-            retained is None
-            or retained.get("phase") != "accepted"
-            or retained.get("regenerationTransactionId") != transaction_id
-        ):
-            raise IdentityError(
-                "convergence_state_conflict",
-                "legacy compatibility journal is not accepted",
+    except Exception:
+        plan = None
+    if (
+        not isinstance(inspected, dict)
+        or inspected.get("ok") is not True
+        or inspected.get("dryRun") is not True
+        or plan is None
+        or inspected.get("initialPlanDigest") != plan.plan_digest
+        or not _regeneration_plan_is_runtime_only(plan)
+    ):
+        return {
+            "ok": False,
+            "error": "device_regeneration_runtime_not_converged",
+            "convergence": inspected,
+        }
+    return {"ok": True, "convergence": inspected}
+
+
+def _regeneration_preflight_failure(
+    error: str,
+    **details: Any,
+) -> dict[str, Any]:
+    """Canonical v3 failure before any journal exists.
+
+    ``phase`` is the external ``preflight`` marker, never a journal phase:
+    no transaction was prepared, so nothing can be resumed.
+    """
+    return {
+        "schema": "dev.xenoid.device-regenerate/v3",
+        "ok": False,
+        "resumed": False,
+        "phase": "preflight",
+        "runtimeOnly": True,
+        "containerRecreated": False,
+        "error": error,
+        **details,
+    }
+
+
+def _regeneration_exception_result(context: Any, exc: Exception) -> dict[str, Any]:
+    """Canonical v3 failure envelope for an interrupted execution.
+
+    When a journal exists its transaction and live phase identify the
+    resumable attempt; before journaling the failure is a preflight-class
+    result with ``resumed`` false. Raw target values stay journal-private
+    either way.
+    """
+    result: dict[str, Any] = {
+        "schema": "dev.xenoid.device-regenerate/v3",
+        "ok": False,
+        "runtimeOnly": True,
+        "containerRecreated": False,
+        "error": getattr(exc, "code", "device_regeneration_state_invalid"),
+    }
+    try:
+        state = RegenerationJournal(context).load()
+    except IdentityError:
+        state = None
+    if state is None:
+        result["resumed"] = False
+        result["phase"] = "preflight"
+    else:
+        result["resumed"] = True
+        result["transactionId"] = state["transactionId"]
+        result["phase"] = state["phase"]
+    return result
+
+
+def _regeneration_google_runtime_postcondition(
+    manager: RuntimeManager,
+) -> dict[str, Any]:
+    """Require a ready Google runtime with a durable offline-seeded identity.
+
+    ``reconcile_google("reuse")`` proves readiness; the mode check proves the
+    seeded-identity marker survived, which ``ok`` alone does not cover.
+    """
+    google_runtime = manager.reconcile_google("reuse")
+    if not isinstance(google_runtime, dict) or google_runtime.get("ok") is not True:
+        return {
+            "ok": False,
+            "error": str(
+                google_runtime.get("error")
+                if isinstance(google_runtime, Mapping)
+                else None
             )
-        compatibility_executor.journal.clear()
-    return finished
+            or "google_services_runtime_not_ready",
+            "googleRuntime": google_runtime,
+        }
+    if (
+        manager.cfg.google_services_provider == PROVIDER_MICROG
+        and google_runtime.get("googleIdentityMode") != "offline-seeded"
+    ):
+        return {
+            "ok": False,
+            "error": "google_identity_not_offline_seeded",
+            "googleRuntime": google_runtime,
+        }
+    return {"ok": True, "googleRuntime": google_runtime}
+
+def _regeneration_dry_run_result(
+    state: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    phase = str(state["phase"]) if state is not None else None
+    completed = REGENERATION_PHASES.index(phase) if phase is not None else -1
+    return {
+        "schema": "dev.xenoid.device-regenerate/v3",
+        "ok": True,
+        "dryRun": True,
+        "resumed": state is not None,
+        "phase": phase,
+        "runtimeOnly": True,
+        "containerRecreated": False,
+        "actions": list(REGENERATION_PHASES[completed + 1 :]),
+    }
+
+
+def _regeneration_success_result(
+    state: Mapping[str, Any],
+    *,
+    resumed: bool,
+    cleaned: bool = False,
+    google_identity: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    regeneration = {
+        "schema": "dev.xenoid.device-regenerate/v3",
+        "transactionId": state["transactionId"],
+        "resumed": resumed,
+        "phase": "committed",
+        "runtimeOnly": True,
+        "containerRecreated": False,
+        **({"cleaned": True} if cleaned else {}),
+        **(
+            {"googleIdentity": dict(google_identity)}
+            if isinstance(google_identity, Mapping)
+            else {}
+        ),
+    }
+    return {**regeneration, "ok": True, "regeneration": regeneration}
 
 
 def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
@@ -2981,99 +3139,165 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
     identity_store = DeviceIdentityStore(context)
     journal = RegenerationJournal(context)
     manager = runtime(args)
-    state = (
-        _restart_legacy_regeneration(
-            args,
-            manager,
-            identity_store,
-            journal,
-        )
-        if bool(getattr(args, "restart_legacy_transaction", False))
-        else journal.load()
-    )
-    if state is not None and state.get("legacyEvidenceSha256") is not None:
-        state = journal.finish_legacy_evidence()
+    state = journal.load()
     resumed = state is not None
+    if state is not None:
+        engine = manager.ensure_engine_started()
+        if engine.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(engine.get("error") or "engine_unavailable"),
+                engine=engine,
+            )
+        pinned = state["before"]
+        # An engine/VM reboot unloads the kmod and eBPF; restore the exact
+        # journal-pinned protection deployment while no runtime is active,
+        # before starting the pinned container. A checkout change during the
+        # pending transaction fails closed as inputs-changed.
+        protection = manager.maintain_shared_protection(
+            expected_digest=str(pinned["protectionExpectedDigest"])
+        )
+        if protection.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    protection.get("error") or "shared_protection_not_ready"
+                ),
+                protection=protection,
+            )
+        resumed_runtime = manager.ensure_regeneration_runtime(
+            str(pinned["containerId"]),
+            str(pinned["containerEpoch"]),
+            str(pinned["imageId"]),
+            str(pinned["imageInputSha256"]),
+            str(pinned["imageBootInputSha256"]),
+        )
+        if resumed_runtime.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    resumed_runtime.get("error")
+                    or "device_regeneration_runtime_unavailable"
+                ),
+                runtime=resumed_runtime,
+            )
+        # A stopped container restarts without rootd or any reconciled
+        # control-plane component; re-provision before rehydration calls
+        # reach them, then re-run the single-user guard before mutating.
+        bootstrap = manager.reconcile_bootstrap()
+        if bootstrap.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    bootstrap.get("error") or "bootstrap_reconcile_failed"
+                ),
+                bootstrap=bootstrap,
+            )
+        manager.assert_regeneration_single_user()
     if state is None:
         identity = identity_store.load()
-        if identity is None:
-            identity = identity_store.initialize()
-        if identity.get("pendingStable") is not None:
-            identity_store.recover_orphaned_regeneration_stable()
-        before = manager.regeneration_snapshot()
         transaction_id = secrets.token_hex(16)
-        network_epoch = secrets.token_hex(16)
-        while network_epoch == before["networkEpoch"]:
-            network_epoch = secrets.token_hex(16)
+        # Deterministic host-only gates run before anything can mutate: the
+        # Google provider/binding preflight reads only local state, and the
+        # runtime preflight accepts only a verified no-op dry-run plan.
+        google_preflight = _regeneration_google_preflight(manager, transaction_id)
+        if google_preflight.get("ok") is not True:
+            return _regeneration_preflight_failure(
+                str(
+                    google_preflight.get("error")
+                    or "google_identity_rotation_unsupported"
+                ),
+            )
+        runtime_preflight = _regeneration_runtime_preflight(manager)
+        if runtime_preflight.get("ok") is not True:
+            return _regeneration_preflight_failure(
+                str(
+                    runtime_preflight.get("error")
+                    or "device_regeneration_runtime_not_converged"
+                ),
+                convergence=runtime_preflight.get("convergence"),
+            )
+        if identity is None:
+            # Structural invariant: a verified no-op preflight means the
+            # identity component is converged, hence initialized. Never
+            # create identity state outside the journal transaction.
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "device identity must be initialized before regeneration",
+            )
+        before = manager.regeneration_snapshot()
         sim_epoch = secrets.token_hex(16)
         while sim_epoch == before["simEpoch"]:
             sim_epoch = secrets.token_hex(16)
-        storage_transaction = secrets.token_hex(16)
-        data_uuid = storage_rotation_target(storage_transaction)
-        rootfs_uuid = storage_rotation_target(
-            storage_transaction,
-            rootfs=True,
-        )
-        while (
-            data_uuid == before["dataFilesystemUuid"]
-            or rootfs_uuid == before["rootfsFilesystemUuid"]
-        ):
-            storage_transaction = secrets.token_hex(16)
-            data_uuid = storage_rotation_target(storage_transaction)
-            rootfs_uuid = storage_rotation_target(
-                storage_transaction,
-                rootfs=True,
-            )
-        pending_identity = identity_store.prepare_regeneration_stable(
-            transaction_id
-        )
-        pending_stable = pending_identity["pendingStable"]
-        if not isinstance(pending_stable, Mapping):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "stable regeneration target was not persisted",
-            )
+        statfs_fsid = secrets.token_hex(8)
+        while statfs_fsid == before["statfsFsid"] or int(statfs_fsid, 16) == 0:
+            statfs_fsid = secrets.token_hex(8)
+        drm_id = secrets.token_hex(16)
+        while drm_id == before["drmDeviceUniqueId"]:
+            drm_id = secrets.token_hex(16)
         location_target = LocationStateStore(
             context.state_root
         ).regeneration_target(sim_epoch)
+        stable_target = generate_stable_target(identity["stable"])
         target = {
-            "stableDigest": pending_stable["digest"],
-            "networkEpoch": network_epoch,
+            "stableDigest": stable_identity_digest(stable_target),
+            "stable": stable_target,
             "simEpoch": sim_epoch,
-            "storageTransactionId": storage_transaction,
-            "dataFilesystemUuid": data_uuid,
-            "rootfsFilesystemUuid": rootfs_uuid,
             "locationProfileDigest": location_target["profileDigest"],
-            "proxyGeneration": before["proxyGeneration"],
+            "bootId": generate_boot_id(),
+            "statfsFsid": statfs_fsid,
+            "bluetoothAddress": _generate_bluetooth_address(before["bluetoothAddress"]),
+            "deviceName": _generate_device_name(before["deviceName"]),
+            "hostname": _generate_hostname(before["hostname"]),
             "googleBindingDigest": before["googleBindingDigest"],
+            "drmDeviceUniqueId": drm_id,
         }
-        state = journal.prepare(
-            transaction_id,
-            before,
-            target,
-        )
+        # The journal owns every fixed target before any identity store
+        state = journal.prepare(transaction_id, before, target)
     else:
         pending = identity_store.load()
-        pending_stable = pending.get("pendingStable") if isinstance(pending, Mapping) else None
+        pending_stable = (
+            pending.get("pendingStable") if isinstance(pending, Mapping) else None
+        )
         mismatch = (
             isinstance(pending_stable, Mapping)
             and (
                 pending_stable.get("transactionId") != state["transactionId"]
-                or pending_stable.get("digest")
-                != state["target"]["stableDigest"]
+                or pending_stable.get("digest") != state["target"]["stableDigest"]
             )
         )
         if (
-            state["phase"] != "committed"
-            and (not isinstance(pending_stable, Mapping) or mismatch)
-            or state["phase"] == "committed"
-            and mismatch
+            mismatch and state["phase"] != "prepared"
+            or not isinstance(pending_stable, Mapping)
+            and state["phase"] not in {"prepared", "committed"}
         ):
             raise IdentityError(
                 "device_regeneration_state_invalid",
                 "regeneration journal and stable target disagree",
             )
-    capability = {"transactionId": str(state["transactionId"])}
+    client = manager.daemon_client(timeout=30.0)
+    if resumed:
+        rehydrated = _rehydrate_regeneration_target(
+            manager,
+            client,
+            identity_store,
+            state,
+        )
+        if rehydrated.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    rehydrated.get("error")
+                    or "device_regeneration_rehydrate_failed"
+                ),
+                rehydrate=rehydrated,
+            )
+
     if state["phase"] == "committed":
         current_identity = identity_store.load()
         if (
@@ -3085,198 +3309,108 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
                 "device_regeneration_state_invalid",
                 "committed regeneration stable identity does not match target",
             )
-        if isinstance(pending_stable, Mapping):
-            identity_store.clear_regeneration_stable(state["transactionId"])
-        journal.clear()
-        return _regeneration_result(
+        # The committed marker is only a crash-resume hint: re-prove the live
+        # surfaces and the Google postconditions before clearing anything.
+        google_identity = _regeneration_google_identity(
+            manager,
             state,
-            ok=True,
-            resumed=True,
-            cleaned=True,
-            legacyRestart=state.get("legacyEvidenceSha256") is not None,
-            factorsMayRotateAgain=state.get("legacyEvidenceSha256") is not None,
+            activate=False,
         )
-    if not _regeneration_phase_at_least(state, "proxy_quarantined"):
-        quarantined = manager.quarantine_proxy_for_lifecycle(
-            str(state["before"]["dataFilesystemUuid"]),
-            str(state["transactionId"]),
-        )
-        if quarantined.get("ok") is not True:
+        if google_identity.get("ok") is not True:
+            # A seed that crashed before marker publication reads back
+            # matching but unseeded; one idempotent activate completes it.
+            google_identity = _regeneration_google_identity(
+                manager,
+                state,
+                activate=True,
+            )
+        if google_identity.get("ok") is not True:
             return _regeneration_result(
                 state,
                 ok=False,
                 error=str(
-                    quarantined.get("error")
-                    or quarantined.get("code")
-                    or "proxy_quarantine_failed"
+                    google_identity.get("error")
+                    or "google_identity_rotation_unverified"
                 ),
+                googleIdentity=google_identity,
             )
-        state = journal.advance("proxy_quarantined")
-    if not _regeneration_phase_at_least(state, "container_removed"):
-        location_store = LocationStateStore(context.state_root)
-        if location_store.load() is None:
-            if state.get("legacyEvidenceSha256") is None:
+        verified_committed = _verify_regeneration_target_state(
+            manager,
+            identity_store,
+            state,
+        )
+        google_identity = verified_committed["googleIdentity"]
+        google_runtime = _regeneration_google_runtime_postcondition(manager)
+        if google_runtime.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    google_runtime.get("error")
+                    or "google_services_runtime_not_ready"
+                ),
+                googleIdentity=google_identity,
+                googleRuntime=google_runtime.get("googleRuntime"),
+            )
+        if isinstance(pending_stable, Mapping):
+            identity_store.clear_regeneration_stable(state["transactionId"])
+        manager.clear_regeneration_restart_receipt(str(state["transactionId"]))
+        journal.clear()
+        return _regeneration_success_result(
+            state,
+            resumed=True,
+            cleaned=True,
+            google_identity=google_identity,
+        )
+    if not _regeneration_phase_at_least(state, "staged"):
+        staged_identity = identity_store.load()
+        if not isinstance(staged_identity, Mapping):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "device identity disappeared during regeneration",
+            )
+        staged_pending = staged_identity.get("pendingStable")
+        if (
+            isinstance(staged_pending, Mapping)
+            and staged_pending.get("transactionId") != state["transactionId"]
+        ):
+            # Legacy v1/v2 delete-and-rerun recovery is now journal-owned:
+            # the new transaction's fixed targets exist before the orphan
+            # marker is cleared. The live stable must still equal the
+            # journal's observed before digest, binding cleanup to this attempt.
+            if (
+                stable_identity_digest(staged_identity["stable"])
+                != state["before"]["stableDigest"]
+            ):
                 raise IdentityError(
                     "device_regeneration_state_invalid",
-                    "Location state is missing outside legacy recovery",
+                    "orphaned stable target does not match regeneration before-state",
                 )
-            location_store.initialize_regeneration_target(
-                context.instance_id,
-                str(state["transactionId"]),
-                str(state["target"]["simEpoch"]),
-                str(state["target"]["locationProfileDigest"]),
+            identity_store.recover_orphaned_regeneration_stable()
+            staged_identity = identity_store.load()
+            staged_pending = (
+                staged_identity.get("pendingStable")
+                if isinstance(staged_identity, Mapping)
+                else None
             )
-        location_state = location_store.rotate_sim_identity(
-            sim_epoch=str(state["target"]["simEpoch"]),
-            expected_epoch=str(state["before"]["simEpoch"]),
-        )
-        pending_location = location_state.get("pending")
+        if not isinstance(staged_pending, Mapping):
+            # Crash between journal prepare and store staging: re-stage the
+            # exact journal-fixed target; the call is idempotent.
+            staged_identity = identity_store.prepare_regeneration_stable(
+                str(state["transactionId"]),
+                state["target"]["stable"],
+            )
+            staged_pending = staged_identity.get("pendingStable")
         if (
-            not isinstance(pending_location, Mapping)
-            or pending_location.get("profileDigest")
-            != state["target"]["locationProfileDigest"]
+            not isinstance(staged_pending, Mapping)
+            or staged_pending.get("transactionId") != state["transactionId"]
+            or staged_pending.get("digest") != state["target"]["stableDigest"]
         ):
             raise IdentityError(
                 "device_regeneration_state_invalid",
-                "fixed Location target was not persisted before replacement",
+                "stable regeneration target was not persisted",
             )
-        if state["before"]["containerId"] != "0" * 64:
-            active_container = manager.location_runtime_container_id()
-            if (
-                active_container is None
-                and state.get("legacyEvidenceSha256") is not None
-                and pending_location.get("phase") != "armed"
-            ):
-                started_legacy = manager.start_owned_container(
-                    expected_container_id=str(state["before"]["containerId"]),
-                    wait=True,
-                )
-                if started_legacy.get("ok") is not True:
-                    return _regeneration_result(
-                        state,
-                        ok=False,
-                        error=str(
-                            started_legacy.get("error")
-                            or "legacy_runtime_start_failed"
-                        ),
-                    )
-                try:
-                    builder = ArtifactBuilder(args.project_root)
-                    if not bool(getattr(args, "skip_build", False)):
-                        built = builder.ensure(["daemon"])
-                        if built.get("ok") is not True:
-                            raise IdentityError(
-                                "journal_artifact_unavailable",
-                                "daemon artifact build failed",
-                            )
-                    snapshot = builder.snapshot(["daemon"])
-                    daemon_record = next(
-                        record
-                        for record in snapshot.records
-                        if record.target == "daemon"
-                    )
-                    daemon_output = next(
-                        output
-                        for output in daemon_record.outputs
-                        if output.path.endswith("/app-debug.apk")
-                    )
-                    daemon_apk = (
-                        args.project_root
-                        / ".xenoid"
-                        / "cache"
-                        / "artifacts"
-                        / "objects"
-                        / "sha256"
-                        / daemon_output.sha256
-                    )
-                except (ArtifactError, IdentityError, OSError, StopIteration, ValueError) as exc:
-                    return _regeneration_result(
-                        state,
-                        ok=False,
-                        error=getattr(
-                            exc,
-                            "code",
-                            "journal_artifact_unavailable",
-                        ),
-                    )
-                installed_daemon = manager.install_daemon(str(daemon_apk))
-                if installed_daemon.get("ok") is not True:
-                    return _regeneration_result(
-                        state,
-                        ok=False,
-                        error=str(
-                            installed_daemon.get("error")
-                            or "daemon_install_failed"
-                        ),
-                    )
-                control = manager.reconcile_control_plane()
-                if control.get("controlReady") is not True:
-                    return _regeneration_result(
-                        state,
-                        ok=False,
-                        error=str(
-                            control.get("error")
-                            or "legacy_control_ready_failed"
-                        ),
-                    )
-                prepared_location = manager._prepare_location_for_replacement(
-                    str(state["before"]["containerId"])
-                )
-                if prepared_location.get("ok") is not True:
-                    return _regeneration_result(
-                        state,
-                        ok=False,
-                        error=str(
-                            prepared_location.get("error")
-                            or "location_stage_failed"
-                        ),
-                    )
-                pending_location = (
-                    location_store.load() or {}
-                ).get("pending")
-                active_container = manager.location_runtime_container_id()
-            if active_container is None:
-                expected_epoch = location_runtime_epoch(
-                    str(state["before"]["containerId"])
-                )
-                if (
-                    not isinstance(pending_location, Mapping)
-                    or pending_location.get("phase") != "armed"
-                    or pending_location.get("restartFromEpoch")
-                    != expected_epoch
-                ):
-                    raise IdentityError(
-                        "device_regeneration_state_invalid",
-                        "absent runtime lacks the recorded armed Location target",
-                    )
-            else:
-                prepared_location = manager._prepare_location_for_replacement(
-                    str(state["before"]["containerId"])
-                )
-                if prepared_location.get("ok") is not True:
-                    return _regeneration_result(
-                        state,
-                        ok=False,
-                        error=str(
-                            prepared_location.get("error")
-                            or "location_stage_failed"
-                        ),
-                    )
-        removed = manager.remove_owned_container_for_regenerate(
-            str(state["before"]["containerId"]),
-            regeneration_capability=capability,
-        )
-        if removed.get("ok") is not True:
-            return _regeneration_result(
-                state,
-                ok=False,
-                error=str(
-                    removed.get("error")
-                    or "device_regenerate_container_remove_failed"
-                ),
-            )
-        state = journal.advance("container_removed")
-    if not _regeneration_phase_at_least(state, "stable_committed"):
+        identity_store.stage_regeneration_boot(str(state["target"]["bootId"]))
         committed_identity = identity_store.commit_regeneration_stable(
             str(state["transactionId"])
         )
@@ -3285,201 +3419,371 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
                 "device_regeneration_state_invalid",
                 "stable identity did not reach its fixed target",
             )
-        state = journal.advance("stable_committed")
-    if not _regeneration_phase_at_least(state, "network_committed"):
-        rotate_instance_network(
-            context,
-            target_epoch=str(state["target"]["networkEpoch"]),
-            expected_epoch=str(state["before"]["networkEpoch"]),
-        )
-        args.context, args.config, args.lease = resolve_instance(
-            args.instance_name,
-            project_root=args.project_root,
-        )
-        manager = runtime(args)
-        if args.lease.network_epoch != state["target"]["networkEpoch"]:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "network identity did not reach its fixed target",
-            )
-        state = journal.advance("network_committed")
-    if not _regeneration_phase_at_least(state, "sim_committed"):
-        location = LocationStateStore(context.state_root)
-        location_state = location.rotate_sim_identity(
-            sim_epoch=str(state["target"]["simEpoch"]),
-            expected_epoch=str(state["before"]["simEpoch"]),
-        )
-        pending_location = location_state.get("pending")
-        if (
-            location_state.get("simEpoch") != state["target"]["simEpoch"]
-            or not isinstance(pending_location, Mapping)
-            or pending_location.get("profileDigest")
-            != state["target"]["locationProfileDigest"]
-        ):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "SIM/location identity did not reach its fixed target",
-            )
-        state = journal.advance("sim_committed")
-    if not _regeneration_phase_at_least(state, "storage_pending"):
-        state = journal.advance("storage_pending")
-    if not _regeneration_phase_at_least(state, "storage_committed"):
-        storage = manager.rotate_storage_identity(
-            transaction_id=str(state["target"]["storageTransactionId"]),
-            data_target_uuid=str(state["target"]["dataFilesystemUuid"]),
-            rootfs_target_uuid=str(state["target"]["rootfsFilesystemUuid"]),
-            expected_data_uuid=str(state["before"]["dataFilesystemUuid"]),
-            expected_rootfs_uuid=str(state["before"]["rootfsFilesystemUuid"]),
-            regeneration_capability=capability,
-        )
-        if storage.get("ok") is not True:
-            return _regeneration_result(
-                state,
-                ok=False,
-                error=str(
-                    storage.get("error")
-                    or "device_regenerate_storage_failed"
-                ),
-            )
-        state = journal.advance("storage_committed")
-    convergence: dict[str, Any] = {
-        "schema": "dev.xenoid.convergence/v1",
-        "ok": True,
-        "resumed": True,
-    }
-    if not _regeneration_phase_at_least(state, "runtime_converging"):
-        state = journal.advance("runtime_converging")
-    if not _regeneration_phase_at_least(state, "runtime_verified"):
-        convergence = _execute_convergence(
-            args,
-            manager=manager,
-            regeneration_capability=capability,
-        )
-        if convergence.get("ok") is not True:
-            return _regeneration_result(
-                state,
-                ok=False,
-                error=str(
-                    convergence.get("error")
-                    or "device_regenerate_convergence_failed"
-                ),
-                convergence=convergence,
-            )
-        _verify_regeneration_target_state(manager, state)
-        pre_google = _regeneration_acceptance(
-            manager,
-            state,
-            mode="regenerate-pre-google",
-        )
-        if (
-            pre_google.get("ok") is not True
-            or pre_google.get("observationValid") is not True
-        ):
-            return _regeneration_result(
-                state,
-                ok=False,
-                error=str(
-                    pre_google.get("errorCode")
-                    or "regenerate_pre_google_acceptance_failed"
-                ),
-                convergence=convergence,
-                acceptance=pre_google,
-            )
-        state = journal.advance("runtime_verified")
-    if not _regeneration_phase_at_least(state, "google_wiping"):
-        state = journal.advance("google_wiping")
-    google_wipe: dict[str, Any]
-    if args.config.google_services_provider != PROVIDER_NONE:
-        google_wipe = _wipe_regeneration_google_packages(
-            manager,
-            journal,
-            capability,
-        )
-        if google_wipe.get("ok") is not True:
-            state = journal.load() or state
-            return _regeneration_result(
-                state,
-                ok=False,
-                error=str(
-                    google_wipe.get("error")
-                    or "google_package_clear_failed"
-                ),
-                googleWipe=google_wipe,
-            )
-    else:
-        google_wipe = {
-            "ok": True,
-            "skipped": True,
-            "reason": "google_services_disabled",
-        }
-    state = journal.load() or state
-    _verify_regeneration_target_state(manager, state)
-    final_acceptance = _regeneration_acceptance(
-        manager,
-        state,
-        mode="regenerate-final",
+        state = journal.advance("staged")
+    identity = identity_store.load()
+    stable = identity.get("stable") if isinstance(identity, Mapping) else None
+    pending_boot = identity.get("pending") if isinstance(identity, Mapping) else None
+    active_boot = identity.get("active") if isinstance(identity, Mapping) else None
+    active_boot_matches = (
+        isinstance(active_boot, Mapping)
+        and active_boot.get("bootId") == state["target"]["bootId"]
+    )
+    pending_boot_matches = (
+        isinstance(pending_boot, Mapping)
+        and pending_boot.get("bootId") == state["target"]["bootId"]
+    )
+    boot_matches = (
+        active_boot_matches
+        if _regeneration_phase_at_least(state, "soft_rebooted")
+        else pending_boot_matches or active_boot_matches
     )
     if (
-        final_acceptance.get("ok") is not True
-        or final_acceptance.get("observationValid") is not True
+        not isinstance(stable, Mapping)
+        or stable_identity_digest(stable) != state["target"]["stableDigest"]
+        or not boot_matches
     ):
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "staged identity does not match the fixed target",
+        )
+    if not _regeneration_phase_at_least(state, "props_committed"):
+        profile = _regeneration_base_profile(manager, client)
+        effective = materialize_profile(profile, identity, pending_boot)
+        applied = client.apply_fingerprint(effective, regenerate_unique=False)
+        if not isinstance(applied, dict) or applied.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    applied.get("error") if isinstance(applied, dict) else None
+                    or "device_identity_apply_failed"
+                ),
+            )
+        staged_drm = _stage_regeneration_drm(
+            manager,
+            str(state["target"]["drmDeviceUniqueId"]),
+        )
+        if staged_drm.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error="drm_identity_stage_failed",
+            )
+        hostname = client.set_fingerprint_field(
+            "net.hostname", state["target"]["hostname"]
+        )
+        if not isinstance(hostname, dict) or hostname.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error="profile_field_apply_failed",
+                field="net.hostname",
+            )
+        hidden = client.hide_apply()
+        if not isinstance(hidden, dict) or hidden.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(hidden.get("error") if isinstance(hidden, dict) else None
+                          or "hide_apply_failed"),
+            )
+        state = journal.advance("props_committed")
+    if not _regeneration_phase_at_least(state, "settings_committed"):
+        for field, value in (
+            ("device_name", state["target"]["deviceName"]),
+            ("bluetooth_address", state["target"]["bluetoothAddress"]),
+        ):
+            applied = client.set_fingerprint_field(field, value)
+            if not isinstance(applied, dict) or applied.get("ok") is not True:
+                return _regeneration_result(
+                    state,
+                    ok=False,
+                    error="profile_field_apply_failed",
+                    field=field,
+                )
+        state = journal.advance("settings_committed")
+    if not _regeneration_phase_at_least(state, "radio_committed"):
+        location_store = LocationStateStore(context.state_root)
+        location_state = location_store.rotate_sim_identity(
+            sim_epoch=str(state["target"]["simEpoch"]),
+            expected_epoch=str(state["before"]["simEpoch"]),
+            expected_profile_digest=str(
+                state["target"]["locationProfileDigest"]
+            ),
+        )
+        epoch = manager._daemon_runtime_epoch()
+        if epoch is None:
+            return _regeneration_result(state, ok=False, error="device_runtime_not_running")
+        pending_location = location_state.get("pending")
+        if (
+            isinstance(pending_location, Mapping)
+            and pending_location.get("phase") == "armed"
+            and pending_location.get("stagedRuntimeEpoch") != epoch
+        ):
+            # Retry after a crash between arm_restart and the journal advance
+            # where the daemon also restarted (START_STICKY): the arm proof is
+            # stale, so rewind and re-stage against the live daemon.
+            location_state = location_store.restage(epoch)
+        _location_stage(location_store, client, location_state, epoch, mark=True)
+        location_store.arm_restart()
+        state = journal.advance("radio_committed")
+    if not _regeneration_phase_at_least(state, "storage_identity_committed"):
+        fsid = manager.shared_protection_manager().set_statfs_fsid(
+            str(state["target"]["statfsFsid"])
+        )
+        if fsid.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(fsid.get("error") or "statfs_fsid_param_failed"),
+            )
+        state = journal.advance("storage_identity_committed")
+    if not _regeneration_phase_at_least(state, "soft_rebooted"):
+        location_store = LocationStateStore(context.state_root)
+        location_state = location_store.load()
+        if not isinstance(location_state, Mapping):
+            raise LocationError("location_state_missing")
+        active = location_state.get("active")
+        pending_location = location_state.get("pending")
+        already_promoted = (
+            isinstance(active, Mapping)
+            and str(active.get("profileDigest"))
+            == str(state["target"]["locationProfileDigest"])
+            and str(active.get("simEpoch")) == str(state["target"]["simEpoch"])
+        )
+        restart_observed = already_promoted
+        if not already_promoted:
+            if not isinstance(pending_location, Mapping):
+                raise LocationError("location_pending_missing")
+            location_phase = pending_location.get("phase")
+            if location_phase not in {"armed", "restarted"}:
+                raise LocationError("location_phase_invalid")
+            completed_userspace = state["restartCompletedUserspaceEpoch"]
+            requested_userspace = state["restartRequestedUserspaceEpoch"]
+            if completed_userspace or requested_userspace:
+                current_userspace_epoch = manager._userspace_runtime_epoch()
+                if current_userspace_epoch is None:
+                    return _regeneration_result(
+                        state, ok=False, error="device_runtime_not_running"
+                    )
+                receipt = manager.regeneration_restart_receipt(
+                    str(state["transactionId"])
+                )
+                if receipt.get("ok") is True and completed_userspace:
+                    # A journaled completion epoch plus the rootd receipt
+                    # prove the restart already ran exactly once. A later
+                    # userspace epoch drift (spontaneous zygote restart) is
+                    # still that same completed restart: never restart a
+                    # second time, never re-wipe SSAIDs.
+                    restart_observed = True
+                elif (
+                    receipt.get("ok") is True
+                    and not completed_userspace
+                    and requested_userspace
+                    and requested_userspace != current_userspace_epoch
+                ):
+                    # The rootd receipt proves the delete+RIL+zygote command
+                    # reached its final instruction; the changed epoch proves
+                    # the requested restart took effect.
+                    state = journal.advance(
+                        "storage_identity_committed",
+                        restartCompletedUserspaceEpoch=current_userspace_epoch,
+                    )
+                    restart_observed = True
+        if not restart_observed and not state["restartRequestedUserspaceEpoch"]:
+            # Persist the pre-restart userspace epoch before the reboot so a
+            # crash between the reboot and the completion record stays
+            # provable and never triggers a second restart.
+            requested_userspace_epoch = manager._userspace_runtime_epoch()
+            if requested_userspace_epoch is None:
+                return _regeneration_result(
+                    state, ok=False, error="device_runtime_not_running"
+                )
+            state = journal.advance(
+                "storage_identity_committed",
+                restartRequestedUserspaceEpoch=requested_userspace_epoch,
+            )
+
+        rebooted = manager.soft_reboot(
+            require_health=False,
+            reset_ssaid=not restart_observed,
+            userspace_restart_observed=restart_observed,
+            restart_receipt=str(state["transactionId"]),
+        )
+        if rebooted.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(rebooted.get("error") or "soft_reboot_timeout"),
+                softReboot=rebooted,
+            )
+        new_epoch = manager._daemon_runtime_epoch()
+        if new_epoch is None:
+            return _regeneration_result(
+                state, ok=False, error="device_runtime_not_running"
+            )
+        new_userspace_epoch = manager._userspace_runtime_epoch()
+        if new_userspace_epoch is None:
+            return _regeneration_result(
+                state, ok=False, error="device_runtime_not_running"
+            )
+        if manager.regeneration_restart_receipt(
+            str(state["transactionId"])
+        ).get("ok") is not True:
+            return _regeneration_result(
+                state, ok=False, error="soft_reboot_receipt_missing"
+            )
+        state = journal.advance(
+            "storage_identity_committed",
+            restartCompletedUserspaceEpoch=new_userspace_epoch,
+        )
+        if not already_promoted:
+            if location_phase == "armed":
+                location_store.mark_restarted(new_epoch)
+            location_state = location_store.load()
+            if not isinstance(location_state, Mapping):
+                raise LocationError("location_state_missing")
+            digest = location_store.target_profile(location_state)["identityDigest"]
+            verified = client.location_verify(digest, new_epoch)
+            if (
+                not isinstance(verified, dict)
+                or verified.get("ok") is not True
+                or verified.get("verified") is not True
+            ):
+                return _regeneration_result(
+                    state, ok=False, error="location_verify_failed"
+                )
+            location_store.promote(new_epoch)
+        healthy = client.health(timeout=60.0)
+        if not isinstance(healthy, dict) or healthy.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error="soft_reboot_daemon_timeout",
+            )
+        identity = identity_store.load()
+        pending_boot = (
+            identity.get("pending") if isinstance(identity, Mapping) else None
+        )
+        active_boot = (
+            identity.get("active") if isinstance(identity, Mapping) else None
+        )
+        active_boot_matches = (
+            isinstance(active_boot, Mapping)
+            and active_boot.get("bootId") == state["target"]["bootId"]
+        )
+        pending_boot_matches = (
+            isinstance(pending_boot, Mapping)
+            and pending_boot.get("bootId") == state["target"]["bootId"]
+        )
+        if pending_boot_matches:
+            identity_store.mark_applied(str(pending_boot["containerEpoch"]))
+        elif not active_boot_matches:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "boot identity target is missing after the soft reboot",
+            )
+        location_converged = manager.reconcile_location("converge")
+        if location_converged.get("ok") is not True:
+            return _regeneration_result(
+                state,
+                ok=False,
+                error=str(
+                    location_converged.get("error")
+                    or "location_convergence_failed"
+                ),
+                location=location_converged,
+            )
+        state = journal.advance("soft_rebooted")
+    google_reset_pending = not _regeneration_phase_at_least(
+        state, "google_reset"
+    )
+    if google_reset_pending:
+        google_identity = _regeneration_google_identity(
+            manager,
+            state,
+            activate=True,
+        )
+    else:
+        google_identity = _regeneration_google_identity(
+            manager,
+            state,
+            activate=False,
+        )
+        if google_identity.get("ok") is not True:
+            google_identity = _regeneration_google_identity(
+                manager,
+                state,
+                activate=True,
+            )
+    if google_identity.get("ok") is not True:
         return _regeneration_result(
             state,
             ok=False,
             error=str(
-                final_acceptance.get("errorCode")
-                or "regenerate_final_acceptance_failed"
+                google_identity.get("error")
+                or (
+                    "google_identity_rotation_failed"
+                    if google_reset_pending
+                    else "google_identity_rotation_unverified"
+                )
             ),
-            googleWipe=google_wipe,
-            acceptance=final_acceptance,
+            googleIdentity=google_identity,
+        )
+    google_runtime = _regeneration_google_runtime_postcondition(manager)
+    if google_runtime.get("ok") is not True:
+        return _regeneration_result(
+            state,
+            ok=False,
+            error=str(
+                google_runtime.get("error")
+                or "google_services_runtime_not_ready"
+            ),
+            googleIdentity=google_identity,
+            googleRuntime=google_runtime.get("googleRuntime"),
+        )
+    if google_reset_pending:
+        state = journal.advance("google_reset")
+    if not _regeneration_phase_at_least(state, "verified"):
+        state = journal.advance("verified")
+    # The verified marker cannot make volatile runtime evidence durable:
+    # re-prove the identical live target and Google postconditions used by
+    # committed-cleanup immediately before committing/clearing.
+    verified_live = _verify_regeneration_target_state(manager, identity_store, state)
+    google_identity = verified_live["googleIdentity"]
+    final_google_runtime = _regeneration_google_runtime_postcondition(manager)
+    if final_google_runtime.get("ok") is not True:
+        return _regeneration_result(
+            state,
+            ok=False,
+            error=str(
+                final_google_runtime.get("error")
+                or "google_services_runtime_not_ready"
+            ),
+            googleIdentity=google_identity,
+            googleRuntime=final_google_runtime.get("googleRuntime"),
         )
     state = journal.advance("committed")
     identity_store.clear_regeneration_stable(str(state["transactionId"]))
+    manager.clear_regeneration_restart_receipt(str(state["transactionId"]))
     journal.clear()
-    return {
-        **convergence,
-        "ok": True,
-        "regeneration": {
-            "schema": "dev.xenoid.device-regenerate/v2",
-            "transactionId": state["transactionId"],
-            "resumed": resumed,
-            "phase": "committed",
-            "googleWipe": google_wipe,
-            "acceptanceSha256": final_acceptance.get("observationSha256"),
-            "legacyRestart": state.get("legacyEvidenceSha256") is not None,
-            "factorsMayRotateAgain": state.get("legacyEvidenceSha256") is not None,
-        },
-    }
+    return _regeneration_success_result(
+        state,
+        resumed=resumed,
+        google_identity=google_identity,
+    )
 
 
 def cmd_device_regenerate(args: argparse.Namespace) -> int:
-    if args.dry_run:
-        state = RegenerationJournal(args.context).load()
-        result = {
-            "schema": "dev.xenoid.device-regenerate/v2",
-            "ok": True,
-            "dryRun": True,
-            "resumed": state is not None,
-            "phase": state.get("phase") if state is not None else None,
-            "legacyRestartRequired": bool(
-                state is not None
-                and state.get("legacyEvidenceSha256") is not None
-            ),
-            "actions": list(REGENERATION_PHASES),
-        }
-    else:
-        try:
+    try:
+        if args.dry_run:
+            result = _regeneration_dry_run_result(
+                RegenerationJournal(args.context).load()
+            )
+        else:
             result = _execute_device_regeneration(args)
-        except (IdentityError, InstanceError, LocationError, StorageError) as exc:
-            result = {
-                "schema": "dev.xenoid.device-regenerate/v2",
-                "ok": False,
-                "error": getattr(
-                    exc,
-                    "code",
-                    "device_regeneration_state_invalid",
-                ),
-            }
+    except (IdentityError, InstanceError, LocationError, StorageError) as exc:
+        result = _regeneration_exception_result(args.context, exc)
     print_json(result)
     return 0 if result.get("ok") else 1
 
@@ -3769,7 +4073,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_verify_release)
 
     s = sub.add_parser("package-release", help="package transferable Xenoid release bundle")
-    s.add_argument("--version", default="dev")
+    s.add_argument("--version", default=__version__)
     s.set_defaults(func=cmd_package_release)
 
 
@@ -4174,15 +4478,13 @@ def build_parser() -> argparse.ArgumentParser:
     keybox_clear.set_defaults(func=cmd_device_keybox_clear)
     rg = dev.add_parser(
         "regenerate",
-        help="rotate every per-device uniqueness factor (IDs, MAC, filesystem identity, per-app SSAID) and re-converge the runtime",
+        help=(
+            "rotate Android/SIM/boot/filesystem/Bluetooth/device-name/hostname/"
+            "DRM/GAID/GSF/SSAID identity in one soft reboot; offline Google "
+            "identity disables FCM"
+        ),
     )
-    rg.add_argument("--skip-build", action="store_true", help="validate prebuilt artifacts instead of rebuilding (same as up --skip-build)")
     rg.add_argument("--dry-run", action="store_true", help="show the rotation plan without changing anything")
-    rg.add_argument(
-        "--restart-legacy-transaction",
-        action="store_true",
-        help="explicitly snapshot and restart an interrupted v1 regeneration as v2",
-    )
     rg.set_defaults(func=cmd_device_regenerate)
 
     s = sub.add_parser("automation", help="automation tasks")
@@ -4364,31 +4666,6 @@ def _refresh_instance_under_lock(args: argparse.Namespace) -> None:
     args.context, args.config, args.lease = context, config, lease
 
 
-def _legacy_proxy_recovery_allowed(
-    args: argparse.Namespace,
-    handler: str,
-) -> bool:
-    if handler == "cmd_proxy_clear" and not bool(
-        getattr(args, "discard_unreadable_state", False)
-    ):
-        return False
-    if handler not in {"cmd_proxy_set", "cmd_proxy_clear"}:
-        return False
-    journal = RegenerationJournal(args.context)
-    try:
-        digest = journal.legacy_source_digest()
-        convergence_state = ConvergenceExecutor(runtime(args)).journal.load()
-    except (IdentityError, InstanceError, OSError, ValueError):
-        return False
-    return bool(
-        isinstance(convergence_state, Mapping)
-        and convergence_state.get("operationId") == digest[:32]
-        and isinstance(
-            convergence_state.get("regenerationTransactionId"),
-            str,
-        )
-        and "quarantined" in convergence_state.get("completed", [])
-    )
 
 
 def _reject_unrelated_regeneration_mutation(args: argparse.Namespace) -> Optional[dict[str, Any]]:
@@ -4398,16 +4675,13 @@ def _reject_unrelated_regeneration_mutation(args: argparse.Namespace) -> Optiona
     try:
         state = RegenerationJournal(args.context).load()
     except IdentityError as exc:
-        if (
-            exc.code == "device_regeneration_legacy_pending"
-            and _legacy_proxy_recovery_allowed(args, handler)
-        ):
-            return None
-        raise
+        # Legacy/malformed journals still produce the canonical v3 envelope
+        # for unrelated mutators, not a bare identity error.
+        return _regeneration_exception_result(args.context, exc)
     if state is None:
         return None
     return {
-        "schema": "dev.xenoid.device-regenerate/v2",
+        "schema": "dev.xenoid.device-regenerate/v3",
         "ok": False,
         "error": "device_regeneration_pending",
         "phase": state["phase"],

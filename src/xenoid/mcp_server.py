@@ -10,6 +10,7 @@ from threading import Event, Lock
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional
 
+from . import __version__
 from .backend import RuntimeManager
 from .cellular import CellularError
 from .convergence import ConvergenceExecutor, ConvergencePlanner
@@ -22,6 +23,8 @@ from .config import (
 )
 from .cli import (
     _execute_device_regeneration,
+    _regeneration_dry_run_result,
+    _regeneration_exception_result,
     _google_services_disable_result,
     _google_services_enable_result,
     _location_converge,
@@ -56,6 +59,7 @@ from .operation_lock import (
     OPERATION_LOCK_TIMEOUT_ENV,
     instance_operation_lock,
 )
+from .storage import StorageError
 from .util import bounded_timeout, command_timeout, read_json_file, validate_release_version
 
 
@@ -525,7 +529,7 @@ def _up_executor_result(runtime: MCPRuntime, args: dict[str, Any]) -> dict[str, 
             try:
                 regeneration = RegenerationJournal(runtime.context).load()
             except IdentityError as exc:
-                return exc.as_dict()
+                return _regeneration_exception_result(runtime.context, exc)
             if regeneration is not None:
                 namespace = SimpleNamespace(
                     context=runtime.context,
@@ -535,15 +539,22 @@ def _up_executor_result(runtime: MCPRuntime, args: dict[str, Any]) -> dict[str, 
                     instance_name=runtime.context.instance_name,
                     skip_build=skip_build,
                     dry_run=False,
-                    restart_legacy_transaction=False,
                     _operation_lock_held=True,
                 )
-                return _execute_device_regeneration(namespace)
+                try:
+                    return _execute_device_regeneration(namespace)
+                except (IdentityError, InstanceError, LocationError, StorageError) as exc:
+                    return _regeneration_exception_result(runtime.context, exc)
             return ConvergenceExecutor(runtime.manager).run(
                 progress=lambda _event: None,
                 skip_build=skip_build,
             )
 
+    # Mirror the CLI: a cold engine host (Colima/VM reboot) is recovered
+    # before the executor, never reported as a convergence failure.
+    engine = runtime.manager.ensure_engine_started()
+    if engine.get("ok") is not True:
+        return text_result({"command": "up", "ok": False, **engine})
     result = _locked_runtime_mutation(
         runtime,
         converge,
@@ -644,7 +655,7 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
         try:
             requested_version = args.get("version")
             version = validate_release_version(
-                "dev" if requested_version is None else requested_version
+                __version__ if requested_version is None else requested_version
             )
         except ValueError:
             return text_result({
@@ -751,14 +762,29 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
         data["returncode"] = proc.returncode
         return text_result(data)
     if name == "xenoid_up_plan":
-        try:
-            plan = ConvergencePlanner(mgr).inspect(skip_build=False)
-            return text_result(plan.to_dict())
-        except (InstanceError, OSError, RuntimeError, ValueError) as exc:
-            return text_result({
-                "ok": False,
-                "error": getattr(exc, "code", "convergence_inspection_failed"),
-            })
+        # The read-only plan must describe the same next operation the real
+        # up would take: a pending regeneration resumes (v3 envelope), a
+        # legacy/malformed journal fails closed, and only a clean state gets
+        # an ordinary convergence plan. The journal decision and inspection
+        # share the instance lock so a concurrent regenerate cannot split
+        # them.
+        with instance_operation_lock(runtime.context.state_root):
+            try:
+                regeneration = RegenerationJournal(runtime.context).load()
+            except IdentityError as exc:
+                return text_result(
+                    _regeneration_exception_result(runtime.context, exc)
+                )
+            if regeneration is not None:
+                return text_result(_regeneration_dry_run_result(regeneration))
+            try:
+                plan = ConvergencePlanner(mgr).inspect(skip_build=False)
+                return text_result(plan.to_dict())
+            except (InstanceError, OSError, RuntimeError, ValueError) as exc:
+                return text_result({
+                    "ok": False,
+                    "error": getattr(exc, "code", "convergence_inspection_failed"),
+                })
     if name == "xenoid_up":
         return _up_executor_result(runtime, args)
     if name == "xenoid_start":
@@ -1051,30 +1077,6 @@ def _refresh_stdio_runtime(runtime: MCPRuntime) -> MCPRuntime:
         operation_lock_timeout_seconds=runtime.operation_lock_timeout_seconds,
     )
 
-def _legacy_proxy_recovery_allowed(
-    runtime: MCPRuntime,
-    name: str,
-    arguments: Mapping[str, Any],
-) -> bool:
-    if name == "xenoid_proxy_clear" and arguments.get(
-        "discardUnreadableState"
-    ) is not True:
-        return False
-    if name not in {"xenoid_proxy_set", "xenoid_proxy_clear"}:
-        return False
-    try:
-        digest = RegenerationJournal(
-            runtime.context
-        ).legacy_source_digest()
-        state = ConvergenceExecutor(runtime.manager).journal.load()
-    except (IdentityError, InstanceError, OSError, ValueError):
-        return False
-    return bool(
-        isinstance(state, Mapping)
-        and state.get("operationId") == digest[:32]
-        and isinstance(state.get("regenerationTransactionId"), str)
-        and "quarantined" in state.get("completed", [])
-    )
 
 
 def _call_stdio_tool(
@@ -1102,17 +1104,7 @@ def _call_stdio_tool(
             try:
                 regeneration = RegenerationJournal(locked.context).load()
             except IdentityError as exc:
-                if (
-                    exc.code == "device_regeneration_legacy_pending"
-                    and _legacy_proxy_recovery_allowed(
-                        locked,
-                        name,
-                        arguments,
-                    )
-                ):
-                    regeneration = None
-                else:
-                    return text_result(exc.as_dict())
+                return text_result(exc.as_dict())
             if regeneration is not None:
                 return text_result(
                     {
@@ -1130,7 +1122,7 @@ def handle(runtime: MCPRuntime, req: dict[str, Any]) -> None:
     method = req.get("method")
     id_ = req.get("id")
     if method == "initialize":
-        respond(id_, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "xenoid", "version": "0.1.0"}})
+        respond(id_, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "xenoid", "version": __version__}})
     elif method == "notifications/initialized":
         return
     elif method == "tools/list":

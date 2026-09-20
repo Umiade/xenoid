@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import re
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from xenoid.cellular import (PROFILE_SCHEMA, CellularError, dataset_countries,
+from xenoid.cellular import (PROFILE_SCHEMA, CellularError, carrier_pin, dataset_countries,
                              dataset_version, encode_profile_v1, generate_cellular_profile,
                              masked_profile_summary, validate_profile)
-from xenoid.location import (DEFAULT_COUNTRY, LocationError, LocationStateStore,
+from xenoid.location import (DEFAULT_COUNTRY, LOCATION_SCHEMA, LocationError, LocationStateStore,
                              convergence_action, location_runtime_epoch, normalize_country,
-                             missing_regeneration_target,
                              public_summary, supported_countries)
 
 INSTANCE = "123e4567-e89b-42d3-a456-426614174000"
@@ -120,6 +122,65 @@ def _pending_store(directory: str, country: str = "SG") -> LocationStateStore:
     return store
 
 
+def _legacy_profile_seed(master_seed: bytes, country: str) -> bytes:
+    return hmac.new(
+        master_seed, ("xenoid-location-profile/v1:" + country).encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+
+
+def _epoch_profile_seed(master_seed: bytes, country: str, sim_epoch: str) -> bytes:
+    return hmac.new(
+        master_seed,
+        ("xenoid-location-profile/v2:" + country + ":" + sim_epoch).encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+
+
+def _seeded_active_store(directory: str, country: str, master_seed: bytes) -> LocationStateStore:
+    """One store whose active record is already promoted for ``country``."""
+    store = LocationStateStore(Path(directory))
+    profile = generate_cellular_profile(country, _legacy_profile_seed(master_seed, country))
+    now = int(time.time())
+    store.save({
+        "schema": LOCATION_SCHEMA,
+        "instanceId": INSTANCE,
+        "masterSeed": base64.b64encode(master_seed).decode("ascii"),
+        "desiredCountry": country,
+        "simEpoch": "",
+        "profiles": {
+            country: {
+                "country": country,
+                "profile": profile,
+                "profileDigest": profile["identityDigest"],
+                "datasetVersion": dataset_version(),
+                "createdAt": now,
+                "simEpoch": "",
+            },
+        },
+        "active": {
+            "country": country,
+            "profileDigest": profile["identityDigest"],
+            "appliedAt": now,
+            "lastValidatedRuntimeEpoch": EPOCH_1,
+            "simEpoch": "",
+        },
+        "pending": None,
+        "updatedAt": now,
+    })
+    return store
+
+
+def _master_seed_for_carrier(country: str, carrier_name: str) -> bytes:
+    # Deterministic scan so each dataset carrier can win initial selection.
+    for value in range(256):
+        master_seed = bytes([value]) * 32
+        profile = generate_cellular_profile(country, _legacy_profile_seed(master_seed, country))
+        if profile["carrier"]["name"] == carrier_name:
+            return master_seed
+    raise AssertionError(carrier_name)
+
+
 def test_first_boot_creates_sg_pending() -> None:
     with tempfile.TemporaryDirectory() as directory:
         store = LocationStateStore(Path(directory))
@@ -149,6 +210,8 @@ def test_crash_safe_recreate_exactly_once() -> None:
         require(action == {"step": "stage", "country": "SG", "recreate": True})
         store.mark_staged(EPOCH_1)
         store.arm_restart()
+        require(store.mark_staged(EPOCH_1)["pending"]["phase"] == "armed")
+        require(store.arm_restart()["pending"]["phase"] == "armed")
         action = convergence_action(store.load(), None, EPOCH_1)
         require(action["step"] == "recreate")
         # crash and retry before docker returned: same epoch, still one recreate due
@@ -158,6 +221,9 @@ def test_crash_safe_recreate_exactly_once() -> None:
         action = convergence_action(store.load(), None, EPOCH_2)
         require(action["step"] == "resume" and action["runtimeEpoch"] == EPOCH_2)
         store.mark_restarted(EPOCH_2)
+        require(store.mark_staged(EPOCH_1)["pending"]["phase"] == "restarted")
+        require(store.arm_restart()["pending"]["phase"] == "restarted")
+        require(store.mark_restarted(EPOCH_2)["pending"]["phase"] == "restarted")
         staged = android(store.load(), pending["profileDigest"], "staged", EPOCH_1)
         action = convergence_action(store.load(), staged, EPOCH_2)
         require(action["step"] == "verify" and action["promote"])
@@ -277,61 +343,122 @@ def test_sim_epoch_rotation_renews_same_country() -> None:
         store.set_desired("SG")
 
 
-def test_missing_location_regeneration_target_is_journal_bound() -> None:
+def test_regeneration_target_and_sim_rotation_are_store_bound() -> None:
     with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        transaction = "ab" * 16
-        sim_epoch = "cd" * 16
-        target = missing_regeneration_target(
-            INSTANCE,
-            transaction,
-            sim_epoch,
+        store = _pending_store(directory)
+        sim_epoch = "ab" * 16
+        first = store.regeneration_target(sim_epoch)
+        require(first == store.regeneration_target(sim_epoch))
+        require(first["simEpoch"] == sim_epoch)
+        before = store.load()
+        rotated = store.rotate_sim_identity(
+            sim_epoch=sim_epoch,
+            expected_epoch=before["simEpoch"],
         )
-        journal = root / "device-regenerate-v2.json"
-        journal.write_text(
-            json.dumps(
-                {
-                    "schema": "dev.xenoid.device-regenerate/v2",
-                    "instanceId": INSTANCE,
-                    "transactionId": transaction,
-                    "target": {
-                        "simEpoch": sim_epoch,
-                        "locationProfileDigest": target["profileDigest"],
-                    },
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
+        require(rotated["simEpoch"] == sim_epoch)
+        pending = rotated["pending"]
+        require(pending is not None and pending["phase"] == "new")
+        require(pending["profileDigest"] == first["profileDigest"])
+        retried = store.rotate_sim_identity(
+            sim_epoch=sim_epoch,
+            expected_epoch=before["simEpoch"],
         )
-        journal.chmod(0o600)
-        store = LocationStateStore(root)
-        created = store.initialize_regeneration_target(
-            INSTANCE,
-            transaction,
-            sim_epoch,
-            target["profileDigest"],
-        )
-        require(created["pending"]["phase"] == "new")
-        require(created["pending"]["profileDigest"] == target["profileDigest"])
-        require(
-            store.initialize_regeneration_target(
-                INSTANCE,
-                transaction,
-                sim_epoch,
-                target["profileDigest"],
-            )
-            == created
-        )
+        require(retried["simEpoch"] == sim_epoch)
+        require(retried["pending"] == rotated["pending"])
         expect(
             "device_regeneration_state_invalid",
-            lambda: store.initialize_regeneration_target(
-                INSTANCE,
-                transaction,
-                "ef" * 16,
-                target["profileDigest"],
+            lambda: store.rotate_sim_identity(
+                sim_epoch="cd" * 16,
+                expected_epoch="ef" * 16,
             ),
         )
+
+
+def test_carrier_pin_contract() -> None:
+    for country in dataset_countries():
+        profile = generate_cellular_profile(country, b"p" * 32)
+        pin = carrier_pin(profile)
+        require(set(pin) == {"name", "mcc", "mnc", "apn", "bands"})
+        repinned = generate_cellular_profile(country, b"q" * 32, pin=pin)
+        require(repinned["carrier"] == profile["carrier"])
+        require(repinned["operator"] == profile["operator"])
+        require(carrier_pin(repinned) == pin)
+        # A pin drawn from the same seed reproduces the unpinned profile.
+        require(generate_cellular_profile(country, b"p" * 32, pin=pin) == profile)
+    hk_pin = carrier_pin(generate_cellular_profile("HK", b"r" * 32))
+    sg_pin = carrier_pin(generate_cellular_profile("SG", b"r" * 32))
+    expect("carrier_pin_invalid", lambda: generate_cellular_profile("HK", b"r" * 32, pin=sg_pin))
+    expect("carrier_pin_invalid", lambda: generate_cellular_profile(
+        "HK", b"r" * 32,
+        pin={"name": "Bogus", "mcc": "999", "mnc": "99", "apn": "x", "bands": [1]}))
+    expect("carrier_pin_invalid", lambda: generate_cellular_profile(
+        "HK", b"r" * 32, pin={"name": "Bogus"}))
+    expect("carrier_pin_invalid", lambda: generate_cellular_profile(
+        "HK", b"r" * 32, pin=dict(hk_pin, bands=["not-a-band"])))
+    expect("cellular_profile_invalid", lambda: carrier_pin({"schema": "nope"}))
+
+
+def test_regeneration_preserves_active_carrier_hk() -> None:
+    records = dataset_countries()["HK"]["carriers"]
+    require(len(records) > 1)
+    epochs = [hashlib.sha256(b"hk-sim-epoch-%d" % index).hexdigest()[:32] for index in range(6)]
+    for record in records:
+        master_seed = _master_seed_for_carrier("HK", record["name"])
+        # Without a pin these epochs re-roll the carrier, so the scenario
+        # exercises genuine multi-choice drift for every active carrier.
+        drift = {
+            generate_cellular_profile("HK", _epoch_profile_seed(master_seed, "HK", epoch))["carrier"]["name"]
+            for epoch in epochs
+        }
+        require(len(drift) > 1)
+        with tempfile.TemporaryDirectory() as directory:
+            store = _seeded_active_store(directory, "HK", master_seed)
+            active = store.load()["profiles"]["HK"]["profile"]
+            require(active["carrier"]["name"] == record["name"])
+            current_epoch = ""
+            previous = active
+            for epoch in epochs:
+                target = store.regeneration_target(epoch)
+                pinned = target["profile"]
+                # Carrier identity is pinned to the active record.
+                require(pinned["carrier"] == active["carrier"])
+                require(pinned["operator"] == active["operator"])
+                require(pinned["carrier"]["apn"] == record["apn"])
+                require(pinned["sim"]["spn"] == record["name"])
+                require(pinned["sim"]["mncLength"] == len(record["mnc"]))
+                # SIM and cell identifiers rotate with the new epoch only.
+                for field in ("imsi", "iccid", "msisdn"):
+                    require(pinned["sim"][field] != previous["sim"][field])
+                require(pinned["sim"]["imsi"].startswith(record["mcc"] + record["mnc"]))
+                require(pinned["sim"]["iccid"].startswith("89" + record["mcc"] + record["mnc"]))
+                require(pinned["cell"]["eci"] != previous["cell"]["eci"])
+                require(any(
+                    pinned["cell"][field] != previous["cell"][field]
+                    for field in ("tac", "pci", "earfcn", "rsrp", "rsrq",
+                                  "rssnr", "cqi", "timingAdvance")
+                ))
+                rotated = store.rotate_sim_identity(
+                    sim_epoch=epoch, expected_epoch=current_epoch,
+                )
+                require(rotated["pending"]["profileDigest"] == target["profileDigest"])
+                # A crash-resume re-derives the identical target and stops.
+                require(store.regeneration_target(epoch) == target)
+                retried = store.rotate_sim_identity(
+                    sim_epoch=epoch, expected_epoch=current_epoch,
+                )
+                require(retried["pending"] == rotated["pending"])
+                current_epoch = epoch
+                previous = pinned
+            # The pinned carrier also survives promotion to the active record.
+            store.mark_staged(EPOCH_1)
+            store.arm_restart()
+            store.mark_restarted(EPOCH_2)
+            promoted = store.promote(EPOCH_2)
+            require(promoted["profiles"]["HK"]["profile"]["carrier"] == active["carrier"])
+            require(
+                promoted["active"]["profileDigest"]
+                == promoted["profiles"]["HK"]["profileDigest"]
+            )
 
 
 def test_state_permissions_and_corruption() -> None:
@@ -430,7 +557,9 @@ def main() -> int:
     test_crash_safe_recreate_exactly_once()
     test_rotation_and_cached_restore()
     test_sim_epoch_rotation_renews_same_country()
-    test_missing_location_regeneration_target_is_journal_bound()
+    test_regeneration_target_and_sim_rotation_are_store_bound()
+    test_carrier_pin_contract()
+    test_regeneration_preserves_active_carrier_hk()
     test_state_permissions_and_corruption()
     test_public_summary_masks_secrets()
     test_legacy_state_cleanup()

@@ -112,7 +112,7 @@ sudo ./scripts/setup-linux-binderfs.sh
 ./xenoid device regenerate
 ```
 
-`device regenerate` 会轮换设备、网络、SIM、启动、存储和应用身份目标，同时保留用户数据与已安装应用。
+`device regenerate` 在运行中的运行时上原位轮换设备、SIM、启动、存储、Google 与应用身份——一次软重启，不重建容器——同时保留用户数据与已安装应用。该命令接受 `--dry-run`，不再接受 `--skip-build`；`up --skip-build` 仍然可用。microG 轮换完成后使用 `googleIdentityMode=offline-seeded`，因此 FCM 注册与投递不可用。
 
 ### 全局代理
 
@@ -161,8 +161,8 @@ python -m pip install frida-tools
 
 ./xenoid build all
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.1.0
-./xenoid verify-release dist/release/xenoid-0.1.0.tar.gz
+./xenoid package-release --version 0.9.2
+./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
 ```
 
 详细契约：

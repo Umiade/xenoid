@@ -59,12 +59,6 @@ final class DeviceProfileManager {
             } else if (generated.containsKey("boot_id")) {
                 actions.add(applyField("boot_id", generated.get("boot_id")));
             }
-            String randomUuid = generated.containsKey("random_uuid") ? generated.get("random_uuid") : (ids == null ? null : ids.optString("random_uuid", null));
-            if (randomUuid != null && randomUuid.length() > 0 && !"REGENERATE".equals(randomUuid)) {
-                actions.add(applyField("random_uuid", randomUuid));
-            } else if (generated.containsKey("random_uuid")) {
-                actions.add(applyField("random_uuid", generated.get("random_uuid")));
-            }
             String serial = generated.containsKey("serial") ? generated.get("serial") : (ids == null ? null : ids.optString("serial", null));
             if (serial != null && serial.length() > 0 && !"REGENERATE".equals(serial)) actions.add(applyField("serial", serial));
             else if (generated.containsKey("serial")) actions.add(applyField("serial", generated.get("serial")));
@@ -647,6 +641,31 @@ final class DeviceProfileManager {
             return out;
         }
     }
+    static Map<String,Object> reapplyRuntimeIdentityFromStagedProfile() {
+        Map<String,Object> out = new LinkedHashMap<>();
+        out.put("field", "net.hostname");
+        out.put("operation", "reapplyRuntimeIdentityFromStagedProfile");
+        Map<String,Object> read = RootHelper.exec(
+                "cat /data/local/tmp/xenoid-profile/hostname 2>/dev/null || true");
+        if (read == null || !Boolean.TRUE.equals(read.get("ok"))) {
+            out.put("ok", false);
+            out.put("retryable", "rootd_unavailable");
+            return out;
+        }
+        String hostname = String.valueOf(read.get("stdout")).trim();
+        if (hostname.isEmpty()) {
+            out.put("ok", true);
+            out.put("skipped", "hostname_absent");
+            return out;
+        }
+        if (!hostname.matches("[A-Za-z0-9][A-Za-z0-9-]{0,62}")) {
+            out.put("ok", false);
+            out.put("error", "hostname_invalid");
+            return out;
+        }
+        return applyField("net.hostname", hostname);
+    }
+
 
     static Map<String,Object> setField(String field, String value) {
         Map<String,Object> out = applyField(field, value);
@@ -679,12 +698,33 @@ final class DeviceProfileManager {
             actions.add(RootHelper.exec("settings put secure android_id " + RootHelper.shellQuote(value)));
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/android_id"));
             actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-ssaid && /data/local/tmp/xenoid-ssaid " + RootHelper.shellQuote(value) + " >/data/local/tmp/xenoid-ssaid.log 2>&1 || true"));
+        } else if ("device_name".equals(field)) {
+            actions.add(RootHelper.exec("settings put global device_name " + RootHelper.shellQuote(value)));
+        } else if ("net.hostname".equals(field) || "hostname".equals(field)) {
+            String hostname = value.trim();
+            if (!hostname.matches("[A-Za-z0-9][A-Za-z0-9-]{0,62}")) {
+                throw new IllegalArgumentException("hostname_invalid");
+            }
+            out.put("value", hostname);
+            actions.add(RootHelper.exec(
+                    "set -eu; d=/data/local/tmp/xenoid-profile; mkdir -p \"$d\"; "
+                    + "umask 077; printf %s " + RootHelper.shellQuote(hostname + "\n")
+                    + " > \"$d/hostname.new\"; chmod 600 \"$d/hostname.new\"; "
+                    + "mv -f \"$d/hostname.new\" \"$d/hostname\"; "
+                    + "setprop net.hostname " + RootHelper.shellQuote(hostname)));
+        } else if ("bluetooth_address".equals(field)) {
+            String address = value.trim().toUpperCase(Locale.ROOT);
+            if (!address.matches("[0-9A-F]{2}(:[0-9A-F]{2}){5}")) {
+                throw new IllegalArgumentException("bluetooth_address_invalid");
+            }
+            out.put("value", address);
+            actions.add(RootHelper.exec(
+                    "settings --user 0 put secure bluetooth_address "
+                    + RootHelper.shellQuote(address)
+                    + " && settings --user 0 put secure bluetooth_addr_valid 1"));
         } else if ("boot_id".equals(field)) {
             actions.add(RootHelper.exec("setprop persist.xenoid.boot_id " + RootHelper.shellQuote(value)));
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/boot_id"));
-            actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
-        } else if ("random_uuid".equals(field)) {
-            actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/random_uuid"));
             actions.add(RootHelper.exec("test -x /system/bin/xenoid-overlay-helper && /system/bin/xenoid-overlay-helper apply >/data/local/tmp/xenoid-overlay.log 2>&1 || true"));
         } else if ("imei".equals(field) || "persist.xenoid.radio.imei".equals(field)) {
             actions.add(RootHelper.exec("setprop persist.xenoid.radio.imei " + RootHelper.shellQuote(value)));
@@ -795,7 +835,6 @@ final class DeviceProfileManager {
         Map<String,String> g = new LinkedHashMap<>();
         g.put("android_id", hex(8));
         g.put("boot_id", UUID.randomUUID().toString());
-        g.put("random_uuid", UUID.randomUUID().toString());
         g.put("serial", randomSerial());
         g.put("imei", randomImei());
         g.put("imeisv", "01");

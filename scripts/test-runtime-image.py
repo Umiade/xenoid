@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import tarfile
 import sys
 import tempfile
 import threading
@@ -73,6 +74,374 @@ def expect_code(code: str, function: Callable[..., Any], *args: Any, **kwargs: A
 
 def sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+PAYLOAD_CONTENT_A = b"payload-A-content" + b"\x00" * 8
+PAYLOAD_CONTENT_B = b"payload-B-content" + b"\x01" * 8
+PAYLOAD_TREE_ONE = b"directory payload one"
+PAYLOAD_TREE_TWO = b"directory payload two"
+
+
+def payload_expected_files() -> dict[str, bytes]:
+    return {
+        "system/lib64/libx.so": PAYLOAD_CONTENT_A,
+        "vendor/lib64/libx.so": PAYLOAD_CONTENT_A,
+        "system/etc/xenoid/one.txt": PAYLOAD_TREE_ONE,
+        "system/etc/xenoid/two.txt": PAYLOAD_TREE_TWO,
+    }
+
+
+def payload_layer_members() -> list[dict[str, Any]]:
+    members: list[dict[str, Any]] = [
+        {"name": directory, "type": "dir"}
+        for directory in (
+            "system",
+            "system/lib64",
+            "system/etc",
+            "system/etc/xenoid",
+            "vendor",
+            "vendor/lib64",
+        )
+    ]
+    members.extend(
+        {"name": name, "data": payload}
+        for name, payload in sorted(payload_expected_files().items())
+    )
+    return members
+
+def pax_records(values: Mapping[str, str]) -> bytes:
+    payload = bytearray()
+    for key, value in values.items():
+        body = f" {key}={value}\n".encode("utf-8")
+        length = len(body) + 1
+        while len(str(length)) + len(body) != length:
+            length = len(str(length)) + len(body)
+        payload.extend(str(length).encode("ascii"))
+        payload.extend(body)
+    return bytes(payload)
+
+
+def build_payload_context(root: Path) -> Path:
+    context = root / "context"
+    tree = context / "payload" / "tree"
+    tree.mkdir(parents=True)
+    (context / "payload" / "libx.so").write_bytes(PAYLOAD_CONTENT_A)
+    (tree / "one.txt").write_bytes(PAYLOAD_TREE_ONE)
+    (tree / "two.txt").write_bytes(PAYLOAD_TREE_TWO)
+    (context / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "COPY payload/libx.so /system/lib64/libx.so\n"
+        "COPY payload/libx.so /vendor/lib64/libx.so\n"
+        "COPY payload/tree/ /system/etc/xenoid/\n",
+        encoding="utf-8",
+    )
+    entries: list[dict[str, Any]] = [
+        {
+            "path": "payload",
+            "type": "directory",
+            "mode": "0755",
+            "size": 0,
+            "sha256": None,
+        },
+        {
+            "path": "payload/tree",
+            "type": "directory",
+            "mode": "0755",
+            "size": 0,
+            "sha256": None,
+        },
+    ]
+    for path, payload in (
+        ("payload/libx.so", PAYLOAD_CONTENT_A),
+        ("payload/tree/one.txt", PAYLOAD_TREE_ONE),
+        ("payload/tree/two.txt", PAYLOAD_TREE_TWO),
+    ):
+        entries.append(
+            {
+                "path": path,
+                "type": "file",
+                "mode": "0644",
+                "size": len(payload),
+                "sha256": sha256(payload),
+            }
+        )
+    (context / "context-manifest.json").write_text(
+        json.dumps(
+            {"schema": "dev.xenoid.runtime-context/v1", "entries": entries},
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return context
+
+
+def write_oci_image_archive(
+    path: Path,
+    layers: list[list[dict[str, Any]]],
+    *,
+    corrupt: str | None = None,
+    layer_media_type: str = "application/vnd.docker.image.rootfs.diff.tar.gzip",
+) -> None:
+    descriptors: list[dict[str, Any]] = []
+    blobs: list[tuple[str, bytes]] = []
+    for members in layers:
+        layer_buffer = io.BytesIO()
+        layer_mode = (
+            "w:"
+            if layer_media_type == "application/vnd.oci.image.layer.v1.tar"
+            else "w:gz"
+        )
+        with tarfile.open(
+            fileobj=layer_buffer,
+            mode=layer_mode,
+            format=tarfile.GNU_FORMAT,
+        ) as layer:
+            for spec in members:
+                member = tarfile.TarInfo(spec["name"])
+                member.mtime = 0
+                kind = spec.get("type", "file")
+                if kind == "dir":
+                    member.type = tarfile.DIRTYPE
+                    member.mode = 0o755
+                    member.size = 0
+                    layer.addfile(member)
+                elif kind == "symlink":
+                    member.type = tarfile.SYMTYPE
+                    member.mode = 0o777
+                    member.linkname = spec["target"]
+                    member.size = 0
+                    layer.addfile(member)
+                else:
+                    payload = spec["data"]
+                    member.mode = 0o644
+                    member.size = len(payload)
+                    member.type = {
+                        "pax": tarfile.XHDTYPE,
+                        "global_pax": tarfile.XGLTYPE,
+                        "gnu_longname": tarfile.GNUTYPE_LONGNAME,
+                        "gnu_sparse": tarfile.GNUTYPE_SPARSE,
+                    }.get(kind, tarfile.REGTYPE)
+                    layer.addfile(member, io.BytesIO(payload))
+        blob = layer_buffer.getvalue()
+        digest = sha256(blob)
+        size = len(blob)
+        if corrupt == "digest":
+            digest = "0" * 64
+        elif corrupt == "size":
+            size += 1
+        media_type = layer_media_type
+        if corrupt == "mediaType":
+            media_type = "application/octet-stream"
+        elif corrupt == "compression":
+            media_type = (
+                "application/vnd.docker.image.rootfs.diff.tar.gzip"
+                if layer_media_type == "application/vnd.oci.image.layer.v1.tar"
+                else "application/vnd.oci.image.layer.v1.tar"
+            )
+        descriptors.append(
+            {
+                "mediaType": media_type,
+                "digest": f"sha256:{digest}",
+                "size": size,
+            }
+        )
+        blobs.append((digest, blob))
+    if corrupt == "layerDescriptorFieldAlias":
+        descriptors[0]["Digest"] = "sha256:" + "9" * 64
+    elif corrupt == "descriptorPlatformFieldAlias":
+        descriptors[0]["platform"] = {
+            "architecture": "arm64",
+            "Architecture": "amd64",
+        }
+
+    config = {
+        "architecture": "arm64",
+        "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": []},
+    }
+    if corrupt == "configBlobFieldAlias":
+        config["Architecture"] = "amd64"
+    elif corrupt == "configRootfsFieldAlias":
+        config["rootfs"]["Type"] = "not-layers"
+    elif corrupt == "configRunFieldAlias":
+        config["config"] = {"Env": [], "env": ["SPLIT=1"]}
+    config_bytes = json.dumps(
+        config,
+        sort_keys=corrupt
+        not in {
+            "configBlobFieldAlias",
+            "configRootfsFieldAlias",
+            "configRunFieldAlias",
+        },
+    ).encode("utf-8")
+    config_digest = sha256(config_bytes)
+    config_size = len(config_bytes)
+    if corrupt == "configDigest":
+        config_digest = "1" * 64
+    elif corrupt == "configSize":
+        config_size += 1
+    manifest = {
+        "schemaVersion": 1 if corrupt == "manifestSchema" else 2,
+        "mediaType": (
+            "application/octet-stream"
+            if corrupt == "manifestMediaType"
+            else "application/vnd.docker.distribution.manifest.v2+json"
+        ),
+        "config": {
+            "mediaType": (
+                "application/octet-stream"
+                if corrupt == "configMediaType"
+                else "application/vnd.docker.container.image.v1+json"
+            ),
+            "digest": f"sha256:{config_digest}",
+            "size": config_size,
+        },
+        "layers": descriptors,
+    }
+    if corrupt == "manifestFieldAlias":
+        manifest["Layers"] = []
+    elif corrupt == "configDescriptorFieldAlias":
+        manifest["config"]["Digest"] = "sha256:" + "9" * 64
+    elif corrupt == "manifestSubjectDescriptorFieldAlias":
+        manifest["subject"] = {
+            "mediaType": "application/octet-stream",
+            "digest": "sha256:" + "7" * 64,
+            "size": 1,
+            "Digest": "sha256:" + "8" * 64,
+        }
+    manifest_bytes = json.dumps(
+        manifest,
+        sort_keys=corrupt
+        not in {
+            "manifestFieldAlias",
+            "configDescriptorFieldAlias",
+            "layerDescriptorFieldAlias",
+            "descriptorPlatformFieldAlias",
+            "manifestSubjectDescriptorFieldAlias",
+        },
+    ).encode("utf-8")
+    manifest_digest = sha256(manifest_bytes)
+    index = {
+        "schemaVersion": 1 if corrupt == "indexSchema" else 2,
+        "manifests": [
+            {
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "digest": f"sha256:{manifest_digest}",
+                "size": (
+                    len(manifest_bytes) + 1
+                    if corrupt == "manifestSize"
+                    else len(manifest_bytes)
+                ),
+            }
+        ],
+    }
+    if corrupt == "indexTopLevelFieldAlias":
+        index["Manifests"] = []
+    elif corrupt == "indexDescriptorFieldAlias":
+        index["manifests"][0]["Digest"] = "sha256:" + "9" * 64
+    elif corrupt == "indexSubjectDescriptorFieldAlias":
+        index["subject"] = {
+            "mediaType": "application/octet-stream",
+            "digest": "sha256:" + "5" * 64,
+            "size": 1,
+            "Digest": "sha256:" + "6" * 64,
+        }
+    index_bytes = json.dumps(
+        index,
+        sort_keys=corrupt
+        not in {
+            "indexTopLevelFieldAlias",
+            "indexDescriptorFieldAlias",
+            "indexSubjectDescriptorFieldAlias",
+        },
+    ).encode("utf-8")
+    if corrupt == "duplicateExactIndexField":
+        index_bytes = index_bytes[:-1] + b',"schemaVersion":2}'
+    layer_paths = [
+        f"blobs/sha256/{descriptor['digest'][7:]}"
+        for descriptor in descriptors
+    ]
+    docker_entry: dict[str, Any] = {
+        "Config": f"blobs/sha256/{config_digest}",
+        "RepoTags": ["xenoid/runtime:fixture"],
+        "Layers": layer_paths,
+    }
+    if corrupt == "dockerConfig":
+        docker_entry["Config"] = "blobs/sha256/" + "9" * 64
+    elif corrupt == "dockerLayers":
+        docker_entry["Layers"] = ["blobs/sha256/" + "8" * 64]
+    elif corrupt == "dockerLayerOrder":
+        docker_entry["Layers"] = list(reversed(layer_paths))
+    elif corrupt == "dockerManifestFieldAlias":
+        docker_entry["layers"] = []
+    elif corrupt == "dockerLayerSourceDescriptorFieldAlias":
+        docker_entry["LayerSources"] = {
+            "sha256:" + "3" * 64: {
+                "mediaType": "application/octet-stream",
+                "digest": "sha256:" + "3" * 64,
+                "size": 1,
+                "Digest": "sha256:" + "4" * 64,
+            }
+        }
+    docker_manifest: list[dict[str, Any]] = [docker_entry]
+    if corrupt == "dockerManifestMultiple":
+        docker_manifest.append(copy.deepcopy(docker_entry))
+    oci_layout = {
+        "imageLayoutVersion": (
+            "0.9.0" if corrupt == "ociLayout" else "1.0.0"
+        )
+    }
+    if corrupt == "ociLayoutFieldAlias":
+        oci_layout["ImageLayoutVersion"] = "0.9.0"
+    oci_layout_bytes = json.dumps(
+        oci_layout,
+        sort_keys=corrupt != "ociLayoutFieldAlias",
+    ).encode("utf-8")
+    docker_manifest_bytes = json.dumps(
+        docker_manifest,
+        sort_keys=corrupt
+        not in {
+            "dockerManifestFieldAlias",
+            "dockerLayerSourceDescriptorFieldAlias",
+        },
+    ).encode("utf-8")
+
+    entries = [
+        ("oci-layout", oci_layout_bytes),
+        ("index.json", index_bytes),
+        ("manifest.json", docker_manifest_bytes),
+        (f"blobs/sha256/{config_digest}", config_bytes),
+        (f"blobs/sha256/{manifest_digest}", manifest_bytes),
+    ]
+    entries.extend((f"blobs/sha256/{digest}", blob) for digest, blob in blobs)
+    if corrupt == "missingOciLayout":
+        entries = [entry for entry in entries if entry[0] != "oci-layout"]
+    elif corrupt == "missingDockerManifest":
+        entries = [entry for entry in entries if entry[0] != "manifest.json"]
+    elif corrupt == "aliasIndex":
+        entries.append(("./index.json", json.dumps(index, sort_keys=True).encode("utf-8")))
+    elif corrupt == "aliasBlob":
+        digest, blob = blobs[0]
+        entries.append((f"./blobs/sha256/{digest}", blob))
+    elif corrupt == "absoluteOuter":
+        entries.append(("/index.json", json.dumps(index, sort_keys=True).encode("utf-8")))
+    elif corrupt == "parentOuter":
+        entries.append(("../index.json", json.dumps(index, sort_keys=True).encode("utf-8")))
+    elif corrupt == "dotOuter":
+        digest, blob = blobs[0]
+        entries.append((f"blobs/./sha256/{digest}", blob))
+    elif corrupt == "slashOuter":
+        digest, blob = blobs[0]
+        entries.append((f"blobs//sha256/{digest}", blob))
+    elif corrupt == "trailingSlashOuter":
+        entries.append(("index.json/", json.dumps(index, sort_keys=True).encode("utf-8")))
+    with tarfile.open(path, mode="w:") as archive:
+        for name, payload in entries:
+            member = tarfile.TarInfo(name)
+            member.mode = 0o644
+            member.mtime = 0
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+    path.chmod(0o600)
 
 
 def zip_info(
@@ -803,7 +1172,10 @@ class FakeDocker:
     def _context(self, destination: Path, base_tag: str) -> None:
         destination.mkdir(parents=True)
         dockerfile = destination / "Dockerfile"
-        dockerfile.write_text(f"FROM {base_tag}\n", encoding="ascii")
+        dockerfile.write_text(
+            f"FROM {base_tag}\nCOPY payload/fixture.bin /system/etc/xenoid/fixture.bin\n",
+            encoding="ascii",
+        )
         dockerfile.chmod(0o644)
         payload = destination / "payload"
         payload.mkdir()
@@ -931,8 +1303,20 @@ class FakeDocker:
                 temporary_tag = suffix[suffix.index("--tag") + 1]
                 require(cwd is not None, "runtime image exporter has no private work directory")
                 archive = Path(cwd) / "image.tar"
-                archive.write_bytes(b"deterministic image archive")
-                archive.chmod(0o600)
+                context_path = Path(suffix[-1])
+                write_oci_image_archive(
+                    archive,
+                    [
+                        [
+                            {
+                                "name": "system/etc/xenoid/fixture.bin",
+                                "data": (
+                                    context_path / "payload" / "fixture.bin"
+                                ).read_bytes(),
+                            }
+                        ]
+                    ],
+                )
                 self.archives[archive] = (
                     temporary_tag,
                     self.image(BUILT_ID, labels=labels),
@@ -1191,6 +1575,558 @@ def production_callers_have_no_legacy_mutable_image_path() -> None:
     require("effective_google_image(" not in backend, "mutable Google image tag remains")
     require("ensure_runtime_image" in cli and "runtime_image_input_record" in cli, "CLI does not share image builder")
     require("ensure_runtime_image" in mcp and "runtime_image_input_record" in mcp, "MCP does not share image builder")
+
+
+@contract_case("archivePayloadVerificationDetectsStaleContent")
+def archive_payload_verification_detects_stale_content() -> None:
+    require(len(PAYLOAD_CONTENT_A) == len(PAYLOAD_CONTENT_B), "same-size fixture required")
+    builder = runtime_image.RuntimeImageBuilder(Path(tempfile.gettempdir()), ("docker",), {})
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        context = build_payload_context(root)
+        archive_path = root / "image.tar"
+        write_oci_image_archive(archive_path, [payload_layer_members()])
+        builder._verify_archive_payload(archive_path, context)
+    expected_files = payload_expected_files()
+    for changed in (
+        {**expected_files, "vendor/lib64/libx.so": PAYLOAD_CONTENT_B},
+        {**expected_files, "system/etc/xenoid/two.txt": b"stale directory payload"},
+        {path: payload for path, payload in expected_files.items() if path != "vendor/lib64/libx.so"},
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = build_payload_context(root)
+            archive_path = root / "image.tar"
+            members = [
+                {"name": name, "data": payload}
+                for name, payload in sorted(changed.items())
+            ]
+            write_oci_image_archive(archive_path, [members])
+            expect_code(
+                "runtime_image_payload_mismatch",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+
+
+@contract_case("archivePayloadVerificationHardensLayerReplay")
+def archive_payload_verification_hardens_layer_replay() -> None:
+    builder = runtime_image.RuntimeImageBuilder(Path(tempfile.gettempdir()), ("docker",), {})
+
+    def staged(
+        members: list[list[dict[str, Any]]],
+        corrupt: str | None = None,
+        *,
+        layer_media_type: str = "application/vnd.docker.image.rootfs.diff.tar.gzip",
+    ):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        context = build_payload_context(root)
+        archive_path = root / "image.tar"
+        write_oci_image_archive(
+            archive_path,
+            members,
+            corrupt=corrupt,
+            layer_media_type=layer_media_type,
+        )
+        return temporary, archive_path, context
+
+    # A legal "./" root directory record is a no-op.
+    temporary, archive_path, context = staged(
+        [[{"name": "./", "type": "dir"}] + payload_layer_members()]
+    )
+    with temporary:
+        builder._verify_archive_payload(archive_path, context)
+
+    # A non-directory root record is rejected.
+    temporary, archive_path, context = staged(
+        [[{"name": "./", "data": b"root-file"}] + payload_layer_members()]
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # Both spellings of a regular-file root record are invalid.
+    temporary, archive_path, context = staged(
+        [[{"name": ".", "data": b"root-file"}] + payload_layer_members()]
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # OCI whiteouts and opaque markers remove parent-layer entries only;
+    # same-layer additions survive regardless of tar member order.
+    whiteout = {"name": "system/lib64/.wh.libx.so", "data": b""}
+    for members in (
+        payload_layer_members() + [whiteout],
+        [whiteout] + payload_layer_members(),
+    ):
+        temporary, archive_path, context = staged([members])
+        with temporary:
+            builder._verify_archive_payload(archive_path, context)
+
+    opaque = {"name": "system/lib64/.wh..wh..opq", "data": b""}
+    temporary, archive_path, context = staged(
+        [payload_layer_members() + [opaque]]
+    )
+    with temporary:
+        builder._verify_archive_payload(archive_path, context)
+
+    # Tar parser failures while locating or reading OCI metadata are normalized.
+    class BrokenMetadataArchive:
+        def getmember(self, name: str) -> tarfile.TarInfo:
+            return tarfile.TarInfo(name)
+
+        def extractfile(self, member: tarfile.TarInfo) -> None:
+            raise tarfile.ReadError("broken metadata")
+
+    broken_member = tarfile.TarInfo("index.json")
+    expect_code(
+        "runtime_image_archive_layout_invalid",
+        builder._archive_layer_descriptors,
+        BrokenMetadataArchive(),
+        {"index.json": broken_member},
+    )
+
+    class OversizedOuterArchive:
+        def __iter__(self):
+            yield tarfile.TarInfo("one")
+            yield tarfile.TarInfo("two")
+
+    original_outer_cap = runtime_image._MAX_IMAGE_ARCHIVE_MEMBERS
+    runtime_image._MAX_IMAGE_ARCHIVE_MEMBERS = 1
+    try:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._archive_member_index,
+            OversizedOuterArchive(),
+        )
+    finally:
+        runtime_image._MAX_IMAGE_ARCHIVE_MEMBERS = original_outer_cap
+
+    # Oversized PAX/GNU pseudo-members after a complete valid layer prefix
+    # must be fatal. TarFile.next() swallows InvalidHeaderError at nonzero
+    # offsets as EOF, which used to hide the later stale overwrite.
+    original_metadata_cap = runtime_image._MAX_LAYER_METADATA_BYTES
+    runtime_image._MAX_LAYER_METADATA_BYTES = 64
+    try:
+        for metadata_kind in ("pax", "gnu_longname"):
+            members = payload_layer_members() + [
+                {
+                    "name": "extended-metadata",
+                    "type": metadata_kind,
+                    "data": b"x" * 65,
+                },
+                {
+                    "name": "system/lib64/libx.so",
+                    "data": PAYLOAD_CONTENT_B,
+                },
+            ]
+            temporary, archive_path, context = staged([members])
+            with temporary:
+                expect_code(
+                    "runtime_image_archive_layout_invalid",
+                    builder._verify_archive_payload,
+                    archive_path,
+                    context,
+                )
+    finally:
+        runtime_image._MAX_LAYER_METADATA_BYTES = original_metadata_cap
+
+    # Pseudo-members do not appear in the layer-member loop, so their byte
+    # budget is cumulative too. Each record fits independently; together
+    # they exceed the cap before the stale second target can be processed.
+    pax_metadata = pax_records({"comment": "x" * 32})
+    runtime_image._MAX_LAYER_METADATA_BYTES = len(pax_metadata) + 1
+    try:
+        members = payload_layer_members() + [
+            {
+                "name": "pax-one",
+                "type": "pax",
+                "data": pax_metadata,
+            },
+            {"name": "unwanted-one", "data": b"one"},
+            {
+                "name": "pax-two",
+                "type": "pax",
+                "data": pax_metadata,
+            },
+            {
+                "name": "system/lib64/libx.so",
+                "data": PAYLOAD_CONTENT_B,
+            },
+        ]
+        temporary, archive_path, context = staged([members])
+        with temporary:
+            expect_code(
+                "runtime_image_archive_layout_invalid",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+    finally:
+        runtime_image._MAX_LAYER_METADATA_BYTES = original_metadata_cap
+
+    # Ordinary per-file PAX metadata remains valid and budgeted.
+    temporary, archive_path, context = staged(
+        [
+            [
+                {
+                    "name": "file-pax",
+                    "type": "pax",
+                    "data": pax_records({"comment": "ordinary"}),
+                },
+                {"name": "unwanted-pax-target", "data": b"ignored"},
+            ]
+            + payload_layer_members()
+        ]
+    )
+    with temporary:
+        builder._verify_archive_payload(archive_path, context)
+
+    # Python tarfile persistently applies global PAX paths, but Go
+    # archive/tar/containerd ignores them. A decoy must not overwrite a stale
+    # lower target in the verifier's replay view only.
+    global_pax_target = "system/lib64/libx.so"
+    stale_lower = [
+        {**member, "data": PAYLOAD_CONTENT_B}
+        if member["name"] == global_pax_target
+        else member
+        for member in payload_layer_members()
+    ]
+    temporary, archive_path, context = staged(
+        [
+            stale_lower,
+            [
+                {
+                    "name": "global-pax",
+                    "type": "global_pax",
+                    "data": pax_records({"path": global_pax_target}),
+                },
+                {"name": "decoy", "data": PAYLOAD_CONTENT_A},
+            ],
+        ]
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # GNU sparse entries and every PAX sparse encoding are rejected before
+    # tarfile can allocate or synthesize logical sparse contents.
+    sparse_members = (
+        [{"name": "sparse.bin", "type": "gnu_sparse", "data": b"x"}],
+        [
+            {
+                "name": "sparse-pax",
+                "type": "pax",
+                "data": pax_records({"GNU.sparse.map": "0,1"}),
+            },
+            {"name": "sparse.bin", "data": b"x"},
+        ],
+        [
+            {
+                "name": "sparse-pax-v1",
+                "type": "pax",
+                "data": pax_records(
+                    {
+                        "GNU.sparse.major": "1",
+                        "GNU.sparse.minor": "0",
+                        "GNU.sparse.realsize": "1",
+                    }
+                ),
+            },
+            {"name": "sparse.bin", "data": b"x"},
+        ],
+    )
+    for sparse_prefix in sparse_members:
+        temporary, archive_path, context = staged(
+            [sparse_prefix + payload_layer_members()]
+        )
+        with temporary:
+            expect_code(
+                "runtime_image_archive_layout_invalid",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+    temporary, archive_path, context = staged(
+        [
+            payload_layer_members(),
+            [{"name": "system/lib64", "type": "symlink", "target": "/elsewhere"}],
+        ]
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_payload_mismatch",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # A member beneath a replaced ancestor in the same layer is malformed.
+    temporary, archive_path, context = staged(
+        [
+            [
+                {"name": "system/lib64", "type": "symlink", "target": "/elsewhere"},
+                {"name": "system/lib64/libx.so", "data": PAYLOAD_CONTENT_A},
+            ]
+            + [
+                member
+                for member in payload_layer_members()
+                if member["name"] not in {"system/lib64", "system/lib64/libx.so"}
+            ]
+        ]
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # Every accepted media type is decoded with its declared compression.
+    for media_type in (
+        "application/vnd.docker.image.rootfs.diff.tar.gzip",
+        "application/vnd.oci.image.layer.v1.tar",
+        "application/vnd.oci.image.layer.v1.tar+gzip",
+    ):
+        temporary, archive_path, context = staged(
+            [payload_layer_members()], layer_media_type=media_type
+        )
+        with temporary:
+            builder._verify_archive_payload(archive_path, context)
+
+    # OCI descriptors, config bytes, Docker compatibility metadata, and
+    # outer-member canonicalization all describe the exact same load view.
+    for corrupt in (
+        "digest",
+        "size",
+        "mediaType",
+        "manifestSize",
+        "compression",
+        "configDigest",
+        "configSize",
+        "indexSchema",
+        "manifestSchema",
+        "manifestMediaType",
+        "configMediaType",
+        "ociLayoutFieldAlias",
+        "indexTopLevelFieldAlias",
+        "indexDescriptorFieldAlias",
+        "indexSubjectDescriptorFieldAlias",
+        "manifestFieldAlias",
+        "configDescriptorFieldAlias",
+        "layerDescriptorFieldAlias",
+        "manifestSubjectDescriptorFieldAlias",
+        "dockerManifestFieldAlias",
+        "descriptorPlatformFieldAlias",
+        "configBlobFieldAlias",
+        "configRootfsFieldAlias",
+        "configRunFieldAlias",
+        "duplicateExactIndexField",
+        "dockerLayerSourceDescriptorFieldAlias",
+        "ociLayout",
+        "missingOciLayout",
+        "missingDockerManifest",
+        "dockerConfig",
+        "dockerLayers",
+        "dockerManifestMultiple",
+        "aliasIndex",
+        "aliasBlob",
+        "absoluteOuter",
+        "parentOuter",
+        "dotOuter",
+        "slashOuter",
+        "trailingSlashOuter",
+    ):
+        temporary, archive_path, context = staged(
+            [payload_layer_members()], corrupt=corrupt
+        )
+        with temporary:
+            expect_code(
+                "runtime_image_archive_layout_invalid",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+
+    # Layer order is part of the classic Docker manifest contract too.
+    temporary, archive_path, context = staged(
+        [
+            [{"name": "unused-first", "data": b"first"}],
+            payload_layer_members(),
+        ],
+        corrupt="dockerLayerOrder",
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # A non-directory ancestor remains blocking across later layers unless an
+    # explicit directory record restores it.
+    temporary, archive_path, context = staged(
+        [
+            payload_layer_members(),
+            [{"name": "system/lib64", "type": "symlink", "target": "/elsewhere"}],
+            [{"name": "system/lib64/libx.so", "data": PAYLOAD_CONTENT_A}],
+        ]
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # Replacing an ancestor after adding its child in the same layer is also
+    # malformed; member order cannot resurrect the child.
+    temporary, archive_path, context = staged(
+        [
+            [
+                {"name": "system/lib64/libx.so", "data": PAYLOAD_CONTENT_A},
+                {"name": "system/lib64", "type": "symlink", "target": "/elsewhere"},
+            ]
+            + [
+                member
+                for member in payload_layer_members()
+                if member["name"] not in {"system/lib64", "system/lib64/libx.so"}
+            ]
+        ]
+    )
+    with temporary:
+        expect_code(
+            "runtime_image_archive_layout_invalid",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+
+    # Replay budgets fail closed.
+    temporary, archive_path, context = staged([payload_layer_members()])
+    with temporary:
+        original = runtime_image._MAX_LAYER_MEMBERS
+        runtime_image._MAX_LAYER_MEMBERS = 2
+        try:
+            expect_code(
+                "runtime_image_archive_layout_invalid",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+        finally:
+            runtime_image._MAX_LAYER_MEMBERS = original
+
+    temporary, archive_path, context = staged([payload_layer_members()])
+    with temporary:
+        original = runtime_image._MAX_LAYER_DECOMPRESSED_BYTES
+        runtime_image._MAX_LAYER_DECOMPRESSED_BYTES = 1
+        try:
+            expect_code(
+                "runtime_image_archive_layout_invalid",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+        finally:
+            runtime_image._MAX_LAYER_DECOMPRESSED_BYTES = original
+
+    # Each tar stream is one RECORDSIZE block and fits by itself, but the
+    # archive-wide decompressed budget must reject their combined replay.
+    temporary, archive_path, context = staged(
+        [
+            [{"name": "unused-first", "data": b"first"}],
+            payload_layer_members(),
+        ]
+    )
+    with temporary:
+        original = runtime_image._MAX_LAYER_DECOMPRESSED_BYTES
+        runtime_image._MAX_LAYER_DECOMPRESSED_BYTES = (
+            tarfile.RECORDSIZE + tarfile.BLOCKSIZE
+        )
+        try:
+            expect_code(
+                "runtime_image_archive_layout_invalid",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+        finally:
+            runtime_image._MAX_LAYER_DECOMPRESSED_BYTES = original
+
+    temporary, archive_path, context = staged([payload_layer_members()])
+    with temporary:
+        original = runtime_image._MAX_IMAGE_LAYERS
+        runtime_image._MAX_IMAGE_LAYERS = 0
+        try:
+            expect_code(
+                "runtime_image_archive_layout_invalid",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+        finally:
+            runtime_image._MAX_IMAGE_LAYERS = original
+
+    temporary, archive_path, context = staged([payload_layer_members()])
+    with temporary:
+        builder._deadline = time.monotonic() - 1
+        expect_code(
+            "runtime_image_timeout",
+            builder._verify_archive_payload,
+            archive_path,
+            context,
+        )
+        builder._deadline = time.monotonic() + 3600
+        cancelled = threading.Event()
+        cancelled.set()
+        builder._cancelled = cancelled
+        try:
+            expect_code(
+                "runtime_image_cancelled",
+                builder._verify_archive_payload,
+                archive_path,
+                context,
+            )
+        finally:
+            builder._cancelled = None
+
+
+@contract_case("payloadVerificationContractRotatesFullAndBootIdentity")
+def payload_verification_contract_rotates_full_and_boot_identity() -> None:
+    record = compute_fixture()
+    original = runtime_image._PAYLOAD_VERIFICATION_CONTRACT
+    runtime_image._PAYLOAD_VERIFICATION_CONTRACT = "layer-replay/v0-test"
+    try:
+        migrated = compute_fixture()
+    finally:
+        runtime_image._PAYLOAD_VERIFICATION_CONTRACT = original
+    require(
+        migrated["inputSha256"] != record["inputSha256"],
+        "payload contract change must rotate input identity",
+    )
+    require(
+        migrated["bootInputSha256"] != record["bootInputSha256"],
+        "payload contract change must rotate boot identity",
+    )
 
 
 def main() -> int:

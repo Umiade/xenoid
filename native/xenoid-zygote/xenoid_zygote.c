@@ -9,12 +9,16 @@
 //
 // Android 13 note: SystemProperties.get (the Build.* path) resolves values via
 // __system_property_find + __system_property_read_callback, NOT
-// __system_property_get. Both are interposed below.
+// __system_property_get. Both are interposed below, and the staged DRM identity
+// property is hidden from app readers on every libc read path (find, get,
+// read_callback enumeration, foreach).
+#include <fcntl.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
@@ -28,6 +32,8 @@ typedef int (*spg_t)(const char*, char*);
 typedef const void *(*spf_t)(const char*);
 typedef void (*rcb_cb_t)(void*, const char*, const char*, uint32_t);
 typedef void (*rcb_t)(const void*, rcb_cb_t, void*);
+typedef void (*foreach_cb_t)(const void*, void*);
+typedef int (*foreach_t)(foreach_cb_t, void*);
 #ifndef XENOID_COMBINED_SHIM
 typedef int (*statfs_t)(const char*, struct statfs*);
 #endif
@@ -37,6 +43,7 @@ typedef long (*syscall_t)(long, unsigned long, unsigned long, unsigned long,
 static spg_t real_get;
 static spf_t real_find;
 static rcb_t real_rcb;
+static foreach_t real_foreach;
 #ifndef XENOID_COMBINED_SHIM
 static statfs_t real_statfs;
 #endif
@@ -77,8 +84,21 @@ static const char *spoof_value(const char *name){
   return NULL;
 }
 
+/* persist.xenoid.drm.id stages the synthetic Widevine identity and is an
+   unmistakable xenoid marker, so inside app processes it behaves as a
+   nonexistent property on every libc read path. Non-app contexts are
+   unaffected by construction: this interposition exists only in zygote
+   descendants, so shell/adbd getprop keeps returning the staged value, and
+   the xenoid_drm.c bridge reads it through RTLD_NEXT real symbols, which
+   bypasses this interposition entirely. */
+static int drm_id_property_hidden(const char *name){
+  return name && getuid() >= 10000
+      && !strcmp(name, "persist.xenoid.drm.id");
+}
+
 int __system_property_get(const char *name, char *value){
   if (!real_get) real_get = (spg_t)dlsym(RTLD_NEXT, "__system_property_get");
+  if (drm_id_property_hidden(name)) { if (value) value[0] = 0; return 0; }
   const char *sv = spoof_value(name);
   if (sv) { size_t n = strlen(sv); memcpy(value, sv, n + 1); return (int)n; }
   if (real_get) return real_get(name, value);
@@ -105,6 +125,7 @@ static const void *synthetic_prop_token(const char *name){
 }
 const void *__system_property_find(const char *name){
   if (!real_find) real_find = (spf_t)dlsym(RTLD_NEXT, "__system_property_find");
+  if (drm_id_property_hidden(name)) return NULL;
   const void *token = synthetic_prop_token(name);
   if (token) return token;
   return real_find ? real_find(name) : NULL;
@@ -133,8 +154,39 @@ void __system_property_read_callback(const void *pi, rcb_cb_t cb, void *cookie){
   real_rcb(pi, rcb_wrap_cb, &w);
 }
 
+/* Legacy enumeration must not surface the hidden DRM identity property
+   either. The caller's callback runs only for entries whose real name
+   survives the filter; names are read through the REAL read_callback. */
+struct foreach_wrap { foreach_cb_t cb; void *cookie; int hidden; };
+static void foreach_name_cb(void *cookie, const char *name, const char *value, uint32_t serial){
+  (void)value; (void)serial;
+  ((struct foreach_wrap *)cookie)->hidden = drm_id_property_hidden(name);
+}
+static void foreach_wrap_cb(const void *pi, void *cookie){
+  struct foreach_wrap *w = (struct foreach_wrap *)cookie;
+  w->hidden = 0;
+  if (!real_rcb) real_rcb = (rcb_t)dlsym(RTLD_NEXT, "__system_property_read_callback");
+  if (real_rcb) real_rcb(pi, foreach_name_cb, w);
+  if (w->hidden) return;
+  w->cb(pi, w->cookie);
+}
+int __system_property_foreach(foreach_cb_t propfn, void *cookie){
+  if (!real_foreach) real_foreach = (foreach_t)dlsym(RTLD_NEXT, "__system_property_foreach");
+  if (!real_foreach) { errno = ENOSYS; return -1; }
+  if (!propfn) return real_foreach(propfn, cookie);
+  struct foreach_wrap w; w.cb = propfn; w.cookie = cookie; w.hidden = 0;
+  return real_foreach(foreach_wrap_cb, &w);
+}
+
 static int path_is_data(const char *path){
   if (!path) return 0;
+#ifdef XENOID_HOST_TEST
+  const char *test_path = getenv("XENOID_TEST_DATA_PATH");
+  if (test_path && (!strcmp(path, test_path) ||
+                    (!strncmp(path, test_path, strlen(test_path)) &&
+                     path[strlen(test_path)] == '/')))
+    return 1;
+#endif
   return !strcmp(path, "/data") || !strncmp(path, "/data/", 6);
 }
 
@@ -158,6 +210,59 @@ static unsigned long long scale_data_statfs_value(
   return quotient*XENOID_DATA_BLOCKS
       + remainder*XENOID_DATA_BLOCKS/total;
 }
+
+/* Staged /data filesystem identity shared with the kmod and shim layers.
+   Absent or invalid staged content passes the real fsid through, matching
+   the kmod's zero/zero default. Loaded once per process; regeneration takes
+   effect through the soft reboot that follows it. */
+static pthread_once_t statfs_fsid_once = PTHREAD_ONCE_INIT;
+static uint64_t statfs_fsid_value;
+static int fsid_hex_nibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+static void initialize_statfs_fsid(void) {
+  typedef int (*open_fn_t)(const char*, int, ...);
+  typedef ssize_t (*read_fn_t)(int, void*, size_t);
+  open_fn_t real_open = (open_fn_t)dlsym(RTLD_NEXT, "open");
+  read_fn_t real_read = (read_fn_t)dlsym(RTLD_NEXT, "read");
+  if (!real_open || !real_read) return;
+  const char *dir = getenv("XENOID_PROFILE_DIR");
+  char path[512];
+  snprintf(path, sizeof(path), "%s/statfs_fsid",
+           (dir && dir[0]) ? dir : "/data/local/tmp/xenoid-profile");
+  int fd = real_open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  char text[32];
+  ssize_t size = real_read(fd, text, sizeof(text) - 1);
+  close(fd);
+  if (size != 17 || text[16] != '\n') return;
+  text[size] = 0;
+  unsigned int v[2] = {0, 0};
+  int ok = 1;
+  for (int half = 0; half < 2 && ok; ++half) {
+    for (int i = 0; i < 8; ++i) {
+      int nibble = fsid_hex_nibble(text[half * 8 + i]);
+      if (nibble < 0) { ok = 0; break; }
+      v[half] = (v[half] << 4) | (unsigned int)nibble;
+    }
+  }
+  if (ok)
+    statfs_fsid_value = ((uint64_t)v[0] << 32) | (uint64_t)v[1];
+}
+static uint64_t load_statfs_fsid(void) {
+  pthread_once(&statfs_fsid_once, initialize_statfs_fsid);
+  return statfs_fsid_value;
+}
+#define XENOID_SHAPE_STATFS_FSID(buf) do { \
+  uint64_t fsid = load_statfs_fsid(); \
+  if (fsid) { \
+    (buf)->f_fsid.__val[0] = (int)(uint32_t)(fsid >> 32); \
+    (buf)->f_fsid.__val[1] = (int)(uint32_t)fsid; \
+  } \
+} while(0)
 #define XENOID_SHAPE_DATA_STATFS(buf) do { \
   unsigned long long real_blocks=(unsigned long long)(buf)->f_blocks; \
   unsigned long long real_bfree=(unsigned long long)(buf)->f_bfree; \
@@ -174,13 +279,19 @@ static unsigned long long scale_data_statfs_value(
     (buf)->f_ffree=scale_data_statfs_value(real_ffree,real_blocks); \
     (buf)->f_namelen=XENOID_DATA_NAME_MAX; \
     (buf)->f_flags=XENOID_DATA_STATFS_FLAGS; \
+    XENOID_SHAPE_STATFS_FSID(buf); \
   } \
 } while(0)
 
 static int fd_is_data_device(int fd) {
   struct stat data_stat;
   struct stat fd_stat;
-  return lstat("/data", &data_stat) == 0 && fstat(fd, &fd_stat) == 0
+  const char *data_path = "/data";
+#ifdef XENOID_HOST_TEST
+  const char *test_path = getenv("XENOID_TEST_DATA_PATH");
+  if (test_path && test_path[0]) data_path = test_path;
+#endif
+  return lstat(data_path, &data_stat) == 0 && fstat(fd, &fd_stat) == 0
       && fd_stat.st_dev == data_stat.st_dev;
 }
 

@@ -4,7 +4,9 @@ import ast
 import contextlib
 import dataclasses
 import fcntl
+import gzip
 import hashlib
+import io
 import json
 import os
 import platform
@@ -12,6 +14,7 @@ import re
 import secrets
 import shutil
 import stat
+import tarfile
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -43,6 +46,147 @@ _SAFE_REPOSITORY_COMPONENT_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 _MAX_RECORD_BYTES = 4 * 1024 * 1024
 _MAX_IMAGE_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024
 _COPY_CHUNK = 1024 * 1024
+_MAX_IMAGE_LAYERS = 256
+_MAX_IMAGE_ARCHIVE_MEMBERS = 1024
+_MAX_LAYER_MEMBERS = 1000000
+_MAX_LAYER_DECOMPRESSED_BYTES = 64 * 1024 * 1024 * 1024
+_MAX_LAYER_METADATA_BYTES = 4 * 1024 * 1024
+# Payload-verification contract mixed into inputSha256 and bootInputSha256:
+# bumping it retires every content label minted before the verifier gained a
+# check, so cached or already-running images can never bypass newly added
+# payload proof.
+_PAYLOAD_VERIFICATION_CONTRACT = "layer-replay/v5"
+_LAYER_TAR_MODES = {
+    "application/vnd.docker.image.rootfs.diff.tar.gzip": "r|gz",
+    "application/vnd.oci.image.layer.v1.tar": "r|",
+    "application/vnd.oci.image.layer.v1.tar+gzip": "r|gz",
+}
+_LAYER_MEDIA_TYPES = frozenset(_LAYER_TAR_MODES)
+
+
+def _go_json_fold_name(name: str) -> str:
+    """Return encoding/json's folded spelling for an ASCII schema name."""
+    folded: list[str] = []
+    for character in name:
+        if "a" <= character <= "z":
+            folded.append(chr(ord(character) - (ord("a") - ord("A"))))
+        elif character == "\N{LATIN SMALL LETTER LONG S}":
+            folded.append("S")
+        elif character == "\N{KELVIN SIGN}":
+            folded.append("K")
+        else:
+            folded.append(character)
+    return "".join(folded)
+
+
+def _go_json_fields(*fields: str) -> dict[str, str]:
+    return {_go_json_fold_name(field): field for field in fields}
+
+
+_OCI_LAYOUT_FIELDS = _go_json_fields("imageLayoutVersion")
+_OCI_INDEX_FIELDS = _go_json_fields(
+    "schemaVersion",
+    "mediaType",
+    "artifactType",
+    "manifests",
+    "subject",
+    "annotations",
+)
+_OCI_DESCRIPTOR_FIELDS = _go_json_fields(
+    "mediaType",
+    "digest",
+    "size",
+    "urls",
+    "annotations",
+    "platform",
+    "artifactType",
+    "data",
+)
+_OCI_PLATFORM_FIELDS = _go_json_fields(
+    "architecture",
+    "os",
+    "os.version",
+    "os.features",
+    "variant",
+)
+_OCI_MANIFEST_FIELDS = _go_json_fields(
+    "schemaVersion",
+    "mediaType",
+    "artifactType",
+    "config",
+    "layers",
+    "subject",
+    "annotations",
+)
+_IMAGE_CONFIG_FIELDS = _go_json_fields(
+    "id",
+    "parent",
+    "comment",
+    "created",
+    "container",
+    "container_config",
+    "docker_version",
+    "author",
+    "config",
+    "architecture",
+    "variant",
+    "os",
+    "Size",
+    "rootfs",
+    "history",
+    "os.version",
+    "os.features",
+)
+_IMAGE_RUN_CONFIG_FIELDS = _go_json_fields(
+    "Hostname",
+    "Domainname",
+    "User",
+    "AttachStdin",
+    "AttachStdout",
+    "AttachStderr",
+    "ExposedPorts",
+    "Tty",
+    "OpenStdin",
+    "StdinOnce",
+    "Env",
+    "Cmd",
+    "Healthcheck",
+    "ArgsEscaped",
+    "Image",
+    "Volumes",
+    "WorkingDir",
+    "Entrypoint",
+    "NetworkDisabled",
+    "MacAddress",
+    "OnBuild",
+    "Labels",
+    "StopSignal",
+    "StopTimeout",
+    "Shell",
+)
+_IMAGE_HEALTHCHECK_FIELDS = _go_json_fields(
+    "Test",
+    "Interval",
+    "Timeout",
+    "StartPeriod",
+    "StartInterval",
+    "Retries",
+)
+_IMAGE_ROOTFS_FIELDS = _go_json_fields("type", "diff_ids")
+_IMAGE_HISTORY_FIELDS = _go_json_fields(
+    "created",
+    "author",
+    "created_by",
+    "comment",
+    "empty_layer",
+)
+_DOCKER_MANIFEST_ENTRY_FIELDS = _go_json_fields(
+    "Config",
+    "RepoTags",
+    "Layers",
+    "Parent",
+    "LayerSources",
+)
 _APKTOOL_NAME = "APKTOOL_SHA256"
 _CONTEXT_INPUT_PATHS = (
     "scripts/make-runtime-context.sh",
@@ -56,6 +200,139 @@ _CONTEXT_INPUT_PATHS = (
     "scripts/xenoid_archive.py",
     "examples/fingerprints/pixel-raven-android13.json",
 )
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    """Reject extended tar metadata before tarfile buffers it in memory.
+
+    Budget and format failures must raise RuntimeImageError, never
+    tarfile.InvalidHeaderError: TarFile.next() swallows InvalidHeaderError
+    raised past the first member and reports a silent end-of-archive, which
+    would truncate a layer parse at the poisoned record and let any later
+    (stale) entries escape verification entirely.
+    """
+
+    @staticmethod
+    def _consume_metadata(archive: tarfile.TarFile, size: int) -> None:
+        if size <= 0 or size > _MAX_LAYER_METADATA_BYTES:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        counter = getattr(archive, "_xenoid_metadata_counter", None)
+        fileobj = archive.fileobj
+        while counter is None and fileobj is not None:
+            counter = getattr(fileobj, "_xenoid_metadata_counter", None)
+            fileobj = getattr(fileobj, "fileobj", None)
+        if counter is not None:
+            counter[0] += size
+            if counter[0] > _MAX_LAYER_METADATA_BYTES:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+
+    def _proc_pax(self, archive: tarfile.TarFile) -> tarfile.TarInfo:
+        self._consume_metadata(archive, self.size)
+        if self.type == tarfile.XGLTYPE:
+            # Go archive/tar ignores global PAX headers, while tarfile applies
+            # their fields to later members. Accepting one would let verifier
+            # replay paths that the OCI loader never observes.
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        try:
+            result = super()._proc_pax(archive)
+        except tarfile.InvalidHeaderError as exc:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid") from exc
+        # Known sparse variants already raised via the overrides below; any
+        # remaining GNU.sparse key (unknown version, bare realsize, a global
+        # header) has no bounded interpretation, so fail closed as well.
+        for headers in (archive.pax_headers, result.pax_headers):
+            if any(key.startswith("GNU.sparse") for key in headers):
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        return result
+
+    def _proc_gnulong(self, archive: tarfile.TarFile) -> tarfile.TarInfo:
+        self._consume_metadata(archive, self.size)
+        return super()._proc_gnulong(archive)
+
+    def _proc_sparse(self, archive: tarfile.TarFile) -> tarfile.TarInfo:
+        # Old-GNU sparse headers claim logical bytes the archive never
+        # carries; there is no safely bounded replay of that, so reject.
+        raise RuntimeImageError("runtime_image_archive_layout_invalid")
+
+    def _proc_gnusparse_00(self, next: tarfile.TarInfo, raw_headers: Any) -> None:
+        raise RuntimeImageError("runtime_image_archive_layout_invalid")
+
+    def _proc_gnusparse_01(self, next: tarfile.TarInfo, pax_headers: Any) -> None:
+        raise RuntimeImageError("runtime_image_archive_layout_invalid")
+
+    def _proc_gnusparse_10(self, next: tarfile.TarInfo, pax_headers: Any, archive: tarfile.TarFile) -> None:
+        raise RuntimeImageError("runtime_image_archive_layout_invalid")
+
+
+class _BoundedOuterTarFile(tarfile.TarFile):
+    """Install the cumulative outer-metadata budget before firstmember parse."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._xenoid_metadata_counter: list[int] = [0]
+        super().__init__(*args, **kwargs)
+
+class _LayerDecompressedReader:
+    """Bound every decompressed byte, including tar parser metadata reads.
+
+    The budget is cumulative across one archive replay: every layer's reader
+    receives the same mutable ``counter`` so many individually under-cap
+    layers cannot multiply the decompression work bound.
+    """
+
+    def __init__(self, raw: Any, *, check: Callable[[], None], counter: list[int]) -> None:
+        self._raw = raw
+        self._check = check
+        self._counter = counter
+
+    def read(self, size: int = -1) -> bytes:
+        self._check()
+        remaining = _MAX_LAYER_DECOMPRESSED_BYTES - self._counter[0]
+        requested = min(_COPY_CHUNK, remaining + 1)
+        if size >= 0:
+            requested = min(size, requested)
+        block = self._raw.read(requested)
+        if block:
+            self._counter[0] += len(block)
+            if self._counter[0] > _MAX_LAYER_DECOMPRESSED_BYTES:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        self._check()
+        return block
+
+
+class _LayerBlobReader:
+    """Count/hash layer bytes and enforce progress budgets on every read."""
+
+    def __init__(
+        self,
+        raw: Any,
+        *,
+        expected_size: int,
+        check: Callable[[], None],
+    ) -> None:
+        self._raw = raw
+        self._expected_size = expected_size
+        self._check = check
+        self._state = hashlib.sha256()
+        self.count = 0
+
+    def read(self, size: int = -1) -> bytes:
+        self._check()
+        block = self._raw.read(size)
+        if block:
+            self._state.update(block)
+            self.count += len(block)
+            if self.count > self._expected_size:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        self._check()
+        return block
+
+    def close(self) -> None:
+        self._raw.close()
+
+    def digest(self) -> str:
+        return self._state.hexdigest()
+
+
 _DAEMON_DESTINATION = "/system/priv-app/XenoidDaemon/XenoidDaemon.apk"
 _RECORD_FIELDS = frozenset(
     {
@@ -112,6 +389,79 @@ class _PreparedInput:
 
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def _reject_duplicate_archive_json_names(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for name, member in pairs:
+        if name in value:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        value[name] = member
+    return value
+
+
+def _require_exact_archive_json_fields(
+    value: Any,
+    consumed_fields: Mapping[str, str],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeImageError("runtime_image_archive_layout_invalid")
+    for name in value:
+        exact = consumed_fields.get(_go_json_fold_name(name))
+        if exact is not None and name != exact:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+    return value
+
+
+def _require_exact_archive_descriptor(value: Any) -> Mapping[str, Any]:
+    descriptor = _require_exact_archive_json_fields(
+        value, _OCI_DESCRIPTOR_FIELDS
+    )
+    platform = descriptor.get("platform")
+    if isinstance(platform, Mapping):
+        _require_exact_archive_json_fields(platform, _OCI_PLATFORM_FIELDS)
+    return descriptor
+
+
+def _require_exact_archive_image_config(value: Any) -> Mapping[str, Any]:
+    image = _require_exact_archive_json_fields(value, _IMAGE_CONFIG_FIELDS)
+    for field in ("config", "container_config"):
+        run_config = image.get(field)
+        if not isinstance(run_config, Mapping):
+            continue
+        run_config = _require_exact_archive_json_fields(
+            run_config, _IMAGE_RUN_CONFIG_FIELDS
+        )
+        healthcheck = run_config.get("Healthcheck")
+        if isinstance(healthcheck, Mapping):
+            _require_exact_archive_json_fields(
+                healthcheck, _IMAGE_HEALTHCHECK_FIELDS
+            )
+    rootfs = image.get("rootfs")
+    if isinstance(rootfs, Mapping):
+        _require_exact_archive_json_fields(rootfs, _IMAGE_ROOTFS_FIELDS)
+    history = image.get("history")
+    if isinstance(history, list):
+        for entry in history:
+            if isinstance(entry, Mapping):
+                _require_exact_archive_json_fields(
+                    entry, _IMAGE_HISTORY_FIELDS
+                )
+    return image
+
+
+def _require_exact_docker_manifest_entry(value: Any) -> Mapping[str, Any]:
+    entry = _require_exact_archive_json_fields(
+        value, _DOCKER_MANIFEST_ENTRY_FIELDS
+    )
+    layer_sources = entry.get("LayerSources")
+    if isinstance(layer_sources, Mapping):
+        for descriptor in layer_sources.values():
+            if isinstance(descriptor, Mapping):
+                _require_exact_archive_descriptor(descriptor)
+    return entry
 
 
 def _digest(value: Any) -> str:
@@ -282,7 +632,10 @@ def compute_input_record(
 
     The boot projection replaces the complete daemon artifact tuple with the
     integration seed contract. Consequently ordinary daemon APK/version/source
-    changes affect the full identity but not boot compatibility.
+    changes affect the full identity but not boot compatibility. The payload
+    verifier contract is part of both payloads: a verifier change invalidates
+    boot compatibility too, so a running container or seeded rootfs minted
+    under weaker payload proof cannot survive the migration.
     """
 
     if _IMAGE_ID_RE.fullmatch(base_image_id) is None:
@@ -305,6 +658,7 @@ def compute_input_record(
         "toolInputs": tools,
         "builderInputs": builder,
         "daemonSeedContract": daemon,
+        "payloadVerification": _PAYLOAD_VERIFICATION_CONTRACT,
     }
     boot_artifacts: list[dict[str, Any]] = []
     for item in artifacts:
@@ -338,6 +692,7 @@ def compute_input_record(
         "toolInputs": tools,
         "builderInputs": builder,
         "daemonSeedContract": boot_daemon,
+        "payloadVerification": _PAYLOAD_VERIFICATION_CONTRACT,
     }
     return {
         "schema": RUNTIME_INPUT_SCHEMA,
@@ -663,6 +1018,7 @@ class RuntimeImageBuilder:
                     cwd=work_root,
                 )
                 self._validate_image_archive(archive_path)
+                self._verify_archive_payload(archive_path, context_path)
                 self._docker_checked(
                     ("image", "load", "--input", str(archive_path)),
                     "runtime_image_load_failed",
@@ -1379,6 +1735,589 @@ class RuntimeImageBuilder:
             os.chmod(path, 0o600, follow_symlinks=False)
         except OSError as exc:
             raise RuntimeImageError("runtime_image_archive_invalid") from exc
+
+    @staticmethod
+    def _archive_copy_map(
+        context_path: Path,
+    ) -> tuple[tuple[str, str, bool], ...]:
+        """Return normalized ``(source, destination, destination_is_dir)`` rules.
+
+        The generated Dockerfile emits one two-argument COPY per line. Reject
+        syntax that would make destination expansion ambiguous instead of
+        silently leaving payload bytes unverified.
+        """
+        dockerfile = context_path / "Dockerfile"
+        try:
+            lines = dockerfile.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise RuntimeImageError("runtime_image_payload_manifest_invalid") from exc
+        rules: list[tuple[str, str, bool]] = []
+        for line in lines:
+            if line.startswith("ADD "):
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            if not line.startswith("COPY "):
+                continue
+            tokens = line[5:].split()
+            while tokens and tokens[0].startswith("--"):
+                option = tokens.pop(0)
+                if option.startswith("--from="):
+                    raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            if (
+                len(tokens) != 2
+                or any(
+                    character in token
+                    for token in tokens
+                    for character in ("*", "?", "[")
+                )
+            ):
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            source_token, destination_token = tokens
+            source_token = source_token.rstrip("/")
+            source = PurePosixPath(source_token)
+            destination = PurePosixPath(destination_token)
+            if (
+                not source_token
+                or source.is_absolute()
+                or str(source) != source_token
+                or ".." in source.parts
+                or not destination_token.startswith("/")
+                or ".." in destination.parts
+            ):
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            normalized_destination = str(destination).lstrip("/")
+            if normalized_destination == ".":
+                normalized_destination = ""
+            rules.append(
+                (
+                    str(source),
+                    normalized_destination,
+                    destination_token.endswith("/"),
+                )
+            )
+        if not rules:
+            raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+        return tuple(rules)
+
+    def _archive_member_index(
+        self,
+        archive: tarfile.TarFile,
+    ) -> dict[str, tarfile.TarInfo]:
+        members: dict[str, tarfile.TarInfo] = {}
+        try:
+            for member in archive:
+                self._payload_budget_check()
+                if len(members) >= _MAX_IMAGE_ARCHIVE_MEMBERS:
+                    raise RuntimeImageError(
+                        "runtime_image_archive_layout_invalid"
+                    )
+                # Image loaders resolve outer members by their canonical
+                # POSIX path, so the verifier must index the same canonical
+                # names: a "./" prefix is normalized away, while absolute
+                # paths, ".." components, and redundant dot/slash spellings
+                # are rejected, and two raw names collapsing to one
+                # canonical name is a duplicate.
+                name = member.name
+                if name.endswith("/") and not member.isdir():
+                    raise RuntimeImageError(
+                        "runtime_image_archive_layout_invalid"
+                    )
+                if name.startswith("./"):
+                    name = name[2:]
+                name = name.rstrip("/")
+                if not name or name == ".":
+                    if member.isdir():
+                        continue
+                    raise RuntimeImageError(
+                        "runtime_image_archive_layout_invalid"
+                    )
+                normalized = PurePosixPath(name)
+                if (
+                    normalized.is_absolute()
+                    or ".." in normalized.parts
+                    or str(normalized) != name
+                    or name in members
+                ):
+                    raise RuntimeImageError(
+                        "runtime_image_archive_layout_invalid"
+                    )
+                members[name] = member
+        except RuntimeImageError:
+            raise
+        except (OSError, tarfile.TarError, RecursionError) as exc:
+            raise RuntimeImageError(
+                "runtime_image_archive_layout_invalid"
+            ) from exc
+        return members
+
+    def _archive_layer_descriptors(
+        self,
+        archive: tarfile.TarFile,
+        members: Mapping[str, tarfile.TarInfo],
+    ) -> tuple[tuple[str, int, str], ...]:
+        def read_metadata(
+            name: str, *, expected_size: int | None = None
+        ) -> tuple[bytes, Any]:
+            try:
+                member = members[name]
+                stream = archive.extractfile(member)
+            except (KeyError, OSError, tarfile.TarError) as exc:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid") from exc
+            if (
+                stream is None
+                or not member.isfile()
+                or member.size <= 0
+                or member.size > _MAX_RECORD_BYTES
+                or (expected_size is not None and member.size != expected_size)
+            ):
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+            try:
+                payload = stream.read(_MAX_RECORD_BYTES + 1)
+                value = json.loads(
+                    payload,
+                    object_pairs_hook=_reject_duplicate_archive_json_names,
+                )
+            except (OSError, ValueError, TypeError, tarfile.TarError) as exc:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid") from exc
+            finally:
+                stream.close()
+            if len(payload) != member.size or len(payload) > _MAX_RECORD_BYTES:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+            return payload, value
+
+        _, index = read_metadata("index.json")
+        index = _require_exact_archive_json_fields(index, _OCI_INDEX_FIELDS)
+        index_subject = index.get("subject")
+        if isinstance(index_subject, Mapping):
+            _require_exact_archive_descriptor(index_subject)
+        if index.get("schemaVersion") != 2:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        try:
+            manifests = index["manifests"]
+            if not isinstance(manifests, list) or len(manifests) != 1:
+                raise TypeError("ambiguous image manifest")
+            descriptor = _require_exact_archive_descriptor(manifests[0])
+            descriptor_media_type = descriptor["mediaType"]
+            digest = descriptor["digest"]
+            manifest_size = descriptor["size"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid") from exc
+        if (
+            not isinstance(digest, str)
+            or _IMAGE_ID_RE.fullmatch(digest) is None
+            or not isinstance(manifest_size, int)
+            or isinstance(manifest_size, bool)
+            or manifest_size <= 0
+            or manifest_size > _MAX_RECORD_BYTES
+        ):
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        manifest_bytes, manifest = read_metadata(
+            f"blobs/sha256/{digest[7:]}", expected_size=manifest_size
+        )
+        manifest = _require_exact_archive_json_fields(
+            manifest, _OCI_MANIFEST_FIELDS
+        )
+        manifest_subject = manifest.get("subject")
+        if isinstance(manifest_subject, Mapping):
+            _require_exact_archive_descriptor(manifest_subject)
+        if (
+            manifest.get("schemaVersion") != 2
+            or not isinstance(descriptor_media_type, str)
+            or descriptor_media_type
+            not in {
+                "application/vnd.docker.distribution.manifest.v2+json",
+                "application/vnd.oci.image.manifest.v1+json",
+            }
+            or manifest.get("mediaType") != descriptor_media_type
+            or hashlib.sha256(manifest_bytes).hexdigest() != digest[7:]
+        ):
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        try:
+            config = _require_exact_archive_descriptor(manifest["config"])
+            config_media_type = config["mediaType"]
+            config_digest = config["digest"]
+            config_size = config["size"]
+            layers = manifest["layers"]
+            if (
+                not isinstance(layers, list)
+                or not layers
+                or len(layers) > _MAX_IMAGE_LAYERS
+            ):
+                raise TypeError("invalid image layers")
+            descriptors = tuple(
+                (
+                    descriptor["digest"],
+                    descriptor["size"],
+                    descriptor["mediaType"],
+                )
+                for descriptor in (
+                    _require_exact_archive_descriptor(layer)
+                    for layer in layers
+                )
+            )
+        except (KeyError, TypeError) as exc:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid") from exc
+        # The config blob is consumed by the loader too, so pin its bytes to
+        # the descriptor exactly like the manifest itself.
+        if (
+            not isinstance(config_digest, str)
+            or _IMAGE_ID_RE.fullmatch(config_digest) is None
+            or not isinstance(config_size, int)
+            or isinstance(config_size, bool)
+            or config_size <= 0
+            or config_size > _MAX_RECORD_BYTES
+            or not isinstance(config_media_type, str)
+            or config_media_type
+            not in {
+                "application/vnd.docker.container.image.v1+json",
+                "application/vnd.oci.image.config.v1+json",
+            }
+        ):
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        config_bytes, config_value = read_metadata(
+            f"blobs/sha256/{config_digest[7:]}", expected_size=config_size
+        )
+        config_value = _require_exact_archive_image_config(config_value)
+        if hashlib.sha256(config_bytes).hexdigest() != config_digest[7:]:
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        for layer_digest, layer_size, media_type in descriptors:
+            if (
+                not isinstance(layer_digest, str)
+                or _IMAGE_ID_RE.fullmatch(layer_digest) is None
+                or not isinstance(layer_size, int)
+                or isinstance(layer_size, bool)
+                or layer_size <= 0
+                or layer_size > _MAX_IMAGE_ARCHIVE_BYTES
+                or not isinstance(media_type, str)
+                or media_type not in _LAYER_MEDIA_TYPES
+            ):
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        # The build exports type=docker: classic Docker load consumes
+        # manifest.json (and containerd selects its OCI importer only when
+        # oci-layout is present), so the archive must carry a valid
+        # oci-layout, and the single Docker manifest entry must reference
+        # exactly the config and ordered layer blob paths the verified OCI
+        # index/manifest named. Anything else means verification and load
+        # can observe different bytes.
+        _, layout = read_metadata("oci-layout")
+        layout = _require_exact_archive_json_fields(
+            layout, _OCI_LAYOUT_FIELDS
+        )
+        if layout.get("imageLayoutVersion") != "1.0.0":
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        _, docker_entries = read_metadata("manifest.json")
+        if (
+            not isinstance(docker_entries, list)
+            or len(docker_entries) != 1
+            or not isinstance(docker_entries[0], Mapping)
+        ):
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        docker_entry = _require_exact_docker_manifest_entry(docker_entries[0])
+        if (
+            docker_entry.get("Config") != f"blobs/sha256/{config_digest[7:]}"
+            or docker_entry.get("Layers")
+            != [
+                f"blobs/sha256/{layer_digest[7:]}"
+                for layer_digest, _, _ in descriptors
+            ]
+        ):
+            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+        return descriptors
+
+    def _payload_budget_check(self) -> None:
+        if time.monotonic() > self._deadline:
+            raise RuntimeImageError("runtime_image_timeout")
+        cancelled = self._cancelled
+        if cancelled is None:
+            return
+        is_set = getattr(cancelled, "is_set", None)
+        if is_set is not None:
+            if is_set():
+                raise RuntimeImageError("runtime_image_cancelled")
+        elif cancelled():
+            raise RuntimeImageError("runtime_image_cancelled")
+
+    def _archive_layer_contents(
+        self,
+        archive: tarfile.TarFile,
+        members: Mapping[str, tarfile.TarInfo],
+        layer_descriptors: Sequence[tuple[str, int, str]],
+        wanted: Mapping[str, int],
+    ) -> dict[str, str]:
+        """Replay layers and hash surviving wanted files without buffering blobs."""
+        wanted_ancestors: set[str] = set()
+        for wanted_path in wanted:
+            parts = wanted_path.split("/")
+            for index in range(1, len(parts)):
+                wanted_ancestors.add("/".join(parts[:index]))
+
+        def relevant(prefix: str) -> bool:
+            if not prefix:
+                return True
+            return any(
+                wanted_path == prefix or wanted_path.startswith(prefix + "/")
+                for wanted_path in wanted
+            )
+
+        found: dict[str, str] = {}
+        members_seen = 0
+        blocked_ancestors: set[str] = set()
+        # One set of replay budgets shared by every layer of this archive.
+        decompressed_counter: list[int] = [0]
+        metadata_counter: list[int] = [0]
+        compressed_bytes = 0
+        for expected_digest, expected_size, media_type in layer_descriptors:
+            self._payload_budget_check()
+            layer_mode = _LAYER_TAR_MODES.get(media_type)
+            if layer_mode is None:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+            compressed_bytes += expected_size
+            if compressed_bytes > _MAX_IMAGE_ARCHIVE_BYTES:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+            try:
+                outer_member = members[f"blobs/sha256/{expected_digest[7:]}"]
+                blob = archive.extractfile(outer_member)
+            except (KeyError, OSError, tarfile.TarError) as exc:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid") from exc
+            if (
+                blob is None
+                or not outer_member.isfile()
+                or outer_member.size != expected_size
+            ):
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+            reader = _LayerBlobReader(
+                blob,
+                expected_size=expected_size,
+                check=self._payload_budget_check,
+            )
+            decoder: Any = (
+                gzip.GzipFile(fileobj=reader, mode="rb")
+                if layer_mode == "r|gz"
+                else reader
+            )
+            decompressed = _LayerDecompressedReader(
+                decoder,
+                check=self._payload_budget_check,
+                counter=decompressed_counter,
+            )
+            setattr(decompressed, "_xenoid_metadata_counter", metadata_counter)
+            updates: dict[str, str | None] = {}
+            whiteouts: set[str] = set()
+            opaque_directories: set[str] = set()
+            try:
+                with tarfile.open(
+                    fileobj=decompressed,
+                    mode="r|",
+                    tarinfo=_BoundedTarInfo,
+                ) as layer:
+                    for member in layer:
+                        members_seen += 1
+                        if members_seen > _MAX_LAYER_MEMBERS:
+                            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+                        self._payload_budget_check()
+                        name = member.name
+                        if name.startswith("./"):
+                            name = name[2:]
+                        name = name.rstrip("/")
+                        if not name or name == ".":
+                            # Legal OCI layers may carry a "." or "./" root
+                            # directory record; a non-directory root is invalid.
+                            if member.isdir():
+                                continue
+                            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+                        normalized = PurePosixPath(name)
+                        if (
+                            normalized.is_absolute()
+                            or ".." in normalized.parts
+                            or str(normalized) != name
+                        ):
+                            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+                        if any(
+                            name.startswith(prefix + "/")
+                            for prefix in blocked_ancestors
+                        ):
+                            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+                        base = name.rsplit("/", 1)[-1]
+                        parent = name[: -len(base)].rstrip("/")
+                        if base == ".wh..wh..opq":
+                            if relevant(parent):
+                                opaque_directories.add(parent)
+                            continue
+                        if base.startswith(".wh."):
+                            target_base = base[4:]
+                            target = (
+                                f"{parent}/{target_base}" if parent else target_base
+                            )
+                            if relevant(target):
+                                whiteouts.add(target)
+                            continue
+                        if name in blocked_ancestors:
+                            if member.isdir():
+                                blocked_ancestors.discard(name)
+                                continue
+                            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+                        if name in wanted_ancestors:
+                            if not member.isdir():
+                                # A wanted path's ancestor was replaced by a
+                                # non-directory: lower-layer descendants and
+                                # any earlier same-layer additions cannot survive.
+                                if any(path.startswith(name + "/") for path in updates):
+                                    raise RuntimeImageError(
+                                        "runtime_image_archive_layout_invalid"
+                                    )
+                                blocked_ancestors.add(name)
+                                for path in tuple(found):
+                                    if path.startswith(name + "/"):
+                                        found.pop(path, None)
+                            continue
+                        if name not in wanted:
+                            continue
+                        if not member.isfile() or member.size != wanted[name]:
+                            updates[name] = None
+                            continue
+                        extracted = layer.extractfile(member)
+                        if extracted is None:
+                            raise RuntimeImageError("runtime_image_archive_layout_invalid")
+                        digest_state = hashlib.sha256()
+                        with extracted:
+                            while True:
+                                block = extracted.read(_COPY_CHUNK)
+                                if not block:
+                                    break
+                                digest_state.update(block)
+                            self._payload_budget_check()
+                        updates[name] = digest_state.hexdigest()
+                while decompressed.read(_COPY_CHUNK):
+                    pass
+                while reader.read(_COPY_CHUNK):
+                    pass
+            except RuntimeImageError:
+                raise
+            except (OSError, tarfile.TarError, zlib.error, RecursionError) as exc:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid") from exc
+            finally:
+                if decoder is not reader:
+                    decoder.close()
+                reader.close()
+            if reader.count != expected_size or reader.digest() != expected_digest[7:]:
+                raise RuntimeImageError("runtime_image_archive_layout_invalid")
+            for target in whiteouts:
+                for path in tuple(found):
+                    if path == target or path.startswith(target + "/"):
+                        found.pop(path, None)
+            for directory in opaque_directories:
+                prefix = directory + "/" if directory else ""
+                for path in tuple(found):
+                    if not directory or path.startswith(prefix):
+                        found.pop(path, None)
+            for name, file_digest in updates.items():
+                if file_digest is None:
+                    found.pop(name, None)
+                else:
+                    found[name] = file_digest
+        return found
+
+    def _verify_archive_payload(self, archive_path: Path, context_path: Path) -> None:
+        """Prove the built image carries every generated context payload byte.
+
+        BuildKit's local-context blob cache can silently substitute a previous
+        build's bytes when a payload file keeps the same path, size, and
+        normalized mtime across a content-only change (observed 2026-09-18 with
+        a constant-only zygote shim edit). Replay the exported image layers and
+        compare every file destination produced by every Dockerfile COPY rule
+        against the verified context manifest.
+        """
+        rules = self._archive_copy_map(context_path)
+        manifest_path = context_path / "context-manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            entries = manifest["entries"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeImageError("runtime_image_payload_manifest_invalid") from exc
+        if not isinstance(entries, list):
+            raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+
+        entry_types: dict[str, str] = {}
+        source_files: dict[str, tuple[str, int]] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            path = entry.get("path")
+            entry_type = entry.get("type")
+            if (
+                not isinstance(path, str)
+                or not isinstance(entry_type, str)
+                or path in entry_types
+            ):
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            entry_types[path] = entry_type
+            if entry_type != "file":
+                continue
+            digest = entry.get("sha256")
+            size = entry.get("size")
+            if (
+                not isinstance(digest, str)
+                or _SHA256_RE.fullmatch(digest) is None
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+            ):
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            source_files[path] = (digest, size)
+
+        expected: dict[str, tuple[str, int]] = {}
+
+        def add_expected(destination: str, source: tuple[str, int]) -> None:
+            normalized = str(PurePosixPath(destination))
+            if not destination or normalized != destination or ".." in PurePosixPath(destination).parts:
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            prior = expected.get(destination)
+            if prior is not None and prior != source:
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            expected[destination] = source
+
+        for source, destination, destination_is_dir in rules:
+            source_type = entry_types.get(source)
+            if source_type == "file":
+                target = (
+                    str(PurePosixPath(destination) / PurePosixPath(source).name)
+                    if destination_is_dir
+                    else destination
+                )
+                add_expected(target, source_files[source])
+                continue
+            if source_type != "directory":
+                raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+            prefix = source + "/"
+            for path, identity in source_files.items():
+                if path.startswith(prefix):
+                    relative = path[len(prefix) :]
+                    target = (
+                        str(PurePosixPath(destination) / relative)
+                        if destination
+                        else relative
+                    )
+                    add_expected(target, identity)
+        if not expected:
+            raise RuntimeImageError("runtime_image_payload_manifest_invalid")
+
+        try:
+            archive = _BoundedOuterTarFile.open(
+                archive_path, mode="r:", tarinfo=_BoundedTarInfo
+            )
+        except (OSError, tarfile.TarError) as exc:
+            raise RuntimeImageError("runtime_image_archive_invalid") from exc
+        with archive:
+            members = self._archive_member_index(archive)
+            layers = self._archive_layer_descriptors(archive, members)
+            actual = self._archive_layer_contents(
+                archive,
+                members,
+                layers,
+                {destination: identity[1] for destination, identity in expected.items()},
+            )
+        for destination, identity in sorted(expected.items()):
+            if actual.get(destination) != identity[0]:
+                raise RuntimeImageError("runtime_image_payload_mismatch")
 
     @staticmethod
     def _runtime_input_lock_name(input_sha: str) -> str:

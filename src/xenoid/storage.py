@@ -1,20 +1,19 @@
 """Crash-safe ownership state for one instance's persistent Android /data image."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import secrets
 import stat
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from .config import InstanceContext, InstanceLease
 
-STORAGE_SCHEMA = "dev.xenoid.instance-storage/v4"
+STORAGE_SCHEMA = "dev.xenoid.instance-storage/v5"
+_V4_STORAGE_SCHEMA = "dev.xenoid.instance-storage/v4"
 _V3_STORAGE_SCHEMA = "dev.xenoid.instance-storage/v3"
 _V2_STORAGE_SCHEMA = "dev.xenoid.instance-storage/v2"
 LEGACY_STORAGE_SCHEMA = "dev.xenoid.instance-storage/v1"
@@ -31,9 +30,6 @@ _TEMPORARY_IMAGE = re.compile(r"^\.xenoid-data\.img\.[0-9a-f]{32}\.new$")
 _VOLUME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SOURCES = frozenset({"fresh", "adopted", "legacy"})
 _STATES = frozenset({"pending", "committed"})
-_ROTATION_TARGET_DOMAIN = b"xenoid-storage-rotation-target/v1\0"
-_ROTATION_ROOTFS_DOMAIN = b"xenoid-storage-rotation-rootfs/v1\0"
-ROOTFS_SOURCE_UUID_NAMESPACE = uuid.UUID("542fba76-f57d-5f23-8a61-9b5d02a9f38c")
 _KEYS = {
     "schema",
     "instanceId",
@@ -61,8 +57,6 @@ _KEYS = {
     "backupRootfsImage",
     "backupRootfsFilesystemUuid",
     "backupRootfsSizeBytes",
-    "rotationTargetUuid",
-    "rotationTargetRootfsUuid",
 }
 _LEGACY_KEYS = {
     "schema",
@@ -114,34 +108,25 @@ def _size(value: Any, *, allow_zero: bool = False) -> int:
         raise StorageError("storage_state_invalid", "invalid instance storage state")
     return value
 
+def _reject_pending_legacy_rotation(markers: Mapping[str, Any]) -> None:
+    """Fail closed when a pre-v5 record still carries a pending rotation.
+
+    A non-empty rotation target is crash-window evidence: the images may
+    already carry the target UUIDs, so silently dropping the markers could
+    wedge the instance into a permanent identity mismatch. Loading is
+    read-only, so raising here keeps the original record byte-for-byte.
+    """
+    for value in markers.values():
+        if _optional_text(value, _UUID, "storage_state_invalid"):
+            raise StorageError(
+                "storage_legacy_rotation_pending",
+                "instance storage has a pending legacy offline rotation; "
+                "the original state is preserved untouched for operator inspection",
+            )
+
 
 def storage_transaction_id() -> str:
     return secrets.token_hex(16)
-
-
-def storage_rotation_target(transaction_id: str, *, rootfs: bool = False) -> str:
-    """Deterministic rotation target UUID for one storage transaction.
-
-    The pending transaction ID is already persisted, so the target identity
-    the engine-host script must converge to can be re-derived after any
-    crash: the script accepts only old→target, and every other observed UUID
-    is a hard mismatch instead of a silent adoption.
-    """
-    transaction = _strict_text(transaction_id, _TRANSACTION, "storage_state_invalid")
-    domain = _ROTATION_ROOTFS_DOMAIN if rootfs else _ROTATION_TARGET_DOMAIN
-    digest = bytearray(hashlib.sha256(domain + transaction.encode("ascii")).digest()[:16])
-    digest[6] = (digest[6] & 0x0F) | 0x40
-    digest[8] = (digest[8] & 0x3F) | 0x80
-    text = digest.hex()
-    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
-
-def rootfs_source_uuid(source_sha256: str) -> str:
-    source = _strict_text(
-        source_sha256,
-        _SHA256,
-        "storage_state_invalid",
-    )
-    return str(uuid.uuid5(ROOTFS_SOURCE_UUID_NAMESPACE, source))
 
 
 def temporary_image_name(transaction_id: str) -> str:
@@ -198,10 +183,12 @@ class StorageStateStore:
         if isinstance(raw, Mapping) and raw.get("schema") == LEGACY_STORAGE_SCHEMA:
             raw = self._migrate_v1(raw)
         if isinstance(raw, Mapping) and raw.get("schema") == _V2_STORAGE_SCHEMA:
-            raw = {**raw, "schema": _V3_STORAGE_SCHEMA, "rotationTargetUuid": ""}
+            raw = {**raw, "schema": _V3_STORAGE_SCHEMA}
         if isinstance(raw, Mapping) and raw.get("schema") == _V3_STORAGE_SCHEMA:
             raw = self._migrate_v3(raw)
             legacy_rootfs = True
+        if isinstance(raw, Mapping) and raw.get("schema") == _V4_STORAGE_SCHEMA:
+            raw = self._migrate_v4(raw)
         return self.validate(raw, allow_legacy_rootfs=legacy_rootfs)
 
     def _migrate_v1(self, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -230,7 +217,6 @@ class StorageStateStore:
             "backupImage": raw.get("backupImage"),
             "backupFilesystemUuid": raw.get("backupFilesystemUuid"),
             "backupSizeBytes": raw.get("backupSizeBytes"),
-            "rotationTargetUuid": "",
         }
 
     def _migrate_v3(self, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -242,12 +228,11 @@ class StorageStateStore:
             "backupRootfsImage",
             "backupRootfsFilesystemUuid",
             "backupRootfsSizeBytes",
-            "rotationTargetRootfsUuid",
         }
-        if set(raw) != expected:
+        if set(raw) - {"rotationTargetUuid"} != expected:
             raise StorageError("storage_state_invalid", "invalid v3 storage state")
-        return {
-            **raw,
+        migrated = {
+            **{key: value for key, value in raw.items() if key != "rotationTargetUuid"},
             "schema": STORAGE_SCHEMA,
             "rootfsImage": "",
             "rootfsFilesystemUuid": "",
@@ -256,12 +241,37 @@ class StorageStateStore:
             "backupRootfsImage": "",
             "backupRootfsFilesystemUuid": "",
             "backupRootfsSizeBytes": 0,
-            "rotationTargetRootfsUuid": (
-                storage_rotation_target(str(raw["transactionId"]), rootfs=True)
-                if raw.get("rotationTargetUuid")
-                else ""
-            ),
         }
+        self.validate(migrated, allow_legacy_rootfs=True)
+        _reject_pending_legacy_rotation(
+            {
+                key: raw[key]
+                for key in ("rotationTargetUuid",)
+                if key in raw
+            }
+        )
+        return migrated
+
+    def _migrate_v4(self, raw: Mapping[str, Any]) -> dict[str, Any]:
+        expected = _KEYS | {"rotationTargetUuid", "rotationTargetRootfsUuid"}
+        if set(raw) != expected:
+            raise StorageError("storage_state_invalid", "invalid v4 storage state")
+        _reject_pending_legacy_rotation(
+            {
+                key: raw[key]
+                for key in ("rotationTargetUuid", "rotationTargetRootfsUuid")
+            }
+        )
+        migrated = {
+            **{
+                key: value
+                for key, value in raw.items()
+                if key not in {"rotationTargetUuid", "rotationTargetRootfsUuid"}
+            },
+            "schema": STORAGE_SCHEMA,
+        }
+        self.validate(migrated)
+        return migrated
 
     def save(self, state: Mapping[str, Any]) -> dict[str, Any]:
         clean = self.validate(state)
@@ -315,8 +325,6 @@ class StorageStateStore:
         backup_rootfs_filesystem_uuid: str = "",
         backup_rootfs_size_bytes: int = 0,
         growth: bool = False,
-        rotation_target_uuid: str = "",
-        rotation_target_rootfs_uuid: str = "",
     ) -> dict[str, Any]:
         transaction = transaction_id or storage_transaction_id()
         state = {
@@ -348,8 +356,6 @@ class StorageStateStore:
             "backupRootfsImage": backup_rootfs_image,
             "backupRootfsFilesystemUuid": backup_rootfs_filesystem_uuid,
             "backupRootfsSizeBytes": backup_rootfs_size_bytes,
-            "rotationTargetUuid": rotation_target_uuid,
-            "rotationTargetRootfsUuid": rotation_target_rootfs_uuid,
         }
         return self.save(state)
 
@@ -365,10 +371,8 @@ class StorageStateStore:
         image_rootfs_uuid = str(image["rootfsFilesystemUuid"]).lower()
         image_rootfs_source = str(image["rootfsSourceSha256"]).lower()
         image_rootfs_size = int(image["rootfsSizeBytes"])
-        expected_data_uuid = state["rotationTargetUuid"] or state["filesystemUuid"]
-        expected_rootfs_uuid = (
-            state["rotationTargetRootfsUuid"] or state["rootfsFilesystemUuid"]
-        )
+        expected_data_uuid = state["filesystemUuid"]
+        expected_rootfs_uuid = state["rootfsFilesystemUuid"]
         if (
             expected_data_uuid
             and image_data_uuid != expected_data_uuid
@@ -378,13 +382,6 @@ class StorageStateStore:
             and image_rootfs_source != state["rootfsSourceSha256"]
             or state["observedRootfsSizeBytes"]
             and image_rootfs_size != state["observedRootfsSizeBytes"]
-            or state["rotationTargetUuid"]
-            and (
-                int(image["logicalSizeBytes"])
-                != state["desiredLogicalSizeBytes"]
-                or int(image["filesystemSizeBytes"])
-                != state["desiredLogicalSizeBytes"]
-            )
         ):
             raise StorageError(
                 "storage_identity_mismatch",
@@ -413,8 +410,6 @@ class StorageStateStore:
             ),
             "state": "committed",
             "temporaryImage": "",
-            "rotationTargetUuid": "",
-            "rotationTargetRootfsUuid": "",
         }
         return self.save(committed)
 
@@ -509,18 +504,12 @@ class StorageStateStore:
         legacy_uuid = _optional_text(state["legacyFilesystemUuid"], _UUID, "storage_state_invalid")
         backup = _optional_text(state["backupImage"], _IMAGE, "storage_state_invalid")
         backup_uuid = _optional_text(state["backupFilesystemUuid"], _UUID, "storage_state_invalid")
-        rotation_target = _optional_text(state["rotationTargetUuid"], _UUID, "storage_state_invalid")
         rootfs_image = _optional_text(state["rootfsImage"], _IMAGE, "storage_state_invalid")
         rootfs_uuid = _optional_text(state["rootfsFilesystemUuid"], _UUID, "storage_state_invalid")
         rootfs_source = _optional_text(state["rootfsSourceSha256"], _SHA256, "storage_state_invalid")
         backup_rootfs = _optional_text(state["backupRootfsImage"], _IMAGE, "storage_state_invalid")
         backup_rootfs_uuid = _optional_text(
             state["backupRootfsFilesystemUuid"],
-            _UUID,
-            "storage_state_invalid",
-        )
-        rotation_rootfs = _optional_text(
-            state["rotationTargetRootfsUuid"],
             _UUID,
             "storage_state_invalid",
         )
@@ -558,28 +547,6 @@ class StorageStateStore:
             raise StorageError("storage_state_invalid", "invalid rootfs image name")
         if not rootfs_image and status == "committed" and not allow_legacy_rootfs:
             raise StorageError("storage_state_invalid", "committed rootfs identity is missing")
-        if status != "pending" or temporary != "":
-            if rotation_target or rotation_rootfs:
-                raise StorageError("storage_state_invalid", "unexpected storage rotation target")
-        elif bool(rotation_target) != bool(rotation_rootfs):
-            raise StorageError("storage_state_invalid", "dual-image rotation target is incomplete")
-        elif (
-            rotation_target
-            and (
-                rotation_target == filesystem_uuid
-                or not rootfs_uuid
-                and not allow_legacy_rootfs
-                or bool(rootfs_uuid)
-                and (
-                    rotation_rootfs == rootfs_uuid
-                    or rotation_rootfs == rootfs_source_uuid(rootfs_source)
-                )
-            )
-        ):
-            raise StorageError(
-                "storage_state_invalid",
-                "storage rotation target matches a source or pending identity",
-            )
         if source == "legacy":
             if not legacy_volume or not legacy_uuid:
                 raise StorageError("storage_state_invalid", "legacy storage source is incomplete")
@@ -613,13 +580,11 @@ class StorageStateStore:
             "legacyFilesystemUuid": legacy_uuid,
             "backupImage": backup,
             "backupFilesystemUuid": backup_uuid,
-            "rotationTargetUuid": rotation_target,
             "rootfsImage": rootfs_image,
             "rootfsFilesystemUuid": rootfs_uuid,
             "rootfsSourceSha256": rootfs_source,
             "backupRootfsImage": backup_rootfs,
             "backupRootfsFilesystemUuid": backup_rootfs_uuid,
-            "rotationTargetRootfsUuid": rotation_rootfs,
             "desiredLogicalSizeBytes": desired,
             "observedLogicalSizeBytes": observed,
             "observedFilesystemSizeBytes": filesystem_size,
@@ -749,11 +714,6 @@ def public_storage_state(state: Optional[Mapping[str, Any]], *, healthy: bool, e
         "rootfsFilesystemUuid": state.get("rootfsFilesystemUuid") or None,
         "rootfsSourceSha256": state.get("rootfsSourceSha256") or None,
         "observedRootfsSizeBytes": state.get("observedRootfsSizeBytes"),
-        **(
-            {"rotationPending": True}
-            if state.get("rotationTargetUuid")
-            else {}
-        ),
         "backup": (
             {
                 "image": state.get("backupImage"),

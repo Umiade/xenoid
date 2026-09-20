@@ -431,7 +431,7 @@ def _validate_misc(profile: dict[str, Any]) -> None:
         _integer(zone, "temp", f"profile.thermal.{zone_name}")
 
     ids = _object(_required(profile, "ids", "profile"), "profile.ids")
-    for key in ("android_id", "boot_id", "random_uuid", "serial", "imei", "imeisv"):
+    for key in ("android_id", "boot_id", "serial", "imei", "imeisv"):
         _string(ids, key, "profile.ids")
 
     usb = _object(_required(profile, "usb", "profile"), "profile.usb")

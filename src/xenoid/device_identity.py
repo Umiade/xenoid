@@ -19,46 +19,47 @@ from .config import InstanceContext, InstanceError
 
 IDENTITY_SCHEMA = "dev.xenoid.device-identity/v1"
 STATE_FILENAME = "device-identity.json"
-REGENERATE_SCHEMA = "dev.xenoid.device-regenerate/v2"
-LEGACY_REGENERATE_FILENAME = "device-regenerate.json"
-REGENERATE_FILENAME = "device-regenerate-v2.json"
-_LEGACY_EVIDENCE_RE = re.compile(
-    r"^device-regenerate-v1\.([0-9a-f]{64})\.evidence\.json$"
+REGENERATE_SCHEMA = "dev.xenoid.device-regenerate/v3"
+REGENERATE_FILENAME = "device-regenerate-v3.json"
+_LEGACY_JOURNAL_MARKERS = (
+    "device-regenerate.json",
+    "device-regenerate-v2.json",
 )
+_LEGACY_EVIDENCE_PREFIX = "device-regenerate-v1."
 _EPOCH_DOMAIN = b"xenoid-device-epoch/v1\0"
 _ANDROID_ID = re.compile(r"^[0-9a-f]{16}$")
 _SERIAL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,31}$")
 _IMEI = re.compile(r"^[0-9]{15}$")
 _IMEISV = re.compile(r"^[0-9]{2}$")
+_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
+_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _EPOCH = re.compile(r"^[0-9a-f]{64}$")
 _TRANSACTION = re.compile(r"^[0-9a-f]{32}$")
+_FSID = re.compile(r"^[0-9a-f]{16}$")
+_PROTECTION_ENGINE_ID = re.compile(r"^[0-9A-Za-z:._-]{4,128}$")
+_MAC_ADDRESS = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+_HOSTNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
+_DRM_ID = re.compile(r"^[0-9a-f]{32}$")
+_DEVICE_NAME = re.compile(r"^[\x20-\x7e]{1,64}$")
 _STABLE_KEYS = {"androidId", "serial", "imei", "imeisv"}
-_BOOT_KEYS = {"containerEpoch", "bootId", "randomUuid", "phase", "createdAt"}
+_BOOT_KEYS = {"containerEpoch", "bootId", "phase", "createdAt"}
 _PENDING_STABLE_KEYS = {"transactionId", "beforeDigest", "target", "digest"}
 _STATE_KEYS = {"schema", "instanceId", "stable", "active", "pending", "pendingStable", "updatedAt"}
 _LEGACY_STATE_KEYS = _STATE_KEYS - {"pendingStable"}
 _SEED_EPOCH = "0" * 64
 REGENERATION_PHASES = (
     "prepared",
-    "proxy_quarantined",
-    "container_removed",
-    "stable_committed",
-    "network_committed",
-    "sim_committed",
-    "storage_pending",
-    "storage_committed",
-    "runtime_converging",
-    "runtime_verified",
-    "google_wiping",
+    "staged",
+    "props_committed",
+    "settings_committed",
+    "radio_committed",
+    "storage_identity_committed",
+    "soft_rebooted",
+    "google_reset",
+    "verified",
     "committed",
 )
-GOOGLE_CLEAR_PACKAGES = (
-    "com.google.android.gms",
-    "com.google.android.gsf",
-    "com.android.vending",
-)
-GOOGLE_MARKER_ROOTS = ("ce", "de")
 _REGENERATION_KEYS = {
     "schema",
     "instanceId",
@@ -66,38 +67,45 @@ _REGENERATION_KEYS = {
     "phase",
     "before",
     "target",
-    "legacyEvidenceSha256",
-    "googleClearedPackages",
-    "googleActivePackage",
-    "googleMarkerRoots",
-    "googlePackageArmed",
     "createdAt",
     "updatedAt",
+    "restartRequestedUserspaceEpoch",
+    "restartCompletedUserspaceEpoch",
 }
 _REGENERATION_BEFORE_KEYS = {
     "containerId",
+    "containerEpoch",
     "imageId",
+    "imageInputSha256",
+    "imageBootInputSha256",
     "runtimeEpoch",
     "stableDigest",
-    "networkEpoch",
     "simEpoch",
-    "dataFilesystemUuid",
-    "rootfsFilesystemUuid",
     "locationDigest",
-    "proxyEnabled",
-    "proxyGeneration",
+    "bootId",
+    "statfsFsid",
+    "bluetoothAddress",
+    "deviceName",
+    "hostname",
     "googleBindingDigest",
+    "drmDeviceUniqueId",
+    "advertisingIdDigest",
+    "gsfAndroidIdDigest",
+    "protectionEngineId",
+    "protectionExpectedDigest",
 }
 _REGENERATION_TARGET_KEYS = {
     "stableDigest",
-    "networkEpoch",
+    "stable",
     "simEpoch",
-    "storageTransactionId",
-    "dataFilesystemUuid",
-    "rootfsFilesystemUuid",
     "locationProfileDigest",
-    "proxyGeneration",
+    "bootId",
+    "statfsFsid",
+    "bluetoothAddress",
+    "deviceName",
+    "hostname",
     "googleBindingDigest",
+    "drmDeviceUniqueId",
 }
 _FIELD_MAP = {
     "android_id": "androidId",
@@ -112,9 +120,7 @@ _FIELD_MAP = {
     "radio.imeisv": "imeisv",
     "persist.xenoid.radio.imeisv": "imeisv",
     "boot_id": "bootId",
-    "random_uuid": "randomUuid",
 }
-
 
 class IdentityError(InstanceError):
     """Stable, secret-free identity failure."""
@@ -123,6 +129,7 @@ class IdentityError(InstanceError):
 class IdentityRuntime(Protocol):
     def location_runtime_container_id(self) -> Optional[str]: ...
     def collect_persisted_device_identity(self) -> dict[str, Any]: ...
+    def ensure_drm_identity(self) -> dict[str, Any]: ...
 
 
 class FingerprintClient(Protocol):
@@ -159,17 +166,40 @@ def _valid_imei(value: str) -> bool:
 _IMEI_TAC = "35180461"  # Google Pixel 6 Pro (G8V0U) Type Allocation Code
 
 
-def _generate_stable() -> dict[str, str]:
-    # TAC is a same-model constant; only the 6-digit serial section rotates.
-    first_fourteen = _IMEI_TAC + "".join(
-        str(secrets.randbelow(10)) for _ in range(6)
-    )
-    return {
-        "androidId": secrets.token_hex(8),
-        "serial": secrets.token_hex(8).upper(),
-        "imei": first_fourteen + _imei_check_digit(first_fourteen),
-        "imeisv": "01",
-    }
+def _generate_stable(
+    previous: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    """Generate stable factors, rotating every field when a prior set exists."""
+    while True:
+        # TAC is a same-model constant; only the 6-digit serial section rotates.
+        first_fourteen = _IMEI_TAC + "".join(
+            str(secrets.randbelow(10)) for _ in range(6)
+        )
+        generated = {
+            "androidId": secrets.token_hex(8),
+            "serial": secrets.token_hex(8).upper(),
+            "imei": first_fourteen + _imei_check_digit(first_fourteen),
+            "imeisv": f"{secrets.randbelow(100):02d}",
+        }
+        if previous is None or all(
+            generated[key] != previous.get(key) for key in _STABLE_KEYS
+        ):
+            return generated
+
+
+def generate_stable_target(previous: Mapping[str, Any]) -> dict[str, str]:
+    """Generate a fully rotated stable identity target without persisting it.
+
+    The caller records the returned values in the regeneration journal first
+    and only then stages exactly these values through
+    ``DeviceIdentityStore.prepare_regeneration_stable``.
+    """
+    return _generate_stable(_validate_stable(previous))
+
+
+def generate_boot_id() -> str:
+    """Generate one fixed ``bootId`` target for the journal before staging."""
+    return _uuid4()
 
 
 def container_epoch(container_id: str) -> str:
@@ -193,7 +223,7 @@ def validate_identity_value(key: str, value: Any) -> str:
         return value
     if key == "imeisv" and _IMEISV.fullmatch(value):
         return value
-    if key in {"bootId", "randomUuid"} and _UUID.fullmatch(value.lower()):
+    if key == "bootId" and _UUID.fullmatch(value.lower()):
         return value.lower()
     raise IdentityError("device_identity_value_invalid", "invalid device identity value")
 
@@ -220,7 +250,6 @@ def _validate_boot(raw: Any, expected_phase: str) -> Optional[dict[str, Any]]:
     return {
         "containerEpoch": epoch,
         "bootId": validate_identity_value("bootId", raw["bootId"]),
-        "randomUuid": validate_identity_value("randomUuid", raw["randomUuid"]),
         "phase": expected_phase,
         "createdAt": created,
     }
@@ -247,6 +276,9 @@ def _regeneration_text(value: Any, pattern: re.Pattern[str]) -> str:
 
 def _regeneration_digest(value: Any) -> str:
     return _regeneration_text(value, _EPOCH)
+
+def _regeneration_optional_digest(value: Any) -> str:
+    return "" if value == "" else _regeneration_digest(value)
 
 
 def _regeneration_epoch(value: Any, *, allow_empty: bool = False) -> str:
@@ -277,42 +309,47 @@ def _regeneration_timestamp(value: Any) -> int:
     return value
 
 
+def _regeneration_bounded_text(value: Any, pattern: re.Pattern[str]) -> str:
+    return _regeneration_text(value, pattern)
+
 def _validate_regeneration_before(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, Mapping) or set(raw) != _REGENERATION_BEFORE_KEYS:
         raise IdentityError(
             "device_regeneration_state_invalid",
             "invalid device regeneration before-state",
         )
-    container_id = _regeneration_digest(raw["containerId"])
-    image_id = raw["imageId"]
-    if (
-        not isinstance(image_id, str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
-    ):
-        raise IdentityError(
-            "device_regeneration_state_invalid",
-            "invalid device regeneration image identity",
-        )
-    proxy_enabled = raw["proxyEnabled"]
-    if not isinstance(proxy_enabled, bool):
-        raise IdentityError(
-            "device_regeneration_state_invalid",
-            "invalid device regeneration proxy state",
-        )
-    return {
-        "containerId": container_id,
-        "imageId": image_id,
+    before = {
+        "containerId": _regeneration_text(raw["containerId"], _CONTAINER_ID),
+        "containerEpoch": _regeneration_digest(raw["containerEpoch"]),
+        "imageId": _regeneration_text(raw["imageId"], _IMAGE_ID),
+        "imageInputSha256": _regeneration_digest(raw["imageInputSha256"]),
+        "imageBootInputSha256": _regeneration_digest(raw["imageBootInputSha256"]),
         "runtimeEpoch": _regeneration_digest(raw["runtimeEpoch"]),
         "stableDigest": _regeneration_digest(raw["stableDigest"]),
-        "networkEpoch": _regeneration_epoch(raw["networkEpoch"], allow_empty=True),
         "simEpoch": _regeneration_epoch(raw["simEpoch"], allow_empty=True),
-        "dataFilesystemUuid": _regeneration_uuid(raw["dataFilesystemUuid"]),
-        "rootfsFilesystemUuid": _regeneration_uuid(raw["rootfsFilesystemUuid"]),
         "locationDigest": _regeneration_digest(raw["locationDigest"]),
-        "proxyEnabled": proxy_enabled,
-        "proxyGeneration": _regeneration_generation(raw["proxyGeneration"]),
+        "bootId": _regeneration_uuid(raw["bootId"]),
+        "statfsFsid": _regeneration_text(raw["statfsFsid"], _FSID),
+        "bluetoothAddress": _regeneration_text(raw["bluetoothAddress"], _MAC_ADDRESS),
+        "drmDeviceUniqueId": _regeneration_text(raw["drmDeviceUniqueId"], _DRM_ID),
+        "deviceName": _regeneration_text(raw["deviceName"], _DEVICE_NAME),
+        "hostname": _regeneration_text(raw["hostname"], _HOSTNAME),
         "googleBindingDigest": _regeneration_digest(raw["googleBindingDigest"]),
+        "advertisingIdDigest": _regeneration_optional_digest(raw["advertisingIdDigest"]),
+        "gsfAndroidIdDigest": _regeneration_optional_digest(raw["gsfAndroidIdDigest"]),
+        "protectionEngineId": _regeneration_text(
+            raw["protectionEngineId"], _PROTECTION_ENGINE_ID
+        ),
+        "protectionExpectedDigest": _regeneration_digest(
+            raw["protectionExpectedDigest"]
+        ),
     }
+    if container_epoch(before["containerId"]) != before["containerEpoch"]:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "device regeneration container identity is inconsistent",
+        )
+    return before
 
 
 def _validate_regeneration_target(
@@ -324,25 +361,35 @@ def _validate_regeneration_target(
             "device_regeneration_state_invalid",
             "invalid device regeneration target-state",
         )
+    stable = _validate_stable(raw["stable"])
     target = {
         "stableDigest": _regeneration_digest(raw["stableDigest"]),
-        "networkEpoch": _regeneration_epoch(raw["networkEpoch"]),
+        "stable": stable,
         "simEpoch": _regeneration_epoch(raw["simEpoch"]),
-        "storageTransactionId": _regeneration_epoch(raw["storageTransactionId"]),
-        "dataFilesystemUuid": _regeneration_uuid(raw["dataFilesystemUuid"]),
-        "rootfsFilesystemUuid": _regeneration_uuid(raw["rootfsFilesystemUuid"]),
         "locationProfileDigest": _regeneration_digest(raw["locationProfileDigest"]),
-        "proxyGeneration": _regeneration_generation(raw["proxyGeneration"]),
+        "bootId": _regeneration_uuid(raw["bootId"]),
+        "statfsFsid": _regeneration_text(raw["statfsFsid"], _FSID),
+        "bluetoothAddress": _regeneration_text(raw["bluetoothAddress"], _MAC_ADDRESS),
+        "drmDeviceUniqueId": _regeneration_text(raw["drmDeviceUniqueId"], _DRM_ID),
+        "deviceName": _regeneration_text(raw["deviceName"], _DEVICE_NAME),
+        "hostname": _regeneration_text(raw["hostname"], _HOSTNAME),
         "googleBindingDigest": _regeneration_digest(raw["googleBindingDigest"]),
     }
+    if stable_identity_digest(stable) != target["stableDigest"]:
+        raise IdentityError(
+            "device_regeneration_state_invalid",
+            "device regeneration stable target digest mismatch",
+        )
     if (
         target["stableDigest"] == before["stableDigest"]
-        or target["networkEpoch"] == before["networkEpoch"]
         or target["simEpoch"] == before["simEpoch"]
-        or target["dataFilesystemUuid"] == before["dataFilesystemUuid"]
-        or target["rootfsFilesystemUuid"] == before["rootfsFilesystemUuid"]
-        or target["proxyGeneration"] != before["proxyGeneration"]
+        or target["bootId"] == before["bootId"]
+        or target["drmDeviceUniqueId"] == before["drmDeviceUniqueId"]
+        or target["statfsFsid"] == before["statfsFsid"]
+        or target["bluetoothAddress"] == before["bluetoothAddress"]
         or target["locationProfileDigest"] == before["locationDigest"]
+        or target["deviceName"] == before["deviceName"]
+        or target["hostname"] == before["hostname"]
         or target["googleBindingDigest"] != before["googleBindingDigest"]
     ):
         raise IdentityError(
@@ -360,202 +407,10 @@ class RegenerationJournal:
     def __init__(self, context: InstanceContext):
         self.context = context
         self.path = context.state_root / REGENERATE_FILENAME
-        self.legacy_path = context.state_root / LEGACY_REGENERATE_FILENAME
-
-    @staticmethod
-    def _private_legacy_info(path: Path) -> os.stat_result:
-        info = path.lstat()
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_size <= 0
-            or info.st_size > 64 * 1024
-        ):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy regeneration evidence is unsafe",
-            )
-        return info
-
-    def _read_legacy(self, path: Path) -> tuple[dict[str, Any], str]:
-        self._private_legacy_info(path)
-        try:
-            payload = path.read_bytes()
-            raw = json.loads(payload)
-        except (OSError, ValueError, UnicodeError) as exc:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy regeneration evidence is invalid",
-            ) from exc
-        if (
-            not isinstance(raw, Mapping)
-            or set(raw) != {"schema", "instanceId", "startedAt"}
-            or raw["schema"] != "dev.xenoid.device-regenerate/v1"
-            or raw["instanceId"] != self.context.instance_id
-            or isinstance(raw["startedAt"], bool)
-            or not isinstance(raw["startedAt"], int)
-            or raw["startedAt"] < 0
-        ):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy regeneration evidence is invalid",
-            )
-        return dict(raw), hashlib.sha256(payload).hexdigest()
-
-    def _evidence_paths(self) -> list[tuple[Path, str]]:
-        result: list[tuple[Path, str]] = []
-        try:
-            entries = os.scandir(self.context.state_root)
-        except FileNotFoundError:
-            return result
-        with entries:
-            for entry in entries:
-                matched = _LEGACY_EVIDENCE_RE.fullmatch(entry.name)
-                if matched is not None:
-                    result.append(
-                        (self.context.state_root / entry.name, matched.group(1))
-                    )
-                elif entry.name.startswith("device-regenerate-v1."):
-                    raise IdentityError(
-                        "device_regeneration_state_invalid",
-                        "unknown legacy regeneration evidence file exists",
-                    )
-        if len(result) > 1:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "multiple legacy regeneration evidence files exist",
-            )
-        return result
-
-    def legacy_source_digest(self) -> str:
-        _, digest = self._read_legacy(self.legacy_path)
-        evidence = self._evidence_paths()
-        if evidence:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy source and evidence both exist",
-            )
-        return digest
-
-    def _validate_legacy_evidence(self, state: Mapping[str, Any]) -> None:
-        source_exists = False
-        try:
-            self._private_legacy_info(self.legacy_path)
-            source_exists = True
-        except FileNotFoundError:
-            pass
-        evidence = self._evidence_paths()
-        expected = state.get("legacyEvidenceSha256")
-        if expected is None:
-            if source_exists:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "unexpected legacy journal accompanies regeneration v2",
-                )
-            if evidence:
-                evidence_path, named_digest = evidence[0]
-                _, observed_digest = self._read_legacy(evidence_path)
-                if observed_digest != named_digest:
-                    raise IdentityError(
-                        "device_regeneration_state_invalid",
-                        "legacy regeneration evidence digest mismatch",
-                    )
-            return
-        expected_path = (
-            self.context.state_root
-            / f"device-regenerate-v1.{expected}.evidence.json"
+        self._legacy_markers = tuple(
+            context.state_root / name for name in _LEGACY_JOURNAL_MARKERS
         )
-        if source_exists and evidence:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy source and evidence both exist",
-            )
-        if source_exists:
-            _, digest = self._read_legacy(self.legacy_path)
-            if digest != expected:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "legacy regeneration source digest mismatch",
-                )
-            return
-        if len(evidence) != 1 or evidence[0][0] != expected_path:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy regeneration evidence is missing or mismatched",
-            )
-        _, digest = self._read_legacy(expected_path)
-        if digest != expected or evidence[0][1] != expected:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy regeneration evidence digest mismatch",
-            )
 
-    @staticmethod
-    def _rename_noreplace(source: Path, destination: Path) -> None:
-        libc = ctypes.CDLL(None, use_errno=True)
-        source_bytes = os.fsencode(source)
-        destination_bytes = os.fsencode(destination)
-        if hasattr(libc, "renamex_np"):
-            function = libc.renamex_np
-            function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-            function.restype = ctypes.c_int
-            result = function(source_bytes, destination_bytes, 0x00000004)
-        elif hasattr(libc, "renameat2"):
-            function = libc.renameat2
-            function.argtypes = [
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            ]
-            function.restype = ctypes.c_int
-            result = function(-100, source_bytes, -100, destination_bytes, 1)
-        else:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "no no-replace rename primitive is available",
-            )
-        if result != 0:
-            error = ctypes.get_errno()
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy evidence publication failed",
-            ) from OSError(error or errno.EIO, os.strerror(error or errno.EIO))
-
-    def finish_legacy_evidence(self) -> dict[str, Any]:
-        state = self.load()
-        if state is None or state["legacyEvidenceSha256"] is None:
-            return state or {}
-        try:
-            self._private_legacy_info(self.legacy_path)
-        except FileNotFoundError:
-            return state
-        digest = state["legacyEvidenceSha256"]
-        _, observed = self._read_legacy(self.legacy_path)
-        if observed != digest:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "legacy regeneration source digest mismatch",
-            )
-        destination = (
-            self.context.state_root
-            / f"device-regenerate-v1.{digest}.evidence.json"
-        )
-        self._rename_noreplace(self.legacy_path, destination)
-        os.chmod(destination, 0o600, follow_symlinks=False)
-        directory_fd = os.open(
-            self.context.state_root,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-        return self.load() or {}
 
     def _write(self, state: Mapping[str, Any]) -> dict[str, Any]:
         clean = self.validate(state)
@@ -656,28 +511,30 @@ class RegenerationJournal:
             finally:
                 os.close(descriptor)
         except FileNotFoundError:
+            legacy = [
+                marker.name
+                for marker in self._legacy_markers
+                if marker.exists()
+            ]
             try:
-                self._read_legacy(self.legacy_path)
+                entries = os.scandir(self.context.state_root)
             except FileNotFoundError:
-                evidence = self._evidence_paths()
-                if evidence:
-                    evidence_path, named_digest = evidence[0]
-                    _, observed_digest = self._read_legacy(evidence_path)
-                    if observed_digest != named_digest:
-                        raise IdentityError(
-                            "device_regeneration_state_invalid",
-                            "legacy regeneration evidence digest mismatch",
-                        )
-                return None
-            if self._evidence_paths():
+                entries = ()
+            else:
+                with entries:
+                    legacy.extend(
+                        entry.name
+                        for entry in entries
+                        if entry.name.startswith(_LEGACY_EVIDENCE_PREFIX)
+                    )
+            if legacy:
                 raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "legacy source and evidence both exist",
+                    "device_regeneration_legacy_pending",
+                    "legacy recreate-era regeneration journal "
+                    + ", ".join(sorted(legacy))
+                    + " is not resumable; delete it and rerun device regenerate",
                 )
-            raise IdentityError(
-                "device_regeneration_legacy_pending",
-                "legacy regeneration requires explicit recovery",
-            )
+            return None
         except IdentityError:
             raise
         except (OSError, ValueError, UnicodeError) as exc:
@@ -685,9 +542,7 @@ class RegenerationJournal:
                 "device_regeneration_state_invalid",
                 "invalid device regeneration journal",
             ) from exc
-        clean = self.validate(raw)
-        self._validate_legacy_evidence(clean)
-        return clean
+        return self.validate(raw)
 
     def pending(self) -> bool:
         return self.load() is not None
@@ -715,73 +570,10 @@ class RegenerationJournal:
             )
         before = _validate_regeneration_before(raw["before"])
         target = _validate_regeneration_target(raw["target"], before)
-        legacy = raw["legacyEvidenceSha256"]
-        if legacy is not None:
-            legacy = _regeneration_digest(legacy)
-        cleared_raw = raw["googleClearedPackages"]
-        if (
-            not isinstance(cleared_raw, list)
-            or cleared_raw != list(GOOGLE_CLEAR_PACKAGES[: len(cleared_raw)])
-        ):
+        if container_epoch(before["containerId"]) != before["containerEpoch"]:
             raise IdentityError(
                 "device_regeneration_state_invalid",
-                "invalid Google package wipe progress",
-            )
-        active = raw["googleActivePackage"]
-        if active is not None and (
-            active not in GOOGLE_CLEAR_PACKAGES
-            or active in cleared_raw
-            or len(cleared_raw) >= len(GOOGLE_CLEAR_PACKAGES)
-            or active != GOOGLE_CLEAR_PACKAGES[len(cleared_raw)]
-        ):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "invalid active Google package wipe",
-            )
-        roots_raw = raw["googleMarkerRoots"]
-        if (
-            not isinstance(roots_raw, list)
-            or any(root not in GOOGLE_MARKER_ROOTS for root in roots_raw)
-            or roots_raw != [
-                root for root in GOOGLE_MARKER_ROOTS if root in roots_raw
-            ]
-        ):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "invalid Google marker roots",
-            )
-        armed = raw["googlePackageArmed"]
-        if not isinstance(armed, bool):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "invalid Google package wipe arm state",
-            )
-        if active is None and (roots_raw or armed):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "Google wipe marker exists without an active package",
-            )
-        if active is not None and not armed and roots_raw:
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "Google wipe roots were recorded before arming",
-            )
-        phase_index = REGENERATION_PHASES.index(phase)
-        google_index = REGENERATION_PHASES.index("google_wiping")
-        if phase_index < google_index and (cleared_raw or active is not None or roots_raw or armed):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "Google wipe progress precedes runtime verification",
-            )
-        if phase == "committed" and (
-            cleared_raw not in ([], list(GOOGLE_CLEAR_PACKAGES))
-            or active is not None
-            or roots_raw
-            or armed
-        ):
-            raise IdentityError(
-                "device_regeneration_state_invalid",
-                "committed device regeneration has incomplete Google cleanup",
+                "device regeneration container identity is inconsistent",
             )
         created_at = _regeneration_timestamp(raw["createdAt"])
         updated_at = _regeneration_timestamp(raw["updatedAt"])
@@ -790,6 +582,24 @@ class RegenerationJournal:
                 "device_regeneration_state_invalid",
                 "device regeneration timestamps are not monotonic",
             )
+        restart_requested_userspace = raw["restartRequestedUserspaceEpoch"]
+        if not isinstance(restart_requested_userspace, str) or (
+            restart_requested_userspace != ""
+            and _EPOCH.fullmatch(restart_requested_userspace) is None
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "invalid device regeneration userspace epoch",
+            )
+        restart_completed_userspace = raw["restartCompletedUserspaceEpoch"]
+        if not isinstance(restart_completed_userspace, str) or (
+            restart_completed_userspace != ""
+            and _EPOCH.fullmatch(restart_completed_userspace) is None
+        ):
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "invalid device regeneration userspace epoch",
+            )
         return {
             "schema": REGENERATE_SCHEMA,
             "instanceId": self.context.instance_id,
@@ -797,13 +607,10 @@ class RegenerationJournal:
             "phase": phase,
             "before": before,
             "target": target,
-            "legacyEvidenceSha256": legacy,
-            "googleClearedPackages": list(cleared_raw),
-            "googleActivePackage": active,
-            "googleMarkerRoots": list(roots_raw),
-            "googlePackageArmed": armed,
             "createdAt": created_at,
             "updatedAt": updated_at,
+            "restartRequestedUserspaceEpoch": restart_requested_userspace,
+            "restartCompletedUserspaceEpoch": restart_completed_userspace,
         }
 
     def prepare(
@@ -811,32 +618,8 @@ class RegenerationJournal:
         transaction_id: str,
         before: Mapping[str, Any],
         target: Mapping[str, Any],
-        *,
-        legacy_evidence_sha256: Optional[str] = None,
-        legacy_restart: bool = False,
     ) -> dict[str, Any]:
-        if legacy_restart:
-            if legacy_evidence_sha256 is None:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "legacy restart requires evidence digest",
-                )
-            observed = self.legacy_source_digest()
-            if observed != legacy_evidence_sha256:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "legacy regeneration source digest mismatch",
-                )
-            try:
-                self.path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "device regeneration journal already exists",
-                )
-        elif self.load() is not None:
+        if self.load() is not None:
             raise IdentityError(
                 "device_regeneration_state_invalid",
                 "device regeneration journal already exists",
@@ -851,13 +634,10 @@ class RegenerationJournal:
                 "phase": "prepared",
                 "before": dict(before),
                 "target": dict(target),
-                "legacyEvidenceSha256": legacy_evidence_sha256,
-                "googleClearedPackages": [],
-                "googleActivePackage": None,
-                "googleMarkerRoots": [],
-                "googlePackageArmed": False,
                 "createdAt": now,
                 "updatedAt": now,
+                "restartRequestedUserspaceEpoch": "",
+                "restartCompletedUserspaceEpoch": "",
             }
         )
 
@@ -891,7 +671,7 @@ class RegenerationJournal:
                 **state,
                 **updates,
                 "phase": phase,
-                "updatedAt": _now(),
+                "updatedAt": max(_now(), state["updatedAt"]),
             }
         )
 
@@ -1002,6 +782,15 @@ class DeviceIdentityStore:
             raise
         except (OSError, ValueError, UnicodeError) as exc:
             raise IdentityError("device_identity_state_invalid", "invalid device identity state") from exc
+        # Pre-0.9.2 states carry a faked randomUuid boot value; the factor is
+        # gone from the model, so migrate by dropping it on read.
+        if isinstance(raw, Mapping):
+            for boot_key in ("active", "pending"):
+                boot = raw.get(boot_key)
+                if isinstance(boot, dict) and "randomUuid" in boot:
+                    boot = dict(boot)
+                    boot.pop("randomUuid")
+                    raw = {**raw, boot_key: boot}
         return self.validate(raw)
 
     def save(self, state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1044,8 +833,6 @@ class DeviceIdentityStore:
             raise IdentityError("device_identity_state_invalid", "invalid device identity timestamp")
         active = _validate_boot(raw["active"], "applied")
         pending = _validate_boot(raw["pending"], "pending")
-        if active is not None and pending is not None and active["containerEpoch"] == pending["containerEpoch"]:
-            raise IdentityError("device_identity_state_invalid", "duplicate active and pending device epoch")
         stable = _validate_stable(raw["stable"])
         pending_stable = _validate_pending_stable(raw.get("pendingStable"))
         if pending_stable is not None:
@@ -1110,7 +897,7 @@ class DeviceIdentityStore:
             )
         return self.save({
             **state,
-            "stable": _generate_stable(),
+            "stable": _generate_stable(state["stable"]),
             "active": None,
             "pending": None,
             "updatedAt": _now(),
@@ -1134,16 +921,23 @@ class DeviceIdentityStore:
                 )
             return state
         before_digest = stable_identity_digest(state["stable"])
-        generated = _validate_stable(target) if target is not None else _generate_stable()
+        generated = (
+            _validate_stable(target)
+            if target is not None
+            else _generate_stable(state["stable"])
+        )
         digest = stable_identity_digest(generated)
-        while digest == before_digest:
-            if target is not None:
-                raise IdentityError(
-                    "device_regeneration_state_invalid",
-                    "stable regeneration target matches the active identity",
-                )
-            generated = _generate_stable()
-            digest = stable_identity_digest(generated)
+        unchanged = [
+            key
+            for key in sorted(_STABLE_KEYS)
+            if generated[key] == state["stable"][key]
+        ]
+        if unchanged:
+            raise IdentityError(
+                "device_regeneration_state_invalid",
+                "stable regeneration target did not rotate: "
+                + ", ".join(unchanged),
+            )
         pending = {
             "transactionId": transaction,
             "beforeDigest": before_digest,
@@ -1206,12 +1000,22 @@ class DeviceIdentityStore:
         )
 
     def recover_orphaned_regeneration_stable(self) -> bool:
+        """Discard a pendingStable left behind without its journal.
+
+        Only the two states the store invariant already allows are
+        recoverable: the stable still equals the recorded before digest (the
+        transaction never took effect, so the marker is pure residue) or it
+        equals the committed target digest (a legacy v1/v2 transaction
+        committed but crashed before clearing, and its journal was deleted
+        per the documented recovery). Anything else means the stable moved
+        outside the transaction and stays fail-closed.
+        """
         state = self.load()
         pending = state.get("pendingStable") if state is not None else None
         if not isinstance(pending, Mapping):
             return False
         current = stable_identity_digest(state["stable"])
-        if current != pending["beforeDigest"]:
+        if current not in {pending["beforeDigest"], pending["digest"]}:
             raise IdentityError(
                 "device_regeneration_state_invalid",
                 "orphaned stable target cannot be discarded after mutation",
@@ -1246,7 +1050,6 @@ class DeviceIdentityStore:
         boot = {
             "containerEpoch": epoch,
             "bootId": _uuid4(),
-            "randomUuid": _uuid4(),
             "phase": "pending",
             "createdAt": _now(),
         }
@@ -1272,7 +1075,6 @@ class DeviceIdentityStore:
         boot = {
             "containerEpoch": _SEED_EPOCH,
             "bootId": _uuid4(),
-            "randomUuid": _uuid4(),
             "phase": "pending",
             "createdAt": _now(),
         }
@@ -1287,6 +1089,38 @@ class DeviceIdentityStore:
             raise IdentityError("device_identity_epoch_mismatch", "device identity epoch changed before commit")
         active = {**state["pending"], "phase": "applied"}
         return self.save({**state, "active": active, "pending": None, "updatedAt": _now()})
+
+    def stage_regeneration_boot(self, boot_id: str) -> dict[str, Any]:
+        """Stage the journal-fixed boot target for the soft reboot, idempotently.
+
+        The regeneration journal owns the fixed ``bootId`` before any identity
+        mutation, so this only ever persists that exact value: an already staged
+        (or already applied) matching boot is returned unchanged, otherwise the
+        pending boot is rewritten in place. The epoch stays bound to the live
+        container: doctor and convergence both require
+        ``active.containerEpoch == container_epoch(container_id)``, so only the
+        boot-scoped value rotates, never the epoch identity. The pending boot
+        therefore shares the active epoch; ``mark_applied`` disambiguates them
+        by phase when it commits after the runtime returns.
+        """
+        target = validate_identity_value("bootId", boot_id)
+        state = self.load()
+        if state is None:
+            raise IdentityError("device_identity_not_initialized", "device identity is not initialized")
+        selected = state["pending"] or state["active"]
+        if selected is None or selected["containerEpoch"] == _SEED_EPOCH:
+            raise IdentityError("device_identity_epoch_missing", "boot-scoped identity has no active epoch")
+        for candidate in (state["pending"], state["active"]):
+            if isinstance(candidate, Mapping) and candidate["bootId"] == target:
+                return dict(candidate)
+        boot = {
+            "containerEpoch": selected["containerEpoch"],
+            "bootId": target,
+            "phase": "pending",
+            "createdAt": _now(),
+        }
+        self.save({**state, "pending": boot, "updatedAt": _now()})
+        return boot
 
     def update_field(self, field: str, value: Any) -> dict[str, Any]:
         key = identity_field_key(field)
@@ -1325,7 +1159,6 @@ def materialize_profile(profile: Mapping[str, Any], state: Mapping[str, Any], bo
         "imei": state["stable"]["imei"],
         "imeisv": state["stable"]["imeisv"],
         "boot_id": boot["bootId"],
-        "random_uuid": boot["randomUuid"],
     }
     usb = effective.get("usb")
     if usb is not None:
@@ -1379,6 +1212,18 @@ def converge_instance_identity(
         return {
             "ok": False,
             "error": "device_identity_apply_failed",
+            "identity": public_identity_state(state),
+            "apply": result,
+        }
+    drm = runtime.ensure_drm_identity()
+    if not isinstance(drm, dict) or drm.get("ok") is not True:
+        # Stock raven always exposes a Widevine deviceUniqueId; converging
+        # identity without one would leave an app-visible anomaly.
+        return {
+            "ok": False,
+            "error": str(
+                drm.get("error") if isinstance(drm, dict) else None
+            ) or "drm_identity_stage_failed",
             "identity": public_identity_state(state),
             "apply": result,
         }

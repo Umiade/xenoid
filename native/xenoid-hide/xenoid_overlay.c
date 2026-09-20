@@ -161,7 +161,7 @@ static const char *overlay_targets[] = {
   "/proc/sys/kernel/modules_disabled", "/proc/sys/kernel/unprivileged_bpf_disabled", "/proc/sys/kernel/yama/ptrace_scope",
   "/proc/cmdline", "/proc/version", "/proc/cpuinfo", "/proc/bus/input/devices", "/proc/fb",
   "/proc/sys/kernel/random/boot_id",
-  "/proc/sys/kernel/random/uuid", "/proc/sys/kernel/random/entropy_avail", "/proc/sys/kernel/random/poolsize", "/proc/sys/kernel/random/urandom_min_reseed_secs",
+  "/proc/sys/kernel/random/entropy_avail", "/proc/sys/kernel/random/poolsize", "/proc/sys/kernel/random/urandom_min_reseed_secs",
   "/sys/class/graphics/fb0/name", "/sys/class/graphics/fb0/virtual_size", "/sys/class/graphics/fb0/bits_per_pixel", "/sys/class/graphics/fb0/modes", "/sys/class/graphics/fb0/refresh_rate",
   "/sys/class/backlight/panel0-backlight/brightness", "/sys/class/backlight/panel0-backlight/max_brightness",
   "/sys/class/backlight/panel0-backlight/actual_brightness", "/sys/class/backlight/panel0-backlight/type",
@@ -201,6 +201,7 @@ static const char *overlay_targets[] = {
   NULL
 };
 static const char *deprecated_dynamic_targets[] = {
+  "/proc/sys/kernel/random/uuid",
   "/sys/block/vdb/queue/rotational", "/sys/block/vda/queue/rotational",
   "/sys/block/vdb/size", "/sys/block/vda/size",
   "/proc/driver/rtc",
@@ -276,23 +277,27 @@ static int cleanup_legacy_cpu_detail_mounts(const char *mi) {
   }
   return fail;
 }
+static int cleanup_target_list(const char *mi, const char *const *targets) {
+  int fail = 0;
+  for (int i = 0; targets[i]; i++) {
+    char resolved[PATH_MAX];
+    const char *t = resolve_overlay_target(targets[i], resolved, sizeof(resolved))
+        ? resolved : targets[i];
+    int count = count_in_mountinfo(mi, t);
+    while (count-- > 0) {
+      if (umount2(t, MNT_DETACH) && errno != EINVAL) fail++;
+    }
+    unmark_mounted(t);
+  }
+  return fail;
+}
 static int cleanup(void) {
   int fail=0;
   char *mi=read_mountinfo();
   if (!mi) { fprintf(stderr, "mountinfo read failed: %s\n", strerror(errno)); return 1; }
   fail += cleanup_legacy_cpu_detail_mounts(mi);
-  for(int i=0; overlay_targets[i]; i++){
-    char resolved[PATH_MAX];
-    const char *t = resolve_overlay_target(overlay_targets[i], resolved, sizeof(resolved)) ? resolved : overlay_targets[i];
-    int c=count_in_mountinfo(mi, t);
-    while(c-- > 0){ if(umount2(t, MNT_DETACH) && errno != EINVAL) fail++; } unmark_mounted(t);
-  }
-  for(int i=0; deprecated_dynamic_targets[i]; i++){
-    char resolved[PATH_MAX];
-    const char *t = resolve_overlay_target(deprecated_dynamic_targets[i], resolved, sizeof(resolved)) ? resolved : deprecated_dynamic_targets[i];
-    int c=count_in_mountinfo(mi, t);
-    while(c-- > 0){ if(umount2(t, MNT_DETACH) && errno != EINVAL) fail++; } unmark_mounted(t);
-  }
+  fail += cleanup_target_list(mi, overlay_targets);
+  fail += cleanup_target_list(mi, deprecated_dynamic_targets);
   free(mi); printf("{\"ok\":%s,\"fail\":%d}\n", fail?"false":"true", fail); return fail?1:0;
 }
 
@@ -1568,10 +1573,6 @@ static int overlay_boot_id(void) {
 }
 static int overlay_random_sysctls(void) {
   int fail = 0;
-  char *uuid = first_or_default(PROFILE_DIR "/random_uuid", "8e77f80f-4f61-4f0d-9d1e-123456789abc\n");
-  char fake[256]; snprintf(fake, sizeof(fake), "%s/random_uuid", OVERLAY_DIR);
-  int rc = write_text(fake, uuid); free(uuid); if (rc) return -1;
-  if (access("/proc/sys/kernel/random/uuid", F_OK) == 0) fail += bind_file(fake, "/proc/sys/kernel/random/uuid") != 0;
   fail += overlay_text_optional("random_entropy_avail", "/proc/sys/kernel/random/entropy_avail", "4096\n") != 0;
   fail += overlay_text_optional("random_poolsize", "/proc/sys/kernel/random/poolsize", "4096\n") != 0;
   fail += overlay_text_optional("random_urandom_min_reseed_secs", "/proc/sys/kernel/random/urandom_min_reseed_secs", "60\n") != 0;
@@ -1602,6 +1603,10 @@ static int apply(void) {
     }
   }
   int fail = 0;
+  char *mi = read_mountinfo();
+  if (!mi) { fprintf(stderr, "mountinfo read failed: %s\n", strerror(errno)); return 2; }
+  fail += cleanup_target_list(mi, deprecated_dynamic_targets);
+  free(mi);
   if (overlay_boot_id()) { printf("boot_id=fail:%s\n", strerror(errno)); fail++; } else printf("boot_id=ok\n");
   if (overlay_random_sysctls()) { printf("random_sysctls=fail:%s\n", strerror(errno)); fail++; } else printf("random_sysctls=ok\n");
   if (overlay_cpuinfo()) { printf("cpuinfo=fail:%s\n", strerror(errno)); fail++; } else printf("cpuinfo=ok\n");
@@ -1639,8 +1644,9 @@ static int revert(void) {
   char *mi = read_mountinfo();
   if (!mi) { fprintf(stderr, "mountinfo read failed: %s\n", strerror(errno)); return 1; }
   fail += cleanup_legacy_cpu_detail_mounts(mi);
+  fail += cleanup_target_list(mi, overlay_targets);
+  fail += cleanup_target_list(mi, deprecated_dynamic_targets);
   free(mi);
-  for (int i=0; overlay_targets[i]; ++i) { if (umount2(overlay_targets[i], MNT_DETACH) && errno != EINVAL) { printf("%s=umount_fail:%s\n", overlay_targets[i], strerror(errno)); fail++; } else { unmark_mounted(overlay_targets[i]); printf("%s=umount_ok\n", overlay_targets[i]); } }
   return fail ? 1 : 0;
 }
 static int isolate_sysfs_mounts(void) {
@@ -1666,6 +1672,6 @@ int main(int argc, char **argv) {
   }
   if (!strcmp(cmd, "status-json")) return status_json();
   printf("xenoid-overlay status\n");
-  status_one("/proc/sys/kernel/random/boot_id"); status_one("/proc/sys/kernel/random/uuid"); status_one("/proc/sys/kernel/random/entropy_avail"); status_one("/sys/class/dmi/id/product_name"); status_one("/proc/device-tree/model"); status_one("/sys/firmware/devicetree/base/model"); status_one("/sys/fs/selinux/enforce"); status_one("/sys/fs/selinux/policyvers"); status_one("/sys/hypervisor/type"); status_one("/proc/cpuinfo"); status_one("/proc/bus/input/devices"); status_one("/proc/fb"); status_one("/sys/class/graphics/fb0/name"); status_one("/sys/class/power_supply/battery/capacity"); status_one("/sys/class/thermal/thermal_zone0/temp"); status_one("/sys/class/backlight/panel0-backlight/max_brightness");
+  status_one("/proc/sys/kernel/random/boot_id"); status_one("/proc/sys/kernel/random/entropy_avail"); status_one("/sys/class/dmi/id/product_name"); status_one("/proc/device-tree/model"); status_one("/sys/firmware/devicetree/base/model"); status_one("/sys/fs/selinux/enforce"); status_one("/sys/fs/selinux/policyvers"); status_one("/sys/hypervisor/type"); status_one("/proc/cpuinfo"); status_one("/proc/bus/input/devices"); status_one("/proc/fb"); status_one("/sys/class/graphics/fb0/name"); status_one("/sys/class/power_supply/battery/capacity"); status_one("/sys/class/thermal/thermal_zone0/temp"); status_one("/sys/class/backlight/panel0-backlight/max_brightness");
   return 0;
 }

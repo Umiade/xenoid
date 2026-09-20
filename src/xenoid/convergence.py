@@ -20,7 +20,6 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 from .operation_lock import instance_operation_lock, operation_lock_is_held
-from .storage import storage_rotation_target
 from .util import bounded_timeout, command_timeout
 
 
@@ -1490,7 +1489,14 @@ class ConvergenceExecutor:
         result_context["resumed"] = resumed
         with reporter.heartbeat(initial_phase, command_started, initial_phase):
             current_observation = self._observe(skip_build=skip_build)
-            if retained is not None:
+            if retained is not None and dry_run:
+                # Dry-run is strictly read-only: validate the retained journal
+                # against the observation, but never adopt runtime drift into
+                # it and never clear an obsolete journal. An inputs-changed
+                # journal is still on disk, so propagate instead of planning
+                # as if no journal existed.
+                self._validate_resume_state(retained, current_observation)
+            elif retained is not None:
                 retained = self._adopt_interrupted_runtime(
                     retained,
                     current_observation,
@@ -1637,6 +1643,7 @@ class ConvergenceExecutor:
         reporter.finish("artifacts", "passed", started, "artifacts_ready")
         return resolved
 
+
     def _execute_plan(
         self,
         plan: ConvergencePlan,
@@ -1663,6 +1670,7 @@ class ConvergenceExecutor:
                 if isinstance(regeneration_capability, Mapping)
                 else None
             )
+
             operation_id = (
                 legacy_evidence[:32]
                 if isinstance(legacy_evidence, str)
@@ -2718,11 +2726,10 @@ def _boot_seed_target_for_plan(
 
 
 def _new_boot_seed_target() -> dict[str, str]:
-    transaction_id = secrets.token_hex(16)
     return {
-        "transactionId": transaction_id,
-        "dataUuid": storage_rotation_target(transaction_id),
-        "rootfsUuid": storage_rotation_target(transaction_id, rootfs=True),
+        "transactionId": secrets.token_hex(16),
+        "dataUuid": str(uuid.uuid4()),
+        "rootfsUuid": str(uuid.uuid4()),
     }
 
 

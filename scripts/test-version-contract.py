@@ -8,13 +8,15 @@ import json
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from xenoid import __version__  # noqa: E402
 from xenoid import remote_service  # noqa: E402
-from xenoid.cli import build_parser  # noqa: E402
+from xenoid.cli import build_parser, cmd_package_release  # noqa: E402
+from xenoid.gates import catalog  # noqa: E402
 
 Case = Callable[[], None]
 CASES: dict[str, Case] = {}
@@ -108,6 +110,32 @@ def daemon_health_version_sourced() -> None:
             "daemon /health still carries a hardcoded version literal")
     require("buildConfig true" in source("daemon/app/build.gradle"),
             "BuildConfig generation disabled in daemon/app/build.gradle")
+    mcp = source("src/xenoid/mcp_server.py")
+    require('"version": __version__' in mcp,
+            "mcp serverInfo version not sourced from __version__")
+    require(re.search(r'serverInfo.*"version":\s*"[0-9]', mcp) is None,
+            "mcp serverInfo still carries a hardcoded version literal")
+
+
+@contract_case("release_label_must_match_package")
+def release_label_must_match_package() -> None:
+    parsed = build_parser().parse_args(["package-release"])
+    require(
+        parsed.version == __version__,
+        "package-release default drifted from package version",
+    )
+    requested = "0.0.0" if __version__ != "0.0.0" else "9.9.9"
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exit_code = cmd_package_release(SimpleNamespace(version=requested))
+    result = json.loads(stdout.getvalue())
+    require(exit_code == 2, "mismatched release label was accepted")
+    require(
+        result.get("code") == "release_version_mismatch"
+        and result.get("requestedVersion") == requested
+        and result.get("packageVersion") == __version__,
+        "release mismatch result lost version evidence",
+    )
 
 
 @contract_case("changelog_newest_matches_version")
@@ -124,6 +152,18 @@ def changelog_heading_parity() -> None:
     en = changelog_headings("CHANGELOG.md")
     cn = changelog_headings("CHANGELOG_CN.md")
     require(en == cn, f"changelog heading drift: en={en} cn={cn}")
+
+@contract_case("gate_cache_inputs_cover_version_and_assembly")
+def gate_cache_inputs_cover_version_and_assembly() -> None:
+    specs = catalog()
+    version_inputs = specs["version-contract"].inputs
+    service = "daemon/app/src/main/java/dev/xenoid/daemon/XenoidDaemonService.java"
+    require(service in version_inputs,
+            "version gate does not hash the daemon version source")
+    for name, spec in specs.items():
+        if spec.cacheable and "native/*/*.c" in spec.inputs:
+            require("native/*/*.S" in spec.inputs,
+                    f"{name} hashes native C inputs but not assembly inputs")
 
 
 def main() -> int:

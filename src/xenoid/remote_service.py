@@ -43,7 +43,6 @@ from .daemon_client import DaemonClient
 from .device_identity import IdentityError, RegenerationJournal
 from .mcp_server import (
     MCPRuntime,
-    _legacy_proxy_recovery_allowed,
     call_tool,
     tools as local_tools,
 )
@@ -916,18 +915,8 @@ class ServiceApplication:
                             current.context
                         ).load()
                     except IdentityError as exc:
-                        if (
-                            exc.code == "device_regeneration_legacy_pending"
-                            and _legacy_proxy_recovery_allowed(
-                                current,
-                                name,
-                                validated,
-                            )
-                        ):
-                            regeneration = None
-                        else:
-                            value = {"ok": False, "error": exc.code}
-                            return _complete_result(value, is_error=True)
+                        value = {"ok": False, "error": exc.code}
+                        return _complete_result(value, is_error=True)
                     if regeneration is not None:
                         value = {
                             "ok": False,

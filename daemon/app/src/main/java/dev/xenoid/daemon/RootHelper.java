@@ -210,6 +210,238 @@ final class RootHelper {
         execRootd("rm -f /data/vendor/radio/xenoid/state.v1", 20000);
     }
 
+    /** Exact effective base APK of the pinned microG GmsCore release asset. */
+    private static final String GMSCORE_FACTORY_PATH =
+            "/system/product/priv-app/GmsCore/GmsCore.apk";
+    private static final String GMSCORE_FACTORY_SHA256 =
+            "52597e77fd25fdd347574d0457ed1936a4b9561cf4c8d34e7ac8dd8191dfd4b9";
+
+    /**
+     * Fail-closed shell predicate proving the installed GMS surface is exactly the
+     * shipped pinned microG build: the package resolves to the single factory
+     * GmsCore APK, it was never updated onto /data/app, and the immutable factory
+     * APK matches the pinned release SHA-256.  Real Google GMS or MindTheGapps
+     * installs fail this check.
+     */
+    private static String pinnedSurfacePredicate() {
+        // Distinct pa/ha names: this fragment is also inlined into the seed
+        // command, whose loops reuse single-letter variables.
+        return "pa=$(pm path com.google.android.gms 2>/dev/null);"
+                + "[ \"$pa\" = 'package:" + GMSCORE_FACTORY_PATH + "' ];"
+                + "! dumpsys package com.google.android.gms 2>/dev/null"
+                + " | grep -q UPDATED_SYSTEM_APP;"
+                + "pa=" + GMSCORE_FACTORY_PATH + ";"
+                + "[ -f $pa ];[ ! -L $pa ];[ \"$(stat -c %h $pa)\" = 1 ];"
+                + "ha=$(sha256sum $pa);ha=${ha%% *};"
+                + "[ \"$ha\" = " + GMSCORE_FACTORY_SHA256 + " ];";
+    }
+
+    /**
+     * True when the rootd failure is a transport/protocol problem rather than a
+     * predicate rejection.  A shell predicate that ran and failed exits nonzero,
+     * which rootd reports as rootd_command_failed; everything else means the
+     * command never ran to a verdict.
+     */
+    private static boolean rootdTransportFailure(Map<String,Object> ran) {
+        return !"rootd_command_failed".equals(String.valueOf(ran.get("errorCode")));
+    }
+
+    /**
+     * Reports whether the installed GMS surface is exactly the shipped, pinned
+     * microG build.  Mutation paths must refuse to run when this is not pinned.
+     */
+    static Map<String,Object> googleProviderSurface() {
+        Map<String,Object> ran = execRootd(
+                "set -eu;" + pinnedSurfacePredicate(), 60000);
+        Map<String,Object> out = new LinkedHashMap<>();
+        if (Boolean.TRUE.equals(ran.get("ok"))) {
+            out.put("ok", true);
+            out.put("pinned", true);
+            return out;
+        }
+        out.put("ok", false);
+        if (rootdTransportFailure(ran)) {
+            out.put("error", "google_identity_unavailable");
+        } else {
+            out.put("pinned", false);
+            out.put("error", "google_identity_provider_unsupported");
+        }
+        return out;
+    }
+
+    /**
+     * Fail-closed read of the offline-seeded marker: the profile directory must be
+     * a real root-owned 0700 directory and the gsf_android_id marker a real,
+     * root-owned 0600, single-link, non-symlink file holding a valid nonzero GSF
+     * ID.  Every anomaly reports "invalid" — never a silent "absent" — so a
+     * tampered or drifted marker fails closed instead of disabling the seeded
+     * guarantees.
+     */
+    static Map<String,Object> offlineGoogleIdentitySeeded() {
+        String command = "x=/data/local/tmp/xenoid-profile;f=$x/gsf_android_id;"
+                + "if [ -L $x ];then echo invalid;exit 0;fi;"
+                + "if [ ! -e $x ];then echo absent;exit 0;fi;"
+                + "if [ ! -d $x ]||[ \"$(readlink -f $x)\" != $x ]"
+                + "||[ \"$(stat -c %u:%g:%a $x)\" != 0:0:700 ];then echo invalid;exit 0;fi;"
+                + "if [ -L $f ];then echo invalid;exit 0;fi;"
+                + "if [ ! -e $f ];then echo absent;exit 0;fi;"
+                + "if [ ! -f $f ]||[ \"$(stat -c %h $f)\" != 1 ]"
+                + "||[ \"$(stat -c %u:%g:%a $f)\" != 0:0:600 ];then echo invalid;exit 0;fi;"
+                + "v=$(cat $f);"
+                + "if [ \"$(printf '%s' \"$v\" | grep -Ec '^[1-9][0-9]{0,18}$')\" != 1 ];"
+                + "then echo invalid;exit 0;fi;"
+                + "echo present;printf '%s\\n' \"$v\"";
+        Map<String,Object> ran = execRootd(command, 20000);
+        Map<String,Object> out = new LinkedHashMap<>();
+        if (Boolean.TRUE.equals(ran.get("ok"))) {
+            String[] lines = String.valueOf(ran.get("stdout")).split("\n", -1);
+            if ("absent".equals(lines[0])) {
+                out.put("ok", true);
+                out.put("seeded", false);
+                return out;
+            }
+            if (lines.length >= 2 && "present".equals(lines[0])
+                    && lines[1].matches("[1-9][0-9]{0,18}")) {
+                try {
+                    if (Long.parseLong(lines[1]) <= 0) throw new NumberFormatException();
+                } catch (NumberFormatException invalid) {
+                    out.put("ok", false);
+                    out.put("error", "google_identity_seed_state_invalid");
+                    return out;
+                }
+                out.put("ok", true);
+                out.put("seeded", true);
+                out.put("gsfAndroidId", lines[1]);
+                return out;
+            }
+            out.put("ok", false);
+            out.put("error", "google_identity_seed_state_invalid");
+            return out;
+        }
+        out.put("ok", false);
+        out.put("error", rootdTransportFailure(ran)
+                ? "google_identity_unavailable" : "google_identity_seed_state_invalid");
+        return out;
+    }
+
+    /**
+     * Seeds the exact GSF Android ID offline (check-in stays disabled) and writes
+     * the protected marker.  Every relevant path is validated fail-closed BEFORE
+     * the force-stop and re-validated after it, so an unsafe surface causes zero
+     * mutations; gservices.db and its SQLite sidecars must be regular, singly
+     * linked, correctly owned files and are never followed through a symlink.
+     * SharedPreferences .bak copies are removed only after the replacement main
+     * XML is fsynced into place, and the shared_prefs directory is fsynced before
+     * microG is allowed to start again.
+     */
+    static Map<String,Object> seedGoogleIdentity(String gsfAndroidId) {
+        if (gsfAndroidId == null || !gsfAndroidId.matches("[1-9][0-9]{0,18}")) {
+            return rootdFailure("google_identity_target_invalid");
+        }
+        try {
+            if (Long.parseLong(gsfAndroidId) <= 0) {
+                return rootdFailure("google_identity_target_invalid");
+            }
+        } catch (NumberFormatException invalid) {
+            return rootdFailure("google_identity_target_invalid");
+        }
+        // Compact canonical SharedPreferences XML keeps the authenticated rootd
+        // command below its 4096-byte body ceiling without weakening the seed.
+        String checkin = "<?xml version='1.0' encoding='utf-8'?><map>"
+                + "<long name=\"androidId\" value=\"" + gsfAndroidId + "\" />"
+                + "<string name=\"digest\">1-929a0dca0eee55513280171a8585da7dcd3700f8</string>"
+                + "<long name=\"lastCheckin\" value=\"0\" />"
+                + "<long name=\"securityToken\" value=\"0\" />"
+                + "<string name=\"versionInfo\"></string>"
+                + "<string name=\"deviceDataVersionInfo\"></string></map>";
+        String sql = "BEGIN IMMEDIATE;"
+                + "CREATE TABLE IF NOT EXISTS main (name TEXT PRIMARY KEY, value TEXT);"
+                + "CREATE TABLE IF NOT EXISTS overrides (name TEXT PRIMARY KEY, value TEXT);"
+                + "CREATE TABLE IF NOT EXISTS saved_system (name TEXT PRIMARY KEY, value TEXT);"
+                + "CREATE TABLE IF NOT EXISTS saved_secure (name TEXT PRIMARY KEY, value TEXT);"
+                + "PRAGMA user_version=3;"
+                + "DELETE FROM overrides WHERE name='android_id';"
+                + "INSERT OR REPLACE INTO main(name,value) VALUES('android_id','"
+                + gsfAndroidId + "');COMMIT;PRAGMA wal_checkpoint(TRUNCATE);";
+        String command = "set -eu;umask 077;"
+                + "p=/data/user/0/com.google.android.gms;"
+                + "d=$p/databases;s=$p/shared_prefs;"
+                + "q=$s/com.google.android.gms_preferences.xml;qb=$q.bak;"
+                + "c=$s/checkin.xml;cb=$c.bak;"
+                + "b=$d/gservices.db;"
+                + "x=/data/local/tmp/xenoid-profile;m=$x/gsf_android_id;t=$m.tmp;"
+                + "qt=$s/.q.x;ct=$s/.c.x;"
+                + "[ -d $p ];[ ! -L $p ];[ \"$(readlink -f $p)\" = $p ];"
+                + "u=$(stat -c %u $p);g=$(stat -c %g $p);"
+                + "case $u:$g in ''|*[!0-9:]*) exit 1;;esac;"
+                + "[ $u -gt 0 ];"
+                + "vdir(){ [ -d \"$1\" ]&&[ ! -L \"$1\" ]"
+                + "&&[ \"$(readlink -f \"$1\")\" = \"$1\" ];};"
+                + "vown(){ o=$(stat -c %u:%g \"$1\");"
+                + "[ \"$o\" = \"$u:$g\" ]||[ \"$o\" = 0:0 ];};"
+                + "vfile(){ [ ! -L \"$1\" ]&&[ -f \"$1\" ]"
+                + "&&[ \"$(stat -c %h \"$1\")\" = 1 ]&&vown \"$1\";};"
+                + "precheck(){ vdir $p;[ \"$(stat -c %u:%g $p)\" = \"$u:$g\" ];"
+                + "vdir $x;[ \"$(stat -c %u:%g:%a $x)\" = 0:0:700 ];"
+                + "for z in $d $s;do if [ -e $z ]||[ -L $z ];then vdir $z;vown $z;fi;done;"
+                + "for f in $b $b-journal $b-wal $b-shm $q $qb $c $cb $qt $ct;do"
+                + " if [ -L $f ];then exit 1;fi;"
+                + " if [ -e $f ];then vfile $f;fi;"
+                + "done;"
+                + "for f in $m $t;do [ ! -L $f ];if [ -e $f ];then [ -f $f ];"
+                + "[ \"$(stat -c %h:%u:%g:%a $f)\" = 1:0:0:600 ];fi;done;};"
+                + pinnedSurfacePredicate()
+                + "precheck;"
+                + "am force-stop com.google.android.gms;"
+                + "precheck;"
+                + "for z in $d $s;do"
+                + " if [ -e $z ]||[ -L $z ];then vdir $z;vown $z;else mkdir -p $z;fi;"
+                + " chown $u:$g $z;chmod 700 $z;"
+                + " restorecon $z >/dev/null 2>&1 || true;"
+                + "done;"
+                + "put(){ a=$1;n=$2;k=$3;chown $u:$g $a;chmod 660 $a;"
+                + "restorecon $a >/dev/null 2>&1 || true;sync -f $a;"
+                + "cp -p $a $k;restorecon $k >/dev/null 2>&1 || true;sync -f $k;"
+                + "mv -f $k $n.bak;sync -f $s;mv -f $a $n;sync -f $n;sync -f $s;"
+                + "rm -f $n.bak;sync -f $s;};"
+                + "r=$q;[ ! -f $qb ]||r=$qb;rm -f $qt;"
+                + "if [ -f $r ];then"
+                + " awk 'index($0,\"checkin_enable_service\")==0 {"
+                + " if (index($0,\"</map>\"))"
+                + " print \"    <boolean name=\\\"checkin_enable_service\\\""
+                + " value=\\\"false\\\" />\";print}' $r >$qt;"
+                + "else printf '%s\\n'"
+                + " '<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?>'"
+                + " '<map>'"
+                + " '    <boolean name=\"checkin_enable_service\" value=\"false\" />'"
+                + " '</map>' >$qt;fi;"
+                + "[ \"$(grep -c 'name=\"checkin_enable_service\" value=\"false\"' $qt)\" = 1 ];"
+                + "put $qt $q $ct;"
+                + "rm -f $ct;printf %s " + shellQuote(checkin) + " >$ct;"
+                + "put $ct $c $qt;"
+                + "export ANDROID_DATA=/data ANDROID_ROOT=/system"
+                + " ANDROID_TZDATA_ROOT=/apex/com.android.tzdata"
+                + " ANDROID_I18N_ROOT=/apex/com.android.i18n;"
+                + "/system/bin/sqlite3 $b 'PRAGMA wal_checkpoint(TRUNCATE);PRAGMA user_version;' >/dev/null;"
+                + "rm -f $b-journal $b-wal $b-shm;"
+                + "/system/bin/sqlite3 $b " + shellQuote(sql) + ";"
+                + "rm -f $b-journal $b-wal $b-shm;"
+                + "v=$(/system/bin/sqlite3 $b"
+                + " \"SELECT value FROM main WHERE name='android_id';\");"
+                + "[ \"$v\" = " + shellQuote(gsfAndroidId) + " ];"
+                + "rm -f $b-journal $b-wal $b-shm;"
+                + "chown $u:$g $b;chmod 660 $b;"
+                + "restorecon $b >/dev/null 2>&1 || true;"
+                + "sync -f $b;sync -f $d;"
+                + "rm -f $t;"
+                + "printf '%s\\n' " + shellQuote(gsfAndroidId) + " >$t;"
+                + "chown 0:0 $t;chmod 600 $t;sync -f $t;"
+                + "mv -f $t $m;sync -f $x;"
+                + "[ \"$(stat -c %h:%u:%g:%a $m)\" = 1:0:0:600 ];"
+                + "[ \"$(cat $m)\" = " + shellQuote(gsfAndroidId) + " ]";
+        return execRootd(command, 20000);
+    }
+
     private static Map<String,Object> execRootd(String command, int timeoutMs) {
         return execRootd(command, timeoutMs, THREAD_CONNECTION.get());
     }

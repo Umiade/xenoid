@@ -13,7 +13,7 @@ import json
 import re
 import struct
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 PROFILE_SCHEMA = "dev.xenoid.cellular-profile/v2"
 PROFILE_MAGIC = b"XENOID_PROFILE_V1\0"
@@ -288,16 +288,74 @@ def _generate_msisdn(seed: bytes, dataset: Mapping[str, Any]) -> str:
     return number
 
 
-def generate_cellular_profile(country: str, seed: bytes) -> dict[str, Any]:
-    """Generate the deterministic profile for one supported country code."""
+def carrier_pin(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract the carrier identity pin from one validated profile.
+
+    The pin captures exactly the dataset carrier fields — name, PLMN
+    (MCC/MNC), APN, and the band matrix — so a later regeneration can fix
+    the serving carrier while every rotational field re-derives from a
+    fresh seed.  The profile is validated first, so a pin never carries a
+    carrier the pinned dataset does not describe.
+    """
+    clean = _validate_profile(profile)
+    carrier = clean["carrier"]
+    return {
+        "name": carrier["name"],
+        "mcc": carrier["mcc"],
+        "mnc": carrier["mnc"],
+        "apn": carrier["apn"],
+        "bands": list(carrier["bands"]),
+    }
+
+
+def _resolve_pin(carriers: Any, pin: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Resolve one carrier pin to its dataset record, or fail closed."""
+    if not isinstance(pin, Mapping):
+        raise CellularError("carrier_pin_invalid")
+    if not isinstance(carriers, list):
+        raise CellularError("cellular_dataset_invalid")
+    bands = pin.get("bands")
+    if (
+        not isinstance(bands, list)
+        or not bands
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in bands)
+    ):
+        raise CellularError("carrier_pin_invalid")
+    for item in carriers:
+        if (
+            isinstance(item, Mapping)
+            and item.get("name") == pin.get("name")
+            and item.get("mcc") == pin.get("mcc")
+            and item.get("mnc") == pin.get("mnc")
+            and item.get("apn") == pin.get("apn")
+            and isinstance(item.get("bands"), list)
+            and sorted(bands) == sorted(item["bands"])
+        ):
+            return item
+    raise CellularError("carrier_pin_invalid")
+
+
+def generate_cellular_profile(
+    country: str, seed: bytes, *, pin: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Generate the deterministic profile for one supported country code.
+
+    Without ``pin`` the seed also selects the carrier, which is the initial
+    country-selection behaviour.  With ``pin`` the carrier identity (name,
+    PLMN, APN, band matrix) is fixed to one previously selected dataset
+    carrier and only the rotational fields — the IMSI/ICCID/MSISDN
+    subscriber digits and the LTE cell identifiers — derive from ``seed``.
+    """
     if not isinstance(seed, bytes) or len(seed) != 32:
         raise CellularError("cellular_seed_invalid")
     country, dataset = _country_record(country)
     timezone = dataset["timezones"][0]
     location_key = f"{country}/{timezone}"
     carriers = dataset["carriers"]
-    index = _bounded_number(seed, "carrier", 0, len(carriers) - 1)
-    selected = carriers[index]
+    if pin is None:
+        selected = carriers[_bounded_number(seed, "carrier", 0, len(carriers) - 1)]
+    else:
+        selected = _resolve_pin(carriers, pin)
     if not isinstance(selected, Mapping):
         raise CellularError("carrier_dataset_invalid")
     mcc = _text(selected.get("mcc"), 3)
@@ -437,6 +495,7 @@ __all__ = [
     "PROFILE_SCHEMA",
     "PROFILE_VERSION",
     "canonical_bytes",
+    "carrier_pin",
     "dataset_countries",
     "dataset_version",
     "encode_profile_v1",

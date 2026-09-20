@@ -2,7 +2,7 @@
 
 ## Artifact records and reuse
 
-All production build consumers use `ArtifactBuilder`; no image, OTA, package, deploy, or `up` path silently compiles a second artifact set. The 20 public targets are published as `dev.xenoid.artifact/v1` records over immutable SHA-256 objects. Each record binds declared sources, command/flags, normalized build environment, resolved toolchain identities, and every output path, mode, size, architecture, and digest. The aggregate manifest digest excludes timestamps and logs.
+All production build consumers use `ArtifactBuilder`; no image, OTA, package, deploy, or `up` path silently compiles a second artifact set. The 21 public targets are published as `dev.xenoid.artifact/v1` records over immutable SHA-256 objects. Each record binds declared sources, command/flags, normalized build environment, resolved toolchain identities, and every output path, mode, size, architecture, and digest. The aggregate manifest digest excludes timestamps and logs.
 
 Normal `./xenoid build all` hashes inputs and reuses valid records. Missing mutable public outputs are rematerialized from the immutable objects without compilation. Stale targets build under normalized output-directory locks with at most four workers and a shared CPU-slot budget; disjoint targets may run concurrently, while helpers that share an output directory serialize. Failed targets publish no record, and dependents are reported blocked.
 
@@ -188,10 +188,10 @@ Runtime images do not read these mutable output paths. They consume the `runtime
 ## OTA and release chain
 
 ```bash
-./xenoid ota make --version 0.1.0-dev
+./xenoid ota make --version 0.9.2
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.1.0-dev
-./xenoid verify-release dist/release/xenoid-0.1.0-dev.tar.gz
+./xenoid package-release --version 0.9.2
+./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
 ```
 
 OTA/context/package consumers never compile a missing artifact. Release packaging runs the acyclic release gate profile with `--fresh`, stages an invocation-private validated artifact snapshot, creates canonical OTA and package archives with fixed `SOURCE_DATE_EPOCH`, and mandates `verify-release` on the candidate before atomic publication. A selectable microG provider selects `release-google` in the same invocation and packages its sanitized normalized acceptance as `evidence/google-services-release.json`; a disabled-clean provider selects the ordinary release profile. A second package operation with the same source/tool/epoch inputs must produce the same archive SHA-256.
@@ -237,7 +237,9 @@ Tracked inputs include both registered release metadata documents, the policy ge
 
 `scripts/verify.sh` is a thin caller of the digest-aware `GateRunner` DAG. Successful runtime-free gates may be reused only when their complete source/data/tool/artifact input digest still matches. `--fresh` deliberately ignores prior successes; sensitive-data audit always recomputes the tracked/untracked candidate inventory and bytes. Independent gates run concurrently, dependencies block after failure, and stdout is one `dev.xenoid.verify/v1` document while stderr carries sanitized JSONL progress.
 
-`scripts/ci.sh` selects the same non-recursive catalog: static by default, `--runtime` for explicit fresh convergence/protection/persistence/dual-instance work, and `--full` for additional cellular/camera/Google/release gates. Minimal production `up` checks runtime-tier `googlePlayServices`, `accountAuth`, `cloudMessaging`, `fusedLocation`, and `playStore`. Full `fcmDelivery`, `fusedLocationBehavior`, `maps`, `auth`, and `playStoreOperations` are release-tier and appear only in the packaged release attestation. `playIntegrity`, `deviceCertification`, `drm`, and `antiCheat` are unsupported.
+`scripts/ci.sh` selects the same non-recursive catalog: static by default, `--runtime` for explicit fresh convergence/protection/persistence/dual-instance work, and `--full` for additional cellular/camera/DRM/Google/release gates. The DRM gate transiently builds and installs the untracked ordinary-app probe, checks Java `MediaDrm` and NDK `AMediaDrm_*` agreement, verifies per-call identity rotation, restores the original property, and removes the APK. In `googleIdentityMode=provider-managed`, production `up` checks runtime-tier `googlePlayServices`, `accountAuth`, `cloudMessaging`, `fusedLocation`, and `playStore`; in `offline-seeded` mode it checks the other four while `cloudMessaging` is `unsupported` because FCM registration/delivery are unavailable. Full `fcmDelivery`, `fusedLocationBehavior`, `maps`, `auth`, and `playStoreOperations` are release-tier and appear only in the packaged release attestation. `playIntegrity`, `deviceCertification`, `drm` playback/provisioning, and `antiCheat` are unsupported.
+
+The production zygote/DRM bridge is ARM64-only. `scripts/build-native-zygote.sh x86_64` exits with an explicit unsupported-architecture error rather than compiling the AArch64 sret assembly shim with an x86 toolchain.
 
 `doctor` is observational. It consumes selected GateRunner records plus a fresh `LiveAcceptance` result for an already-running runtime. `doctor --full` selects the broader doctor-safe record set, but never builds artifacts/images, packages, calls `up`, ensures daemon/rootd, or invokes mutating runtime/release gates. Cache hits cannot make `complete=true`; only a fresh live observation can.
 

@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# Pre-seed boot-scoped device identity (boot_id, random_uuid) into a stopped
+# Pre-seed boot-scoped device identity (boot_id) into a stopped
 # instance's data image, so the zygote boot snapshot and the post-boot live
 # apply present the same values. Idempotent: safe to re-run before a create.
 #
-# Usage: seed-boot-identity.sh VOLUME BOOT_ID RANDOM_UUID
+# Usage: seed-boot-identity.sh VOLUME BOOT_ID
 # Requires: docker, e2fsprogs (e2fsck/debugfs) on the Docker engine host.
 set -euo pipefail
 VOLUME="${1:-}"
 BOOT_ID="${2:-}"
-RANDOM_UUID="${3:-}"
 [[ "$VOLUME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || { echo "invalid volume" >&2; exit 2; }
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
 [[ "$BOOT_ID" =~ $UUID_RE ]] || { echo "invalid boot id" >&2; exit 2; }
-[[ "$RANDOM_UUID" =~ $UUID_RE ]] || { echo "invalid random uuid" >&2; exit 2; }
 DOCKER=(docker)
 if [[ -n "${XENOID_DOCKER_CONTEXT:-}" ]]; then
   DOCKER+=(--context "$XENOID_DOCKER_CONTEXT")
@@ -72,7 +70,6 @@ write_data_file() {
   [ "\$actual" = "\$2" ] || { echo "failed to verify \$1 in the data image" >&2; exit 63; }
 }
 write_data_file 'local/tmp/xenoid-profile/boot_id' '$BOOT_ID'
-write_data_file 'local/tmp/xenoid-profile/random_uuid' '$RANDOM_UUID'
 sync -f "\$data"
 EOF
 )"

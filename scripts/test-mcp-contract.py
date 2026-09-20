@@ -60,6 +60,10 @@ class FakeManager:
         self.calls.append(("legacy-token-migration",))
         return {"ok": True, "removed": 0}
 
+    def ensure_engine_started(self) -> dict:
+        self.calls.append(("engine-start",))
+        return {"ok": True, "started": False}
+
     def deploy_netctl_helper(self, path: str, remote_path: str) -> dict:
         self.calls.append(("deploy", path, remote_path))
         return {"ok": True, "operation": "deploy"}
@@ -333,6 +337,10 @@ def up_tools_use_in_process_convergence() -> None:
 
     require(result == result_payload, "xenoid_up changed the executor result")
     require(
+        result.get("schema") == "dev.xenoid.convergence/v1",
+        "normal xenoid_up result is not convergence/v1",
+    )
+    require(
         calls[0] == ("executor", runtime.manager)
         and calls[1][0] == "run"
         and calls[1][1].get("skip_build") is True,
@@ -349,14 +357,25 @@ def up_tools_use_in_process_convergence() -> None:
         "xenoid_up_plan result is not the canonical plan",
     )
 
-    regeneration_payload = {
-        "schema": "dev.xenoid.convergence/v1",
-        "ok": True,
-        "regeneration": {
-            "schema": "dev.xenoid.device-regenerate/v2",
-            "transactionId": "3" * 32,
-            "phase": "committed",
+    regeneration = {
+        "schema": "dev.xenoid.device-regenerate/v3",
+        "transactionId": "3" * 32,
+        "resumed": True,
+        "phase": "committed",
+        "runtimeOnly": True,
+        "containerRecreated": False,
+        "googleIdentity": {
+            "ok": True,
+            "provider": "microg",
+            "rotated": True,
+            "advertisingIdSha256": "4" * 64,
+            "gsfAndroidIdSha256": "5" * 64,
         },
+    }
+    regeneration_payload = {
+        **regeneration,
+        "ok": True,
+        "regeneration": dict(regeneration),
     }
     with mock.patch.object(mcp_server, "RegenerationJournal") as journal_type, \
          mock.patch.object(
@@ -370,7 +389,7 @@ def up_tools_use_in_process_convergence() -> None:
              side_effect=AssertionError("regeneration bypassed shared resume"),
          ):
         journal_type.return_value.load.return_value = {
-            "schema": "dev.xenoid.device-regenerate/v2",
+            "schema": "dev.xenoid.device-regenerate/v3",
             "transactionId": "3" * 32,
         }
         regenerated = decoded(
@@ -380,6 +399,13 @@ def up_tools_use_in_process_convergence() -> None:
         regenerated == regeneration_payload,
         "xenoid_up changed regeneration resume result",
     )
+    require(
+        regenerated.get("schema") == "dev.xenoid.device-regenerate/v3"
+        and regenerated.get("runtimeOnly") is True
+        and regenerated.get("containerRecreated") is False
+        and regenerated.get("regeneration") == regeneration,
+        "pending-regeneration xenoid_up result is not canonical device-regenerate/v3",
+    )
     resume_args = resume.call_args.args[0]
     require(
         resume_args.context is runtime.context
@@ -387,6 +413,62 @@ def up_tools_use_in_process_convergence() -> None:
         and resume_args._operation_lock_held is True,
         "xenoid_up did not pass the locked runtime into regeneration resume",
     )
+
+    journal_state = {
+        "schema": "dev.xenoid.device-regenerate/v3",
+        "transactionId": "3" * 32,
+        "phase": "radio_committed",
+    }
+    with mock.patch.object(mcp_server, "RegenerationJournal") as mcp_journal, \
+         mock.patch.object(cli, "RegenerationJournal") as cli_journal, \
+         mock.patch.object(
+             mcp_server,
+             "_execute_device_regeneration",
+             side_effect=mcp_server.LocationError("location_state_invalid"),
+         ):
+        mcp_journal.return_value.load.return_value = journal_state
+        cli_journal.return_value.load.return_value = journal_state
+        failed_regeneration = decoded(
+            mcp_server.call_tool(runtime, "xenoid_up", {"skipBuild": True})
+        )
+    require(
+        failed_regeneration == {
+            "schema": "dev.xenoid.device-regenerate/v3",
+            "ok": False,
+            "runtimeOnly": True,
+            "containerRecreated": False,
+            "error": "location_state_invalid",
+            "resumed": True,
+            "transactionId": "3" * 32,
+            "phase": "radio_committed",
+        },
+        "xenoid_up degraded a regeneration failure outside the canonical v3 envelope",
+    )
+
+    invalid_journal = mcp_server.IdentityError(
+        "device_regeneration_state_invalid",
+        "invalid regeneration journal",
+    )
+    with mock.patch.object(mcp_server, "RegenerationJournal") as mcp_journal, \
+         mock.patch.object(cli, "RegenerationJournal") as cli_journal:
+        mcp_journal.return_value.load.side_effect = invalid_journal
+        cli_journal.return_value.load.side_effect = invalid_journal
+        malformed_regeneration = decoded(
+            mcp_server.call_tool(runtime, "xenoid_up", {"skipBuild": True})
+        )
+    require(
+        malformed_regeneration == {
+            "schema": "dev.xenoid.device-regenerate/v3",
+            "ok": False,
+            "runtimeOnly": True,
+            "containerRecreated": False,
+            "error": "device_regeneration_state_invalid",
+            "resumed": False,
+            "phase": "preflight",
+        },
+        "xenoid_up degraded a corrupt journal outside the canonical v3 envelope",
+    )
+
 
     failed_payload = {
         **result_payload,
@@ -706,6 +788,26 @@ def versions_are_path_safe_before_side_effects() -> None:
     require(result.get("code") == "release_version_invalid", "MCP release validation")
     run_mock.assert_not_called()
 
+    package_proc = SimpleNamespace(
+        ok=False,
+        state="failed",
+        error_code="process_failed",
+        stdout_tail="",
+        stderr_tail="",
+        returncode=1,
+    )
+    with mock.patch.object(
+        mcp_server,
+        "run_bounded",
+        return_value=package_proc,
+    ) as run_mock:
+        decoded(mcp_server.call_tool(runtime, "xenoid_package_release", {}))
+    command = run_mock.call_args.args[0]
+    require(
+        command[-1] == mcp_server.__version__,
+        "MCP release default drifted from package version",
+    )
+
     for relative in ("scripts/package-release.sh", "scripts/make-ota-bundle.sh"):
         proc = subprocess.run(
             [str(ROOT / relative), "a/../../../../outside"],
@@ -766,59 +868,6 @@ def runtime_image_tool_uses_content_addressed_builder() -> None:
     ], "runtime image MCP did not dispatch to shared builder APIs")
 
 
-def legacy_proxy_recovery_requires_bound_quarantine() -> None:
-    runtime = FakeRuntime()
-    digest = "ab" * 32
-    bound_state = {
-        "operationId": digest[:32],
-        "regenerationTransactionId": "cd" * 16,
-        "completed": ["planned", "quarantined"],
-    }
-    with mock.patch.object(
-        mcp_server,
-        "RegenerationJournal",
-    ) as journal_type, mock.patch.object(
-        mcp_server,
-        "ConvergenceExecutor",
-    ) as executor_type:
-        journal_type.return_value.legacy_source_digest.return_value = digest
-        executor_type.return_value.journal.load.return_value = bound_state
-        require(
-            mcp_server._legacy_proxy_recovery_allowed(
-                runtime,
-                "xenoid_proxy_set",
-                {},
-            ),
-            "bound proxy import recovery was rejected",
-        )
-        require(
-            mcp_server._legacy_proxy_recovery_allowed(
-                runtime,
-                "xenoid_proxy_clear",
-                {"discardUnreadableState": True},
-            ),
-            "bound explicit proxy discard recovery was rejected",
-        )
-        require(
-            not mcp_server._legacy_proxy_recovery_allowed(
-                runtime,
-                "xenoid_proxy_clear",
-                {"discardUnreadableState": False},
-            ),
-            "ordinary clear bypassed regeneration guard",
-        )
-        forged = dict(bound_state, operationId="ef" * 16)
-        executor_type.return_value.journal.load.return_value = forged
-        require(
-            not mcp_server._legacy_proxy_recovery_allowed(
-                runtime,
-                "xenoid_proxy_set",
-                {},
-            ),
-            "forged compatibility journal authorized proxy recovery",
-        )
-
-
 def main() -> int:
     cases = (
         registered_tools_have_handlers,
@@ -830,7 +879,6 @@ def main() -> int:
         generated_mcp_config_is_checkout_runnable,
         up_source_has_no_nested_process,
         stdio_mutations_use_shared_instance_lock,
-        legacy_proxy_recovery_requires_bound_quarantine,
         remote_command_deadline_bounds_unset_subprocesses,
         versions_are_path_safe_before_side_effects,
         runtime_image_tool_uses_content_addressed_builder,

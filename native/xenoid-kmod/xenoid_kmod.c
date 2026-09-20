@@ -10,6 +10,7 @@
 //
 // Everything is kprobe/kretprobe based: no syscall table patching or ABI hacks.
 #include <linux/module.h>
+#include <linux/spinlock.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/kprobes.h>
@@ -41,6 +42,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/skbuff.h>
 #include <net/net_namespace.h>
+#include <net/netns/generic.h>
 #include <net/sock.h>
 #include <linux/sysinfo.h>
 #include <uapi/linux/android/binder.h>
@@ -214,6 +216,139 @@ static struct kretprobe sysinfo_kprobes[] = {
 #define XENOID_DATA_BLOCKS 31250000ULL
 #define XENOID_DATA_NAME_MAX 255ULL
 #define XENOID_DATA_STATFS_FLAGS 0x426ULL
+/*
+ * Runtime-rotatable /data filesystem identity, scoped per network namespace
+ * so concurrent Xenoid instances sharing this one module keep independent
+ * FSIDs. The single 16-hex-digit parameter commits one aligned u64, so a
+ * statfs caller can observe only the old identity or the new identity. Zero
+ * means pass through. Parameter get/set operate on the caller's current
+ * network namespace; writes are accepted only from a marked Xenoid Android
+ * runtime (the namespace that owns rmnet_data0), which rejects host or
+ * global commits.
+ */
+struct xenoid_statfs_net {
+	u64 fsid __aligned(8);
+};
+
+static unsigned int xenoid_statfs_net_id;
+static bool xenoid_statfs_pernet_registered;
+
+static int __net_init xenoid_statfs_net_init(struct net *net)
+{
+	struct xenoid_statfs_net *xnet = net_generic(net, xenoid_statfs_net_id);
+
+	WRITE_ONCE(xnet->fsid, 0);
+	return 0;
+}
+
+static void __net_exit xenoid_statfs_net_exit(struct net *net)
+{
+	(void)net;
+	/*
+	 * Per-net generic storage is freed with its namespace and a fresh
+	 * namespace always starts zeroed through ->init, so neither namespace
+	 * churn nor a module reload can resurrect a stale FSID.
+	 */
+}
+
+static struct pernet_operations xenoid_statfs_net_ops = {
+	.init = xenoid_statfs_net_init,
+	.exit = xenoid_statfs_net_exit,
+	.id = &xenoid_statfs_net_id,
+	.size = sizeof(struct xenoid_statfs_net),
+};
+
+static struct xenoid_statfs_net *xenoid_statfs_net_state(void)
+{
+	if (!READ_ONCE(xenoid_statfs_pernet_registered) || !current->nsproxy)
+		return NULL;
+	return net_generic(current->nsproxy->net_ns, xenoid_statfs_net_id);
+}
+
+static int statfs_fsid_set(const char *value, const struct kernel_param *kp)
+{
+	unsigned long long parsed;
+	struct xenoid_statfs_net *xnet;
+	unsigned int i;
+
+	(void)kp;
+	if (!value || strlen(value) != 16)
+		return -EINVAL;
+	for (i = 0; i < 16; i++)
+		if (hex_to_bin(value[i]) < 0)
+			return -EINVAL;
+	if (kstrtoull(value, 16, &parsed) || !parsed)
+		return -EINVAL;
+	if (!current_net_is_xenoid_android_runtime())
+		return -EPERM;
+	xnet = xenoid_statfs_net_state();
+	if (!xnet)
+		return -ENODEV;
+	WRITE_ONCE(xnet->fsid, (u64)parsed);
+	return 0;
+}
+
+static int statfs_fsid_reset_set(const char *value,
+				 const struct kernel_param *kp)
+{
+	struct xenoid_statfs_net *xnet;
+	bool reset;
+
+	(void)kp;
+	if (!value || kstrtobool(value, &reset) || !reset)
+		return -EINVAL;
+	if (!current_net_is_xenoid_android_runtime())
+		return -EPERM;
+	xnet = xenoid_statfs_net_state();
+	if (!xnet)
+		return -ENODEV;
+	WRITE_ONCE(xnet->fsid, 0);
+	return 0;
+}
+
+static int statfs_fsid_get(char *buffer, const struct kernel_param *kp)
+{
+	struct xenoid_statfs_net *xnet;
+	u64 fsid = 0;
+
+	(void)kp;
+	xnet = xenoid_statfs_net_state();
+	if (xnet)
+		fsid = READ_ONCE(xnet->fsid);
+	return scnprintf(buffer, PAGE_SIZE, "%08x%08x",
+			 (unsigned int)(fsid >> 32), (unsigned int)fsid);
+}
+
+static const struct kernel_param_ops statfs_fsid_ops = {
+	.set = statfs_fsid_set,
+	.get = statfs_fsid_get,
+};
+module_param_cb(statfs_fsid, &statfs_fsid_ops, NULL, 0600);
+MODULE_PARM_DESC(statfs_fsid,
+		 "Per-network-namespace /data statfs f_fsid (Xenoid runtime namespaces only)");
+
+static const struct kernel_param_ops statfs_fsid_reset_ops = {
+	.set = statfs_fsid_reset_set,
+};
+module_param_cb(statfs_fsid_reset, &statfs_fsid_reset_ops, NULL, 0200);
+MODULE_PARM_DESC(statfs_fsid_reset,
+		 "Clear /data statfs f_fsid in the caller's Xenoid network namespace");
+
+static void unregister_statfs_pernet(void)
+{
+	if (!xenoid_statfs_pernet_registered)
+		return;
+	/*
+	 * The module parameter core holds kernel_param_lock() around ->set and
+	 * ->get, so taking it here guarantees no contextual callback is inside
+	 * net_generic() while the per-net storage ids are released. Probes are
+	 * already synchronized down by the caller before this runs.
+	 */
+	kernel_param_lock(THIS_MODULE);
+	WRITE_ONCE(xenoid_statfs_pernet_registered, false);
+	kernel_param_unlock(THIS_MODULE);
+	unregister_pernet_subsys(&xenoid_statfs_net_ops);
+}
 
 struct statfs_ctx {
 	struct kstatfs *buf;
@@ -289,6 +424,17 @@ static void shape_data_statfs(struct kstatfs *buf)
 		   scale_data_statfs_value(real_ffree, real_blocks));
 	WRITE_ONCE(buf->f_namelen, XENOID_DATA_NAME_MAX);
 	WRITE_ONCE(buf->f_flags, XENOID_DATA_STATFS_FLAGS);
+	{
+		struct xenoid_statfs_net *xnet = xenoid_statfs_net_state();
+		u64 fsid = xnet ? READ_ONCE(xnet->fsid) : 0;
+		u32 val0 = (u32)(fsid >> 32);
+		u32 val1 = (u32)fsid;
+
+		if (val0 || val1) {
+			WRITE_ONCE(buf->f_fsid.val[0], val0);
+			WRITE_ONCE(buf->f_fsid.val[1], val1);
+		}
+	}
 }
 
 static bool statfs_cloned_abi;
@@ -336,6 +482,7 @@ module_param_string(artifact_digest, artifact_digest,
 		    sizeof(artifact_digest), 0444);
 MODULE_PARM_DESC(artifact_digest,
 		 "SHA-256 of the immutable module artifact loaded by the manager");
+
 
 static bool lowercase_sha256_valid(const char *value)
 {
@@ -2279,6 +2426,13 @@ static int __init xenoid_kmod_init(void)
         return -EINVAL;
     }
 
+    ret = register_pernet_subsys(&xenoid_statfs_net_ops);
+    if (ret) {
+        pr_err("xenoid_kmod: required per-net statfs state failed: %d\n", ret);
+        return ret;
+    }
+    WRITE_ONCE(xenoid_statfs_pernet_registered, true);
+
     for (i = 0; i < ARRAY_SIZE(seclabel_rprobes); i++) {
         ret = register_kretprobe(seclabel_rprobes[i]);
         if (ret) {
@@ -2372,12 +2526,14 @@ static int __init xenoid_kmod_init(void)
 
 fail:
     unregister_protection();
+    unregister_statfs_pernet();
     return ret ? ret : -EINVAL;
 }
 
 static void __exit xenoid_kmod_exit(void)
 {
     unregister_protection();
+    unregister_statfs_pernet();
     pr_info("xenoid_kmod: unloaded\n");
 }
 

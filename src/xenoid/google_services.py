@@ -2671,6 +2671,33 @@ class GoogleBindingStore:
             return value
         return self.save({**value, "state": "committed"})
 
+    def regeneration_gsf_android_id(self, transaction_id: str) -> str:
+        if not isinstance(transaction_id, str) or _TRANSACTION.fullmatch(transaction_id) is None:
+            raise GoogleServicesError(
+                "google_services_spec_mismatch",
+                "invalid Google identity regeneration transaction",
+            )
+        binding = self.load()
+        if binding is None or binding["state"] != "committed":
+            raise GoogleServicesError(
+                "google_services_runtime_not_ready",
+                "Google runtime binding is not committed",
+            )
+        payload = _canonical_json(
+            {
+                "schema": "dev.xenoid.google-identity-seed/v1",
+                "instanceId": self.context.instance_id,
+                "transactionId": transaction_id,
+                "provider": binding["provider"],
+                "release": binding["release"],
+                "specSha256": binding["specSha256"],
+                "dataCompatibilitySha256": binding["dataCompatibilitySha256"],
+            }
+        )
+        candidate = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+        candidate &= (1 << 63) - 1
+        return str(candidate or 1)
+
 
 def expected_binding_identity(spec: Optional[ReleaseSpec]) -> dict[str, str]:
     fingerprint = spec.fingerprint if spec else disabled_runtime_spec_fingerprint()

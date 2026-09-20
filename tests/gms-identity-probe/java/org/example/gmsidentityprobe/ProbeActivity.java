@@ -126,7 +126,8 @@ public final class ProbeActivity extends Activity {
             if (raw == null) {
                 return "unavailable:null";
             }
-            return Long.toString(Long.parseLong(raw, 16));
+            long value = Long.parseLong(raw);
+            return value > 0 ? Long.toString(value) : "unavailable:non_positive";
         } catch (SecurityException denied) {
             return "denied:SecurityException";
         } catch (Exception failure) {

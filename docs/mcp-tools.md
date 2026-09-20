@@ -30,9 +30,9 @@ _No parameters._
 Run the canonical full Xenoid production convergence path.
   - `skipBuild` (boolean): validate required artifact records/objects and fail on stale or missing inputs instead of compiling
 
-Reuse is automatic; no runtime-reuse field exists. The executor chooses no-op, resume, start, create, or recreate and independently refines component actions. Results use `schema=dev.xenoid.convergence/v1` and include `plan`, `resumed`, safe `phases`, immutable `before`/`after`, and `nextActions`. CLI callers additionally receive pre-hash `dev.xenoid.progress/v1` JSONL and five-second heartbeats on stderr; MCP receives only the final bounded result.
+Reuse is automatic; no runtime-reuse field exists. With no pending regeneration, the executor chooses no-op, resume, start, create, or recreate and returns `schema=dev.xenoid.convergence/v1` with `plan`, `resumed`, safe `phases`, immutable `before`/`after`, and `nextActions`. CLI callers additionally receive pre-hash `dev.xenoid.progress/v1` JSONL and five-second heartbeats on stderr; MCP receives only the final bounded result.
 
-`xenoid_up` also resumes a validated `dev.xenoid.device-regenerate/v2` transaction using its recorded fixed targets. A v1-only regeneration remains blocked; the evidence-preserving `device regenerate --restart-legacy-transaction` escape is trusted-local CLI only and is not an MCP tool.
+When a validated regeneration is pending, `xenoid_up` resumes its recorded fixed targets and returns the canonical top-level `schema=dev.xenoid.device-regenerate/v3` result instead of wrapping it as convergence. Successful v3 results include `runtimeOnly=true`, `containerRecreated=false`, and the backward-compatible nested `regeneration` mirror. Regeneration is runtime-only and never recreates the container. A completed microG regeneration enters `googleIdentityMode=offline-seeded`; FCM registration/delivery are unavailable and Google status reports `cloudMessaging=unsupported` with `offline-checkin-disabled`. A legacy v1/v2 journal remains blocked (`device_regeneration_legacy_pending`); the delete-and-rerun recovery is trusted-local CLI only and is not an MCP tool.
 
 ### `xenoid_start`
 Start the low-level Android runtime without full state convergence or acceptance.

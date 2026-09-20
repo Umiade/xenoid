@@ -846,43 +846,8 @@ def proxy_discard_cli_is_explicit() -> None:
     require(recovery.discard_unreadable_state is True)
 
 
-@contract_case("legacyRegenerationRestartCliIsExplicit")
-def legacy_regeneration_restart_cli_is_explicit() -> None:
-    ordinary = cli.build_parser().parse_args(["device", "regenerate"])
-    require(ordinary.restart_legacy_transaction is False)
-    recovery = cli.build_parser().parse_args(
-        ["device", "regenerate", "--restart-legacy-transaction"]
-    )
-    require(recovery.restart_legacy_transaction is True)
-
-@contract_case("legacyProxyRecoveryRequiresBoundCliJournal")
-def legacy_proxy_recovery_requires_bound_cli_journal() -> None:
-    digest = "ab" * 32
-    bound = {
-        "operationId": digest[:32],
-        "regenerationTransactionId": "cd" * 16,
-        "completed": ["planned", "quarantined"],
-    }
-    args = SimpleNamespace(
-        context=SimpleNamespace(instance_id=ID_A),
-        discard_unreadable_state=False,
-    )
-    with mock.patch.object(cli, "RegenerationJournal") as journal_type, \
-         mock.patch.object(cli, "ConvergenceExecutor") as executor_type, \
-         mock.patch.object(cli, "runtime", return_value=object()):
-        journal_type.return_value.legacy_source_digest.return_value = digest
-        executor_type.return_value.journal.load.return_value = bound
-        require(cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_set"))
-        args.discard_unreadable_state = True
-        require(cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_clear"))
-        args.discard_unreadable_state = False
-        require(not cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_clear"))
-        executor_type.return_value.journal.load.return_value = {
-            **bound,
-            "operationId": "ef" * 16,
-        }
-        require(not cli._legacy_proxy_recovery_allowed(args, "cmd_proxy_set"))
-
+@contract_case("legacyRegenerationPendingBlocksProxyMutation")
+def legacy_regeneration_pending_blocks_proxy_mutation() -> None:
     error = cli.IdentityError(
         "device_regeneration_legacy_pending",
         "legacy regeneration requires recovery",
@@ -890,18 +855,21 @@ def legacy_proxy_recovery_requires_bound_cli_journal() -> None:
     with mock.patch.object(cli, "RegenerationJournal") as journal_type:
         journal_type.return_value.load.side_effect = error
         journal_type.return_value.legacy_source_digest.side_effect = error
-        try:
-            cli._reject_unrelated_regeneration_mutation(
-                SimpleNamespace(
-                    context=args.context,
-                    func=SimpleNamespace(__name__="cmd_proxy_clear"),
-                    discard_unreadable_state=False,
-                )
+        blocked = cli._reject_unrelated_regeneration_mutation(
+            SimpleNamespace(
+                context=SimpleNamespace(instance_id=ID_A),
+                func=SimpleNamespace(__name__="cmd_proxy_clear"),
+                discard_unreadable_state=False,
             )
-        except cli.IdentityError as exc:
-            require(exc.code == "device_regeneration_legacy_pending")
-        else:
-            raise ContractFailure
+        )
+    # Unrelated mutators are blocked by the canonical v3 envelope, never by
+    # a bare identity exception escaping the CLI boundary.
+    require(
+        isinstance(blocked, dict)
+        and blocked.get("schema") == "dev.xenoid.device-regenerate/v3"
+        and blocked.get("ok") is False
+        and blocked.get("error") == "device_regeneration_legacy_pending"
+    )
 
 
 def main() -> int:

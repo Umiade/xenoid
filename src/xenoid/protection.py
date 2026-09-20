@@ -36,6 +36,9 @@ KMOD_PROBES = (
 )
 EBPF_LINKS = ("path", "selinuxPermission", "unameEntry", "unameReturn")
 EBPF_MAPS = ("denyCount", "policyIdentity")
+STATFS_FSID_LEAF = "/data/local/tmp/xenoid-profile/statfs_fsid"
+STATFS_FSID_PARAM = "/sys/module/xenoid_kmod/parameters/statfs_fsid"
+STATFS_FSID_RESET_PARAM = "/sys/module/xenoid_kmod/parameters/statfs_fsid_reset"
 EBPF_PROBES = ("linkInventory", "unprivilegedDeny")
 
 
@@ -1557,6 +1560,297 @@ sync -f "$base"
         proc = self.runtime._engine_host_shell(script, timeout=30)
         if proc.returncode != 0:
             raise SharedProtectionError("shared_protection_state_publish_failed")
+
+    def _statfs_fsid_leaf(self) -> dict[str, Any]:
+        """Read the instance-local staged FSID leaf from the owned container."""
+        read = self.runtime.docker_exec(
+            [
+                "sh",
+                "-c",
+                f"test ! -e {STATFS_FSID_LEAF} || "
+                f"{{ test -f {STATFS_FSID_LEAF} && test ! -L {STATFS_FSID_LEAF} "
+                f"&& cat {STATFS_FSID_LEAF}; }}",
+            ],
+            timeout=10,
+        )
+        if read.get("ok") is not True:
+            return {
+                "ok": False,
+                "code": "statfs_fsid_leaf_unreadable",
+                "error": "statfs_fsid_leaf_unreadable",
+            }
+        value = str(read.get("stdout") or "").strip()
+        if not value:
+            return {"ok": True, "value": None}
+        if re.fullmatch(r"[0-9a-f]{16}", value) is None:
+            return {
+                "ok": False,
+                "code": "statfs_fsid_leaf_invalid",
+                "error": "statfs_fsid_leaf_invalid",
+            }
+        return {"ok": True, "value": value}
+
+    def _statfs_fsid_container_exec(
+        self,
+        container_id: str,
+        args: Sequence[str],
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Execute a read-only proof against one already-inspected container.
+        Pinning the container ID prevents a concurrent recreate from making a
+        namespace proof or parameter readback silently target its successor.
+        """
+        if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            return {"ok": False}
+        try:
+            seconds = bounded_timeout(timeout) or timeout
+            result = run_bounded(
+                [*self.runtime.docker_base_cmd(), "exec", container_id, *args],
+                cwd=self.project_root,
+                deadline=time.monotonic() + max(0.001, seconds),
+                env=self.runtime.docker_env(),
+                cancelled=getattr(self.runtime, "cancellation_event", None),
+                project_root=self.project_root,
+            )
+        except BaseException:
+            return {"ok": False}
+        return {
+            "ok": result.state == "passed" and result.returncode == 0,
+            "stdout": result.stdout_tail,
+            "stderr": result.stderr_tail,
+        }
+
+    def _statfs_fsid_netns_target(self) -> dict[str, Any]:
+        """Prove the owned container's current network-namespace identity.
+        The container-ID-scoped ``readlink /proc/self/ns/net`` pins the exact
+        namespace the container lives in; the engine host then requires the
+        inspected PID's namespace link and cgroup membership to match at
+        commit time, so a recycled PID can never redirect the write. The
+        lease-owned network mode also proves the container never shares its
+        network namespace with the host or another container.
+        """
+        unavailable = {
+            "ok": False,
+            "code": "statfs_fsid_runtime_not_running",
+            "error": "statfs_fsid_runtime_not_running",
+        }
+        try:
+            container, _error = self.runtime._owned_container_record(timeout=10)
+        except BaseException:
+            return dict(unavailable)
+        if not isinstance(container, Mapping):
+            return dict(unavailable)
+        state = container.get("State")
+        pid = state.get("Pid") if isinstance(state, Mapping) else None
+        container_id = container.get("Id")
+        host_config = container.get("HostConfig")
+        network_mode = (
+            host_config.get("NetworkMode") if isinstance(host_config, Mapping) else None
+        )
+        if (
+            not isinstance(state, Mapping)
+            or state.get("Running") is not True
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+            or not isinstance(network_mode, str)
+            or network_mode in {"host", "none"}
+            or network_mode.startswith("container:")
+        ):
+            return dict(unavailable)
+        probe = self._statfs_fsid_container_exec(
+            container_id, ["readlink", "/proc/self/ns/net"]
+        )
+        netns = str(probe.get("stdout") or "").strip() if probe.get("ok") is True else ""
+        if re.fullmatch(r"net:\[[0-9]+\]", netns) is None:
+            return dict(unavailable)
+        return {"ok": True, "pid": pid, "containerId": container_id, "netns": netns}
+
+    def _set_statfs_fsid_locked(self, fsid_hex: str) -> dict[str, Any]:
+        staged = self.runtime.docker_exec(
+            [
+                "sh",
+                "-c",
+                "set -eu; d=/data/local/tmp/xenoid-profile; "
+                "f=$d/statfs_fsid; t=$d/.statfs_fsid.new; "
+                "mkdir -p \"$d\"; umask 077; rm -f -- \"$t\"; "
+                f"printf '%s\\n' {fsid_hex} > \"$t\"; "
+                "chown 0:0 \"$t\"; chmod 0644 \"$t\"; sync; "
+                "mv -f \"$t\" \"$f\"; sync",
+            ],
+            timeout=10,
+        )
+        if staged.get("ok") is not True:
+            return {"ok": False, "code": "statfs_fsid_stage_failed", "error": "statfs_fsid_stage_failed"}
+        target = self._statfs_fsid_netns_target()
+        if target.get("ok") is not True:
+            return target
+        pid = target["pid"]
+        container_id = target["containerId"]
+        netns = target["netns"]
+        script = f'''
+set -eu
+netns=/proc/{pid}/ns/net
+[ -e "$netns" ]
+exec 9<"$netns"
+pinned_netns=/proc/self/fd/9
+grep -q {container_id} /proc/{pid}/cgroup
+[ "$(readlink "$pinned_netns")" = "{netns}" ]
+for other in $(docker ps -q --no-trunc); do
+    [ "$other" = "{container_id}" ] && continue
+    other_pid=$(docker inspect --format '{{{{.State.Pid}}}}' "$other")
+    case "$other_pid" in ''|*[!0-9]*|0) exit 4;; esac
+    if [ -e "/proc/$other_pid/ns/net" ] && [ "$(readlink "/proc/$other_pid/ns/net")" = "{netns}" ]; then exit 4; fi
+done
+nsenter --net="$pinned_netns" -- sh -c '
+set -eu
+printf %s {fsid_hex} > {STATFS_FSID_PARAM}
+[ "$(cat {STATFS_FSID_PARAM})" = "{fsid_hex}" ]
+'
+if ! {{ [ -e "$netns" ] && grep -q {container_id} /proc/{pid}/cgroup && [ "$(readlink "$netns")" = "{netns}" ]; }}; then
+    nsenter --net="$pinned_netns" -- sh -c 'printf %s 1 > {STATFS_FSID_RESET_PARAM}' || true
+    exit 3
+fi
+'''
+        proc = self.runtime._engine_host_shell(script, timeout=30)
+        if proc.returncode == 3:
+            return {"ok": False, "code": "statfs_fsid_ownership_lost", "error": "statfs_fsid_ownership_lost"}
+        if proc.returncode == 4:
+            return {"ok": False, "code": "statfs_fsid_namespace_shared", "error": "statfs_fsid_namespace_shared"}
+        if proc.returncode != 0:
+            return {"ok": False, "code": "statfs_fsid_param_failed", "error": "statfs_fsid_param_failed"}
+        verify = self._statfs_fsid_container_exec(
+            container_id, ["cat", STATFS_FSID_PARAM]
+        )
+        if verify.get("ok") is not True or str(verify.get("stdout") or "").strip() != fsid_hex:
+            return {"ok": False, "code": "statfs_fsid_verify_failed", "error": "statfs_fsid_verify_failed"}
+        return {"ok": True, "fsid": fsid_hex}
+
+    def set_statfs_fsid(self, fsid_hex: str) -> dict[str, Any]:
+        """Publish one /data ``f_fsid`` to the kernel and userland layers.
+        The kmod keeps the identity per network namespace and accepts writes
+        only from a namespace owning rmnet_data0, so the commit enters this
+        instance's container network namespace through the fd-pinned
+        ``/proc/<pid>/ns/net`` link. Staging and kernel publication are both
+        serialized by the shared-protection engine lock, preventing two
+        concurrent callers from leaving the leaf and kernel out of sync. A
+        host or global write is never accepted. The shim and zygote layers
+        read the staged instance-local leaf at process start, so processes
+        created after this call report the new value and a zygote restart
+        makes it universal. All zeroes are the pass-through default and are
+        not a valid published identity.
+        """
+        if re.fullmatch(r"[0-9a-f]{16}", fsid_hex) is None:
+            return {"ok": False, "code": "statfs_fsid_invalid", "error": "statfs_fsid_invalid"}
+        if int(fsid_hex, 16) == 0:
+            return {"ok": False, "code": "statfs_fsid_invalid", "error": "statfs_fsid_invalid"}
+        try:
+            with self.runtime._shared_protection_engine_lock():
+                return self._set_statfs_fsid_locked(fsid_hex)
+        except BaseException:
+            return {"ok": False, "code": "statfs_fsid_unavailable", "error": "statfs_fsid_unavailable"}
+
+    def republish_statfs_fsid(self) -> dict[str, Any]:
+        """Replay the instance-local staged FSID into the current netns.
+        After a container create, start, or recreate the new network
+        namespace starts zeroed; the staged leaf is the durable per-instance
+        record. An absent or all-zero leaf means the identity was never
+        rotated and is a no-op; a malformed nonempty leaf fails closed.
+        """
+        try:
+            with self.runtime._shared_protection_engine_lock():
+                leaf = self._statfs_fsid_leaf()
+                if leaf.get("ok") is not True:
+                    return {"ok": False, "code": leaf["code"], "error": leaf["code"], "published": False}
+                value = leaf["value"]
+                if value is None:
+                    return {"ok": True, "published": False, "reason": "absent"}
+                if int(value, 16) == 0:
+                    return {"ok": True, "published": False, "reason": "zero"}
+                published = self._set_statfs_fsid_locked(value)
+                if published.get("ok") is not True:
+                    return {**published, "published": False}
+                return {"ok": True, "published": True, "fsid": value}
+        except BaseException:
+            return {
+                "ok": False,
+                "code": "statfs_fsid_unavailable",
+                "error": "statfs_fsid_unavailable",
+                "published": False,
+            }
+
+    def _statfs_fsid_status_locked(self) -> dict[str, Any]:
+        """Compare the staged FSID leaf with the kernel value in this
+        instance's current network namespace; a diverged result forces a
+        republish before the runtime can be considered ready.
+        """
+        leaf = self._statfs_fsid_leaf()
+        if leaf.get("ok") is not True:
+            code = leaf.get("code", "statfs_fsid_unavailable")
+            return {
+                "ok": False,
+                "code": code,
+                "error": code,
+                "running": False,
+                "staged": None,
+                "stagedValid": False,
+                "kernel": None,
+                "published": False,
+                "diverged": False,
+            }
+        staged = leaf["value"]
+        result: dict[str, Any] = {
+            "ok": True,
+            "running": False,
+            "staged": staged,
+            "stagedValid": True,
+            "kernel": None,
+            "published": False,
+            "diverged": False,
+        }
+        target = self._statfs_fsid_netns_target()
+        if target.get("ok") is not True:
+            return result
+        result["running"] = True
+        verify = self._statfs_fsid_container_exec(
+            target["containerId"], ["cat", STATFS_FSID_PARAM]
+        )
+        kernel = str(verify.get("stdout") or "").strip() if verify.get("ok") is True else ""
+        if re.fullmatch(r"[0-9a-f]{16}", kernel) is None:
+            result["ok"] = False
+            result["code"] = result["error"] = "statfs_fsid_kernel_unavailable"
+            return result
+        result["kernel"] = kernel
+        if staged is not None and int(staged, 16) != 0:
+            result["published"] = kernel == staged
+            result["diverged"] = kernel != staged
+        else:
+            result["published"] = int(kernel, 16) == 0
+            result["diverged"] = int(kernel, 16) != 0
+        return result
+
+    def statfs_fsid_status(self) -> dict[str, Any]:
+        """Return a coherent staged-versus-kernel FSID status snapshot."""
+        if self.runtime._shared_protection_capability is not None:
+            return self._statfs_fsid_status_locked()
+        try:
+            with self.runtime._shared_protection_engine_lock():
+                return self._statfs_fsid_status_locked()
+        except BaseException:
+            return {
+                "ok": False,
+                "code": "statfs_fsid_unavailable",
+                "error": "statfs_fsid_unavailable",
+                "running": False,
+                "staged": None,
+                "stagedValid": False,
+                "kernel": None,
+                "published": False,
+                "diverged": False,
+            }
 
     def prepare(self) -> dict[str, Any]:
         try:
