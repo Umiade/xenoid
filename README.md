@@ -96,9 +96,15 @@ This section covers the everyday subset. The [command reference](docs/commands.m
 ./xenoid --instance phone-a init --config examples/config-macos-colima.json --no-google-services
 ./xenoid --instance phone-a up
 ./xenoid --instance phone-a status
+./xenoid --instance phone-a delete --dry-run
+./xenoid --instance phone-a delete
 ```
 
-Without `--instance`, Xenoid selects `default`.
+Without `--instance`, Xenoid selects `default`. `delete` irreversibly
+destroys the instance's Android user data and releases its container, data
+volume, Docker network, ports, and registry lease; shared runtime images and
+engine-host protection are retained. `--dry-run` reports the plan without
+deleting.
 
 ### Device and Location Identity
 

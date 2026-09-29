@@ -131,6 +131,7 @@ class FakeRuntime(backend.RuntimeManager):
         self.images: dict[tuple[str, str], dict[str, Any]] = {}
         self.attachments: dict[str, list[tuple[str, str]]] = {}
         self.containers: dict[str, dict[str, Any]] = {}
+        self.networks: dict[str, dict[str, Any]] = {}
         self.actions: list[str] = []
         self.initializations = 0
         self.proxy_captures = 0
@@ -145,6 +146,8 @@ class FakeRuntime(backend.RuntimeManager):
             value = self.volumes.get(name)
         elif object_type == "container":
             value = self.containers.get(name)
+        elif object_type == "network":
+            value = self.networks.get(name)
         else:
             value = None
         return value, subprocess.CompletedProcess([], 0 if value is not None else 1, "", "")
@@ -1305,6 +1308,154 @@ def start_seeds_boot_identity_before_create() -> None:
         require(device_identity.converge_instance_identity(context, runtime_stub, client, {})["ok"] is True)
         require(client.profiles[0]["ids"]["boot_id"] == captured[0])
 
+
+
+def network_record(manager: backend.RuntimeManager) -> dict[str, Any]:
+    return {
+        "Name": manager.lease.network_name,
+        "Driver": "bridge",
+        "EnableIPv6": True,
+        "Labels": dict(manager.lease.owner_labels),
+        "IPAM": {
+            "Config": [
+                {"Subnet": manager.lease.ipv4_subnet, "Gateway": manager.lease.ipv4_gateway},
+                {"Subnet": manager.lease.ipv6_subnet, "Gateway": manager.lease.ipv6_gateway},
+            ]
+        },
+        "Options": {"com.docker.network.bridge.name": manager.lease.bridge_name},
+    }
+
+
+class DeleteRuntime(FakeRuntime):
+    def __init__(self, context, cfg, lease):
+        self.removed_containers: list[str] = []
+        self.removed: list[list[str]] = []
+        self.proxy_cleanups = 0
+        super().__init__(context, cfg, lease)
+
+    def _remove_container_safely(
+        self,
+        container: dict[str, Any],
+        *,
+        ownership: str,
+        expected_container_id: str | None = None,
+    ) -> dict[str, Any]:
+        del expected_container_id
+        self.removed_containers.append(f"{ownership}:{container['Id']}")
+        self.containers.pop(self.lease.container_name, None)
+        cleanup = self.proxy_cleanup()
+        return {
+            "ok": cleanup.get("ok") is True,
+            "ownership": ownership,
+            "containerId": container["Id"],
+            "proxyCleanup": cleanup,
+        }
+
+    def proxy_cleanup(self) -> dict[str, Any]:
+        self.proxy_cleanups += 1
+        return {"ok": True, "notPrepared": True}
+
+
+def delete_run(runtime: DeleteRuntime):
+    def fake_run(cmd, *, check=False, capture=True, timeout=None, stdin=None, env=None):
+        del check, capture, timeout, stdin, env
+        runtime.removed.append(list(cmd))
+        if "rm" in cmd and "volume" in cmd:
+            runtime.volumes.pop(cmd[-1], None)
+        elif "rm" in cmd and "network" in cmd:
+            runtime.networks.pop(cmd[-1], None)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    return fake_run
+
+
+@contract_case("deleteReleasesOwnedResourcesAndRecord")
+def delete_releases_owned_resources_and_record() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A, ID_B, TX_B):
+        context_a, cfg_a, lease_a = initialize(project, state, "phone-a")
+        context_b, cfg_b, lease_b = initialize(project, state, "phone-b")
+        runtime_a = DeleteRuntime(context_a, cfg_a, lease_a)
+        require(runtime_a.ensure_instance_storage()["ok"] is True)
+        container = owned_container_record(runtime_a, "a" * 64, running=True)
+        runtime_a.containers[lease_a.container_name] = container
+        runtime_a.networks[lease_a.network_name] = network_record(runtime_a)
+        with mock.patch.object(backend, "which", return_value="/engine/docker"):
+            plan = runtime_a.delete_owned_runtime(dry_run=True)
+        require(plan["ok"] is True and plan["dryRun"] is True)
+        require(plan["container"]["present"] is True)
+        require(plan["volume"]["present"] is True)
+        require(plan["network"]["present"] is True)
+        require(plan["hostAllocatedBytes"] is not None)
+        require(runtime_a.removed_containers == [] and runtime_a.removed == [])
+        require(context_a.config_path.is_file() and context_a.state_root.is_dir())
+        with mock.patch.object(backend, "which", return_value="/engine/docker"), mock.patch.object(
+            backend, "run", delete_run(runtime_a)
+        ):
+            engine = runtime_a.delete_owned_runtime()
+        require(engine["ok"] is True)
+        require(runtime_a.removed_containers == [f"lease:{'a' * 64}"])
+        require(runtime_a.proxy_cleanups == 1)
+        require(runtime_a.containers == {} and runtime_a.volumes == {} and runtime_a.networks == {})
+        record = config.delete_instance_record(context_a)
+        require(record["ok"] is True and record["slot"] == lease_a.slot)
+        require(not context_a.state_root.exists() and not context_a.config_path.parent.exists())
+        try:
+            config.resolve_instance("phone-a", project_root=project, state_home=state, env={})
+        except config.InstanceError as exc:
+            require(exc.code == "instance_not_initialized")
+        else:
+            raise ContractFailure
+        registry = json.loads((state / "registry.json").read_text())
+        require(ID_A not in registry["leases"] and ID_B in registry["leases"])
+        sibling_context, _, sibling_lease = config.resolve_instance(
+            "phone-b", project_root=project, state_home=state, env={}
+        )
+        require(sibling_context.instance_id == ID_B)
+        require(sibling_lease.slot == lease_b.slot)
+
+
+@contract_case("deleteWithoutEngineResourcesIsIdempotent")
+def delete_without_engine_resources_is_idempotent() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = DeleteRuntime(context, cfg, lease)
+        with mock.patch.object(backend, "which", return_value="/engine/docker"), mock.patch.object(
+            backend, "run", delete_run(runtime)
+        ):
+            result = runtime.delete_owned_runtime()
+        require(result["ok"] is True)
+        require(result["container"]["present"] is False)
+        require(result["volume"]["present"] is False)
+        require(result["network"]["present"] is False)
+        require(runtime.proxy_cleanups == 1)
+        require(runtime.removed == [])
+        record = config.delete_instance_record(context)
+        require(record["ok"] is True)
+
+
+@contract_case("deleteRefusesForeignEngineResources")
+def delete_refuses_foreign_engine_resources() -> None:
+    with roots() as (project, state), fixed_uuids(ID_A, TX_A):
+        context, cfg, lease = initialize(project, state, "phone-a")
+        runtime = DeleteRuntime(context, cfg, lease)
+        foreign = volume_record(runtime, lease.volume_name)
+        foreign["Labels"] = {}
+        runtime.volumes[lease.volume_name] = foreign
+        with mock.patch.object(backend, "which", return_value="/engine/docker"):
+            result = runtime.delete_owned_runtime()
+        require(result["ok"] is False and result["error"] == "resource_conflict")
+        require(runtime.removed_containers == [] and runtime.removed == [])
+        require(context.config_path.is_file() and context.state_root.is_dir())
+        registry = json.loads((state / "registry.json").read_text())
+        require(ID_A in registry["leases"])
+        runtime.volumes.pop(lease.volume_name)
+        foreign_container = owned_container_record(runtime, "b" * 64)
+        foreign_container["Config"]["Labels"] = {}
+        runtime.containers[lease.container_name] = foreign_container
+        with mock.patch.object(backend, "which", return_value="/engine/docker"):
+            result = runtime.delete_owned_runtime()
+        require(result["ok"] is False and result["error"] == "resource_conflict")
+        require(context.config_path.is_file())
 
 def main() -> int:
     failures: list[str] = []

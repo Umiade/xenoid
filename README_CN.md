@@ -96,9 +96,13 @@ sudo ./scripts/setup-linux-binderfs.sh
 ./xenoid --instance phone-a init --config examples/config-macos-colima.json --no-google-services
 ./xenoid --instance phone-a up
 ./xenoid --instance phone-a status
+./xenoid --instance phone-a delete --dry-run
+./xenoid --instance phone-a delete
 ```
 
-未指定 `--instance` 时选择 `default`。
+未指定 `--instance` 时选择 `default`。`delete` 会不可逆地销毁该实例的
+Android 用户数据，并释放其容器、数据卷、Docker 网络、端口和 registry 租约；共享的
+运行时镜像与引擎宿主机保护层会被保留。`--dry-run` 只报告计划，不执行删除。
 
 ### 设备与位置身份
 

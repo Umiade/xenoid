@@ -7,6 +7,20 @@ All notable changes to Xenoid are documented here. The format follows
 `xenoid-<version>` and the daemon `versionCode` is
 `major * 10000 + minor * 100 + patch`.
 
+## [Unreleased]
+
+### Added
+
+- `xenoid --instance <name> delete`: irreversibly deletes the
+  selected instance and frees its owned engine resources. The command
+  quiesces and removes the owned container, removes the owned data volume
+  and Docker network, runs proxy cleanup, then drops the private control
+  state, instance config, and operator registry lease (slot, host ports,
+  subnets, route tables). It fails closed when any engine resource's
+  ownership labels do not match the lease, always retains shared runtime
+  images and engine-host protection, is idempotent across interruptions,
+  and supports `--dry-run` to report the plan without mutating.
+
 ## [0.9.2] - 2026-09-18
 
 In-place runtime device regeneration. `xenoid device regenerate` no longer

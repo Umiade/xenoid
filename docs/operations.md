@@ -29,6 +29,8 @@ Each instance is a logical device with three persistent components:
 
 `stop` installs/verifies proxy quarantine, syncs, and stops the owned container without removing it. The immutable container ID and data volume survive, so `stop -> up` starts the same container. Only explicit recreate may change the ID; `device regenerate` keeps the same container and rotates identity in place. External volume deletion/prune or loss of private host state fails closed rather than creating an empty disk.
 
+`delete` is the only destructive lifecycle command: it quiesces and removes the owned container, removes the owned data volume and Docker network, runs proxy cleanup, then drops the private control state, instance config, and operator registry lease (slot, ports, subnets, route tables). It is fail-closed: any resource whose ownership labels do not match the lease aborts before removal, shared runtime images and engine-host protection are always retained, every step is idempotent so an interrupted delete can be retried, and `--dry-run` reports the plan without mutating. Deleting an instance destroys its Android user data irreversibly.
+
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
 
 The canonical Raven profile requests a 128,000,000,000-byte logical data device and an Android-facing f2fs contract. Xenoid grows an existing smaller ext4 backing image transactionally before startup, preserves its filesystem UUID and data, and resumes or rolls back an interrupted host-side growth transaction. It never shrinks, recreates, or silently replaces a committed image. After profile convergence, `/proc/partitions`, `/proc/diskstats`, `/dev/block/sda`, the Raven userdata by-name alias, block sysfs, mount records, and unprivileged libc/raw-syscall filesystem magic must agree. Privileged maintenance still sees ext4.
@@ -50,6 +52,34 @@ Artifact builds use content-addressed records plus output-directory locks: disjo
 ```
 
 Device identity is generated once per instance. `device regenerate` publishes its stable, SIM, boot, storage, DRM, and Google-binding targets once in a `dev.xenoid.device-regenerate/v3` journal, commits them without stopping or recreating the container, and runs one host-driven soft reboot. The transaction deterministically fixes the exact offline-seeded GSF Android ID. GAID is an opaque microG-generated postcondition rather than a journal target: acceptance requires only a nonzero app-facing value different from the pre-transaction value, and later GmsCore recreation may rekey it. Plain `up` resumes a validated v3 transaction; legacy v1/v2 journals fail with `device_regeneration_legacy_pending`.
+
+### Reclaiming host disk space (macOS Colima)
+
+Docker state lives in two raw disk images that never shrink on their own:
+`~/.colima/_lima/_disks/colima/datadisk` (Docker images/volumes) and
+`~/.colima/_lima/colima/disk` (VM root). Measure real usage with `du -h`; the
+`ls -lh` logical size never changes, and guest `fstrim` does not propagate to
+the host files.
+
+```bash
+# 1. Free guest filesystem space first.
+docker system prune
+
+# 2. Optional: zero the guest's free blocks so step 3 can hole-punch them.
+#    The fill temporarily grows host allocation; keep it below free host space.
+colima ssh -- sudo sh -c 'dd if=/dev/zero of=/mnt/lima-colima/.zerofill bs=1M || true; rm -f /mnt/lima-colima/.zerofill; sync'
+
+# 3. Rewrite the disks sparsely while the VM is stopped.
+colima stop
+/bin/dd if=~/.colima/_lima/_disks/colima/datadisk of=~/.colima/_lima/_disks/colima/datadisk.sparse bs=4m conv=sparse
+mv ~/.colima/_lima/_disks/colima/datadisk.sparse ~/.colima/_lima/_disks/colima/datadisk
+/bin/dd if=~/.colima/_lima/colima/disk of=~/.colima/_lima/colima/disk.sparse bs=4m conv=sparse
+mv ~/.colima/_lima/colima/disk.sparse ~/.colima/_lima/colima/disk
+colima start
+```
+
+The existing files may be APFS-compressed, so compare `du -h` before replacing
+the original: rewriting without the zero-fill in step 2 can grow host usage.
 
 ## Linux ARM
 

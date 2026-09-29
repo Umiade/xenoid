@@ -1261,3 +1261,58 @@ def list_instances(
         except InstanceError as exc:
             rows.append({"instanceName": child.name, "ok": False, "error": exc.code})
     return rows
+
+
+def delete_instance_record(context: InstanceContext) -> dict[str, Any]:
+    """Remove the operator record (registry lease, private state, config).
+
+    Engine-owned resources must already be released by the caller. The
+    registry lease is dropped only after the state and config directories
+    are gone, so an interrupted delete leaves a resolvable instance that can
+    be retried.
+    """
+    state_root = context.state_root
+    config_dir = context.config_path.parent
+    if state_root != context.registry_root / "instances" / context.instance_id:
+        raise InstanceError("resource_conflict", "instance state path diverges from the registry layout")
+    if config_dir != context.project_root / ".xenoid" / "instances" / context.instance_name:
+        raise InstanceError("resource_conflict", "instance config path diverges from the registry layout")
+    for path in (state_root, config_dir):
+        if path.is_symlink():
+            raise InstanceError("resource_conflict", "instance state must not be a symlink")
+    with _registry_lock(context.registry_root):
+        registry = _read_registry(context.registry_root)
+        raw = registry["leases"].get(context.instance_id)
+        if raw is None:
+            raise InstanceError("resource_conflict", "client registry lease is missing")
+        registered = InstanceLease.from_dict(raw)
+        if (
+            registered.instance_name != context.instance_name
+            or registered.resource_tag != context.resource_tag
+        ):
+            raise InstanceError("instance_identity_mismatch", "registry lease belongs to another instance")
+        removed_pending = 0
+        for transaction_id, pending_raw in list(registry.get("pending", {}).items()):
+            try:
+                pending_lease = _pending_lease(pending_raw)
+            except InstanceError:
+                continue
+            if pending_lease.instance_id == context.instance_id:
+                registry["pending"].pop(transaction_id)
+                removed_pending += 1
+        had_state = state_root.exists()
+        had_config = config_dir.exists()
+        if had_state:
+            shutil.rmtree(state_root)
+        if had_config:
+            shutil.rmtree(config_dir)
+        registry["leases"].pop(context.instance_id, None)
+        _atomic_json(context.registry_root / "registry.json", registry)
+    return {
+        "ok": True,
+        "instanceId": context.short_id,
+        "slot": registered.slot,
+        "removedState": had_state,
+        "removedConfig": had_config,
+        "removedPendingTransactions": removed_pending,
+    }

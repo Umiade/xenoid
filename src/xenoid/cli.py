@@ -24,6 +24,7 @@ from .artifacts import ALL_TARGETS, TARGETS, ArtifactBuilder, ArtifactError
 from .cellular import CellularError, encode_profile_v1
 from .config import (
     InstanceError,
+    delete_instance_record,
     initialize_instance,
     list_instances,
     merge_config,
@@ -656,6 +657,45 @@ def cmd_instance_list(args: argparse.Namespace) -> int:
     print_json({
         "ok": True,
         "instances": list_instances(project_root=args.project_root),
+    })
+    return 0
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    dry_run = bool(getattr(args, "dry_run", False))
+    engine = runtime(args).delete_owned_runtime(dry_run=dry_run)
+    if engine.get("ok") is not True:
+        print_json({
+            "schema": "dev.xenoid.instance-delete/v1",
+            "ok": False,
+            "dryRun": dry_run,
+            "instance": args.context.public_dict(),
+            "engine": engine,
+            "error": engine.get("error", "resource_conflict"),
+        })
+        return 1
+    if dry_run:
+        print_json({
+            "schema": "dev.xenoid.instance-delete/v1",
+            "ok": True,
+            "dryRun": True,
+            "instance": args.context.public_dict(),
+            "engine": engine,
+            "record": {
+                "slot": args.lease.slot,
+                "configPresent": args.context.config_path.is_file(),
+                "statePresent": args.context.state_root.is_dir(),
+            },
+        })
+        return 0
+    record = delete_instance_record(args.context)
+    print_json({
+        "schema": "dev.xenoid.instance-delete/v1",
+        "ok": True,
+        "dryRun": False,
+        "instance": args.context.public_dict(),
+        "engine": engine,
+        "record": record,
     })
     return 0
 
@@ -4172,6 +4212,17 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stop", help="stop and retain the owned Android runtime container")
     s.set_defaults(func=cmd_stop)
 
+    s = sub.add_parser(
+        "delete",
+        help="delete the selected instance and release its owned resources",
+    )
+    s.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report the resources that would be released without deleting",
+    )
+    s.set_defaults(func=cmd_delete)
+
     s = sub.add_parser("logs", help="collect Docker/ADB runtime logs")
     s.add_argument("--out-dir")
     s.set_defaults(func=cmd_logs)
@@ -4639,7 +4690,7 @@ def _command_mutates_instance(args: argparse.Namespace) -> bool:
     handler_name = getattr(getattr(args, "func", None), "__name__", "")
     if handler_name in _READ_ONLY_INSTANCE_COMMANDS:
         return False
-    if handler_name == "cmd_up" and bool(getattr(args, "dry_run", False)):
+    if handler_name in {"cmd_up", "cmd_delete"} and bool(getattr(args, "dry_run", False)):
         return False
     if handler_name == "cmd_proxy_status" and not bool(getattr(args, "check", False)):
         return False
@@ -4670,7 +4721,7 @@ def _refresh_instance_under_lock(args: argparse.Namespace) -> None:
 
 def _reject_unrelated_regeneration_mutation(args: argparse.Namespace) -> Optional[dict[str, Any]]:
     handler = getattr(getattr(args, "func", None), "__name__", "")
-    if handler in {"cmd_up", "cmd_device_regenerate"}:
+    if handler in {"cmd_up", "cmd_device_regenerate", "cmd_delete"}:
         return None
     try:
         state = RegenerationJournal(args.context).load()

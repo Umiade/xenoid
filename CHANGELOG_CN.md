@@ -7,6 +7,17 @@ Xenoid 的所有重要变更都记录在此。格式遵循
 `xenoid-<版本号>`，daemon 的 `versionCode` 计算规则为
 `major * 10000 + minor * 100 + patch`。
 
+## [Unreleased]
+
+### Added
+
+- `xenoid --instance <name> delete`：不可逆地删除指定实例并释放其
+  占用的引擎资源。命令会停止并移除自有容器，删除自有数据卷和 Docker 网络，
+  执行代理清理，然后移除私有控制状态、实例配置和 operator registry 租约
+  （slot、宿主机端口、网段、路由表）。任何引擎资源的 ownership 标签与租约
+  不一致时都会在删除前失败关闭；共享运行时镜像与引擎宿主机保护层始终保留；
+  各步骤幂等，中断后可重试；`--dry-run` 只报告计划不做修改。
+
 ## [0.9.2] - 2026-09-18
 
 原地运行时设备身份轮换。`xenoid device regenerate` 不再重建容器：它在

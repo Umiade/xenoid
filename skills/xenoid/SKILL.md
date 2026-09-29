@@ -41,6 +41,8 @@ Each instance is a logical device with three persistent components:
 
 `stop` quarantines, syncs, and stops the owned container without deleting it. The immutable container ID and data volume persist, so the next `up` starts that container. Only explicit recreate may change the ID; `device regenerate` keeps the same container and rotates identity in place. External volume/state loss fails closed rather than silently creating a new device.
 
+`delete` destroys an instance irreversibly: it removes the owned container, data volume, and Docker network, runs proxy cleanup, then drops the private control state, instance config, and operator registry lease. Any resource whose ownership labels do not match the lease aborts before removal; shared runtime images and engine-host protection are retained. Use `--dry-run` to inspect the plan first.
+
 Cache and login state are stored in the same `/data` partition and persist across restarts. Android's own storage pressure and app cache-clearing semantics still apply; Xenoid does not add a separate wipe-on-start mode.
 
 Raven applications observe the profile-owned f2fs contract across mount records, the userdata by-name alias, libc filesystem calls, and direct raw syscalls. Root maintenance continues to inspect the real ext4 backing image.

@@ -4116,6 +4116,115 @@ cat >/dev/null
             operation="regenerate",
         )
 
+    def delete_owned_runtime(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """Release every engine resource owned by this instance.
+
+        Quiesces and removes the owned container, removes the owned data
+        volume and Docker network, and runs proxy cleanup so host-side
+        routing is released. Shared runtime images and engine-host
+        protection are retained. Host-side operator records are removed by
+        the caller only after this succeeds. Every step is idempotent so an
+        interrupted delete can be retried.
+        """
+        self.ensure_instance_lease()
+        if which("docker") is None:
+            return {"ok": False, "error": "docker not found"}
+        container, error = self._owned_container_record()
+        if container is None and error != "instance container does not exist":
+            return {"ok": False, "error": "resource_conflict", "message": error}
+        if container is not None and not self._container_has_lease_owner(container):
+            return self._storage_error(
+                "resource_conflict",
+                "Docker container is not owned by this instance",
+            )
+        volume, _ = self._inspect_docker_object("volume", self.lease.volume_name)
+        volume_present = isinstance(volume, dict) and bool(volume)
+        if volume_present and not self._volume_matches_lease(volume):
+            return self._storage_error(
+                "resource_conflict",
+                "Docker volume is not owned by this instance",
+            )
+        network, _ = self._inspect_docker_object("network", self.lease.network_name)
+        network_present = isinstance(network, dict) and bool(network)
+        if network_present and not self._network_matches_lease(network):
+            return self._storage_error(
+                "resource_conflict",
+                "Docker network is not owned by this instance",
+            )
+        allocated_bytes: Optional[int] = None
+        try:
+            storage_state = StorageStateStore(self.context, self.lease).load()
+        except StorageError:
+            storage_state = None
+        if isinstance(storage_state, dict):
+            value = storage_state.get("hostAllocatedBytes")
+            if isinstance(value, int) and value >= 0:
+                allocated_bytes = value
+        result: dict[str, Any] = {
+            "ok": True,
+            "dryRun": dry_run,
+            "container": {
+                "name": self.lease.container_name,
+                "present": container is not None,
+            },
+            "volume": {"name": self.lease.volume_name, "present": volume_present},
+            "network": {"name": self.lease.network_name, "present": network_present},
+            "hostAllocatedBytes": allocated_bytes,
+            "retained": {"runtimeImage": "shared", "engineProtection": "shared"},
+        }
+        if dry_run:
+            return result
+        if container is not None:
+            removal = self._remove_container_safely(container, ownership="lease")
+            result["container"]["removed"] = removal.get("ok") is True
+            result["proxyCleanup"] = removal.get("proxyCleanup")
+            if removal.get("ok") is not True:
+                result["ok"] = False
+                result["error"] = removal.get("error", "container_remove_failed")
+                result["containerRemoval"] = removal
+                return result
+        else:
+            try:
+                cleanup = self.proxy_cleanup()
+            except InstanceError as exc:
+                cleanup = self._proxy_failure(exc.code)
+            except Exception:
+                cleanup = self._proxy_failure("engine_unavailable")
+            result["proxyCleanup"] = cleanup
+            if cleanup.get("ok") is not True:
+                result["ok"] = False
+                result["error"] = "proxy_cleanup_failed"
+                return result
+        if volume_present:
+            removed_volume = run(
+                [*self.docker_base_cmd(), "volume", "rm", self.lease.volume_name],
+                timeout=60,
+                env=self.docker_env(),
+            )
+            if removed_volume.returncode != 0:
+                remaining, _ = self._inspect_docker_object("volume", self.lease.volume_name)
+                if isinstance(remaining, dict) and remaining:
+                    result["ok"] = False
+                    result["error"] = "volume_remove_failed"
+                    result["volume"]["removeStderr"] = (removed_volume.stderr or "").strip()[-500:]
+                    return result
+            result["volume"]["removed"] = True
+        if network_present:
+            removed_network = run(
+                [*self.docker_base_cmd(), "network", "rm", self.lease.network_name],
+                timeout=30,
+                env=self.docker_env(),
+            )
+            if removed_network.returncode != 0:
+                remaining, _ = self._inspect_docker_object("network", self.lease.network_name)
+                if isinstance(remaining, dict) and remaining:
+                    result["ok"] = False
+                    result["error"] = "network_remove_failed"
+                    result["network"]["removeStderr"] = (removed_network.stderr or "").strip()[-500:]
+                    return result
+            result["network"]["removed"] = True
+        return result
+
 
 
     def _remove_legacy_container(
