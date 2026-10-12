@@ -2569,14 +2569,31 @@ class ConvergenceExecutor:
             and isinstance(protection.get("observed"), Mapping)
             else protection
         )
+        recorded_engine = journal_state.get("protectionEngineId")
+        recorded_digest = journal_state.get("protectionExpectedDigest")
+        observed_engine = (
+            protection_observed.get("engineId")
+            if isinstance(protection_observed, Mapping)
+            else None
+        )
+        observed_digest = (
+            protection.get("expectedDigest") if isinstance(protection, Mapping) else None
+        )
+        # A transient inability to observe the engine-host protection deployment
+        # (engine momentarily unreachable) reads as engineId/expectedDigest None.
+        # When the journal recorded a concrete deployment, that is unobserved,
+        # not an input change: fail closed and preserve the journal (recommend
+        # resume) rather than discarding one that may hold unrecoverable
+        # boot-seed or location transaction state. Only a concretely observed
+        # and genuinely different deployment is an input change.
         if (
             not isinstance(protection, Mapping)
             or not isinstance(protection_observed, Mapping)
-            or protection_observed.get("engineId")
-            != journal_state.get("protectionEngineId")
-            or protection.get("expectedDigest")
-            != journal_state.get("protectionExpectedDigest")
+            or (recorded_engine is not None and observed_engine is None)
+            or (recorded_digest is not None and observed_digest is None)
         ):
+            raise ConvergenceError("convergence_protection_unobserved")
+        if observed_engine != recorded_engine or observed_digest != recorded_digest:
             raise ConvergenceError("convergence_inputs_changed")
         if "shared_protection_maintained" in journal_state.get("completed", ()):
             if (

@@ -1044,11 +1044,21 @@ class DaemonClient:
                     request,
                     timeout=bounded_timeout(remaining),
                 ) as response:
-                    raw = response.read().decode()
-                    result = json.loads(raw) if raw else {"ok": True}
-                    if response.status == 401 and attempt == 0:
-                        self._clear_token()
-                        continue
+                    # Bound the success read exactly like the error path: a 2xx
+                    # body is still untrusted and must not be read unboundedly
+                    # into memory. (A 401 always raises HTTPError and is handled
+                    # below, so there is no 401 success branch.)
+                    raw = response.read(PROXY_MAX_RESPONSE_BYTES + 1)
+                    if len(raw) > PROXY_MAX_RESPONSE_BYTES:
+                        return _proxy_failure("response_too_large")
+                    if not raw:
+                        return {"ok": True}
+                    try:
+                        result = json.loads(raw.decode())
+                    except (ValueError, UnicodeDecodeError):
+                        return _proxy_failure("daemon_response_invalid")
+                    if not isinstance(result, dict):
+                        return _proxy_failure("daemon_response_invalid")
                     return result
             except urllib.error.HTTPError as exc:
                 if exc.code == 401 and attempt == 0:

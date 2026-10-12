@@ -1714,6 +1714,47 @@ def legacy_missing_rootfs_uuid_journals_as_null() -> None:
         )
 
 
+@case("transientProtectionUnobservedPreservesJournal")
+def transient_protection_unobserved_preserves_journal() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["createSpecMatches"] = False
+    with manager_fixture(snapshot) as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect()
+        journal = convergence.ConvergenceJournal(manager)
+        state = _create_journal(journal, plan)
+        # Engine host momentarily unreachable: the protection deployment cannot
+        # be observed (engineId/expectedDigest None). The journal, which may hold
+        # unrecoverable boot-seed/location state, must be preserved for retry,
+        # not discarded as inputs-changed.
+        unobserved = copy.deepcopy(snapshot)
+        unobserved["components"]["protection"] = {
+            "state": "unknown",
+            "expectedDigest": None,
+            "currentDigest": None,
+            "replacementRequired": None,
+            "maintenanceRequired": None,
+            "siblingRuntimeActive": None,
+            "error": "engine_unavailable",
+            "observed": {"ok": False, "engineId": None},
+        }
+        expect_error(
+            lambda: convergence.ConvergenceExecutor(manager)._validate_resume_state(
+                state, unobserved
+            ),
+            "convergence_protection_unobserved",
+        )
+        # A concretely observed but genuinely different deployment is still an
+        # input change that discards the obsolete journal.
+        changed = copy.deepcopy(snapshot)
+        changed["components"]["protection"]["expectedDigest"] = "f" * 64
+        expect_error(
+            lambda: convergence.ConvergenceExecutor(manager)._validate_resume_state(
+                state, changed
+            ),
+            "convergence_inputs_changed",
+        )
+
+
 @case("storageOwnerCrashResumesBeforeStateRefresh")
 def storage_owner_crash_resumes_before_state_refresh() -> None:
     snapshot = healthy_snapshot()

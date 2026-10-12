@@ -185,25 +185,44 @@ def run_bounded(
             "process_start_failed",
         )
 
-    if input_bytes is not None and process.stdin is not None:
-        try:
-            process.stdin.write(input_bytes)
-            process.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-        finally:
-            process.stdin.close()
-
     selector = selectors.DefaultSelector()
     assert process.stdout is not None and process.stderr is not None
     for stream_name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
         os.set_blocking(stream.fileno(), False)
         selector.register(stream, selectors.EVENT_READ, stream_name)
+    # Feed stdin inside the selector loop rather than with a blocking pre-loop
+    # write: a child that does not drain stdin would otherwise block the write
+    # once the pipe buffer fills, so the absolute deadline and cancellation
+    # would never take effect.
+    pending_input: memoryview | None = None
+    if process.stdin is not None:
+        if input_bytes:
+            os.set_blocking(process.stdin.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            pending_input = memoryview(input_bytes)
+        else:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
     tails = {"stdout": bytearray(), "stderr": bytearray()}
     state = "passed"
     error_code: str | None = None
     terminating_at: float | None = None
+    killed_at: float | None = None
     last_progress = started
+
+    def _close_stdin() -> None:
+        if process.stdin is None:
+            return
+        try:
+            selector.unregister(process.stdin)
+        except (KeyError, ValueError):
+            pass
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
 
     def is_cancelled() -> bool:
         if cancelled is None:
@@ -231,11 +250,35 @@ def run_bounded(
             ):
                 _signal_group(process, signal.SIGKILL)
                 terminating_at = None
+                killed_at = now
+            # Once the group has been killed and the direct child reaped, stop
+            # waiting on stdout/stderr: an orphaned grandchild can hold the pipe
+            # write end open indefinitely, so the streams would never reach EOF
+            # and the loop would otherwise spin past the deadline forever.
+            if killed_at is not None and process.poll() is not None:
+                break
             try:
                 selected = selector.select(timeout=0.1)
             except InterruptedError:
                 continue
             for key, _ in selected:
+                if key.data == "stdin":
+                    if pending_input is None:
+                        _close_stdin()
+                        continue
+                    try:
+                        written = os.write(key.fd, bytes(pending_input[:65536]))
+                    except BlockingIOError:
+                        continue
+                    except (BrokenPipeError, OSError):
+                        pending_input = None
+                        _close_stdin()
+                        continue
+                    pending_input = pending_input[written:]
+                    if len(pending_input) == 0:
+                        pending_input = None
+                        _close_stdin()
+                    continue
                 try:
                     chunk = os.read(key.fd, 8192)
                 except BlockingIOError:
@@ -297,7 +340,9 @@ def run_bounded(
         raise
     finally:
         selector.close()
-        for stream in (process.stdout, process.stderr):
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None:
+                continue
             try:
                 stream.close()
             except OSError:
