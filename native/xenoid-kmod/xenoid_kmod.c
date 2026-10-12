@@ -10,7 +10,17 @@
 //
 // Everything is kprobe/kretprobe based: no syscall table patching or ABI hacks.
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/spinlock.h>
+
+/* Several post handlers read hook/dispatcher arguments positionally from
+ * pt_regs (for example vfs_getxattr/security_inode_getsecurity gained the
+ * mnt_userns/mnt_idmap first parameter in 5.12). The register ordering this
+ * module assumes holds from 5.12 onward; refuse to build against an older
+ * kernel rather than silently misreading arguments. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
+#error "xenoid_kmod requires Linux >= 5.12 (argument register layout assumption)"
+#endif
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/kprobes.h>
@@ -1442,7 +1452,7 @@ static struct kretprobe igs_kp = {
 	.maxactive = 32,
 };
 
-/* security_getprocattr(task, name, &value) */
+/* inner LSM getprocattr hook: <lsm>_getprocattr(task, name, &value) */
 struct gpa_ctx {
 	struct task_struct *task;
 	const char *name;
@@ -1727,13 +1737,16 @@ static int gpa_post(struct kretprobe_instance *ri, struct pt_regs *regs)
 	regs_set_return_value(regs, len);
 	return 0;
 }
-static struct kretprobe gpa_kp = {
-	.handler = gpa_post,
-	.entry_handler = gpa_pre,
-	.data_size = sizeof(struct gpa_ctx),
-	.kp = { .symbol_name = "security_getprocattr" },
-	.maxactive = 32,
-};
+/* Hook the inner LSM getprocattr implementation directly, never the
+ * security_getprocattr dispatcher. The dispatcher signature is
+ * (task, lsm|lsmid, name, value) since 5.11 and its second argument became an
+ * int lsmid in 6.8, so a probe assuming (task, name, value) would read the
+ * per-LSM id (for example 104 for AppArmor on /proc/<pid>/attr/apparmor/*) as
+ * a char* and dereference it, panicking the engine host from any container
+ * process. gpa_pre/gpa_post match the stable 3-argument inner hook
+ * (task, name, value); apparmor_getprocattr is the active getprocattr hook on
+ * the supported hosts, and SELinux/Smack inner hooks share the same shape if
+ * ever needed. */
 static struct kretprobe aa_gpa_kp = {
 	.handler = gpa_post,
 	.entry_handler = gpa_pre,
@@ -2360,7 +2373,7 @@ static struct kretprobe *rprobes[] = {
     &affinity_kp, &statfs_kp,
 };
 static struct kretprobe *seclabel_rprobes[] = {
-    &igs_kp, &vfs_xattr_kp, &gpa_kp, &aa_gpa_kp, &tiocsti_kp,
+    &igs_kp, &vfs_xattr_kp, &aa_gpa_kp, &tiocsti_kp,
     &socket_create_kp, &ptrace_access_kp, &netlink_send_kp,
 };
 static unsigned int rprobes_registered;
