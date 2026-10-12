@@ -481,9 +481,10 @@ if "$ADB_BIN" -s "$ADB_TARGET" shell 'wm size | grep -q "1440x3120" && wm densit
 "$XENOID_BIN" device set serial 3A4940E5EDFA >/tmp/xenoid-smoke-usb-serial.out 2>&1 || true
 if "$ADB_BIN" -s "$ADB_TARGET" shell 'p=/config/usb_gadget/g1/strings/0x409/serialnumber; if [ -e "$p" ]; then test "$(cat "$p" 2>/dev/null)" = 3A4940E5EDFA && test "$(cat /config/usb_gadget/g1/strings/0x409/manufacturer 2>/dev/null)" = Google && grep -q "Pixel" /config/usb_gadget/g1/strings/0x409/product 2>/dev/null; else exit 77; fi' >/tmp/xenoid-smoke-usb.out 2>&1; then add usb_identity true "usb gadget serial/manufacturer/product sanitized"; else rc=$?; if [ "$rc" = 77 ]; then add usb_identity true "no usb gadget configfs on this runtime; skip"; else add usb_identity false "$(cat /tmp/xenoid-smoke-usb.out)"; fi; fi
 
-# The profile helper updates the device-wide secure android_id without rewriting
-# Android's app-scoped SSAIDs. Both files require uid=0 access.
-if as_root 'test -x /data/local/tmp/xenoid-ssaid && before=$(sha256sum /data/system/users/0/settings_ssaid.xml | cut -c 1-64) && /data/local/tmp/xenoid-ssaid 1234567890abcdef >/data/local/tmp/xenoid-ssaid-smoke.log 2>&1 && after=$(sha256sum /data/system/users/0/settings_ssaid.xml | cut -c 1-64) && test "$before" = "$after" && strings /data/system/users/0/settings_secure.xml 2>/dev/null | grep -q 1234567890abcdef' >/tmp/xenoid-smoke-ssaid.out 2>&1; then add ssaid_file true "settings_ssaid.xml preserved; settings_secure.xml contains 1234567890abcdef"; else add ssaid_file false "$(cat /tmp/xenoid-smoke-ssaid.out)"; fi
+# SettingsProvider is the sole owner of the device-wide secure android_id;
+# writing it must not disturb Android's app-scoped SSAID store. Both files
+# require uid=0 access. The original value is restored afterwards.
+if as_root 'cur=$(settings get secure android_id); before=$(sha256sum /data/system/users/0/settings_ssaid.xml | cut -c 1-64); settings put secure android_id 1234567890abcdef && test "$(settings get secure android_id)" = 1234567890abcdef && after=$(sha256sum /data/system/users/0/settings_ssaid.xml | cut -c 1-64) && test "$before" = "$after"; rc=$?; settings put secure android_id "$cur" 2>/dev/null || true; exit $rc' >/tmp/xenoid-smoke-ssaid.out 2>&1; then add ssaid_file true "android_id round-trips via SettingsProvider; settings_ssaid.xml preserved"; else add ssaid_file false "$(cat /tmp/xenoid-smoke-ssaid.out)"; fi
 
 # Live Frida injection is opt-in because production `up` deliberately removes
 # frida-server and payloads. Static hook surfaces remain mandatory in full doctor.

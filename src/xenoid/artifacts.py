@@ -539,13 +539,6 @@ _TARGET_LIST = (
         "native/xenoid-hide",
     ),
     _target(
-        "ssaid",
-        ("scripts/build-native-for-arch.sh", "xenoid-ssaid", "native/xenoid-hide/xenoid_ssaid.c", "native/xenoid-hide/xenoid-ssaid", "arm64"),
-        (*_GENERIC_ANDROID, "native/xenoid-hide/xenoid_ssaid.c"),
-        (_out("native/xenoid-hide/xenoid-ssaid"),),
-        "native/xenoid-hide",
-    ),
-    _target(
         "proxySandbox",
         ("scripts/build-proxy-sandbox.sh",),
         ("scripts/build-proxy-sandbox.sh", "native/xenoid-proxy-sandbox/xenoid_proxy_sandbox.c", "native/xenoid-proxy-sandbox/Makefile"),
@@ -579,7 +572,7 @@ CONSUMER_TARGETS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "ril",
             "radioConfig",
         ),
-        "liveDeploy": ("daemon", "rootd", "shimArm64", "ssaid", "proxySandbox"),
+        "liveDeploy": ("daemon", "rootd", "shimArm64", "proxySandbox"),
         "release": ALL_TARGETS,
     }
 )

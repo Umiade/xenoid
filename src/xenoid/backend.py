@@ -130,7 +130,6 @@ _CONVERGENCE_REMOTE_ARTIFACTS = {
     "profile": ("native/xenoid-profile/xenoid-profile", "/data/local/tmp/xenoid-profile-helper", 0o755),
     "rootd": ("native/xenoid-rootd/xenoid-rootd-arm64", _ROOTD_REMOTE_PATH, 0o755),
     "netctl": ("native/xenoid-netctl/xenoid-netctl", "/data/local/tmp/xenoid-netctl", 0o755),
-    "ssaid": ("native/xenoid-hide/xenoid-ssaid", "/data/local/tmp/xenoid-ssaid", 0o755),
 }
 _CONVERGENCE_ACCEPTANCE_CHECKS = (
     "container",

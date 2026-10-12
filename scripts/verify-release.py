@@ -82,7 +82,6 @@ _ARTIFACT_PAIRS = {
     "artifacts/hwcomposer.raven.so": "native/xenoid-hwcomposer/hwcomposer.raven.so",
     "artifacts/xenoid-overlay-helper": "native/xenoid-hide/xenoid-overlay",
     "artifacts/xenoid-prop-area": "native/xenoid-hide/xenoid-prop-area",
-    "artifacts/xenoid-ssaid": "native/xenoid-hide/xenoid-ssaid",
     "scripts/xenoid-proxy-sandbox": "native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",
     "artifacts/libxenoid-ril.so": "native/xenoid-ril/libxenoid-ril.so",
     "artifacts/android.hardware.radio.config-service.xenoid": "native/xenoid-radio-config/android.hardware.radio.config-service.xenoid",

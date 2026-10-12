@@ -28,8 +28,6 @@ native/xenoid-hide/xenoid-hide-x86_64
 native/xenoid-hide/xenoid-overlay
 native/xenoid-hide/xenoid-overlay-x86_64
 native/xenoid-hide/xenoid-overlay-arm64
-native/xenoid-hide/xenoid-ssaid
-native/xenoid-hide/xenoid-ssaid-x86_64
 native/xenoid-input/xenoid-input
 native/xenoid-input/xenoid-input-x86_64
 native/xenoid-profile/xenoid-profile

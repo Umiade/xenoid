@@ -270,7 +270,6 @@ _SOURCE_SMOKES = (
     _smoke("frida-install-source", "smoke-frida-install.py"),
     _smoke("app-process-source", "smoke-app-process-needed.py"),
     _smoke("install-runtime-source", "smoke-install-runtime.py"),
-    _smoke("idstore-helper-source", "smoke-idstore-helper.py"),
     _smoke("input-profile-source", "smoke-input-profile.py"),
     _smoke("rtc-overlay-source", "smoke-rtc-overlay.py"),
     _smoke("network-overlay-source", "smoke-network-overlay.py"),

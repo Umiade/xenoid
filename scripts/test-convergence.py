@@ -351,7 +351,6 @@ def healthy_snapshot() -> dict[str, Any]:
                 "profile": "matching",
                 "rootd": "matching",
                 "netctl": "matching",
-                "ssaid": "matching",
             },
             "identity": {"state": "matching"},
             "location": {"state": "matching"},

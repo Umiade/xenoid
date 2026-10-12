@@ -227,11 +227,11 @@ def exact_catalog_and_virtual_dag() -> None:
         "daemon", "keymint", "input", "hide", "profile", "rootd", "netctl",
         "overlay", "zygote", "svcman", "sensorsHal", "gralloc", "hwcomposer",
         "cameraProvider", "ril", "radioConfig", "shimArm64", "pivot",
-        "propArea", "ssaid", "proxySandbox",
+        "propArea", "proxySandbox",
     )
-    require(artifacts.ALL_TARGETS == expected, "the exact 21 target names/order changed")
+    require(artifacts.ALL_TARGETS == expected, "the exact 20 target names/order changed")
     require(tuple(artifacts.TARGETS) == expected, "TARGETS does not match ALL_TARGETS")
-    require(len(set(artifacts.ALL_TARGETS)) == 21, "duplicate target name")
+    require(len(set(artifacts.ALL_TARGETS)) == 20, "duplicate target name")
     require(dataclasses.is_dataclass(artifacts.BuildTarget), "BuildTarget is not a record")
     require(artifacts.BuildTarget.__dataclass_params__.frozen, "BuildTarget is mutable")
     require(artifacts.OutputSpec.__dataclass_params__.frozen, "OutputSpec is mutable")
@@ -245,7 +245,7 @@ def exact_catalog_and_virtual_dag() -> None:
         "cameraProvider", "ril", "radioConfig",
     ), "runtimeContext dependency closure changed")
     require(consumers["liveDeploy"] ==
-            ("daemon", "rootd", "shimArm64", "ssaid", "proxySandbox"),
+            ("daemon", "rootd", "shimArm64", "proxySandbox"),
             "liveDeploy dependency closure changed")
     require(consumers["release"] == expected, "release is not the full closure")
 
@@ -287,7 +287,6 @@ def exact_catalog_and_virtual_dag() -> None:
         "shimArm64": ("native/xenoid-shim/libxenoid_shim-arm64.so",),
         "pivot": ("native/xenoid-pivot/xenoid-pivot",),
         "propArea": ("native/xenoid-hide/xenoid-prop-area",),
-        "ssaid": ("native/xenoid-hide/xenoid-ssaid",),
         "proxySandbox":
             ("native/xenoid-proxy-sandbox/xenoid-proxy-sandbox",),
     }
@@ -342,7 +341,7 @@ def exact_catalog_and_virtual_dag() -> None:
                             f"non-PIE artifact declaration: {output.path}")
     shared_hide = {name for name, target in artifacts.TARGETS.items()
                    if target.output_directory == "native/xenoid-hide"}
-    require(shared_hide == {"hide", "overlay", "propArea", "ssaid"},
+    require(shared_hide == {"hide", "overlay", "propArea"},
             "shared xenoid-hide serialization set is incomplete")
 
 

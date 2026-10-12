@@ -695,9 +695,18 @@ final class DeviceProfileManager {
         out.put("value", value);
         List<Object> actions = new ArrayList<>();
         if ("android_id".equals(field) || "settings.secure.android_id".equals(field)) {
-            actions.add(RootHelper.exec("settings put secure android_id " + RootHelper.shellQuote(value)));
+            // SettingsProvider is the sole owner of the device-wide secure
+            // android_id. Put it and read it back (with a bounded retry) instead
+            // of hand-editing settings_secure.xml: that store is Android 12+
+            // binary XML (ABX), so an offline text rewrite silently replaced the
+            // whole file. A read-back mismatch fails the field apply.
+            actions.add(RootHelper.exec(
+                    "v=" + RootHelper.shellQuote(value) + "; i=0; "
+                    + "while [ $i -lt 3 ]; do settings put secure android_id \"$v\"; "
+                    + "cur=$(settings get secure android_id 2>/dev/null); "
+                    + "[ \"$cur\" = \"$v\" ] && exit 0; i=$((i+1)); sleep 1; done; "
+                    + "echo android_id_readback_mismatch >&2; exit 1"));
             actions.add(RootHelper.exec("mkdir -p /data/local/tmp/xenoid-profile && printf %s " + RootHelper.shellQuote(value + "\n") + " > /data/local/tmp/xenoid-profile/android_id"));
-            actions.add(RootHelper.exec("test -x /data/local/tmp/xenoid-ssaid && /data/local/tmp/xenoid-ssaid " + RootHelper.shellQuote(value) + " >/data/local/tmp/xenoid-ssaid.log 2>&1 || true"));
         } else if ("device_name".equals(field)) {
             actions.add(RootHelper.exec("settings put global device_name " + RootHelper.shellQuote(value)));
         } else if ("net.hostname".equals(field) || "hostname".equals(field)) {
