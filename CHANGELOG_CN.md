@@ -9,7 +9,12 @@ Xenoid 的所有重要变更都记录在此。格式遵循
 
 ## [Unreleased]
 
-### Added
+## [0.9.3] - 2026-10-12
+
+围绕收敛、恢复路径与引擎宿主机的可靠性加固，并恢复宿主机 Python 3.9
+兼容性。
+
+### 新增
 
 - `xenoid --instance <name> delete`：不可逆地删除指定实例并释放其
   占用的引擎资源。命令会停止并移除自有容器，删除自有数据卷和 Docker 网络，
@@ -17,6 +22,36 @@ Xenoid 的所有重要变更都记录在此。格式遵循
   （slot、宿主机端口、网段、路由表）。任何引擎资源的 ownership 标签与租约
   不一致时都会在删除前失败关闭；共享运行时镜像与引擎宿主机保护层始终保留；
   各步骤幂等，中断后可重试；`--dry-run` 只报告计划不做修改。
+
+### 修复
+
+- 所有宿主机入口在官方 Python 3.9 解释器上恢复可导入、可运行；新增
+  契约门固定该下限。
+- 外部容器重启后，`xenoid up` 会自愈控制面（root helper、adbd 端口、
+  daemon bootstrap、代理 epoch），不再在验收阶段失败；此时
+  `xenoid status` 报告 `control_plane_restart_required`。
+- 只读命令与 MCP/远程读工具不再顺带重启 root helper 或执行 bootstrap；
+  恢复统一由显式 `xenoid up` 完成。
+- `xenoid delete` 在引擎不可达时失败关闭，不再遗留无主数据卷。
+- 身份轮换恢复路径不再因 receipt 读取抖动触发第二次擦除 SSAID 的
+  重启；活动区定位读回失败时会重新打开真正的恢复事务，不再空转到
+  失败。
+- 代理期望状态可从崩溃残留的临时文件/空 control 文件恢复（此前只能
+  手工清理）；daemon 设置页的"清除代理"按钮恢复可用。
+- 修复相机 HAL flush/close 的锁顺序死锁。
+- 引擎宿主机内核模块不再探测 `security_getprocattr` 调度函数：在 6.8
+  内核上，容器进程读取 `/proc/self/attr/apparmor/*` 可能触发宿主机
+  崩溃；SELinux 标签合成行为不变。模块在低于 5.12 的内核上拒绝构建。
+- 保护层暂时不可观测时收敛 journal 不再被丢弃；有界子进程运行器对
+  stdin 大数据量与孤儿孙进程场景也能按截止时间退出。
+- 设备级 `android_id` 改为经 SettingsProvider 写入并做 fail-closed
+  读回校验。
+
+### 移除
+
+- `xenoid-ssaid` helper：它以文本方式重写 secure settings 存储，而该
+  文件在 Android 13 上是二进制 XML。SettingsProvider 现在是唯一写入方，
+  运行时冒烟同时验证 app 级 SSAID 存储不受影响。
 
 ## [0.9.2] - 2026-09-18
 

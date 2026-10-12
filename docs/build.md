@@ -188,10 +188,10 @@ Runtime images do not read these mutable output paths. They consume the `runtime
 ## OTA and release chain
 
 ```bash
-./xenoid ota make --version 0.9.2
+./xenoid ota make --version 0.9.3
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.9.2
-./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
+./xenoid package-release --version 0.9.3
+./xenoid verify-release dist/release/xenoid-0.9.3.tar.gz
 ```
 
 OTA/context/package consumers never compile a missing artifact. Release packaging runs the acyclic release gate profile with `--fresh`, stages an invocation-private validated artifact snapshot, creates canonical OTA and package archives with fixed `SOURCE_DATE_EPOCH`, and mandates `verify-release` on the candidate before atomic publication. A selectable microG provider selects `release-google` in the same invocation and packages its sanitized normalized acceptance as `evidence/google-services-release.json`; a disabled-clean provider selects the ordinary release profile. A second package operation with the same source/tool/epoch inputs must produce the same archive SHA-256.

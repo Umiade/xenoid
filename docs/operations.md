@@ -441,8 +441,8 @@ A matching module/link/map inventory is reused across instances. eBPF replacemen
 ./xenoid build all
 ./xenoid build all --force
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.9.2
-./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
+./xenoid package-release --version 0.9.3
+./xenoid verify-release dist/release/xenoid-0.9.3.tar.gz
 ```
 
 Normal builds reuse content-addressed artifact records; `--force` rebuilds and rejects nondeterministic output for an unchanged input/tool identity. Release packaging runs the non-recursive release gate profile fresh, stages validated immutable objects, creates canonical OTA/package archives with fixed `SOURCE_DATE_EPOCH`, and requires `verify-release` on the candidate before publication. A selectable microG provider requires the fresh `release-google` profile and packages only its normalized `evidence/google-services-release.json`; ordinary offline evidence never claims live Google capability.

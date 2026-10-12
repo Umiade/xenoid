@@ -9,6 +9,11 @@ All notable changes to Xenoid are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-12
+
+Reliability hardening across convergence, recovery paths, and the engine
+host, plus host Python 3.9 compatibility.
+
 ### Added
 
 - `xenoid --instance <name> delete`: irreversibly deletes the
@@ -20,6 +25,43 @@ All notable changes to Xenoid are documented here. The format follows
   ownership labels do not match the lease, always retains shared runtime
   images and engine-host protection, is idempotent across interruptions,
   and supports `--dry-run` to report the plan without mutating.
+
+### Fixed
+
+- All host entrypoints import and run on the stock Python 3.9
+  interpreter again; a new contract gate pins the declared floor.
+- `xenoid up` self-heals the control plane after an out-of-band
+  container restart (root helper, adbd port, daemon bootstrap, proxy
+  epoch) instead of failing acceptance; `xenoid status` reports
+  `control_plane_restart_required` in that state.
+- Read-only commands and MCP/remote read tools no longer restart the
+  root helper or run bootstrap; recovery is an explicit `xenoid up`.
+- `xenoid delete` fails closed when the engine is unreachable instead of
+  orphaning the data volume.
+- Regeneration resume no longer risks a second SSAID-wiping reboot on a
+  transient receipt read, and an active-location read-back failure
+  reopens a real restore transaction instead of retrying to failure.
+- Proxy desired-state recovers from crash-orphaned temporary and empty
+  control files (previously wedged until manual cleanup), and the daemon
+  settings "Clear proxy" button works again.
+- Camera HAL flush/close lock-order deadlock removed.
+- The engine-host kernel module no longer probes the
+  `security_getprocattr` dispatcher: on 6.8 kernels a container process
+  reading `/proc/self/attr/apparmor/*` could panic the host. SELinux
+  label synthesis is unchanged. The module now refuses to build on
+  kernels older than 5.12.
+- Convergence journals are preserved when the protection deployment is
+  only momentarily unobservable, and the bounded child-process runner
+  honors its deadline for stdin-heavy and orphaned-grandchild cases.
+- The device-wide `android_id` is applied through SettingsProvider with
+  fail-closed read-back.
+
+### Removed
+
+- The `xenoid-ssaid` helper: it rewrote the secure settings store as
+  text, which is binary XML on Android 13. SettingsProvider is the single
+  writer, and the runtime smoke now verifies the app-scoped SSAID store
+  is preserved.
 
 ## [0.9.2] - 2026-09-18
 

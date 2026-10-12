@@ -167,8 +167,8 @@ New instances default to `microg` release `microg-0.3.15.250932-phonesky-30.4.17
 
 ./xenoid build all
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.9.2
-./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
+./xenoid package-release --version 0.9.3
+./xenoid verify-release dist/release/xenoid-0.9.3.tar.gz
 ```
 
 Detailed contracts:

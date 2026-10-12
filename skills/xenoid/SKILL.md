@@ -238,8 +238,8 @@ The remote service adds required `instance` to each instance tool. Remote `xenoi
 ./xenoid build all
 ./xenoid build all --force
 ./scripts/verify.sh --fresh
-./xenoid package-release --version 0.9.2
-./xenoid verify-release dist/release/xenoid-0.9.2.tar.gz
+./xenoid package-release --version 0.9.3
+./xenoid verify-release dist/release/xenoid-0.9.3.tar.gz
 ```
 
 Normal builds reuse content-addressed records; force requires deterministic output for unchanged inputs. Runtime images are published under content-derived tags from immutable base/artifact/tool/Google identities, with a separate boot-compatible daemon seed digest. Release packaging runs fresh non-recursive gates, snapshots validated artifacts, produces canonical archives under `SOURCE_DATE_EPOCH`, and verifies the candidate before publication. Packaged `doctor.json` is offline evidence with `complete=false`.
