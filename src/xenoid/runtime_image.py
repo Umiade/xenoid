@@ -365,14 +365,14 @@ class RuntimeImageError(RuntimeError):
         self.code = code
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class _RunResult:
     returncode: int
     stdout: bytes
     stderr: bytes
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class _BaseImage:
     reference: str
     image_id: str
@@ -380,7 +380,7 @@ class _BaseImage:
     architecture: str
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class _PreparedInput:
     public: Mapping[str, Any]
     snapshot: ArtifactSnapshot

@@ -94,7 +94,7 @@ class ArtifactError(RuntimeError):
         self.code = code
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class OutputSpec:
     path: str
     mode: int
@@ -113,7 +113,7 @@ class OutputSpec:
         _normalize_elf_type(self.elf_type)
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class BuildTarget:
     name: str
     command: tuple[str, ...]
@@ -150,7 +150,7 @@ class BuildTarget:
             raise ValueError("artifact_environment_duplicate")
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class ArtifactOutput:
     path: str
     mode: int
@@ -166,7 +166,7 @@ class ArtifactOutput:
         }
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class ArtifactRecord:
     target: str
     input_sha256: str
@@ -185,7 +185,7 @@ class ArtifactRecord:
         }
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class ArtifactSnapshot:
     targets: tuple[str, ...]
     records: tuple[ArtifactRecord, ...]
@@ -585,7 +585,7 @@ CONSUMER_TARGETS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 )
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass()
 class _RunResult:
     returncode: int
     stdout_tail: bytes

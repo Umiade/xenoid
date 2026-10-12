@@ -193,6 +193,17 @@ _CONTRACTS = (
             "CHANGELOG_CN.md",
         ),
     ),
+    _py(
+        "python-compat-contract",
+        "scripts/test-python-compat.py",
+        inputs=(
+            "scripts/test-python-compat.py",
+            "src/xenoid/**/*.py",
+            "scripts/*.py",
+            "pyproject.toml",
+            "setup.py",
+        ),
+    ),
     _py("bootstrap-contract", "scripts/test-bootstrap-contract.py"),
     _py("proxy-instance-contract", "scripts/test-proxy.py"),
     _py(

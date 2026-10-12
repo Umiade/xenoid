@@ -389,7 +389,7 @@ def _normalize_deploy_components(raw: Any) -> Mapping[str, str] | None:
     return MappingProxyType(clean)
 
 
-@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+@dataclasses.dataclass(frozen=True)
 class ConvergencePlan:
     resolution: str
     artifact_targets: tuple[str, ...] = ()
@@ -1326,7 +1326,7 @@ class ConvergencePlanner:
         raise ConvergenceError("convergence_observation_invalid")
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass()
 class _Progress:
     callback: Callable[[Mapping[str, Any]], Any] | None
     phases: list[dict[str, Any]] = dataclasses.field(default_factory=list)
