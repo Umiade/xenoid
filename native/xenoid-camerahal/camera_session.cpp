@@ -786,7 +786,18 @@ ScopedAStatus CameraSession::flush() {
             return halError(Status::INTERNAL_ERROR, "camera session is closed");
         }
 
+        // Re-check the drain under both locks, acquired in the canonical
+        // submissionMutex -> mutex order that shutdown() also uses. Never take
+        // submissionMutex while already holding mutex: that reversed order
+        // deadlocks a concurrent close()/shutdown() (ABBA) and leaves the
+        // camera permanently in use. Release mutex first, then reacquire both.
+        lock.unlock();
         submissionLock.lock();
+        lock.lock();
+        if (impl_->state == Impl::State::Closed) {
+            submissionLock.unlock();
+            return halError(Status::INTERNAL_ERROR, "camera session is closed");
+        }
         if (impl_->activeSubmissions.load(std::memory_order_acquire) != 0 ||
                 impl_->inFlight || !impl_->queue.empty()) {
             submissionLock.unlock();
