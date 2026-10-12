@@ -1021,9 +1021,17 @@ final class ProxyStateStore {
                 Metadata metadata = filesystem.lstat(control);
                 if (!metadata.exists) continue;
                 if (!metadata.regular || metadata.symbolic || metadata.uid != filesystem.ownerUid()
-                        || metadata.linkCount != 1 || metadata.size <= 0
+                        || metadata.linkCount != 1
                         || metadata.size > MAX_PENDING_BYTES) {
                     throw invalid();
+                }
+                if (metadata.size == 0) {
+                    // A control created O_EXCL but killed before its first write
+                    // has no bytes to preserve as evidence; it is an empty crash
+                    // orphan. Remove it so recovery proceeds instead of wedging
+                    // both recoverImport and clear --discard-unreadable-state.
+                    filesystem.delete(control);
+                    continue;
                 }
                 byte[] raw = filesystem.read(control, MAX_PENDING_BYTES);
                 try {
@@ -1198,6 +1206,37 @@ final class ProxyStateStore {
         ensureDirectory(stateDirectory, true);
         ensureDirectory(evidenceDirectory, true);
         ensureDirectory(quarantineDirectory, true);
+        sweepStaleTemporaries();
+    }
+
+    // replace() writes a randomly named ".<name>.<24hex>.tmp" sibling then
+    // renames it; writeNew() deliberately keeps a content-synced temp if the
+    // directory fsync fails. A crash or fsync failure can therefore orphan a
+    // temp file, and the strict root whitelist (validateRootEntries) plus the
+    // empty-object-dir check (v2ObjectDirectoriesEmpty) would then reject every
+    // load forever. Because load and all mutations are synchronized on this
+    // store, no temp can belong to an in-flight operation here, so any temp
+    // present is a crash orphan and is safe to remove. Only owned, regular,
+    // non-symlink files matching the exact temp shape are swept; anything else
+    // is left for the strict validators to fail closed on.
+    private static final java.util.regex.Pattern STALE_TEMP =
+            java.util.regex.Pattern.compile("^\\..+\\.[0-9a-f]{24}\\.tmp$");
+
+    private void sweepStaleTemporaries() throws Exception {
+        File[] directories = {
+            rootDirectory, keyDirectory, stateDirectory, evidenceDirectory, quarantineDirectory,
+        };
+        for (File directory : directories) {
+            for (String name : boundedList(directory)) {
+                if (!STALE_TEMP.matcher(name).matches()) continue;
+                File candidate = new File(directory, name);
+                Metadata metadata = filesystem.lstat(candidate);
+                if (metadata.exists && metadata.regular && !metadata.symbolic
+                        && metadata.uid == filesystem.ownerUid()) {
+                    filesystem.delete(candidate);
+                }
+            }
+        }
     }
 
     private void ensureDirectory(File directory, boolean create) throws Exception {

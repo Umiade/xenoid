@@ -762,7 +762,12 @@ public class MainActivity extends Activity {
                         "The proxy could not be cleared. The previous proxy state is unchanged.",
                         new ProxyOperation() {
                             @Override public Map<String,Object> run() {
-                                return proxyRequest("POST", "/proxy/clear", "{}",
+                                // /proxy/clear requires exactly the
+                                // discardUnreadableState key; an empty object is
+                                // rejected as invalid_request_schema. The UI
+                                // button is the ordinary (non-discarding) clear.
+                                return proxyRequest("POST", "/proxy/clear",
+                                        "{\"discardUnreadableState\":false}",
                                         PROXY_MUTATION_TIMEOUT_MS);
                             }
                         }, null);

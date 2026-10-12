@@ -399,6 +399,31 @@ public final class ProxyStateStoreTest {
     }
 
     @Test
+    public void staleTemporaryIsSweptSoLoadSucceeds() throws Exception {
+        Fixture fixture = configuredFixture();
+        File orphanTemp = new File(
+                fixture.root(),
+                "." + ProxyStateStore.ACTIVE_NAME + "." + repeat('a', 24) + ".tmp");
+        fixture.fs.putFile(orphanTemp, "partial".getBytes(StandardCharsets.UTF_8),
+                0600, fixture.fs.ownerUid());
+        assertState(fixture.restart().load(), 1, true, FIRST);
+        assertFalse(fixture.fs.exists(orphanTemp));
+        assertState(fixture.store.update(INSTANCE, false, SECOND), 2, false, SECOND);
+    }
+
+    @Test
+    public void zeroByteControlIsRemovedSoDiscardProceeds() throws Exception {
+        Fixture fixture = configuredFixture();
+        fixture.fs.replaceRaw(fixture.activeFile(), new byte[0], 0600, fixture.fs.ownerUid());
+        ProxyStateStore.LoadedState cleared = fixture.restart().clear(INSTANCE, true);
+        assertFalse(cleared.enabled);
+        assertNull(cleared.source);
+        assertTrue(cleared.generation >= 0);
+        // The empty orphan no longer wedges recovery: the cleared state reloads.
+        assertFalse(fixture.restart().load().enabled);
+    }
+
+    @Test
     public void recoveryCrashAfterControlDeletionPreservesGenerationFloor()
             throws Exception {
         Fixture fixture = configuredFixture();
