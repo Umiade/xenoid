@@ -60,7 +60,10 @@ fi
 
 write_data_file() {
   # write_data_file <image-path> <content>
-  stage="/tmp/.xenoid-seed-\$\$"
+  # mktemp creates the staging file O_EXCL with a random name and mode 0600, so
+  # a predictable name in the shared engine-host /tmp cannot be pre-created as a
+  # symlink to redirect this root write.
+  stage="\$(mktemp "\${TMPDIR:-/tmp}/xenoid-seed.XXXXXXXX")"
   printf '%s\n' "\$2" > "\$stage"
   debugfs -w -R "rm \$1" "\$data" >/dev/null 2>&1 || true
   debugfs -w -R "write \$stage \$1" "\$data" >/dev/null 2>&1 ||
