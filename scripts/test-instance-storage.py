@@ -152,6 +152,11 @@ class FakeRuntime(backend.RuntimeManager):
             value = None
         return value, subprocess.CompletedProcess([], 0 if value is not None else 1, "", "")
 
+    def engine_reachable(self) -> bool:
+        # The in-memory fake models a reachable engine; the real probe would
+        # otherwise shell out to docker version.
+        return True
+
     def ensure_volume(self) -> dict[str, Any]:
         existing = self.volumes.get(self.lease.volume_name)
         if existing is not None:

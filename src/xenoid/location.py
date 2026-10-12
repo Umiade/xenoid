@@ -440,6 +440,39 @@ class LocationStateStore:
         }
         return self._write(state), True
 
+    def reopen_active_transaction(self) -> dict[str, Any]:
+        """Re-stage the current active country as a fresh pending transaction.
+
+        ``set_desired`` deliberately no-ops when the requested country already
+        equals the active country with no pending, so it cannot escalate a
+        failed active-country read-back back into the crash-safe recreate path.
+        This re-opens the active country's existing cached profile entry (same
+        SIM epoch, same identity) as a new pending transaction, so the identity
+        is re-converged without rotating the SIM or deriving a new identity.
+        """
+        state = self.load()
+        if state is None:
+            raise LocationError("location_state_missing")
+        active = state["active"]
+        if not isinstance(active, dict):
+            raise LocationError("location_identity_unverified")
+        target = active["country"]
+        entry = state["profiles"].get(target)
+        if entry is None:
+            raise LocationError("location_state_invalid")
+        state = dict(state)
+        state["desiredCountry"] = target
+        state["pending"] = {
+            "country": target,
+            "profileDigest": entry["profileDigest"],
+            "phase": "new",
+            "stagedRuntimeEpoch": "",
+            "restartFromEpoch": "",
+            "restartCompletedEpoch": "",
+            "createdAt": int(time.time()),
+        }
+        return self._write(state)
+
     def regeneration_target(self, sim_epoch: str) -> dict[str, Any]:
         """Derive, without mutation, the profile pinned by a regeneration.
 

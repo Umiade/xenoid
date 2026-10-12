@@ -4129,6 +4129,14 @@ cat >/dev/null
         self.ensure_instance_lease()
         if which("docker") is None:
             return {"ok": False, "error": "docker not found"}
+        # docker inspect returning non-zero is indistinguishable between "no such
+        # object" and "engine unreachable". If the engine is down, every inspect
+        # below would read as absent, the owned container/volume/network would be
+        # silently skipped, and the caller would then drop the operator records,
+        # orphaning the data volume with no way to reclaim it. Require a reachable
+        # engine so a missing object genuinely means absent.
+        if not self.engine_reachable():
+            return {"ok": False, "error": "engine_unavailable"}
         container, error = self._owned_container_record()
         if container is None and error != "instance container does not exist":
             return {"ok": False, "error": "resource_conflict", "message": error}

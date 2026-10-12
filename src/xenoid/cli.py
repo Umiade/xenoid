@@ -2032,7 +2032,7 @@ def _location_converge(
                 active = state.get("active")
                 if not isinstance(active, Mapping):
                     raise LocationError(_location_error_code(verified, "location_identity_unverified"))
-                store.set_desired(str(active["country"]))
+                store.reopen_active_transaction()
                 continue
             verify_code = _location_error_code(verified, "location_identity_unverified")
             if verify_code in _LOCATION_REPAIRABLE_CODES and repair_if_possible():
@@ -3600,7 +3600,14 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
                 raise LocationError("location_phase_invalid")
             completed_userspace = state["restartCompletedUserspaceEpoch"]
             requested_userspace = state["restartRequestedUserspaceEpoch"]
-            if completed_userspace or requested_userspace:
+            if completed_userspace:
+                # The journal already records a completed restart. That is the
+                # single authoritative fact for exactly-once: a momentarily
+                # unreadable rootd receipt (for example a transient docker exec
+                # failure) must never downgrade this to "not restarted" and
+                # trigger a second destructive reboot that re-wipes SSAIDs.
+                restart_observed = True
+            elif requested_userspace:
                 current_userspace_epoch = manager._userspace_runtime_epoch()
                 if current_userspace_epoch is None:
                     return _regeneration_result(
@@ -3609,17 +3616,8 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
                 receipt = manager.regeneration_restart_receipt(
                     str(state["transactionId"])
                 )
-                if receipt.get("ok") is True and completed_userspace:
-                    # A journaled completion epoch plus the rootd receipt
-                    # prove the restart already ran exactly once. A later
-                    # userspace epoch drift (spontaneous zygote restart) is
-                    # still that same completed restart: never restart a
-                    # second time, never re-wipe SSAIDs.
-                    restart_observed = True
-                elif (
+                if (
                     receipt.get("ok") is True
-                    and not completed_userspace
-                    and requested_userspace
                     and requested_userspace != current_userspace_epoch
                 ):
                     # The rootd receipt proves the delete+RIL+zygote command
