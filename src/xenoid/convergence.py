@@ -1186,6 +1186,26 @@ class ConvergencePlanner:
                 raise ConvergenceError("google_services_release_retired")
             raise ConvergenceError("convergence_image_input_unavailable")
 
+        # An out-of-band container restart keeps the container ID and leaves it
+        # running, so the plan would otherwise be a bare reuse, but adbd, the
+        # host rootd process, the daemon bootstrap, and the proxy engine epoch
+        # are all stale. The observation marks the control plane not ready when
+        # the running container's StartedAt no longer matches the last accepted
+        # marker; re-run the idempotent start path (which re-asserts adb/adbd/
+        # daemon transport) so the following control-plane phase can rebuild
+        # rootd and bootstrap. Absent observation (older callers) stays reuse.
+        control_plane = observation.get("controlPlane")
+        control_plane_ready = (
+            not isinstance(control_plane, Mapping)
+            or control_plane.get("ready") is True
+        )
+        if (
+            runtime_state == "running"
+            and runtime_action == "reuse"
+            and not control_plane_ready
+        ):
+            runtime_action = "restart"
+
         runtime_hides_live = runtime_action != "reuse"
         if runtime_hides_live:
             daemon_action = "inspect"
@@ -2127,6 +2147,17 @@ class ConvergenceExecutor:
         if accepted.get("ok") is not True:
             code = _safe_code(accepted.get("errorCode"), "live_acceptance_failed")
             raise ConvergenceError(code, phase="accepted")
+        # The control plane (adb/adbd transport, rootd, daemon bootstrap) is now
+        # accepted for this exact container instantiation. Record its StartedAt
+        # so a healthy repeated up stays a no-op, while an out-of-band restart
+        # (new StartedAt) re-triggers the idempotent recovery. Best-effort: a
+        # failed write only costs one redundant recovery next time.
+        recorder = getattr(self.manager, "record_control_plane_ready", None)
+        if callable(recorder):
+            try:
+                recorder()
+            except Exception:
+                pass
         if journal_state is not None:
             if "accepted" not in completed:
                 journal_state = self.journal.advance("accepted")

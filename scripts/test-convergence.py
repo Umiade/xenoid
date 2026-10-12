@@ -323,6 +323,11 @@ def artifact_record(target: str = "daemon") -> dict[str, Any]:
 def healthy_snapshot() -> dict[str, Any]:
     return {
         "instanceId": INSTANCE_ID,
+        "controlPlane": {
+            "ready": True,
+            "observedStartedAt": "2026-01-01T00:00:00.000000000Z",
+            "recordedStartedAt": "2026-01-01T00:00:00.000000000Z",
+        },
         "artifactTargets": [],
         "artifactRecords": [artifact_record()],
         "desiredImageInputSha256": INPUT_DIGEST,
@@ -331,6 +336,7 @@ def healthy_snapshot() -> dict[str, Any]:
         "runtime": {
             "state": "running",
             "containerId": OLD_CONTAINER,
+            "startedAt": "2026-01-01T00:00:00.000000000Z",
             "ownershipValid": True,
             "integrationIdentityValid": True,
             "storageValid": True,
@@ -1343,6 +1349,30 @@ def canonical_plan_and_digest() -> None:
     invalid = dict(payload)
     invalid["unknown"] = True
     expect_error(lambda: convergence.ConvergencePlan.from_dict(invalid))
+
+
+@case("controlPlaneRestartTriggersStartPath")
+def control_plane_restart_triggers_start_path() -> None:
+    # An out-of-band container restart keeps the container running with the same
+    # ID but a new StartedAt, so observation marks the control plane not ready.
+    # The planner must re-run the idempotent start path (not a bare reuse) so
+    # rootd/adbd/bootstrap are rebuilt, and must recommend "start".
+    stale = healthy_snapshot()
+    stale["controlPlane"] = {
+        "ready": False,
+        "observedStartedAt": "2026-02-02T00:00:00.000000000Z",
+        "recordedStartedAt": "2026-01-01T00:00:00.000000000Z",
+    }
+    stale["runtime"]["startedAt"] = "2026-02-02T00:00:00.000000000Z"
+    plan = planner_for(stale)
+    require(plan.runtime_action == "restart", "stale control plane did not re-run the start path")
+    require(
+        convergence.recommended_action(plan) == "start",
+        "stale control plane not recommended as start",
+    )
+    # A ready control plane on the same running container stays a no-op reuse.
+    ready = healthy_snapshot()
+    require(planner_for(ready).runtime_action == "reuse", "ready control plane not reused")
 
 
 @case("minimumActionMatrixAndPrecedence")

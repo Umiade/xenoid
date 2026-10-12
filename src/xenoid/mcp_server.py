@@ -631,6 +631,26 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
         require_bootstrap()
         return ProxyController(context, cfg, runtime.lease, mgr, dc)
 
+    def require_transport() -> None:
+        # Read tools are strictly observational: they establish the read
+        # transport (adb forward + public transport readiness) but never run
+        # the bootstrap sequence, so a read never restarts rootd, relaunches the
+        # Activity, or reconciles components. Recovery is an explicit xenoid_up.
+        forwarded = mgr.forward_daemon_port(timeout=5.0)
+        if not isinstance(forwarded, dict) or forwarded.get("ok") is not True:
+            raise InstanceError("daemon_unreachable", "daemon_unreachable")
+        transport = dc.transport(timeout=5.0)
+        if not isinstance(transport, dict) or transport.get("transportReady") is not True:
+            raise InstanceError("daemon_unreachable", "daemon_unreachable")
+
+    def rdc() -> DaemonClient:
+        require_transport()
+        return dc
+
+    def rpc() -> ProxyController:
+        require_transport()
+        return ProxyController(context, cfg, runtime.lease, mgr, dc)
+
     if name == "xenoid_verify_release":
         script = context.project_root / "scripts" / "verify-release.py"
         proc = run_bounded(
@@ -839,9 +859,9 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
             "proxyConverged": proxy,
         })
     if name == "xenoid_proxy_status":
-        return proxy_text_result(lambda: epc().status())
+        return proxy_text_result(lambda: rpc().status())
     if name == "xenoid_proxy_check":
-        return proxy_text_result(lambda: epc().status(check=True))
+        return proxy_text_result(lambda: rpc().status(check=True))
     if name == "xenoid_proxy_on":
         return proxy_text_result(lambda: epc().set_enabled(True))
     if name == "xenoid_proxy_off":
@@ -889,7 +909,7 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
             })
         return _location_result(runtime, country.strip())
     if name == "xenoid_root_status":
-        return text_result(edc().root_status())
+        return text_result(rdc().root_status())
     if name == "xenoid_root_exec":
         return text_result(edc().root_exec(str(args["command"])))
     if name == "xenoid_frida_install":
@@ -916,7 +936,7 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_frida_stop":
         return text_result(edc().frida_stop())
     if name == "xenoid_frida_status":
-        return text_result(edc().frida_status())
+        return text_result(rdc().frida_status())
     if name == "xenoid_input_deploy":
         return text_result(mgr.deploy_input_helper(str(args["path"]), str(args.get("remotePath") or "/data/local/tmp/xenoid-input")))
     if name == "xenoid_input_tap":
@@ -926,13 +946,13 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_profile_deploy_helper":
         return text_result(mgr.deploy_profile_helper(str(args["path"]), str(args.get("remotePath") or "/data/local/tmp/xenoid-profile-helper")))
     if name == "xenoid_profile_helper_status":
-        return text_result(edc().profile_helper_status())
+        return text_result(rdc().profile_helper_status())
     if name == "xenoid_profile_helper_env":
-        return text_result(edc().profile_helper_env())
+        return text_result(rdc().profile_helper_env())
     if name == "xenoid_profile_helper_dump":
-        return text_result(edc().profile_helper_dump())
+        return text_result(rdc().profile_helper_dump())
     if name == "xenoid_device_collect":
-        return text_result(edc().collect_fingerprint())
+        return text_result(rdc().collect_fingerprint())
     if name == "xenoid_device_apply":
         client = edc()
         return text_result(converge_instance_identity(
@@ -991,7 +1011,7 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_hide_deploy":
         return text_result(mgr.deploy_hide_helper(str(args["path"]), str(args.get("remotePath") or "/data/local/tmp/xenoid-hide-helper")))
     if name == "xenoid_hide_status":
-        return text_result(edc().hide_status())
+        return text_result(rdc().hide_status())
     if name == "xenoid_hide_overlay_status":
         return text_result(mgr.overlay_status())
     if name == "xenoid_hide_cleanup_overlay":
@@ -1037,7 +1057,7 @@ def call_tool(runtime: MCPRuntime, name: str, args: dict[str, Any]) -> Any:
     if name == "xenoid_ota_install_bundle":
         return text_result(mgr.apply_ota_bundle(str(args["bundle"])))
     if name == "xenoid_ota_check":
-        return text_result(edc().ota_check())
+        return text_result(rdc().ota_check())
     if name == "xenoid_ota_apply":
         return text_result(edc().ota_apply(str(args.get("channel") or "stable")))
     raise ValueError(f"unknown tool: {name}")

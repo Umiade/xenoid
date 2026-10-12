@@ -990,6 +990,25 @@ def bootstrap_client(args: argparse.Namespace) -> DaemonClient:
     return daemon(args, manager)
 
 
+def transport_client(args: argparse.Namespace) -> DaemonClient:
+    """Read-only daemon client: establish the read transport but never repair.
+
+    Status reads are strictly observational. They set up the adb port forward
+    and confirm public transport readiness, but never run the bootstrap
+    sequence, so a read never restarts rootd, relaunches the Activity, or
+    reconciles components. Recovery is an explicit `xenoid up`.
+    """
+    manager = runtime(args)
+    forwarded = manager.forward_daemon_port(timeout=5.0)
+    if not isinstance(forwarded, dict) or forwarded.get("ok") is not True:
+        raise InstanceError("daemon_unreachable", "daemon_unreachable")
+    client = daemon(args, manager)
+    transport = client.transport(timeout=5.0)
+    if not isinstance(transport, dict) or transport.get("transportReady") is not True:
+        raise InstanceError("daemon_unreachable", "daemon_unreachable")
+    return client
+
+
 def cmd_daemon_ensure(args: argparse.Namespace) -> int:
     mgr = runtime(args)
     bootstrap = mgr.reconcile_bootstrap()
@@ -2223,7 +2242,7 @@ def cmd_cellular_status(args: argparse.Namespace) -> int:
 
 
 def cmd_root_status(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).root_status()
+    result = transport_client(args).root_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2282,7 +2301,7 @@ def cmd_frida_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_frida_status(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).frida_status()
+    result = transport_client(args).frida_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -2295,25 +2314,25 @@ def cmd_profile_deploy_helper(args: argparse.Namespace) -> int:
 
 
 def cmd_profile_helper_status(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).profile_helper_status()
+    result = transport_client(args).profile_helper_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_profile_helper_env(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).profile_helper_env()
+    result = transport_client(args).profile_helper_env()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_profile_helper_dump(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).profile_helper_dump()
+    result = transport_client(args).profile_helper_dump()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
 
 def cmd_device_collect(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).collect_fingerprint()
+    result = transport_client(args).collect_fingerprint()
     if args.out and result.get("ok", True):
         write_json_file(args.out, result)
     print_json(result)
@@ -3956,7 +3975,7 @@ def cmd_hide_cleanup_overlay(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 def cmd_hide_status(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).hide_status()
+    result = transport_client(args).hide_status()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 
@@ -3981,7 +4000,7 @@ def cmd_ota_install_bundle(args: argparse.Namespace) -> int:
 
 
 def cmd_ota_check(args: argparse.Namespace) -> int:
-    result = bootstrap_client(args).ota_check()
+    result = transport_client(args).ota_check()
     print_json(result)
     return 0 if result.get("ok", False) else 1
 

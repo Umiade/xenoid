@@ -105,6 +105,8 @@ _ROOTD_LEGACY_PATH = "/data/local/tmp/.netd-helper"
 _ROOTD_RUN_DIRECTORY = "/data/local/tmp/xenoid-rootd-run"
 _ROOTD_PROCESS_RECORD = f"{_ROOTD_RUN_DIRECTORY}/process.json"
 _REGENERATION_RESTART_RECEIPT = "/data/local/tmp/xenoid-profile/regeneration_restart_receipt"
+_CONTROL_PLANE_RECORD = "control-plane-v1.json"
+_CONTROL_PLANE_SCHEMA = "dev.xenoid.control-plane/v1"
 _ROOTD_PROCESS_SCHEMA = "dev.xenoid.rootd-process/v1"
 _DAEMON_RUNTIME_PERMISSIONS = (
     "android.permission.ACCESS_COARSE_LOCATION",
@@ -7018,6 +7020,7 @@ cat >/dev/null
         image_boot: Optional[str] = None
         create_spec: Optional[bool] = None
         integration_valid = True
+        started_at: Optional[str] = None
         if container is not None:
             container_id = str(container.get("Id") or "") or None
             image_id = str(container.get("Image") or "") or None
@@ -7028,6 +7031,8 @@ cat >/dev/null
                 and runtime_state.get("Running") is True
                 else "stopped"
             )
+            if isinstance(runtime_state, Mapping):
+                started_at = str(runtime_state.get("StartedAt") or "") or None
             create_spec = self._container_matches_lease(
                 container,
                 image_identity={"ok": True},
@@ -7294,9 +7299,27 @@ cat >/dev/null
             else "unknown"
         )
         pending = self._observe_pending_operations()
+        control_plane_record = self._read_control_plane_record()
+        control_plane_ready = bool(
+            state == "running"
+            and container_id is not None
+            and started_at is not None
+            and isinstance(control_plane_record, Mapping)
+            and control_plane_record.get("containerId") == container_id
+            and control_plane_record.get("startedAt") == started_at
+        )
         return {
             "schema": "dev.xenoid.convergence-observation/v1",
             "instanceId": self.context.instance_id,
+            "controlPlane": {
+                "ready": control_plane_ready,
+                "observedStartedAt": started_at,
+                "recordedStartedAt": (
+                    control_plane_record.get("startedAt")
+                    if isinstance(control_plane_record, Mapping)
+                    else None
+                ),
+            },
             "skipBuild": bool(skip_build),
             "artifactTargets": artifact_targets,
             "artifactRecords": artifact_records,
@@ -7316,6 +7339,7 @@ cat >/dev/null
                 "state": state,
                 "containerId": container_id,
                 "imageId": image_id,
+                "startedAt": started_at,
                 "ownershipValid": ownership_valid,
                 "integrationIdentityValid": integration_valid,
                 "storageValid": (
@@ -8122,6 +8146,13 @@ cat >/dev/null
         elif runtime.get("state") == "stopped":
             recommended = "start"
             drift.append("container_stopped")
+        elif (
+            runtime.get("state") == "running"
+            and isinstance(observation.get("controlPlane"), Mapping)
+            and observation["controlPlane"].get("ready") is False
+        ):
+            recommended = "start"
+            drift.append("control_plane_restart_required")
         elif components["daemon"].get("state") == "incompatible":
             recommended = "daemon-incompatible"
             drift.append("daemon_identity_incompatible")
@@ -11172,6 +11203,84 @@ cat >/dev/null
             value = action.get("action") or action.get("state") or action.get("step")
             return str(value) if isinstance(value, str) else ""
         return ""
+
+    def _control_plane_record_path(self) -> Path:
+        return self.context.state_root / _CONTROL_PLANE_RECORD
+
+    def _read_control_plane_record(self) -> Optional[dict[str, Any]]:
+        """Return the last accepted control-plane marker, or None.
+
+        The marker binds the container ID and its ``State.StartedAt`` at the
+        time the control plane (rootd, daemon bootstrap, adb transport) was last
+        fully accepted. A mismatch means the container was (re)started since,
+        so rootd/adbd/bootstrap must be re-established.
+        """
+        try:
+            raw = json.loads(self._control_plane_record_path().read_text())
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema") != _CONTROL_PLANE_SCHEMA
+            or not isinstance(raw.get("containerId"), str)
+            or not isinstance(raw.get("startedAt"), str)
+        ):
+            return None
+        return raw
+
+    def record_control_plane_ready(self) -> dict[str, Any]:
+        """Persist the accepted control-plane marker for the running container.
+
+        Best-effort: a failed write only means the next ``up`` re-runs the
+        idempotent control-plane recovery, never an incorrect skip.
+        """
+        container, _ = self._owned_container_record()
+        if container is None:
+            return {"ok": False, "error": "instance container does not exist"}
+        container_id = str(container.get("Id") or "")
+        runtime_state = container.get("State")
+        started_at = (
+            str(runtime_state.get("StartedAt") or "")
+            if isinstance(runtime_state, Mapping)
+            else ""
+        )
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+            or runtime_state is None
+            or runtime_state.get("Running") is not True
+            or not started_at
+        ):
+            return {"ok": False, "error": "control_plane_runtime_not_running"}
+        payload = (
+            json.dumps(
+                {
+                    "schema": _CONTROL_PLANE_SCHEMA,
+                    "containerId": container_id,
+                    "startedAt": started_at,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        try:
+            self.context.state_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+            path = self._control_plane_record_path()
+            fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=self.context.state_root)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb", closefd=True) as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        except OSError as exc:
+            return {"ok": False, "error": "control_plane_record_write_failed", "detail": str(exc)[:200]}
+        return {"ok": True, "containerId": container_id, "startedAt": started_at}
 
     def reconcile_control_plane(self) -> dict[str, Any]:
         """Run bounded bootstrap and restore the UUID-bound storage sentinel."""
