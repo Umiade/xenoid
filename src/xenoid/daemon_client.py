@@ -161,21 +161,22 @@ _PROXY_CAPABILITY_KEYS = (
 _PROXY_PROBE_TIMEOUT_MS = 45_000
 
 
-def _proxy_capabilities_match(value: Any, udp_allowed: Any) -> bool:
+def _proxy_capabilities_match(value: Any, udp_allowed: Any, ipv6_allowed: Any) -> bool:
     if (
         not isinstance(value, dict)
         or set(value) != set(_PROXY_CAPABILITY_KEYS)
         or not isinstance(udp_allowed, bool)
+        or not isinstance(ipv6_allowed, bool)
         or any(not isinstance(value[key], bool) for key in _PROXY_CAPABILITY_KEYS)
     ):
         return False
     return (
         value["v4DnsProxy"]
         and value["v4TcpProxy"]
-        and value["v6DnsProxy"]
-        and value["v6TcpProxy"]
+        and value["v6DnsProxy"] is ipv6_allowed
+        and value["v6TcpProxy"] is ipv6_allowed
         and value["v4UdpProxy"] is udp_allowed
-        and value["v6UdpProxy"] is udp_allowed
+        and value["v6UdpProxy"] is (udp_allowed and ipv6_allowed)
     )
 
 
@@ -293,6 +294,7 @@ def _validated_proxy_status(value: Any, instance_id: str) -> dict[str, Any]:
         "selectedNode",
         "udpAllowed",
         "allowInsecureHttp",
+        "ipv6Allowed",
         "quarantined",
         "checkId",
         "runtimeEpoch",
@@ -322,6 +324,7 @@ def _validated_proxy_status(value: Any, instance_id: str) -> dict[str, Any]:
             or value.get("selectedNode") is not None
             or value.get("udpAllowed") is not None
             or value.get("allowInsecureHttp") is not None
+            or value.get("ipv6Allowed") is not None
             or value.get("quarantined") is not True
             or value.get("report") is not None
             or value.get("probe") is not None
@@ -337,6 +340,7 @@ def _validated_proxy_status(value: Any, instance_id: str) -> dict[str, Any]:
         or not isinstance(value.get("configured"), bool)
         or not isinstance(value.get("udpAllowed"), bool)
         or not isinstance(value.get("allowInsecureHttp"), bool)
+        or not isinstance(value.get("ipv6Allowed"), bool)
         or not isinstance(value.get("quarantined"), bool)
         or not isinstance(value.get("selectedNode"), str)
         or len(value["selectedNode"]) > 128
@@ -356,6 +360,7 @@ def _validated_proxy_status(value: Any, instance_id: str) -> dict[str, Any]:
         or value["selectedNode"]
         or value["udpAllowed"]
         or value["allowInsecureHttp"]
+        or value["ipv6Allowed"]
     ):
         return _proxy_failure("daemon_response_invalid")
     return value
@@ -396,6 +401,7 @@ def _validated_proxy_export(value: Any, instance_id: str) -> dict[str, Any]:
             "selectedNode",
             "udpAllowed",
             "allowInsecureHttp",
+            "ipv6Allowed",
         }
         or source.get("kind")
         not in {"endpoint", "uri_list", "clash", "subscription"}
@@ -403,6 +409,7 @@ def _validated_proxy_export(value: Any, instance_id: str) -> dict[str, Any]:
         or not isinstance(source.get("selectedNode"), str)
         or not isinstance(source.get("udpAllowed"), bool)
         or not isinstance(source.get("allowInsecureHttp"), bool)
+        or not isinstance(source.get("ipv6Allowed"), bool)
     ):
         return _proxy_failure("daemon_response_invalid")
     try:
@@ -675,7 +682,8 @@ def wait_for_proxy_check(
                 or isinstance(elapsed_ms, bool)
                 or not 0 <= elapsed_ms <= _PROXY_PROBE_TIMEOUT_MS
                 or not _proxy_capabilities_match(
-                    probe.get("capabilities"), status.get("udpAllowed")
+                    probe.get("capabilities"), status.get("udpAllowed"),
+                    status.get("ipv6Allowed"),
                 )
             ):
                 return _proxy_failure("data_plane_unverified")
@@ -687,7 +695,8 @@ def wait_for_proxy_check(
             and report.get("structuralApplied") is True
             and report.get("dataPlaneVerified") is True
             and _proxy_capabilities_match(
-                report.get("capabilities"), status.get("udpAllowed")
+                report.get("capabilities"), status.get("udpAllowed"),
+                status.get("ipv6Allowed"),
             )
         )
         if core_ready:
@@ -1339,6 +1348,7 @@ class DaemonClient:
         selected_node: str = "",
         udp_allowed: bool = True,
         allow_insecure_http: bool = False,
+        ipv6_allowed: bool = True,
     ) -> dict[str, Any]:
         if (
             kind not in ("endpoint", "uri_list", "clash", "subscription")
@@ -1348,6 +1358,7 @@ class DaemonClient:
             or not isinstance(enable, bool)
             or not isinstance(udp_allowed, bool)
             or not isinstance(allow_insecure_http, bool)
+            or not isinstance(ipv6_allowed, bool)
         ):
             return _proxy_failure("invalid_request_schema")
         try:
@@ -1370,6 +1381,7 @@ class DaemonClient:
                 "selectedNode": selected_node,
                 "udpAllowed": udp_allowed,
                 "allowInsecureHttp": allow_insecure_http,
+                "ipv6Allowed": ipv6_allowed,
             },
         )
         if result.get("ok") is not True:

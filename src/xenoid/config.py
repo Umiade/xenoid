@@ -834,7 +834,7 @@ def _write_instance_transaction(
             from .location import DEFAULT_COUNTRY, LocationStateStore
 
             DeviceIdentityStore(context).initialize()
-            location_store = LocationStateStore(context.state_root)
+            location_store = LocationStateStore(context.state_root, cfg.network_dns_servers)
             location_state, _ = location_store.ensure(
                 context.instance_id,
                 DEFAULT_COUNTRY,

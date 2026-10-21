@@ -311,6 +311,7 @@ def completed_proxy_status(check_id: int = 9) -> Dict[str, Any]:
         "checkId": check_id,
         "runtimeEpoch": EPOCH,
         "udpAllowed": False,
+        "ipv6Allowed": True,
         "probe": {
             "checkId": check_id,
             "capabilities": capabilities,
@@ -337,25 +338,45 @@ def udp_capability_policy() -> None:
         "v6TcpProxy": True,
         "v6UdpProxy": False,
     }
-    require(not _proxy_capabilities_match(capabilities, True))
+    require(not _proxy_capabilities_match(capabilities, True, True))
 
     capabilities["v6UdpProxy"] = True
-    require(_proxy_capabilities_match(capabilities, True))
+    require(_proxy_capabilities_match(capabilities, True, True))
 
     capabilities["v6TcpProxy"] = False
-    require(not _proxy_capabilities_match(capabilities, True))
+    require(not _proxy_capabilities_match(capabilities, True, True))
     capabilities["v6TcpProxy"] = True
 
     capabilities["v4UdpProxy"] = False
-    require(not _proxy_capabilities_match(capabilities, True))
-    require(not _proxy_capabilities_match(capabilities, False))
+    require(not _proxy_capabilities_match(capabilities, True, True))
+    require(not _proxy_capabilities_match(capabilities, False, True))
 
     capabilities["v6UdpProxy"] = False
-    require(_proxy_capabilities_match(capabilities, False))
+    require(_proxy_capabilities_match(capabilities, False, True))
 
     capabilities["v4UdpProxy"] = True
     capabilities["v6UdpProxy"] = "false"
-    require(not _proxy_capabilities_match(capabilities, True))
+    require(not _proxy_capabilities_match(capabilities, True, True))
+
+    # IPv4-only mode: IPv6 capabilities must be absent-and-blocked, and the
+    # dual-stack form must conversely fail the v4-only policy.
+    capabilities = {
+        "v4DnsProxy": True,
+        "v4TcpProxy": True,
+        "v4UdpProxy": True,
+        "v6DnsProxy": False,
+        "v6TcpProxy": False,
+        "v6UdpProxy": False,
+    }
+    require(_proxy_capabilities_match(capabilities, True, False))
+    require(not _proxy_capabilities_match(capabilities, True, True))
+    require(not _proxy_capabilities_match(capabilities, False, False))
+    capabilities["v6DnsProxy"] = True
+    require(not _proxy_capabilities_match(capabilities, True, False))
+    capabilities["v6DnsProxy"] = False
+    capabilities["v4UdpProxy"] = False
+    require(_proxy_capabilities_match(capabilities, False, False))
+    require(not _proxy_capabilities_match(capabilities, False, True))
 
 
 class PendingCheckDaemon:

@@ -664,6 +664,7 @@ def daemon_proxy_desired_survives_update() -> None:
                         "selectedNode": "",
                         "udpAllowed": True,
                         "allowInsecureHttp": False,
+                        "ipv6Allowed": True,
                     },
                 }
 
@@ -677,6 +678,7 @@ def daemon_proxy_desired_survives_update() -> None:
                 selected_node: str,
                 udp_allowed: bool,
                 allow_insecure_http: bool,
+                ipv6_allowed: bool,
             ) -> dict[str, Any]:
                 restored_calls.append(
                     (
@@ -686,6 +688,7 @@ def daemon_proxy_desired_survives_update() -> None:
                         selected_node,
                         udp_allowed,
                         allow_insecure_http,
+                        ipv6_allowed,
                     )
                 )
                 return {"ok": True}
@@ -699,7 +702,7 @@ def daemon_proxy_desired_survives_update() -> None:
         require(restored == {"ok": True, "restored": True})
         require(
             restored_calls
-            == [("endpoint", source_value, True, "", True, False)]
+            == [("endpoint", source_value, True, "", True, False, True)]
         )
         require(manager._pending_proxy_restore is None)
 

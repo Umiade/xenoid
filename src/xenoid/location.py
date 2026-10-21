@@ -22,7 +22,7 @@ import tempfile
 import stat
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from .cellular import (
     CellularError,
@@ -33,6 +33,7 @@ from .cellular import (
     mask_secret,
     masked_profile_summary,
     validate_profile,
+    with_dns_servers,
 )
 
 LOCATION_SCHEMA = "dev.xenoid.location-state/v2"
@@ -156,10 +157,11 @@ def _derive_seed(master_seed: bytes, country: str, sim_epoch: str = "") -> bytes
 class LocationStateStore:
     """0600 atomic host state for one instance's location transaction."""
 
-    def __init__(self, state_root: Path):
+    def __init__(self, state_root: Path, network_dns_servers: Optional[Sequence[str]] = None):
         self.root = Path(state_root)
         self.path = self.root / STATE_FILENAME
         self.legacy_path = self.root / LEGACY_STATE_FILENAME
+        self._dns_servers = tuple(network_dns_servers or ())
 
     # ------------------------------------------------------------- persistence
     def load(self) -> Optional[dict[str, Any]]:
@@ -277,8 +279,8 @@ class LocationStateStore:
                 raise LocationError("location_dataset_version_changed")
             _timestamp(entry.get("createdAt"))
             profiles[country] = dict(entry, profile=profile)
-        active = self._validate_active(raw.get("active"), profiles, sim_epoch)
         pending = self._validate_pending(raw.get("pending"), profiles)
+        active = self._validate_active(raw.get("active"), profiles, sim_epoch, pending)
         if active is None and pending is None and desired not in profiles:
             raise LocationError("location_state_invalid")
         if pending is not None and pending["country"] != desired:
@@ -294,7 +296,11 @@ class LocationStateStore:
         return state
 
     def _validate_active(
-        self, value: Any, profiles: Mapping[str, Any], current_epoch: str = "",
+        self,
+        value: Any,
+        profiles: Mapping[str, Any],
+        current_epoch: str = "",
+        pending: Optional[Mapping[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         if value is None:
             return None
@@ -310,9 +316,14 @@ class LocationStateStore:
         entry = profiles.get(country)
         if entry is None:
             raise LocationError("location_state_invalid")
-        if entry["profileDigest"] != digest and active_epoch == current_epoch:
+        if (
+            entry["profileDigest"] != digest
+            and active_epoch == current_epoch
+            and not (isinstance(pending, Mapping) and pending.get("country") == country)
+        ):
             # A digest mismatch is only tolerable for a superseded active record
-            # (its SIM epoch was rotated; the fresh pending transaction takes over).
+            # (its SIM epoch was rotated, or a fresh pending transaction for the
+            # same country — e.g. a data-call DNS sync — has taken over).
             raise LocationError("location_state_invalid")
         _timestamp(value.get("appliedAt"))
         _epoch_text(value.get("lastValidatedRuntimeEpoch"))
@@ -365,7 +376,9 @@ class LocationStateStore:
             return existing, False
         target = normalize_country(country) if country is not None else DEFAULT_COUNTRY
         master_seed = secrets.token_bytes(32)
-        profile = generate_cellular_profile(target, _derive_seed(master_seed, target, ""))
+        profile = generate_cellular_profile(
+            target, _derive_seed(master_seed, target, ""), dns_servers=list(self._dns_servers)
+        )
         now = int(time.time())
         state = {
             "schema": LOCATION_SCHEMA,
@@ -418,7 +431,8 @@ class LocationStateStore:
             # derive a fresh SIM identity for the current epoch.
             master_seed = base64.b64decode(state["masterSeed"], validate=True)
             profile = generate_cellular_profile(
-                target, _derive_seed(master_seed, target, state["simEpoch"])
+                target, _derive_seed(master_seed, target, state["simEpoch"]),
+                dns_servers=list(self._dns_servers),
             )
             entry = {
                 "country": target,
@@ -473,6 +487,45 @@ class LocationStateStore:
         }
         return self._write(state)
 
+    def sync_data_call_dns(self) -> tuple[Optional[dict[str, Any]], bool]:
+        """Open a pending transaction when the desired country's cached profile
+        no longer carries the configured instance DNS servers.
+
+        The profile's seed-derived identity (SIM, carrier, cell) is preserved;
+        only ``dataCall.dnses`` and the digest change.  A pending transaction
+        already in flight takes over as-is, so this is a no-op while one runs.
+        """
+        state = self.load()
+        if state is None:
+            return None, False
+        if state["pending"] is not None:
+            return state, False
+        target = state["desiredCountry"]
+        entry = state["profiles"].get(target)
+        if entry is None:
+            return state, False
+        configured = list(self._dns_servers)
+        if entry["profile"]["dataCall"]["dnses"] == configured:
+            return state, False
+        profile = with_dns_servers(entry["profile"], configured)
+        state = dict(state)
+        state["profiles"] = dict(state["profiles"])
+        state["profiles"][target] = {
+            **entry,
+            "profile": profile,
+            "profileDigest": profile["identityDigest"],
+        }
+        state["pending"] = {
+            "country": target,
+            "profileDigest": profile["identityDigest"],
+            "phase": "new",
+            "stagedRuntimeEpoch": "",
+            "restartFromEpoch": "",
+            "restartCompletedEpoch": "",
+            "createdAt": int(time.time()),
+        }
+        return self._write(state), True
+
     def regeneration_target(self, sim_epoch: str) -> dict[str, Any]:
         """Derive, without mutation, the profile pinned by a regeneration.
 
@@ -498,6 +551,7 @@ class LocationStateStore:
             target,
             _derive_seed(master_seed, target, sim_epoch),
             pin=pin,
+            dns_servers=list(self._dns_servers),
         )
         return {
             "simEpoch": sim_epoch,

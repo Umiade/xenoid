@@ -153,7 +153,10 @@ final class LocationIdentityManager {
             }
             try {
                 configureApn(name, numeric.substring(0, 3), numeric.substring(3), apn);
-                if (apnPresent(numeric, apn)) return state;
+                if (apnPresent(numeric, apn)) {
+                    applyDataCallDns(state);
+                    return state;
+                }
                 failure = new IllegalStateException("location_apn_verify_failed");
             } catch (Exception retryable) {
                 failure = retryable;
@@ -246,6 +249,7 @@ final class LocationIdentityManager {
         state.put("carrier", string(carrier, "name"));
         state.put("operatorNumeric", string(object(profile, "operator"), "numeric"));
         state.put("apn", string(carrier, "apn"));
+        state.put("dnses", new ArrayList<>(array(object(profile, "dataCall"), "dnses")));
         state.put("band", strictLong(cell, "band", 1));
         state.put("earfcn", strictLong(cell, "earfcn", 0));
         state.put("bandwidthKhz", strictLong(cell, "bandwidthKhz", 1));
@@ -384,7 +388,15 @@ final class LocationIdentityManager {
                 || !"IPV4V6".equals(string(dataCall, "protocol")) || strictLong(dataCall, "mtu", 1280) != 1500) {
             throw invalidProfile();
         }
-        array(dataCall, "addresses"); array(dataCall, "gateways"); array(dataCall, "dnses");
+        array(dataCall, "addresses"); array(dataCall, "gateways");
+        List<Object> dnses = array(dataCall, "dnses");
+        if (dnses.size() > 4) throw invalidProfile();
+        for (Object item : dnses) {
+            if (!(item instanceof String)
+                    || !android.util.Patterns.IP_ADDRESS.matcher((String) item).matches()) {
+                throw invalidProfile();
+            }
+        }
         List<Object> locales = array(profile, "locale");
         if (locales.isEmpty() || locales.size() > 16) throw invalidProfile();
         for (Object item : locales) if (!(item instanceof String) || !((String) item).matches("[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*")) throw invalidProfile();
@@ -572,6 +584,14 @@ final class LocationIdentityManager {
             }
             android.net.LinkProperties link = connectivity.getLinkProperties(activeNetwork);
             if (link == null || !"rmnet_data0".equals(link.getInterfaceName())) { step = "linkIface:" + (link == null ? "null" : link.getInterfaceName()); return logSurfaceFail(step); }
+            Object dnsState = state.get("dnses");
+            if (dnsState instanceof List && !((List<?>) dnsState).isEmpty()) {
+                List<String> expectedDns = new ArrayList<>();
+                for (Object item : (List<?>) dnsState) expectedDns.add(String.valueOf(item));
+                List<String> actualDns = new ArrayList<>();
+                for (java.net.InetAddress address : link.getDnsServers()) actualDns.add(address.getHostAddress());
+                if (!actualDns.equals(expectedDns)) { step = "linkDns:" + actualDns; return logSurfaceFail(step); }
+            }
             for (android.net.Network network : connectivity.getAllNetworks()) {
                 android.net.NetworkCapabilities capabilities = connectivity.getNetworkCapabilities(network);
                 if (capabilities != null
@@ -689,6 +709,31 @@ final class LocationIdentityManager {
                 new String[]{numeric, apn}, null)) {
             return cursor != null && cursor.moveToFirst();
         }
+    }
+
+    /**
+     * Publish the operator-configured data-call DNS and re-establish the data
+     * call so the vendor RIL re-reads net.dns1/net.dns2.  The properties are
+     * volatile, so this runs from the per-boot bootstrap restore; the
+     * same-value short-circuit keeps steady-state boots free of a bounce.
+     */
+    private void applyDataCallDns(Map<String, Object> state) {
+        Object raw = state.get("dnses");
+        if (!(raw instanceof List)) return;
+        List<?> dnses = (List<?>) raw;
+        if (dnses.isEmpty() || dnses.size() > 4) throw new IllegalStateException("location_state_invalid");
+        String primary = String.valueOf(dnses.get(0));
+        String secondary = dnses.size() > 1 ? String.valueOf(dnses.get(1)) : null;
+        String currentSecondary = getProperty("net.dns2");
+        if (primary.equals(getProperty("net.dns1"))
+                && (secondary == null ? currentSecondary.isEmpty() : secondary.equals(currentSecondary))) {
+            return;
+        }
+        String command = "set -eu;setprop net.dns1 " + quote(primary) + ";"
+                + (secondary != null ? "setprop net.dns2 " + quote(secondary) + ";" : "setprop net.dns2 '';")
+                + "svc data disable;sleep 2;svc data enable";
+        Map<String, Object> result = RootHelper.execRootd(command);
+        if (!Boolean.TRUE.equals(result.get("ok"))) throw new IllegalStateException("location_dns_apply_failed");
     }
 
     private static void setLocationProperties(Map<String, Object> profile, Map<String, Object> cell,
@@ -835,7 +880,8 @@ final class LocationIdentityManager {
         Map<String, Object> result = new LinkedHashMap<>();
         for (String key : new String[]{"state", "locationKey", "profileDigest",
                 "runtimeEpoch", "countryCode", "timezone", "locale", "callingCode", "carrier",
-                "operatorNumeric", "band", "earfcn", "bandwidthKhz", "imsi", "iccid", "msisdn"}) {
+                "operatorNumeric", "band", "earfcn", "bandwidthKhz", "imsi", "iccid", "msisdn",
+                "dnses"}) {
             if (state.containsKey(key)) result.put(key, state.get(key));
         }
         result.put("dataIface", "rmnet_data0");

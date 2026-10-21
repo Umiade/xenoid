@@ -9,6 +9,30 @@ All notable changes to Xenoid are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `proxy set|import|subscribe --no-ipv6`: operator-selected IPv4-only proxy
+  mode for exits without IPv6 egress. The desired state persists an
+  `ipv6Allowed` flag end to end (host CLI, daemon state store, agent,
+  engine); the engine publishes no IPv6 listeners, meters device IPv6 and
+  then drops it before any redirect or uplink path, and the data-plane
+  proof requires IPv6 to be blocked rather than functional, mirroring the
+  existing `--no-udp` semantics. Dual-stack remains the default; existing
+  persisted sources decode with IPv6 allowed.
+
+### Fixed
+
+- The instance `network_dns_servers` configuration now actually reaches the
+  Android data plane. The cellular profile's `dataCall.dnses` carries the
+  configured list, the daemon publishes it through `net.dns1`/`net.dns2` and
+  re-establishes the data call on every boot, and location verification
+  reads back the effective `LinkProperties` DNS. Previously the value only
+  fed Docker's `--dns`, which never surfaces inside the Android mount
+  namespace, so the vendor RIL always fell back to `1.1.1.1`/`8.8.8.8`.
+  Host observation opens a pending location transaction when the cached
+  profile's DNS list drifts from the configuration, so existing instances
+  converge (one container recreate) on the next `./xenoid up`.
+
 ## [0.9.3] - 2026-10-12
 
 Reliability hardening across convergence, recovery paths, and the engine

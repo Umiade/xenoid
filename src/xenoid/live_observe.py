@@ -791,9 +791,10 @@ class LiveAcceptance:
                 "v4DnsProxy": True,
                 "v4TcpProxy": True,
                 "v4UdpProxy": status.get("udpAllowed") is True,
-                "v6DnsProxy": True,
-                "v6TcpProxy": True,
-                "v6UdpProxy": status.get("udpAllowed") is True,
+                "v6DnsProxy": status.get("ipv6Allowed") is True,
+                "v6TcpProxy": status.get("ipv6Allowed") is True,
+                "v6UdpProxy": status.get("udpAllowed") is True
+                and status.get("ipv6Allowed") is True,
             }
             capability_proof = (
                 report_capabilities == expected_capabilities

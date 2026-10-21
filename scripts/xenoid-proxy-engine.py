@@ -288,6 +288,12 @@ def owner(m,create=True):
  if create and any(resource.get("scope")=="epoch-temporary" for resource in o["resources"]):recover_epoch_transaction(m,o)
  if m["generation"]<o["manifestGeneration"]:raise Error("generation_stale")
  if not create and (m["generation"]!=o["manifestGeneration"] or m["manifestDigest"]!=o["manifestDigest"]):raise Error("ownership_mismatch")
+ # A manifest validated through the mutating path (same instance, lease,
+ # epoch, engine identity, and a monotonically advanced generation) becomes
+ # the new pin: without this, the read-only status path rejects every later
+ # generation of the same epoch and wedged off/status transitions.
+ if m["generation"]!=o["manifestGeneration"] or m["manifestDigest"]!=o["manifestDigest"]:
+  o["manifestGeneration"]=m["generation"];o["manifestDigest"]=m["manifestDigest"];save_owner(m,o)
  return o
 def remember(m,o,r):
  if r.get("kind")=="file":
@@ -628,21 +634,34 @@ def listener(value,hosts,port):
 def validate_config(m,c):
  if not isinstance(c,dict):raise Error("config_invalid")
  top={"mode","log-level","allow-lan","bind-address","find-process-mode","ipv6","hosts","listeners","external-controller","tun","iptables","profile","geo-auto-update","sniffer","dns","proxies","proxy-groups","rules","secret"}
- if set(c)!=top or c["mode"]!="global" or c["log-level"]!="info" or c["allow-lan"] is not True or c["bind-address"]!="*" or c["find-process-mode"]!="off" or c["ipv6"] is not True or c["geo-auto-update"] is not False:raise Error("config_invalid")
+ if set(c)!=top or c["mode"]!="global" or c["log-level"]!="info" or c["allow-lan"] is not True or c["bind-address"]!="*" or c["find-process-mode"]!="off" or not isinstance(c["ipv6"],bool) or c["geo-auto-update"] is not False:raise Error("config_invalid")
+ ipv6_allowed=c["ipv6"]
  if c["tun"]!={"enable":False} or c["iptables"]!={"enable":False} or c["profile"]!={"store-selected":False,"store-fake-ip":False} or c["rules"]!=["MATCH,GLOBAL"]:raise Error("config_invalid")
  expected_sniffer={"enable":True,"force-dns-mapping":True,"parse-pure-ip":True,"override-destination":True,"sniff":{"HTTP":{"ports":[80,"8080-8880"]},"TLS":{"ports":[443,8443]},"QUIC":{"ports":[443,8443]}}}
  if c["sniffer"]!=expected_sniffer:raise Error("config_invalid")
  listeners=c["listeners"]
- if not isinstance(listeners,list) or len(listeners)!=4 or not all(isinstance(listener,dict) for listener in listeners):raise Error("config_invalid")
+ if not isinstance(listeners,list) or not all(isinstance(listener,dict) for listener in listeners):raise Error("config_invalid")
  listener_ports=tuple(item.get("port") for item in listeners)
- candidate="a" if listener_ports==(7893,7895,7897,7899) else "b" if listener_ports==(7894,7896,7898,7900) else None
+ if ipv6_allowed:
+  if len(listeners)!=4:raise Error("config_invalid")
+  candidate="a" if listener_ports==(7893,7895,7897,7899) else "b" if listener_ports==(7894,7896,7898,7900) else None
+ else:
+  if len(listeners)!=2:raise Error("config_invalid")
+  candidate="a" if listener_ports==(7893,7897) else "b" if listener_ports==(7894,7898) else None
  if candidate is None:raise Error("config_invalid")
- udp_allowed=listeners[2].get("udp")
- if not isinstance(udp_allowed,bool) or listeners[3].get("udp")!=udp_allowed:raise Error("config_invalid")
- expected_listeners=[{"name":"xenoid-redir-v4","type":"redir","port":listener_ports[0],"listen":"0.0.0.0"},{"name":"xenoid-redir-v6","type":"redir","port":listener_ports[1],"listen":"::"},{"name":"xenoid-tproxy-v4","type":"tproxy","port":listener_ports[2],"listen":"0.0.0.0","udp":udp_allowed},{"name":"xenoid-tproxy-v6","type":"tproxy","port":listener_ports[3],"listen":"::","udp":udp_allowed}]
+ udp_allowed=listeners[-1].get("udp")
+ if not isinstance(udp_allowed,bool) or (ipv6_allowed and listeners[-2].get("udp")!=udp_allowed):raise Error("config_invalid")
+ if ipv6_allowed:
+  expected_listeners=[{"name":"xenoid-redir-v4","type":"redir","port":listener_ports[0],"listen":"0.0.0.0"},{"name":"xenoid-redir-v6","type":"redir","port":listener_ports[1],"listen":"::"},{"name":"xenoid-tproxy-v4","type":"tproxy","port":listener_ports[2],"listen":"0.0.0.0","udp":udp_allowed},{"name":"xenoid-tproxy-v6","type":"tproxy","port":listener_ports[3],"listen":"::","udp":udp_allowed}]
+ else:
+  expected_listeners=[{"name":"xenoid-redir-v4","type":"redir","port":listener_ports[0],"listen":"0.0.0.0"},{"name":"xenoid-tproxy-v4","type":"tproxy","port":listener_ports[1],"listen":"0.0.0.0","udp":udp_allowed}]
  if listeners!=expected_listeners:raise Error("config_invalid")
- transparent_ports=((listener_ports[0],listener_ports[1]),(listener_ports[2],listener_ports[3]));dns_port,controller_port=(1053,9091) if candidate=="a" else (1054,9092);dns=c["dns"];secret=c["secret"]
- expected_dns={"enable":True,"listen":f"[::]:{dns_port}","enhanced-mode":"redir-host","respect-rules":True,"ipv6":True,"nameserver":["https://8.8.8.8/dns-query#GLOBAL","https://8.8.4.4/dns-query#GLOBAL"],"proxy-server-nameserver":["https://8.8.8.8/dns-query#DIRECT","https://8.8.4.4/dns-query#DIRECT"]}
+ if ipv6_allowed:
+  transparent_ports=((listener_ports[0],listener_ports[1]),(listener_ports[2],listener_ports[3]))
+ else:
+  transparent_ports=((listener_ports[0],),(listener_ports[1],))
+ dns_port,controller_port=(1053,9091) if candidate=="a" else (1054,9092);dns=c["dns"];secret=c["secret"]
+ expected_dns={"enable":True,"listen":f"[::]:{dns_port}","enhanced-mode":"redir-host","respect-rules":True,"ipv6":ipv6_allowed,"nameserver":["https://8.8.8.8/dns-query#GLOBAL","https://8.8.4.4/dns-query#GLOBAL"],"proxy-server-nameserver":["https://8.8.8.8/dns-query#DIRECT","https://8.8.4.4/dns-query#DIRECT"]}
  if dns!=expected_dns or c["external-controller"]!=f"127.0.0.1:{controller_port}" or not isinstance(secret,str) or not SECRET.fullmatch(secret):raise Error("config_invalid")
  proxy_keys={
   "http":{"name","type","server","port","udp","username","password","tls","sni","skip-cert-verify","fingerprint","alpn"},
@@ -724,7 +743,7 @@ def validate_config(m,c):
  if not isinstance(global_group,dict) or set(global_group)!={"name","type","proxies"} or global_group["name"]!="GLOBAL" or global_group["type"]!="select" or not isinstance(global_group["proxies"],list):raise Error("config_invalid")
  members=global_group["proxies"]
  if len(members)!=len(names)+1 or members.count("XENOID-AUTO")!=1 or members.index("XENOID-AUTO") not in (0,len(members)-1) or set(members)-{"XENOID-AUTO"}!=set(names) or len(set(members))!=len(members):raise Error("config_invalid")
- return candidate,transparent_ports,dns_port,controller_port,secret,udp_allowed
+ return candidate,transparent_ports,dns_port,controller_port,secret,udp_allowed,ipv6_allowed
 def resolve_proxy_hosts(c):
  servers={}
  for proxy in c["proxies"]:
@@ -795,11 +814,33 @@ def write_config(m,o,payload,expected_generation=None):
  atomic(path,data,0o640,0,account.pw_gid);remember(m,o,{"kind":"file","path":str(path),"sha256":digest});o["candidate"]={"generation":generation,"name":candidate,"path":str(path),"sha256":digest};o["phase"]="configured";save_owner(m,o)
 def marks(m,c):
  r=0x00100000 if c=="a" else 0x00200000;b=m["routing"]["mark"];return b|r,b|r|0x00010000,b|r|0x00020000
-def configure(m,c,ports,dp,udp_allowed):
+def configure(m,c,ports,dp,udp_allowed,ipv6_allowed=True):
  n=names(m);cap,resp,up=marks(m,c);mask=m["routing"]["mask"];tcp_ports,udp_ports=ports
  for f,exe in (("4","iptables"),("6","ip6tables")):
-  a=m["android"]["ipv4" if f=="4" else "ipv6"];p=m["veth"]["proxyIpv4" if f=="4" else "proxyIpv6"];index=0 if f=="4" else 1;tcp_port=tcp_ports[index];udp_port=udp_ports[index];t,d,o,mark_chain,input_chain=n["tproxy"+f],n["dns"+f],n["output"+f],n["mark"+f],n["input"+f]
+  a=m["android"]["ipv4" if f=="4" else "ipv6"];p=m["veth"]["proxyIpv4" if f=="4" else "proxyIpv6"];t,d,o,mark_chain,input_chain=n["tproxy"+f],n["dns"+f],n["output"+f],n["mark"+f],n["input"+f]
   tcp_up,udp_up,dns_up=n["meterTcpUp"+f],n["meterUdpUp"+f],n["meterDnsUp"+f]
+  if f=="6" and not ipv6_allowed:
+   # IPv4-only mode: device IPv6 is metered exactly like the active data
+   # plane (so the proof can observe it) and then dropped before any
+   # redirect, listener, or uplink path.
+   tproxy_rules=[f"-F {tcp_up}",f"-A {tcp_up} -j RETURN",f"-F {udp_up}",f"-A {udp_up} -j RETURN",f"-F {t}"]
+   tproxy_rules += [f"-A {t} -p ipv6-icmp --icmpv6-type 135 -m hl --hl-eq 255 -j RETURN",f"-A {t} -p ipv6-icmp --icmpv6-type 136 -m hl --hl-eq 255 -j RETURN"]
+   tproxy_rules += [f"-A {t} -d {p} -j RETURN"]
+   for proto in ("tcp","udp"):tproxy_rules += [f"-A {t} -s {a} -p {proto} --dport 53 -j RETURN"]
+   tproxy_rules += [f"-A {t} -p tcp -j {tcp_up}",f"-A {t} -p tcp -j DROP",f"-A {t} -p udp -j {udp_up}",f"-A {t} -p udp -j DROP",f"-A {t} -j DROP"]
+   restore(exe,"mangle",tproxy_rules,m["proxyNamespace"],m)
+   restore(exe,"nat",[f"-F {dns_up}",f"-A {dns_up} -j RETURN",f"-F {d}",f"-A {d} -p tcp --dport 53 -j {dns_up}",f"-A {d} -p udp --dport 53 -j {dns_up}"],m["proxyNamespace"],m)
+   restore(exe,"mangle",[f"-F {mark_chain}"],m["proxyNamespace"],m)
+   input_rules=[f"-F {input_chain}",f"-A {input_chain} -i lo -j ACCEPT"]
+   input_rules += [f"-A {input_chain} -i {m['veth']['proxy']} -p ipv6-icmp --icmpv6-type 135 -m hl --hl-eq 255 -j ACCEPT",f"-A {input_chain} -i {m['veth']['proxy']} -p ipv6-icmp --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT"]
+   input_rules += [f"-A {input_chain} -j DROP"]
+   restore(exe,"filter",input_rules,m["proxyNamespace"],m)
+   output=[f"-F {o}",f"-A {o} -o lo -j ACCEPT",f"-A {o} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"]
+   output += [f"-A {o} -d {network} -j DROP" for network in blocked_destinations(f)]
+   output += [f"-A {o} -j DROP"]
+   restore(exe,"filter",output,m["proxyNamespace"],m)
+   continue
+  index=0 if f=="4" else 1;tcp_port=tcp_ports[index];udp_port=udp_ports[index]
   tproxy_rules=[f"-F {tcp_up}",f"-A {tcp_up} -j RETURN",f"-F {udp_up}",f"-A {udp_up} -j RETURN",f"-F {t}"]
   if f=="6":tproxy_rules += [f"-A {t} -p ipv6-icmp --icmpv6-type 135 -m hl --hl-eq 255 -j RETURN",f"-A {t} -p ipv6-icmp --icmpv6-type 136 -m hl --hl-eq 255 -j RETURN"]
   for proto in ("tcp","udp"):tproxy_rules += [f"-A {t} -s {a} -p {proto} --dport 53 -j MARK --set-xmark 0x{cap:x}/0x{mask:x}",f"-A {t} -s {a} -p {proto} --dport 53 -j RETURN"]
@@ -927,16 +968,17 @@ def checked_process(m,path,generation,candidate):
  current=identity(m,pid)
  if any(record.get(key)!=value for key,value in current.items()) or record.get("generation")!=generation or record.get("candidate")!=candidate or record.get("supervisor")!="systemd-unit":raise Error("process_identity_mismatch")
  return record
-def health(m,child,ports,secret,udp_allowed,record=None):
+def health(m,child,ports,secret,udp_allowed,ipv6_allowed=True,record=None):
  deadline=time.monotonic()+20
+ families=("4","6") if ipv6_allowed else ("4",)
  while time.monotonic()<deadline:
   if child is not None and child.poll() is not None:break
   if record is not None:
    try:checked_process(m,proc_path(m,record["stateName"]),record["generation"],record["candidate"])
    except Error:break
   dual=run([*netns_command(m["proxyNamespace"]),tool("sysctl"),"-n","net.ipv6.bindv6only"],capture=True,check=False)
-  udp_ready=all(socket_bound(m,"u",family,ports[0][1][0 if family=="4" else 1])==udp_allowed for family in ("4","6"))
-  if not dual.returncode and dual.stdout.strip()==b"0" and all(socket_bound(m,"t",family,ports[0][0][0 if family=="4" else 1]) for family in ("4","6")) and udp_ready and all(socket_bound(m,protocol,"6",ports[1]) for protocol in ("t","u")) and socket_bound(m,"t","4",ports[2]):
+  udp_ready=all(socket_bound(m,"u",family,ports[0][1][0 if family=="4" else 1])==udp_allowed for family in families)
+  if not dual.returncode and dual.stdout.strip()==b"0" and all(socket_bound(m,"t",family,ports[0][0][0 if family=="4" else 1]) for family in families) and udp_ready and all(socket_bound(m,protocol,"6",ports[1]) for protocol in ("t","u")) and socket_bound(m,"t","4",ports[2]):
    data=("silent\nfail\nmax-time = 2\n"+f'header = "Authorization: Bearer {secret}"\n').encode();response=run([*netns_command(m["proxyNamespace"]),tool("curl"),"--config","-",f"http://127.0.0.1:{ports[2]}/version"],data=data,check=False)
    if not response.returncode:return
   time.sleep(.25)
@@ -974,9 +1016,9 @@ def stop(m,n,child=None):
  finally:os.close(pidfd)
  p.unlink()
 def candidate_config(m,path,expected_name):
- root_file(path);config=json.loads(path.read_text());candidate,tproxy_port,dns_port,controller_port,secret,udp_allowed=validate_config(m,config)
+ root_file(path);config=json.loads(path.read_text());candidate,tproxy_port,dns_port,controller_port,secret,udp_allowed,ipv6_allowed=validate_config(m,config)
  if candidate!=expected_name:raise Error("config_invalid")
- return config,tproxy_port,dns_port,controller_port,secret,udp_allowed
+ return config,tproxy_port,dns_port,controller_port,secret,udp_allowed,ipv6_allowed
 def apply_stage(name,function,*arguments):
  try:return function(*arguments)
  except Error as exc:
@@ -987,8 +1029,8 @@ def apply(m,o,target="candidate",commit=False,expected_generation=None):
   quarantine(m,o);stop(m,"pending-process");previous=o.get("previous")
   if not isinstance(previous,dict) or not proc_path(m,"process").exists():
    o["candidate"]=o["previous"]=None;save_owner(m,o);return
-  config_path=Path(m["paths"]["config"]);_,tp,dp,cp,secret,udp_allowed=candidate_config(m,config_path,previous["name"]);record=checked_process(m,proc_path(m,"process"),previous["generation"],previous["name"])
-  configure(m,previous["name"],tp,dp,udp_allowed);health(m,None,(tp,dp,cp),secret,udp_allowed,{"stateName":"process","generation":record["generation"],"candidate":record["candidate"]});activate(m,previous["name"])
+  config_path=Path(m["paths"]["config"]);_,tp,dp,cp,secret,udp_allowed,ipv6_allowed=candidate_config(m,config_path,previous["name"]);record=checked_process(m,proc_path(m,"process"),previous["generation"],previous["name"])
+  configure(m,previous["name"],tp,dp,udp_allowed,ipv6_allowed);health(m,None,(tp,dp,cp),secret,udp_allowed,ipv6_allowed,{"stateName":"process","generation":record["generation"],"candidate":record["candidate"]});activate(m,previous["name"])
   o["appliedGeneration"],o["activeCandidate"]=previous["generation"],previous["name"];o["candidate"]=o["previous"]=None;o["phase"]="applied";save_owner(m,o);return
  if target!="candidate":raise Error("ipc_request_invalid")
  if expected_generation is not None:
@@ -996,8 +1038,8 @@ def apply(m,o,target="candidate",commit=False,expected_generation=None):
   if not isinstance(candidate,dict) or candidate.get("generation")!=expected_generation:raise Error("ipc_request_invalid")
  if commit:
   if o["phase"]!="applied-pending" or not isinstance(o.get("candidate"),dict):raise Error("apply_not_pending")
-  meta=o["candidate"];path=Path(meta["path"]);_,tp,dp,cp,secret,udp_allowed=candidate_config(m,path,meta["name"]);pending=checked_process(m,proc_path(m,"pending-process"),meta["generation"],meta["name"])
-  configure(m,meta["name"],tp,dp,udp_allowed);health(m,None,(tp,dp,cp),secret,udp_allowed,{"stateName":"pending-process","generation":pending["generation"],"candidate":pending["candidate"]});activate(m,meta["name"])
+  meta=o["candidate"];path=Path(meta["path"]);_,tp,dp,cp,secret,udp_allowed,ipv6_allowed=candidate_config(m,path,meta["name"]);pending=checked_process(m,proc_path(m,"pending-process"),meta["generation"],meta["name"])
+  configure(m,meta["name"],tp,dp,udp_allowed,ipv6_allowed);health(m,None,(tp,dp,cp),secret,udp_allowed,ipv6_allowed,{"stateName":"pending-process","generation":pending["generation"],"candidate":pending["candidate"]});activate(m,meta["name"])
   config_path=Path(m["paths"]["config"]);candidate_bytes=path.read_bytes();proxy_user=pwd.getpwnam(m["users"]["proxy"])
   stop(m,"process");os.replace(proc_path(m,"pending-process"),proc_path(m,"process"));atomic(config_path,candidate_bytes,0o640,0,proxy_user.pw_gid)
   o["appliedGeneration"],o["activeCandidate"]=meta["generation"],meta["name"];o["candidate"]=o["previous"]=None;o["phase"]="applied";save_owner(m,o);return
@@ -1005,12 +1047,12 @@ def apply(m,o,target="candidate",commit=False,expected_generation=None):
  if not isinstance(meta,dict):raise Error("config_missing")
  path=Path(meta["path"])
  if sha(path)!=meta["sha256"]:raise Error("config_digest_mismatch")
- _,tproxy_port,dns_port,controller_port,secret,udp_allowed=candidate_config(m,path,meta["name"])
+ _,tproxy_port,dns_port,controller_port,secret,udp_allowed,ipv6_allowed=candidate_config(m,path,meta["name"])
  apply_stage("baseline",quarantine,m,o);prerequisites();validate_binary(m)
  apply_stage("topology",topology,m,o);apply_stage("policy",policy,m,o);apply_stage("dataplane",dataplane,m,o)
- configure(m,meta["name"],tproxy_port,dns_port,udp_allowed)
+ configure(m,meta["name"],tproxy_port,dns_port,udp_allowed,ipv6_allowed)
  child=launch(m,o,path,meta["name"],meta["generation"],"pending-process")
- try:health(m,child,(tproxy_port,dns_port,controller_port),secret,udp_allowed);activate(m,meta["name"]);outbound_ready(m,controller_port,secret)
+ try:health(m,child,(tproxy_port,dns_port,controller_port),secret,udp_allowed,ipv6_allowed);activate(m,meta["name"]);outbound_ready(m,controller_port,secret)
  except Error:quarantine(m,o);stop(m,"pending-process",child);raise
  o["previous"]={"generation":o["appliedGeneration"],"name":o["activeCandidate"]} if isinstance(o["appliedGeneration"],int) and o["activeCandidate"] in ("a","b") else None;o["phase"]="applied-pending";save_owner(m,o)
 def _iptables_absent(command):
@@ -1103,15 +1145,20 @@ def status(m,o,expected_generation=None):
  structural=process is not None and process.exists() and isinstance(generation,int) and candidate in ("a","b")
  if structural:
   validate_accounts(m);validate_binary(m);checked_process(m,process,generation,candidate)
-  _,configured_ports,_,_,_,udp_allowed=candidate_config(m,config_path,candidate)
+  _,configured_ports,_,_,_,udp_allowed,ipv6_allowed=candidate_config(m,config_path,candidate)
   for family,exe in (("4",tool("iptables")),("6",tool("ip6tables"))):
    chain_specs=((n["guard"+family],"filter",False),(n["capture"+family],"mangle",False),(n["rawReturn"+family],"raw",False),(n["uplink"+family],"filter",False),(n["gatewayMark"+family],"mangle",False),(n["nat"+family],"nat",False),(n["meterIn"+family],"mangle",False),(n["meterUp"+family],"filter",False),(n["meterOut"+family],"filter",False),(n["meterDnsIn"+family],"mangle",False),(n["meterTcpIn"+family],"mangle",False),(n["meterUdpIn"+family],"mangle",False),(n["meterDnsOut"+family],"filter",False),(n["meterTcpOut"+family],"filter",False),(n["meterUdpOut"+family],"filter",False),(n["tproxy"+family],"mangle",True),(n["dns"+family],"nat",True),(n["output"+family],"filter",True),(n["mark"+family],"mangle",True),(n["input"+family],"filter",True),(n["meterDnsUp"+family],"nat",True),(n["meterTcpUp"+family],"mangle",True),(n["meterUdpUp"+family],"mangle",True))
    for chain_name,table,inside in chain_specs:
     if run([*pref(m,exe,inside),"-w","-t",table,"-S",chain_name],check=False).returncode:raise Error("engine_structure_mismatch")
    address=m["android"]["ipv4" if family=="4" else "ipv6"];restore_owner=f"xenoid-proxy/{m['resourceTag']}/{m['runtimeEpoch']}/{m['generation']}";hook_owner=f"xenoid-proxy/{m['resourceTag']}/DOCKER-USER/{m['runtimeEpoch']}/{m['generation']}";capture_owner=f"xenoid-proxy/{m['resourceTag']}/PREROUTING/{m['runtimeEpoch']}/{m['generation']}";nat_owner=f"xenoid-proxy/{m['resourceTag']}/POSTROUTING/{m['runtimeEpoch']}/{m['generation']}"
-   ports,dp,_=((((7893,7895),(7897,7899)),1053,9091) if candidate=="a" else (((7894,7896),(7898,7900)),1054,9092));tcp_port=ports[0][0 if family=="4" else 1];udp_port=ports[1][0 if family=="4" else 1];cap,resp,up=marks(m,candidate);mask=m["routing"]["mask"]
-   check_rule(exe,"mangle",n["gatewayMark"+family],["-d",address,"-j","MARK","--set-xmark",f"0x{resp:x}/0x{mask:x}"],restore_owner);check_rule(exe,"mangle",n["gatewayMark"+family],["!","-d",address,"-j","MARK","--set-xmark",f"0x{up:x}/0x{mask:x}"],restore_owner);check_rule(exe,"raw","PREROUTING",["-i",m["veth"]["host"],"-d",address,"-j",n["rawReturn"+family]],capture_owner);check_rule(exe,"raw",n["rawReturn"+family],["-j","ACCEPT"],restore_owner);check_rule(exe,"filter",n["uplink"+family],["-i",m["veth"]["host"],"-o",m["bridgeName"],"-d",address,"-m","mark","--mark",f"0x{resp:x}/0x{mask:x}","-m","conntrack","--ctstate","ESTABLISHED,RELATED","-j","RETURN"],restore_owner);check_rule(exe,"nat","POSTROUTING",["-s",address,"-j",n["nat"+family]],nat_owner);check_rule(exe,"nat",n["nat"+family],["-m","mark","--mark",f"0x{cap:x}/0x{mask:x}","-j","ACCEPT"],restore_owner);check_rule(pref(m,exe,True),"nat",n["dns"+family],["-p","tcp","-j","REDIRECT","--to-ports",str(tcp_port)],restore_owner);check_rule(pref(m,exe,True),"nat",n["dns"+family],["-p","udp","--dport","53","-j","REDIRECT","--to-ports",str(dp)],restore_owner)
-   if udp_allowed:check_rule(pref(m,exe,True),"mangle",n["tproxy"+family],["-p","udp","-j","TPROXY","--on-port",str(udp_port),"--tproxy-mark",f"0x{cap:x}/0x{mask:x}"],restore_owner)
+   if ipv6_allowed:ports,dp,_=((((7893,7895),(7897,7899)),1053,9091) if candidate=="a" else (((7894,7896),(7898,7900)),1054,9092))
+   else:ports,dp,_=((((7893,),(7897,)),1053,9091) if candidate=="a" else (((7894,),(7898,)),1054,9092))
+   cap,resp,up=marks(m,candidate);mask=m["routing"]["mask"]
+   check_rule(exe,"mangle",n["gatewayMark"+family],["-d",address,"-j","MARK","--set-xmark",f"0x{resp:x}/0x{mask:x}"],restore_owner);check_rule(exe,"mangle",n["gatewayMark"+family],["!","-d",address,"-j","MARK","--set-xmark",f"0x{up:x}/0x{mask:x}"],restore_owner);check_rule(exe,"raw","PREROUTING",["-i",m["veth"]["host"],"-d",address,"-j",n["rawReturn"+family]],capture_owner);check_rule(exe,"raw",n["rawReturn"+family],["-j","ACCEPT"],restore_owner);check_rule(exe,"filter",n["uplink"+family],["-i",m["veth"]["host"],"-o",m["bridgeName"],"-d",address,"-m","mark","--mark",f"0x{resp:x}/0x{mask:x}","-m","conntrack","--ctstate","ESTABLISHED,RELATED","-j","RETURN"],restore_owner);check_rule(exe,"nat","POSTROUTING",["-s",address,"-j",n["nat"+family]],nat_owner);check_rule(exe,"nat",n["nat"+family],["-m","mark","--mark",f"0x{cap:x}/0x{mask:x}","-j","ACCEPT"],restore_owner)
+   if family=="4" or ipv6_allowed:
+    tcp_port=ports[0][0 if family=="4" else 1];udp_port=ports[1][0 if family=="4" else 1]
+    check_rule(pref(m,exe,True),"nat",n["dns"+family],["-p","tcp","-j","REDIRECT","--to-ports",str(tcp_port)],restore_owner);check_rule(pref(m,exe,True),"nat",n["dns"+family],["-p","udp","--dport","53","-j","REDIRECT","--to-ports",str(dp)],restore_owner)
+   if udp_allowed and (family=="4" or ipv6_allowed):check_rule(pref(m,exe,True),"mangle",n["tproxy"+family],["-p","udp","-j","TPROXY","--on-port",str(udp_port),"--tproxy-mark",f"0x{cap:x}/0x{mask:x}"],restore_owner)
    else:check_rule(pref(m,exe,True),"mangle",n["tproxy"+family],["-p","udp","-j","DROP"],restore_owner)
    if family=="6":check_rule(pref(m,exe,True),"mangle",n["tproxy6"],["-p","ipv6-icmp","--icmpv6-type","135","-m","hl","--hl-eq","255","-j","RETURN"],restore_owner)
   android_ipv6(m,container_netns(m)[0])
@@ -1123,7 +1170,7 @@ def status(m,o,expected_generation=None):
   for family,address in (("-4","198.18.0.1/32"),("-6","fd00::1/128")):
    if run([*netns_command(m["proxyNamespace"]),tool("ip"),family,"address","show","dev","lo","to",address],capture=True,code="topology_peer_missing").stdout.strip()==b"":raise Error("topology_peer_missing")
   if run([*netns_command(m["proxyNamespace"]),tool("sysctl"),"-n","net.ipv6.bindv6only"],capture=True,code="ipv6_unsupported").stdout.strip()!=b"0":raise Error("ipv6_unsupported")
-  if not all(socket_bound(m,"t",family,configured_ports[0][0 if family=="4" else 1]) for family in ("4","6")) or not all(socket_bound(m,"u",family,configured_ports[1][0 if family=="4" else 1])==udp_allowed for family in ("4","6")) or not all(socket_bound(m,protocol,"6",dns_port) for protocol in ("t","u")) or not socket_bound(m,"t","4",controller_port):raise Error("engine_structure_mismatch")
+  if not all(socket_bound(m,"t",family,configured_ports[0][0 if family=="4" else 1]) for family in (("4","6") if ipv6_allowed else ("4",))) or not all(socket_bound(m,"u",family,configured_ports[1][0 if family=="4" else 1])==udp_allowed for family in (("4","6") if ipv6_allowed else ("4",))) or not all(socket_bound(m,protocol,"6",dns_port) for protocol in ("t","u")) or not socket_bound(m,"t","4",controller_port):raise Error("engine_structure_mismatch")
  offok=phase_state=="off" and not proc_path(m,"process").exists() and not proc_path(m,"pending-process").exists()
  if offok:
   verify_off(m,o)

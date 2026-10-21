@@ -164,17 +164,21 @@ def _compile(request: dict[str, Any]) -> dict[str, Any]:
         "selectedNode",
         "udpAllowed",
         "allowInsecureHttp",
+        "ipv6Allowed",
     } or request.get("op") != "compile":
         raise WorkerFailure
     kind = request.get("kind")
     selected_node = request.get("selectedNode")
     udp_allowed = request.get("udpAllowed")
     allow_insecure = request.get("allowInsecureHttp")
+    ipv6_allowed = request.get("ipv6Allowed")
     if kind not in {"endpoint", "uri_list", "clash", "subscription"}:
         raise WorkerFailure
     if not isinstance(selected_node, str) or len(selected_node) > 128:
         raise WorkerFailure
     if not isinstance(udp_allowed, bool) or not isinstance(allow_insecure, bool):
+        raise WorkerFailure
+    if not isinstance(ipv6_allowed, bool):
         raise WorkerFailure
     source = _decode_source(request.get("valueBase64"))
     fetcher = _ProviderFetcher()
@@ -184,6 +188,7 @@ def _compile(request: dict[str, Any]) -> dict[str, Any]:
             selected_node=selected_node,
             udp_allowed=udp_allowed,
             allow_insecure_http=allow_insecure,
+            ipv6_allowed=ipv6_allowed,
             fetcher=fetcher,
         )
     else:
@@ -193,6 +198,7 @@ def _compile(request: dict[str, Any]) -> dict[str, Any]:
             selected_node=selected_node,
             udp_allowed=udp_allowed,
             allow_insecure_http=allow_insecure,
+            ipv6_allowed=ipv6_allowed,
             fetcher=fetcher,
         )
     config = compiled.config

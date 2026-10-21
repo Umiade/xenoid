@@ -29,7 +29,7 @@ Commands marked *(internal)* run as part of `up` convergence and are not everyda
 
 - `./xenoid instance list` — list initialized instances.
 - `./xenoid config show` — print the selected instance context and config as JSON.
-- `./xenoid config set [--backend B] [--image I] [--runtime-image-tag T] [--docker-context C] [--network-dns-server ADDR] [--auto-build-runtime-image | --no-auto-build-runtime-image]` — update selected fields of the instance config.
+- `./xenoid config set [--backend B] [--image I] [--runtime-image-tag T] [--docker-context C] [--network-dns-server ADDR] [--auto-build-runtime-image | --no-auto-build-runtime-image]` — update selected fields of the instance config. `--network-dns-server` may repeat; the list feeds both the container resolver and the Android cellular data-call DNS (carried in the location profile and applied by the daemon on every boot), so changing it recreates the owned container once.
 
 ## Runtime image and rootfs
 
@@ -71,9 +71,15 @@ Commands marked *(internal)* run as part of `up` convergence and are not everyda
 ## Global proxy
 
 - `./xenoid proxy status [--check]` — show redacted proxy status; `--check` runs a fresh data-plane proof.
-- `./xenoid proxy set (--stdin | --prompt | --source-file FILE) [--kind endpoint|uri_list|clash|subscription] [--name NAME] [--udp | --no-udp] [--allow-insecure-http] [--enable | --no-enable]` — set a source from stdin or a current-user-owned mode-0600 file.
-- `./xenoid proxy subscribe (--stdin | --prompt | --source-file FILE) [--name NAME] [--udp | --no-udp] [--allow-insecure-http] [--enable | --no-enable]` — set an online configuration URL from stdin or a private file.
-- `./xenoid proxy import [--kind KIND] [--name NAME] [--udp | --no-udp] [--allow-insecure-http] [--enable | --no-enable] FILE` — import a regular, non-symlink, current-user-owned mode-0600 file.
+- `./xenoid proxy set (--stdin | --prompt | --source-file FILE) [--kind endpoint|uri_list|clash|subscription] [--name NAME] [--udp | --no-udp] [--ipv6 | --no-ipv6] [--allow-insecure-http] [--enable | --no-enable]` — set a source from stdin or a current-user-owned mode-0600 file.
+- `./xenoid proxy subscribe (--stdin | --prompt | --source-file FILE) [--name NAME] [--udp | --no-udp] [--ipv6 | --no-ipv6] [--allow-insecure-http] [--enable | --no-enable]` — set an online configuration URL from stdin or a private file.
+- `./xenoid proxy import [--kind KIND] [--name NAME] [--udp | --no-udp] [--ipv6 | --no-ipv6] [--allow-insecure-http] [--enable | --no-enable] FILE` — import a regular, non-symlink, current-user-owned mode-0600 file.
+
+`--no-ipv6` selects IPv4-only operation for exits without IPv6 egress: the
+engine publishes no IPv6 listeners, device IPv6 traffic is metered and then
+dropped (never leaked direct), and the data-plane proof requires IPv6 to be
+blocked instead of working. It is persisted in the desired state like
+`--no-udp` and can only change through a new set/import/subscribe.
 - `./xenoid proxy on` — enable the configured source.
 - `./xenoid proxy off` — disable proxying while preserving the configured source.
 - `./xenoid proxy clear [--discard-unreadable-state]` — disable and clear the configured source.

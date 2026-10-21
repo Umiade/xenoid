@@ -408,6 +408,7 @@ class ProxyController:
         selected_node: str = "",
         udp_allowed: bool = True,
         allow_insecure_http: bool = False,
+        ipv6_allowed: bool = True,
     ) -> dict[str, Any]:
         with self._mutation_scope():
             guarded = self._quarantine_for_mutation()
@@ -420,6 +421,7 @@ class ProxyController:
                 selected_node=selected_node,
                 udp_allowed=udp_allowed,
                 allow_insecure_http=allow_insecure_http,
+                ipv6_allowed=ipv6_allowed,
             )
             if mutation.get("ok") is not True:
                 return mutation

@@ -118,6 +118,7 @@ STATE = {
         "selectedNode": "",
         "udpAllowed": False,
         "allowInsecureHttp": False,
+        "ipv6Allowed": False,
         "checkId": 0,
         "stateReadable": True,
         "stateError": None,
@@ -410,6 +411,7 @@ def _proxy_status() -> dict[str, Any]:
         "selectedNode": proxy["selectedNode"] if readable else None,
         "udpAllowed": proxy["udpAllowed"] if readable else None,
         "allowInsecureHttp": proxy["allowInsecureHttp"] if readable else None,
+        "ipv6Allowed": proxy["ipv6Allowed"] if readable else None,
         "quarantined": proxy["quarantined"] if readable else True,
         "checkId": proxy["checkId"],
         "runtimeEpoch": "",
@@ -431,6 +433,7 @@ def _proxy_export() -> dict[str, Any]:
             "selectedNode": proxy["selectedNode"],
             "udpAllowed": proxy["udpAllowed"],
             "allowInsecureHttp": proxy["allowInsecureHttp"],
+            "ipv6Allowed": proxy["ipv6Allowed"],
         }
     return {
         "ok": True,
@@ -453,6 +456,7 @@ def _proxy_desired_state() -> tuple[Any, ...]:
         proxy["selectedNode"],
         proxy["udpAllowed"],
         proxy["allowInsecureHttp"],
+        proxy["ipv6Allowed"],
     )
 
 def _commit_proxy_mutation(before: tuple[Any, ...]) -> None:
@@ -505,6 +509,7 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
                 "selectedNode",
                 "udpAllowed",
                 "allowInsecureHttp",
+                "ipv6Allowed",
             }
             if set(body) != expected:
                 return _proxy_error("invalid_request_schema")
@@ -514,6 +519,7 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
             selected_node = body["selectedNode"]
             udp_allowed = body["udpAllowed"]
             allow_insecure_http = body["allowInsecureHttp"]
+            ipv6_allowed = body["ipv6Allowed"]
             if (
                 not isinstance(kind, str)
                 or not isinstance(value, str)
@@ -521,6 +527,7 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
                 or not _valid_proxy_name(selected_node, allow_empty=True)
                 or not isinstance(udp_allowed, bool)
                 or not isinstance(allow_insecure_http, bool)
+                or not isinstance(ipv6_allowed, bool)
             ):
                 return _proxy_error("invalid_request_schema")
             if kind not in PROXY_SOURCE_KINDS or not value or "\x00" in value:
@@ -540,6 +547,7 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
             proxy["selectedNode"] = selected_node
             proxy["udpAllowed"] = udp_allowed
             proxy["allowInsecureHttp"] = allow_insecure_http
+            proxy["ipv6Allowed"] = ipv6_allowed
             proxy["stateReadable"] = True
             proxy["stateError"] = None
             proxy["quarantined"] = True
@@ -598,6 +606,7 @@ def _proxy_response(path: str, method: str, body: Any) -> dict[str, Any]:
             proxy["selectedNode"] = ""
             proxy["udpAllowed"] = False
             proxy["allowInsecureHttp"] = False
+            proxy["ipv6Allowed"] = False
             proxy["stateReadable"] = True
             proxy["stateError"] = None
             proxy["quarantined"] = True

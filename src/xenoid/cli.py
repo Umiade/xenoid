@@ -1537,6 +1537,7 @@ def cmd_proxy_set(args: argparse.Namespace) -> int:
             selected_node=args.name or "",
             udp_allowed=args.udp,
             allow_insecure_http=args.allow_insecure_http,
+            ipv6_allowed=args.ipv6,
         ),
     )
     return _emit_proxy_result(result)
@@ -2168,7 +2169,7 @@ def cmd_location_status(args: argparse.Namespace) -> int:
 def cmd_location_set(args: argparse.Namespace) -> int:
     try:
         manager = runtime(args)
-        store = LocationStateStore(args.context.state_root)
+        store = LocationStateStore(args.context.state_root, manager.cfg.network_dns_servers)
         target = normalize_country(args.country)
         store.ensure(args.context.instance_id, target)
         store.set_desired(target)
@@ -2196,7 +2197,7 @@ def cmd_location_apply(args: argparse.Namespace) -> int:
     """Explicitly converge the persisted Location state."""
     try:
         manager = runtime(args)
-        store = LocationStateStore(args.context.state_root)
+        store = LocationStateStore(args.context.state_root, manager.cfg.network_dns_servers)
         default = normalize_country(args.default) if args.default else None
         state, _ = store.ensure(args.context.instance_id, default)
         store.set_desired(str(state["desiredCountry"]))
@@ -3299,7 +3300,7 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
         while drm_id == before["drmDeviceUniqueId"]:
             drm_id = secrets.token_hex(16)
         location_target = LocationStateStore(
-            context.state_root
+            context.state_root, manager.cfg.network_dns_servers
         ).regeneration_target(sim_epoch)
         stable_target = generate_stable_target(identity["stable"])
         target = {
@@ -3562,7 +3563,7 @@ def _execute_device_regeneration(args: argparse.Namespace) -> dict[str, Any]:
                 )
         state = journal.advance("settings_committed")
     if not _regeneration_phase_at_least(state, "radio_committed"):
-        location_store = LocationStateStore(context.state_root)
+        location_store = LocationStateStore(context.state_root, manager.cfg.network_dns_servers)
         location_state = location_store.rotate_sim_identity(
             sim_epoch=str(state["target"]["simEpoch"]),
             expected_epoch=str(state["before"]["simEpoch"]),
@@ -4314,6 +4315,12 @@ def build_parser() -> argparse.ArgumentParser:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="allow UDP proxying (default: --udp)",
+        )
+        command.add_argument(
+            "--ipv6",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="allow IPv6 proxying and require it in the data-plane proof (default: --ipv6)",
         )
         command.add_argument(
             "--allow-insecure-http",

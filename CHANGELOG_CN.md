@@ -9,6 +9,25 @@ Xenoid 的所有重要变更都记录在此。格式遵循
 
 ## [Unreleased]
 
+### 新增
+
+- `proxy set|import|subscribe --no-ipv6`：面向无 IPv6 出口节点的纯 IPv4
+  代理模式。`ipv6Allowed` 标志端到端持久化（宿主 CLI、daemon 状态存储、
+  agent、引擎）；引擎不再发布 IPv6 监听器，设备 IPv6 流量先计量再在
+  任何重定向或上行路径之前丢弃，数据面证明要求 IPv6 被封死而非可用，
+  语义与既有 `--no-udp` 一致。默认仍为双栈；已持久化的配置按允许
+  IPv6 解码。
+
+### 修复
+
+- 实例的 `network_dns_servers` 配置现在真正生效于 Android 数据面。蜂窝
+  配置文件的 `dataCall.dnses` 携带该列表，daemon 每次开机通过
+  `net.dns1`/`net.dns2` 发布并重建数据呼叫，位置校验回读实际的
+  `LinkProperties` DNS。此前该值只写入 Docker 的 `--dns`，而在 Android
+  挂载命名空间内不可见，vendor RIL 始终回退到 `1.1.1.1`/`8.8.8.8`。
+  宿主机观测在缓存配置的 DNS 列表与实例配置漂移时开启待处理位置事务，
+  已有实例在下一次 `./xenoid up` 时自动收敛（容器重建一次）。
+
 ## [0.9.3] - 2026-10-12
 
 围绕收敛、恢复路径与引擎宿主机的可靠性加固，并恢复宿主机 Python 3.9

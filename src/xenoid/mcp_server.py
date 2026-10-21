@@ -362,7 +362,9 @@ def _location_result(runtime: MCPRuntime, country_code: str) -> dict[str, Any]:
     def operation() -> dict[str, Any]:
         args = _feature_args(runtime, country=country_code)
         try:
-            store = LocationStateStore(runtime.context.state_root)
+            store = LocationStateStore(
+                runtime.context.state_root, runtime.manager.cfg.network_dns_servers
+            )
             target = normalize_country(country_code)
             store.ensure(runtime.context.instance_id, target)
             store.set_desired(target)

@@ -988,7 +988,11 @@ def _desired(channel: DaemonChannel, manifest: dict[str, Any], floor: int) -> di
     if source is not None:
         if not isinstance(source, dict):
             raise AgentFailure("agent_schema_invalid")
-        _require_keys(source, {"kind", "value", "selectedNode", "udpAllowed", "allowInsecureHttp"})
+        if "ipv6Allowed" not in source:
+            # Daemons predating the IPv4-only mode implicitly allow IPv6.
+            source = dict(source)
+            source["ipv6Allowed"] = True
+        _require_keys(source, {"kind", "value", "selectedNode", "udpAllowed", "allowInsecureHttp", "ipv6Allowed"})
         if source["kind"] not in {"endpoint", "uri_list", "clash", "subscription"}:
             raise AgentFailure("source_invalid")
         if not isinstance(source["value"], str) or not source["value"] or len(source["value"].encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -996,6 +1000,8 @@ def _desired(channel: DaemonChannel, manifest: dict[str, Any], floor: int) -> di
         if not isinstance(source["selectedNode"], str) or len(source["selectedNode"]) > 128:
             raise AgentFailure("source_invalid")
         if not isinstance(source["udpAllowed"], bool) or not isinstance(source["allowInsecureHttp"], bool):
+            raise AgentFailure("source_invalid")
+        if not isinstance(source["ipv6Allowed"], bool):
             raise AgentFailure("source_invalid")
     return value
 
@@ -1376,6 +1382,7 @@ def _compile_source(manifest: dict[str, Any], source: dict[str, Any], metadata: 
         "selectedNode": compile_source["selectedNode"],
         "udpAllowed": compile_source["udpAllowed"],
         "allowInsecureHttp": compile_source["allowInsecureHttp"],
+        "ipv6Allowed": compile_source.get("ipv6Allowed", True),
     }
     try:
         if time.monotonic() >= deadline:
@@ -1519,13 +1526,16 @@ def _probe_data_plane(
     if error_code:
         raise AgentFailure(error_code)
     udp_allowed = desired["source"]["udpAllowed"]
+    ipv6_allowed = desired["source"].get("ipv6Allowed", True)
+    if not isinstance(ipv6_allowed, bool):
+        raise AgentFailure("data_plane_unverified")
     policy_matches = (
         capabilities["v4DnsProxy"]
         and capabilities["v4TcpProxy"]
-        and capabilities["v6DnsProxy"]
-        and capabilities["v6TcpProxy"]
+        and capabilities["v6DnsProxy"] == ipv6_allowed
+        and capabilities["v6TcpProxy"] == ipv6_allowed
         and capabilities["v4UdpProxy"] == udp_allowed
-        and capabilities["v6UdpProxy"] == udp_allowed
+        and capabilities["v6UdpProxy"] == (udp_allowed and ipv6_allowed)
     )
     if not policy_matches:
         raise AgentFailure("data_plane_unverified")

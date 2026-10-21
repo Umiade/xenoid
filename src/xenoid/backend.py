@@ -3573,12 +3573,14 @@ cat >/dev/null
         selected_node = source.get("selectedNode")
         udp_allowed = source.get("udpAllowed")
         allow_insecure_http = source.get("allowInsecureHttp")
+        ipv6_allowed = source.get("ipv6Allowed")
         if (
             kind not in {"endpoint", "uri_list", "clash", "subscription"}
             or not isinstance(value, str)
             or not isinstance(selected_node, str)
             or not isinstance(udp_allowed, bool)
             or not isinstance(allow_insecure_http, bool)
+            or not isinstance(ipv6_allowed, bool)
         ):
             return self._proxy_failure("proxy_state_backup_failed")
         try:
@@ -3593,6 +3595,7 @@ cat >/dev/null
             selected_node,
             udp_allowed,
             allow_insecure_http,
+            ipv6_allowed,
         )
         return {"ok": True, "captured": True, "configured": True}
 
@@ -3616,7 +3619,7 @@ cat >/dev/null
         if pending is None:
             return {"ok": True, "restored": False}
         self._pending_proxy_restore = None
-        kind, source, enabled, selected_node, udp_allowed, allow_insecure_http = pending
+        kind, source, enabled, selected_node, udp_allowed, allow_insecure_http, ipv6_allowed = pending
         try:
             try:
                 value = source.decode("utf-8", "strict")
@@ -3629,6 +3632,7 @@ cat >/dev/null
                 selected_node=selected_node,
                 udp_allowed=udp_allowed,
                 allow_insecure_http=allow_insecure_http,
+                ipv6_allowed=ipv6_allowed,
             )
             if not isinstance(restored, dict) or restored.get("ok") is not True:
                 return self._proxy_failure("proxy_state_restore_failed")
@@ -3956,7 +3960,7 @@ cat >/dev/null
                 location_runtime_epoch,
             )
 
-            store = LocationStateStore(self.context.state_root)
+            store = LocationStateStore(self.context.state_root, self.cfg.network_dns_servers)
             state = store.load()
             if state is None or not isinstance(state.get("pending"), Mapping):
                 return {"ok": True, "skipped": True}
@@ -5812,7 +5816,7 @@ cat >/dev/null
         try:
             from .location import DEFAULT_COUNTRY, LocationError, LocationStateStore
 
-            location_store = LocationStateStore(self.context.state_root)
+            location_store = LocationStateStore(self.context.state_root, self.cfg.network_dns_servers)
             location_state, _ = location_store.ensure(
                 self.context.instance_id,
                 DEFAULT_COUNTRY,
@@ -7102,9 +7106,8 @@ cat >/dev/null
                 public_summary,
             )
 
-            location_host = public_summary(
-                LocationStateStore(self.context.state_root).load()
-            )
+            store = LocationStateStore(self.context.state_root, self.cfg.network_dns_servers)
+            location_host = public_summary(store.sync_data_call_dns()[0])
             location_state = (
                 "pending"
                 if isinstance(location_host.get("pending"), Mapping)
@@ -7268,6 +7271,26 @@ cat >/dev/null
                 != expected_location_epoch
             ):
                 location_state = "drift"
+        if state == "running" and location_state == "matching" and isinstance(
+            location_runtime_status, Mapping
+        ):
+            # The staged daemon state must carry the configured data-call DNS;
+            # a state written before dnses existed is re-staged once so the
+            # daemon picks the list up (one recreate through the pending path).
+            android_dnses = location_runtime_status.get("dnses")
+            if location_runtime_status.get("ok") is True and android_dnses != list(
+                self.cfg.network_dns_servers
+            ):
+                try:
+                    from .location import LocationStateStore, public_summary
+
+                    reopened = LocationStateStore(
+                        self.context.state_root, self.cfg.network_dns_servers
+                    ).reopen_active_transaction()
+                    location_host = public_summary(reopened)
+                    location_state = "pending"
+                except Exception:
+                    location_state = "incompatible"
         proxy_daemon = (
             components.get("proxy")
             if isinstance(components.get("proxy"), Mapping)
@@ -7882,7 +7905,7 @@ cat >/dev/null
             )
         from .location import LocationStateStore
 
-        location = LocationStateStore(self.context.state_root).load()
+        location = LocationStateStore(self.context.state_root, self.cfg.network_dns_servers).load()
         active_location = location.get("active") if isinstance(location, Mapping) else None
         if not isinstance(active_location, Mapping):
             raise IdentityError(
@@ -11436,7 +11459,7 @@ cat >/dev/null
                 public_summary,
             )
 
-            store = LocationStateStore(self.context.state_root)
+            store = LocationStateStore(self.context.state_root, self.cfg.network_dns_servers)
             state = store.load()
             if state is None:
                 return {"ok": False, "error": "location_state_missing"}

@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import struct
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 PROFILE_SCHEMA = "dev.xenoid.cellular-profile/v2"
 PROFILE_MAGIC = b"XENOID_PROFILE_V1\0"
@@ -186,6 +187,24 @@ def _validate_msisdn(value: str, dataset: Mapping[str, Any]) -> None:
         raise CellularError("cellular_msisdn_invalid")
 
 
+def _validate_dns_servers(value: Any) -> list[str]:
+    """Validate the data-call DNS list: zero to four literal IP addresses."""
+    if not isinstance(value, list) or len(value) > 4:
+        raise CellularError("cellular_data_call_invalid")
+    result: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise CellularError("cellular_data_call_invalid")
+        try:
+            address = ipaddress.ip_address(entry)
+        except ValueError as exc:
+            raise CellularError("cellular_data_call_invalid") from exc
+        result.append(str(address))
+    if len(set(result)) != len(result):
+        raise CellularError("cellular_data_call_invalid")
+    return result
+
+
 def _validate_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(profile, Mapping):
         raise CellularError("cellular_profile_invalid")
@@ -250,6 +269,7 @@ def _validate_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
         raise CellularError("cellular_data_call_invalid")
     if data_call.get("protocol") not in {"IP", "IPV4V6", "IPV6"}:
         raise CellularError("cellular_data_call_invalid")
+    _validate_dns_servers(data_call.get("dnses"))
     locale = profile["locale"]
     if not isinstance(locale, list) or not locale or any(not isinstance(item, str) for item in locale):
         raise CellularError("cellular_locale_invalid")
@@ -337,6 +357,7 @@ def _resolve_pin(carriers: Any, pin: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def generate_cellular_profile(
     country: str, seed: bytes, *, pin: Optional[Mapping[str, Any]] = None,
+    dns_servers: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Generate the deterministic profile for one supported country code.
 
@@ -345,6 +366,8 @@ def generate_cellular_profile(
     PLMN, APN, band matrix) is fixed to one previously selected dataset
     carrier and only the rotational fields — the IMSI/ICCID/MSISDN
     subscriber digits and the LTE cell identifiers — derive from ``seed``.
+    ``dns_servers`` is the operator-configured instance DNS list; it is not
+    seed-derived and carries over verbatim into ``dataCall.dnses``.
     """
     if not isinstance(seed, bytes) or len(seed) != 32:
         raise CellularError("cellular_seed_invalid")
@@ -406,7 +429,9 @@ def generate_cellular_profile(
                  "cqi": _bounded_number(seed, "cqi", 7, 15),
                  "timingAdvance": _bounded_number(seed, "timingAdvance", 0, 63)},
         "dataCall": {"iface": "rmnet_data0", "state": "CONNECTED", "protocol": "IPV4V6",
-                     "addresses": [], "gateways": [], "dnses": [], "mtu": 1500},
+                     "addresses": [], "gateways": [],
+                     "dnses": _validate_dns_servers(list(dns_servers)) if dns_servers is not None else [],
+                     "mtu": 1500},
         "locale": list(dataset["locales"]),
         "timezone": timezone,
         "callingCode": dataset["callingCode"],
@@ -414,6 +439,20 @@ def generate_cellular_profile(
     }
     profile["identityDigest"] = _digest(profile)
     return _validate_profile(profile)
+
+
+def with_dns_servers(profile: Mapping[str, Any], dns_servers: Sequence[str]) -> dict[str, Any]:
+    """Return ``profile`` with ``dataCall.dnses`` replaced and the identity
+    digest recomputed.  Every seed-derived identity field is preserved, so a
+    stored profile keeps its SIM, carrier, and cell identity across the swap.
+    """
+    clean = _validate_profile(profile)
+    updated = {key: value for key, value in clean.items() if key != "identityDigest"}
+    data_call = dict(updated["dataCall"])
+    data_call["dnses"] = _validate_dns_servers(list(dns_servers))
+    updated["dataCall"] = data_call
+    updated["identityDigest"] = _digest(updated)
+    return _validate_profile(updated)
 
 
 def encode_profile_v1(profile: Mapping[str, Any]) -> bytes:

@@ -898,7 +898,8 @@ final class ProxyStateStore {
                 "source", source.value,
                 "selectedNode", source.selectedNode,
                 "udpAllowed", source.udpAllowed,
-                "allowInsecureHttp", source.allowInsecureHttp);
+                "allowInsecureHttp", source.allowInsecureHttp,
+                "ipv6Allowed", source.ipv6Allowed);
         byte[] bytes = canonicalBytes(object);
         if (bytes.length > MAX_SOURCE_BYTES + 2048) {
             wipe(bytes);
@@ -912,14 +913,21 @@ final class ProxyStateStore {
             throw invalid();
         }
         Map<String, Object> object = parseCanonicalObject(plaintext, MAX_SOURCE_BYTES + 2048);
+        if (!object.containsKey("ipv6Allowed")) {
+            // States written before the IPv4-only mode existed implicitly
+            // allowed IPv6; decode them with the flag defaulted on.
+            object = new LinkedHashMap<>(object);
+            object.put("ipv6Allowed", Boolean.TRUE);
+        }
         requireExactKeys(object, "kind", "source", "selectedNode", "udpAllowed",
-                "allowInsecureHttp");
+                "allowInsecureHttp", "ipv6Allowed");
         Source source = new Source(
                 requireString(object, "kind"),
                 requireString(object, "source"),
                 requireString(object, "selectedNode"),
                 requireBoolean(object, "udpAllowed"),
-                requireBoolean(object, "allowInsecureHttp"));
+                requireBoolean(object, "allowInsecureHttp"),
+                requireBoolean(object, "ipv6Allowed"));
         validateSource(source);
         return source;
     }
@@ -992,7 +1000,7 @@ final class ProxyStateStore {
         boolean udpAllowed = input.readBoolean();
         boolean allowInsecureHttp = input.readBoolean();
         if (input.read() != -1) throw invalid();
-        Source source = new Source(kind, value, selectedNode, udpAllowed, allowInsecureHttp);
+        Source source = new Source(kind, value, selectedNode, udpAllowed, allowInsecureHttp, true);
         validateSource(source);
         return source;
     }
@@ -1802,18 +1810,21 @@ final class ProxyStateStore {
         final String selectedNode;
         final boolean udpAllowed;
         final boolean allowInsecureHttp;
+        final boolean ipv6Allowed;
 
         Source(
                 String kind,
                 String value,
                 String selectedNode,
                 boolean udpAllowed,
-                boolean allowInsecureHttp) {
+                boolean allowInsecureHttp,
+                boolean ipv6Allowed) {
             this.kind = kind;
             this.value = value;
             this.selectedNode = selectedNode;
             this.udpAllowed = udpAllowed;
             this.allowInsecureHttp = allowInsecureHttp;
+            this.ipv6Allowed = ipv6Allowed;
         }
 
         boolean sameAs(Source other) {
@@ -1822,7 +1833,8 @@ final class ProxyStateStore {
                     && value.equals(other.value)
                     && selectedNode.equals(other.selectedNode)
                     && udpAllowed == other.udpAllowed
-                    && allowInsecureHttp == other.allowInsecureHttp;
+                    && allowInsecureHttp == other.allowInsecureHttp
+                    && ipv6Allowed == other.ipv6Allowed;
         }
     }
 

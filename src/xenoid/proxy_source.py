@@ -1646,7 +1646,7 @@ def _uri_proxies(text: str, udp_allowed: bool) -> List[Dict[str, Any]]:
 
 
 def _final_config(proxies: List[Dict[str, Any]], selected_node: str,
-                  udp_allowed: bool) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
+                  udp_allowed: bool, ipv6_allowed: bool = True) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
     if not proxies or len(proxies) > MAX_NODES:
         raise ProxySourceError("provider_empty") from None
     names: List[str] = []
@@ -1670,16 +1670,23 @@ def _final_config(proxies: List[Dict[str, Any]], selected_node: str,
     controller_secret = hashlib.sha256(
         b"xenoid-mihomo-controller/v1\x00" + controller_payload
     ).hexdigest()
-    config: Dict[str, Any] = {
-        "mode": "global", "log-level": "info", "allow-lan": True,
-        "bind-address": "*", "find-process-mode": "off", "ipv6": True,
-        "hosts": {},
-        "listeners": [
+    if ipv6_allowed:
+        listeners: List[Dict[str, Any]] = [
             {"name": "xenoid-redir-v4", "type": "redir", "port": 7893, "listen": "0.0.0.0"},
             {"name": "xenoid-redir-v6", "type": "redir", "port": 7895, "listen": "::"},
             {"name": "xenoid-tproxy-v4", "type": "tproxy", "port": 7897, "listen": "0.0.0.0", "udp": bool(udp_allowed)},
             {"name": "xenoid-tproxy-v6", "type": "tproxy", "port": 7899, "listen": "::", "udp": bool(udp_allowed)},
-        ],
+        ]
+    else:
+        listeners = [
+            {"name": "xenoid-redir-v4", "type": "redir", "port": 7893, "listen": "0.0.0.0"},
+            {"name": "xenoid-tproxy-v4", "type": "tproxy", "port": 7897, "listen": "0.0.0.0", "udp": bool(udp_allowed)},
+        ]
+    config: Dict[str, Any] = {
+        "mode": "global", "log-level": "info", "allow-lan": True,
+        "bind-address": "*", "find-process-mode": "off", "ipv6": bool(ipv6_allowed),
+        "hosts": {},
+        "listeners": listeners,
         "external-controller": "127.0.0.1:9091",
         "secret": controller_secret,
         "tun": {"enable": False}, "iptables": {"enable": False},
@@ -1698,7 +1705,7 @@ def _final_config(proxies: List[Dict[str, Any]], selected_node: str,
         },
         "dns": {
             "enable": True, "listen": "[::]:1053", "enhanced-mode": "redir-host",
-            "respect-rules": True, "ipv6": True,
+            "respect-rules": True, "ipv6": bool(ipv6_allowed),
             "nameserver": [
                 "https://8.8.8.8/dns-query#GLOBAL",
                 "https://8.8.4.4/dns-query#GLOBAL",
@@ -1724,11 +1731,13 @@ def _final_config(proxies: List[Dict[str, Any]], selected_node: str,
 
 def compile_source(kind: str, value: Any, selected_node: str = "",
                    udp_allowed: bool = True, allow_insecure_http: bool = False,
+                   ipv6_allowed: bool = True,
                    fetcher: Optional[Callable[..., Any]] = None) -> CompiledSource:
     """Compile one complete candidate; any malformed member rejects it all."""
     if (kind not in ("endpoint", "uri_list", "clash")
             or not isinstance(udp_allowed, bool)
-            or not isinstance(allow_insecure_http, bool)):
+            or not isinstance(allow_insecure_http, bool)
+            or not isinstance(ipv6_allowed, bool)):
         raise ProxySourceError("source_invalid") from None
     raw = _source_bytes(value)
     if kind == "endpoint":
@@ -1740,7 +1749,7 @@ def compile_source(kind: str, value: Any, selected_node: str = "",
         _validate_tree(document)
         proxies = _clash_proxies(document, udp_allowed, fetcher,
                                   allow_insecure_http)
-    config, names = _final_config(proxies, selected_node, udp_allowed)
+    config, names = _final_config(proxies, selected_node, udp_allowed, ipv6_allowed)
     return CompiledSource(config, names, hashlib.sha256(raw).hexdigest())
 
 def compile_fetched_subscription(
@@ -1748,6 +1757,7 @@ def compile_fetched_subscription(
     selected_node: str = "",
     udp_allowed: bool = True,
     allow_insecure_http: bool = False,
+    ipv6_allowed: bool = True,
     fetcher: Optional[Callable[..., Any]] = None,
 ) -> CompiledSource:
     """Compile an already-fetched subscription body without fetching its URL."""
@@ -1766,6 +1776,7 @@ def compile_fetched_subscription(
         selected_node=selected_node,
         udp_allowed=udp_allowed,
         allow_insecure_http=allow_insecure_http,
+        ipv6_allowed=ipv6_allowed,
         fetcher=fetcher,
     )
 

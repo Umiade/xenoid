@@ -165,6 +165,7 @@ public final class ProxyManager {
                 "selectedNode", source == null ? "" : source.selectedNode,
                 "udpAllowed", source != null && source.udpAllowed,
                 "allowInsecureHttp", source != null && source.allowInsecureHttp,
+                "ipv6Allowed", source != null && source.ipv6Allowed,
                 "quarantined", quarantineInstalled,
                 "checkId", checkId,
                 "runtimeEpoch", runtimeEpoch,
@@ -239,8 +240,13 @@ public final class ProxyManager {
 
     public synchronized Map<String, Object> setSource(Map<String, Object> request)
             throws ProxyException {
+        if (!request.containsKey("ipv6Allowed")) {
+            // Hosts predating the IPv4-only mode implicitly allow IPv6.
+            request = new LinkedHashMap<>(request);
+            request.put("ipv6Allowed", Boolean.TRUE);
+        }
         requireKeys(request, "kind", "value", "enable", "selectedNode", "udpAllowed",
-                "allowInsecureHttp");
+                "allowInsecureHttp", "ipv6Allowed");
         String kind = requireString(request, "kind", 16, false);
         if (!"endpoint".equals(kind) && !"uri_list".equals(kind)
                 && !"clash".equals(kind) && !"subscription".equals(kind)) {
@@ -251,6 +257,7 @@ public final class ProxyManager {
         boolean enable = requireBoolean(request, "enable");
         boolean udpAllowed = requireBoolean(request, "udpAllowed");
         boolean allowInsecureHttp = requireBoolean(request, "allowInsecureHttp");
+        boolean ipv6Allowed = requireBoolean(request, "ipv6Allowed");
         if (containsNul(value) || containsNul(selectedNode)
                 || ("endpoint".equals(kind) && udpAllowed
                 && isHttpEndpoint(value))
@@ -259,7 +266,7 @@ public final class ProxyManager {
             throw new ProxyException("source_invalid");
         }
         Desired desired = new Desired(
-                kind, value, selectedNode, udpAllowed, allowInsecureHttp);
+                kind, value, selectedNode, udpAllowed, allowInsecureHttp, ipv6Allowed);
         State current = state;
         if (current != null && current.enabled == enable && desired.sameAs(current.desired)) {
             return mutationResult();
@@ -300,7 +307,7 @@ public final class ProxyManager {
         Desired current = currentState.desired;
         Desired desired = new Desired(
                 current.kind, current.value, name, current.udpAllowed,
-                current.allowInsecureHttp);
+                current.allowInsecureHttp, current.ipv6Allowed);
         if (name.equals(current.selectedNode)) return mutationResult();
         ensureQuarantineLocked();
         if (currentState.enabled) requireCheckCapacityLocked();
@@ -427,20 +434,22 @@ public final class ProxyManager {
         long requestedCheck = requireLong(request, "checkId", 1, Long.MAX_VALUE);
         long expectedGeneration;
         boolean udpAllowed;
+        boolean ipv6Allowed;
         synchronized (this) {
             requireCurrentRuntime(instanceId, epoch);
             if (!state.enabled || state.desired == null) {
                 throw new ProxyException("agent_rejected");
             }
             if (requestedCheck != checkId || checkId == 0) {
-                throw new ProxyException("agent_rejected");
+                throw new ProxyException("agent_stale");
             }
             expectedGeneration = state.generation;
             udpAllowed = state.desired.udpAllowed;
+            ipv6Allowed = state.desired.ipv6Allowed;
         }
 
-        ProbeResult result = executeAndroidProbe(requestedCheck, udpAllowed);
-        String errorCode = probeErrorCode(result, udpAllowed);
+        ProbeResult result = executeAndroidProbe(requestedCheck, udpAllowed, ipv6Allowed);
+        String errorCode = probeErrorCode(result, udpAllowed, ipv6Allowed);
         Map<String, Object> observation = map(
                 "checkId", requestedCheck,
                 "capabilities", probeCapabilities(result),
@@ -466,19 +475,24 @@ public final class ProxyManager {
         recoveryInstanceId = null;
     }
 
-    private ProbeResult executeAndroidProbe(long requestedCheck, boolean udpAllowed) {
+    private ProbeResult executeAndroidProbe(long requestedCheck, boolean udpAllowed,
+            boolean ipv6Allowed) {
         long started = SystemClock.elapsedRealtime();
         long deadline = started + PROBE_TIMEOUT_MS;
         Future<NetworkProbe> v4DnsFuture = probeExecutor.submit(
-                () -> runDnsProbe(false, requestedCheck));
+                () -> runDnsProbe(false, requestedCheck, PROBE_DNS_TIMEOUT_MS));
+        int v6DnsTimeout = ipv6Allowed ? PROBE_DNS_TIMEOUT_MS : PROBE_BLOCKED_UDP_TIMEOUT_MS;
         Future<NetworkProbe> v6DnsFuture = probeExecutor.submit(
-                () -> runDnsProbe(true, requestedCheck));
+                () -> runDnsProbe(true, requestedCheck, v6DnsTimeout));
         NetworkProbe v4Dns = awaitProbe(v4DnsFuture, deadline);
         NetworkProbe v6Dns = awaitProbe(v6DnsFuture, deadline);
 
         Future<NetworkProbe> v4TcpFuture = probeExecutor.submit(
                 () -> runTcpProbe(false));
         NetworkProbe v4Tcp = awaitProbe(v4TcpFuture, deadline);
+        // Like the blocked-UDP probes, the v6 TCP probe always generates
+        // traffic: the engine-side metering proof must observe it being
+        // dropped in IPv4-only mode, not merely see it absent.
         Future<NetworkProbe> v6TcpFuture = probeExecutor.submit(
                 () -> runTcpProbe(true));
         NetworkProbe v6Tcp = awaitProbe(v6TcpFuture, deadline);
@@ -495,11 +509,12 @@ public final class ProxyManager {
                 v4Dns.succeeded, v4Tcp.succeeded, v4Udp.succeeded,
                 v6Dns.succeeded, v6Tcp.succeeded, v6Udp.succeeded,
                 boundedElapsed(started),
-                v4Dns.timedOut || v4Tcp.timedOut || v6Dns.timedOut
+                v4Dns.timedOut || v4Tcp.timedOut
+                        || (ipv6Allowed && v6Dns.timedOut)
                         || (udpAllowed && v4Udp.timedOut));
     }
 
-    private static NetworkProbe runDnsProbe(boolean ipv6, long requestedCheck) {
+    private static NetworkProbe runDnsProbe(boolean ipv6, long requestedCheck, int timeoutMs) {
         DatagramSocket socket = null;
         try {
             String query = freshDnsName(
@@ -514,7 +529,7 @@ public final class ProxyManager {
             socket = new DatagramSocket(null);
             socket.setReuseAddress(false);
             socket.bind(new InetSocketAddress(localAddress, 0));
-            socket.setSoTimeout(PROBE_DNS_TIMEOUT_MS);
+            socket.setSoTimeout(timeoutMs);
             socket.connect(address, 53);
             socket.send(new DatagramPacket(request, request.length));
             byte[] response = new byte[4096];
@@ -704,9 +719,10 @@ public final class ProxyManager {
                 "v6UdpProxy", result.v6UdpProxy);
     }
 
-    private static String probeErrorCode(ProbeResult result, boolean udpAllowed) {
+    private static String probeErrorCode(ProbeResult result, boolean udpAllowed,
+            boolean ipv6Allowed) {
         if (result.timedOut) return "probe_timeout";
-        if (!result.matchesPolicy(udpAllowed)) return "probe_failed";
+        if (!result.matchesPolicy(udpAllowed, ipv6Allowed)) return "probe_failed";
         return "";
     }
 
@@ -721,7 +737,8 @@ public final class ProxyManager {
                 "value", desired.value,
                 "selectedNode", desired.selectedNode,
                 "udpAllowed", desired.udpAllowed,
-                "allowInsecureHttp", desired.allowInsecureHttp);
+                "allowInsecureHttp", desired.allowInsecureHttp,
+                "ipv6Allowed", desired.ipv6Allowed);
         return map(
                 "schemaVersion", SCHEMA_VERSION,
                 "instanceId", current.instanceId == null ? "" : current.instanceId,
@@ -778,12 +795,13 @@ public final class ProxyManager {
             if (!(item instanceof Boolean)) return false;
         }
         boolean udpAllowed = current.desired.udpAllowed;
+        boolean ipv6Allowed = current.desired.ipv6Allowed;
         return Boolean.TRUE.equals(capabilities.get("v4DnsProxy"))
                 && Boolean.TRUE.equals(capabilities.get("v4TcpProxy"))
-                && Boolean.TRUE.equals(capabilities.get("v6DnsProxy"))
-                && Boolean.TRUE.equals(capabilities.get("v6TcpProxy"))
+                && Boolean.valueOf(ipv6Allowed).equals(capabilities.get("v6DnsProxy"))
+                && Boolean.valueOf(ipv6Allowed).equals(capabilities.get("v6TcpProxy"))
                 && Boolean.valueOf(udpAllowed).equals(capabilities.get("v4UdpProxy"))
-                && Boolean.valueOf(udpAllowed).equals(capabilities.get("v6UdpProxy"));
+                && Boolean.valueOf(udpAllowed && ipv6Allowed).equals(capabilities.get("v6UdpProxy"));
     }
     private void requireCheckCapacityLocked() throws ProxyException {
         if (checkId == Long.MAX_VALUE) throw new ProxyException("proxy_unavailable");
@@ -908,7 +926,7 @@ public final class ProxyManager {
         ProxyStateStore.Source source = loaded.source;
         Desired desired = source == null ? null : new Desired(
                 source.kind, source.value, source.selectedNode,
-                source.udpAllowed, source.allowInsecureHttp);
+                source.udpAllowed, source.allowInsecureHttp, source.ipv6Allowed);
         return new State(loaded.instanceId, loaded.generation, loaded.enabled, desired);
     }
     private void markUnreadable(String code) {
@@ -936,7 +954,7 @@ public final class ProxyManager {
     private static ProxyStateStore.Source toStoreSource(Desired desired) {
         return desired == null ? null : new ProxyStateStore.Source(
                 desired.kind, desired.value, desired.selectedNode,
-                desired.udpAllowed, desired.allowInsecureHttp);
+                desired.udpAllowed, desired.allowInsecureHttp, desired.ipv6Allowed);
     }
 
 
@@ -1238,15 +1256,17 @@ public final class ProxyManager {
         final String selectedNode;
         final boolean udpAllowed;
         final boolean allowInsecureHttp;
+        final boolean ipv6Allowed;
 
         Desired(
                 String kind, String value, String selectedNode, boolean udpAllowed,
-                boolean allowInsecureHttp) {
+                boolean allowInsecureHttp, boolean ipv6Allowed) {
             this.kind = kind;
             this.value = value;
             this.selectedNode = selectedNode;
             this.udpAllowed = udpAllowed;
             this.allowInsecureHttp = allowInsecureHttp;
+            this.ipv6Allowed = ipv6Allowed;
         }
 
         boolean sameAs(Desired other) {
@@ -1255,7 +1275,8 @@ public final class ProxyManager {
                     && value.equals(other.value)
                     && selectedNode.equals(other.selectedNode)
                     && udpAllowed == other.udpAllowed
-                    && allowInsecureHttp == other.allowInsecureHttp;
+                    && allowInsecureHttp == other.allowInsecureHttp
+                    && ipv6Allowed == other.ipv6Allowed;
         }
     }
 
@@ -1305,9 +1326,10 @@ public final class ProxyManager {
             this.timedOut = timedOut;
         }
 
-        boolean matchesPolicy(boolean udpAllowed) {
-            return v4DnsProxy && v4TcpProxy && v6DnsProxy && v6TcpProxy
-                    && v4UdpProxy == udpAllowed && v6UdpProxy == udpAllowed;
+        boolean matchesPolicy(boolean udpAllowed, boolean ipv6Allowed) {
+            return v4DnsProxy && v4TcpProxy
+                    && v6DnsProxy == ipv6Allowed && v6TcpProxy == ipv6Allowed
+                    && v4UdpProxy == udpAllowed && v6UdpProxy == (udpAllowed && ipv6Allowed);
         }
     }
 

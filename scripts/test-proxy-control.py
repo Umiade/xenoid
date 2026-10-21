@@ -39,6 +39,7 @@ def ready_status() -> dict:
         "ok": True, "enabled": True, "instanceId": INSTANCE,
         "runtimeEpoch": EPOCH, "generation": 7, "checkId": 9,
         "udpAllowed": True,
+        "ipv6Allowed": True,
         "report": {
             "generation": 7, "checkId": 9, "phase": "active",
             "structuralApplied": True, "dataPlaneVerified": True,
@@ -314,6 +315,7 @@ def test_status_v2_readable_and_unreadable_are_exact() -> None:
         "selectedNode": "",
         "udpAllowed": True,
         "allowInsecureHttp": False,
+        "ipv6Allowed": True,
         "quarantined": True,
         "checkId": 3,
         "runtimeEpoch": EPOCH,
@@ -333,6 +335,7 @@ def test_status_v2_readable_and_unreadable_are_exact() -> None:
         "selectedNode": None,
         "udpAllowed": None,
         "allowInsecureHttp": None,
+        "ipv6Allowed": None,
         "quarantined": True,
         "runtimeEpoch": "",
     }
