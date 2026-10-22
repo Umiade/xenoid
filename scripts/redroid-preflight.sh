@@ -21,7 +21,12 @@ if [[ -n "$DOCKER_BIN" ]]; then
   if DOCKER_INFO="$("$DOCKER_BIN" info 2>&1)"; then add_check docker true "$(printf '%s\n' "$DOCKER_INFO" | sed -n '1,5p' | tr '\n' ' ')" ""
   else add_check docker false "$DOCKER_INFO" "start Docker/Colima daemon"
   fi
-else add_check docker false "not found" "macOS: brew install docker colima; Linux: install docker"
+  if BUILDX_VERSION="$("$DOCKER_BIN" buildx version 2>&1)"; then
+    add_check buildx true "$BUILDX_VERSION" ""
+  else
+    add_check buildx false "Docker CLI Buildx plugin is unavailable" "macOS: ./xenoid install-runtime; Linux: install the Docker Buildx plugin"
+  fi
+else add_check docker false "not found" "macOS: ./xenoid install-runtime; Linux: install docker and its Buildx plugin"
 fi
 if [[ "$OS" == Darwin ]]; then
   COLIMA_BIN="$(find_cmd colima)"
@@ -37,7 +42,7 @@ if [[ "$OS" == Darwin ]]; then
     case "$BINDER_PROBE" in
       *binderfs-ready*) add_check colima_binder true "binderfs mounted inside Colima VM" "" ;;
       *modprobe-ok*) add_check colima_binder true "binder_linux module loaded inside Colima VM (binderfs mount pending)" "" ;;
-      *) add_check colima_binder false "The Colima VM lacks the binder_linux module" "xenoid start automatically installs linux-modules-extra-$(uname -r), loads binder_linux, and mounts binderfs" ;;
+      *) add_check colima_binder false "Colima binderfs is unavailable or its engine-host probe failed; this does not prove the kernel module is missing" "Run ./xenoid up to restore binder_linux and the binderfs mount on the engine host" ;;
     esac
   fi
 else

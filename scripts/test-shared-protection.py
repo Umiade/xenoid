@@ -532,6 +532,43 @@ def main() -> int:
     denied = Harness("00000000-0000-4000-8000-000000000001")
     assert denied.unload_ebpf(maintenance=False)["error"] == "shared_protection_maintenance_required"
 
+    # Engine/VM reboot: the durable record survives but the kmod/eBPF
+    # deployment is unloaded. Status reports the loss as maintenance-required
+    # drift, and ensure restores binder first, then redeploys the exact
+    # recorded digest without a legacy unload.
+    rebooted = Harness("00000000-0000-4000-8000-000000000001")
+    rebooted.record = valid_record()
+    rebooted.kmod = {
+        "ok": False,
+        "loaded": False,
+        "digest": None,
+        "artifactSha256": None,
+    }
+    rebooted.ebpf = {
+        "ok": False,
+        "loaded": False,
+        "digest": None,
+        "artifactSha256": None,
+        "attach": None,
+    }
+    binder_calls: list[int] = []
+    runtime_binder = rebooted.runtime.ensure_binder
+    rebooted.runtime.ensure_binder = lambda: (  # type: ignore[method-assign]
+        binder_calls.append(1) or runtime_binder()
+    )
+    rebooted_status = rebooted.status()
+    assert rebooted_status["ok"] is False
+    assert rebooted_status["currentDigest"] is None
+    assert rebooted_status["maintenanceRequired"] is True
+    assert rebooted_status["error"] == "shared_protection_drift"
+    rebooted_result = rebooted.ensure(C)
+    assert rebooted_result["ok"] is True
+    assert rebooted_result["reused"] is False
+    assert rebooted_result["currentDigest"] == C
+    assert rebooted.deployed is True and rebooted.legacy_unloaded is False
+    assert binder_calls == [1]
+    assert rebooted.status()["ok"] is True
+
     print("shared protection contracts: ok")
     return 0
 

@@ -1696,7 +1696,10 @@ def test_regeneration_snapshot_uses_passive_inspect_only() -> None:
         state_root=Path("/nonexistent"), instance_id=INSTANCE_ID
     )
     manager.lease = object()
-    manager.cfg = SimpleNamespace(google_services_provider=gs.PROVIDER_MICROG)
+    manager.cfg = SimpleNamespace(
+        google_services_provider=gs.PROVIDER_MICROG,
+        network_dns_servers=["1.1.1.1", "8.8.8.8"],
+    )
     manager.ensure_instance_lease = lambda: None
     manager._owned_container_record = lambda: (
         {"Id": container_id, "Image": image_id, "State": {"Running": True}},

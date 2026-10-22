@@ -875,6 +875,603 @@ def legacy_regeneration_pending_blocks_proxy_mutation() -> None:
     )
 
 
+def _load_proxy_engine() -> Any:
+    module_path = ROOT / "scripts" / "xenoid-proxy-engine.py"
+    spec = importlib.util.spec_from_file_location(
+        "xenoid_proxy_engine_contract",
+        module_path,
+    )
+    require(spec is not None and spec.loader is not None)
+    engine = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = engine
+    spec.loader.exec_module(engine)
+    return engine
+
+
+def _engine_manifest(
+    engine: Any, state: Path, generation: int
+) -> dict[str, Any]:
+    tag = "0123456789ab"
+    manifest: dict[str, Any] = {
+        "schema": "dev.xenoid.proxy-engine/v1",
+        "instanceId": ID_A,
+        "resourceTag": tag,
+        "runtimeEpoch": "epoch-" + "a" * 24,
+        "generation": generation,
+        "containerId": "c" * 64,
+        "networkId": "d" * 64,
+        "bridgeName": f"xbr{tag}",
+        "proxyNamespace": f"xenoid-p-{tag}",
+        "android": {
+            "ipv4": "172.31.0.58",
+            "ipv6": "fd78:656e:6f69:3::10",
+            "mac": "02:11:22:33:44:55",
+        },
+        "users": {
+            "proxy": f"xpm{tag}",
+            "fetcher": f"xpf{tag}",
+            "compiler": f"xpc{tag}",
+            "agent": f"xpa{tag}",
+        },
+        "veth": {
+            "host": f"xph{tag}",
+            "proxy": f"xpp{tag}",
+            "hostIpv4": "169.254.13.1",
+            "proxyIpv4": "169.254.13.2",
+            "hostIpv6": "fd78:7072:6f78:3::1",
+            "proxyIpv6": "fd78:7072:6f78:3::2",
+        },
+        "routing": {
+            "mark": 0xA0000300,
+            "mask": 0xFFFFFF00,
+            "tables": [20012, 20013, 20014, 20015],
+            "rulePriorities": [30012, 30013, 30014, 30015],
+        },
+        "engine": {
+            "binaryPath": "/usr/lib/xenoid/proxy/mihomo-v1.19.29",
+            "binarySha256": "8e02308f672e89c076bfc2fa1b03379bd54e58b0bafa81ffb01113fcf6da348d",
+        },
+        "paths": {
+            "config": str(state / "config.yaml"),
+            "state": str(state),
+            "key": str(state / "agent.key"),
+        },
+        "daemon": {"ip": "172.31.0.58", "port": 18765, "adbPort": 62111},
+    }
+    manifest["manifestDigest"] = engine.manifest_digest(manifest)
+    manifest["_state"] = state
+    return manifest
+
+
+def _engine_redigest(engine: Any, manifest: dict[str, Any]) -> str:
+    wire = {
+        key: value
+        for key, value in manifest.items()
+        if not key.startswith("_")
+    }
+    return engine.manifest_digest(wire)
+
+
+def _ownership_document(
+    *,
+    instance_id: str,
+    resource_tag: str,
+    runtime_epoch: str,
+    generation: int,
+    manifest_digest: str,
+    lease_digest: str,
+    binary_sha256: str,
+    resources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema": "dev.xenoid.proxy-engine.ownership/v1",
+        "instanceId": instance_id,
+        "resourceTag": resource_tag,
+        "runtimeEpoch": runtime_epoch,
+        "manifestDigest": manifest_digest,
+        "leaseDigest": lease_digest,
+        "manifestGeneration": generation,
+        "appliedGeneration": None,
+        "phase": "quarantine",
+        "activeCandidate": None,
+        "candidate": None,
+        "previous": None,
+        "binarySha256": binary_sha256,
+        "pythonPath": str(Path(sys.executable).resolve()),
+        "resources": resources,
+    }
+
+
+def _command_resource(
+    resource_tag: str,
+    runtime_epoch: str,
+    index: int,
+    *,
+    padding_args: int = 0,
+) -> dict[str, Any]:
+    delete = [
+        "/usr/sbin/iptables", "-w", "-t", "filter", "-D", "DOCKER-USER",
+        "-i", f"xph{resource_tag}",
+        "-m", "comment", "--comment",
+        f"xenoid-proxy/{resource_tag}/DOCKER-USER/{runtime_epoch}",
+        "-p", "tcp", "--dport", str(1024 + index),
+        "-j", f"XP4_{resource_tag}_G",
+    ]
+    delete.extend("x" * 256 for _ in range(padding_args))
+    return {
+        "kind": "command",
+        "delete": delete,
+        "scope": "transient",
+        "state": "committed",
+    }
+
+
+def _require_engine_error(
+    engine: Any, code: str, action: Callable[[], Any]
+) -> None:
+    try:
+        action()
+    except engine.Error as exc:
+        require(exc.code == code)
+    else:
+        raise ContractFailure
+
+
+@contextmanager
+def _engine_sandbox(engine: Any) -> Iterator[SimpleNamespace]:
+    # The engine is root-only production code; the sandbox keeps every mutable
+    # path in a temporary tree and patches deployment hardening (root-owned
+    # parents, fchown) that a runtime-free suite cannot exercise, while the
+    # ledger protocol under test (dedup identity, size/count bounds, canonical
+    # serialization) runs for real.
+    with tempfile.TemporaryDirectory(prefix="xenoid-engine-") as directory:
+        base = Path(directory)
+        installed: set[tuple[str, ...]] = set()
+        mutations: list[tuple[str, ...]] = []
+
+        def check_form(command: tuple[str, ...]) -> tuple[str, ...]:
+            # Map a mutating argv to its existence-check argv, mirroring how
+            # the engine pairs -N with -S and -A/-I (+insert position) with
+            # -C for the same netfilter object.
+            normalized = list(command)
+            for index, value in enumerate(normalized):
+                if value == "-N":
+                    normalized[index] = "-S"
+                    return tuple(normalized)
+                if value in ("-A", "-I"):
+                    normalized[index] = "-C"
+                    if value == "-I":
+                        del normalized[index + 2]
+                    return tuple(normalized)
+            return command
+
+        def fake_run(
+            argv: Any,
+            *,
+            data: Any = None,
+            capture: bool = False,
+            capture_error: bool = False,
+            check: bool = True,
+            code: str = "engine_command_failed",
+        ) -> SimpleNamespace:
+            command = tuple(str(value) for value in argv)
+            if "-C" in command or "-S" in command:
+                return SimpleNamespace(
+                    returncode=0 if command in installed else 1,
+                    stdout=b"",
+                    stderr=b"",
+                )
+            if "-A" in command or "-I" in command or "-N" in command:
+                installed.add(check_form(command))
+                mutations.append(command)
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        def root_file_shim(path: Any, mode: Any = None) -> Any:
+            info = Path(path).lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise engine.Error("unsafe_path")
+            return info
+
+        with mock.patch.object(engine, "STATE", base / "state-root"), mock.patch.object(
+            engine, "RUN", base / "run-root"
+        ), mock.patch.object(
+            engine, "secure_parents", lambda path: None
+        ), mock.patch.object(
+            engine,
+            "mkdir",
+            lambda path, mode: Path(path).mkdir(parents=True, exist_ok=True),
+        ), mock.patch.object(
+            engine, "tool", lambda name: f"/usr/sbin/{name}"
+        ), mock.patch.object(
+            engine, "run", fake_run
+        ), mock.patch.object(
+            engine, "root_file", root_file_shim
+        ), mock.patch("os.fchown", lambda *args: None), mock.patch(
+            "os.chown", lambda *args: None
+        ):
+            yield SimpleNamespace(
+                base=base, installed=installed, mutations=mutations
+            )
+
+
+@contract_case("proxyOwnershipLedgerStableAcrossGenerations")
+def proxy_ownership_ledger_stable_across_generations() -> None:
+    engine = _load_proxy_engine()
+    with _engine_sandbox(engine) as sandbox:
+        state = sandbox.base / "instance-state"
+        manifest = _engine_manifest(engine, state, 7)
+        ownership = _ownership_document(
+            instance_id=ID_A,
+            resource_tag=manifest["resourceTag"],
+            runtime_epoch=manifest["runtimeEpoch"],
+            generation=7,
+            manifest_digest=manifest["manifestDigest"],
+            lease_digest=engine.lease_digest(manifest),
+            binary_sha256=manifest["engine"]["binarySha256"],
+            resources=[],
+        )
+        engine.dataplane(manifest, ownership)
+        engine.ensure_baseline(manifest, ownership)
+        engine.save_owner(manifest, ownership)
+        first_count = len(ownership["resources"])
+        first_installed = set(sandbox.installed)
+        first_mutations = len(sandbox.mutations)
+        first_size = (state / "engine-ownership.json").stat().st_size
+
+        # A new config generation must reuse structural rules and their
+        # rollback records rather than accumulating duplicate hooks.
+        manifest["generation"] = 8
+        manifest["manifestDigest"] = _engine_redigest(engine, manifest)
+        ownership["manifestGeneration"] = 8
+        ownership["manifestDigest"] = manifest["manifestDigest"]
+        engine.dataplane(manifest, ownership)
+        engine.ensure_baseline(manifest, ownership)
+        engine.save_owner(manifest, ownership)
+        require(len(ownership["resources"]) == first_count)
+        require(sandbox.installed == first_installed)
+        require(len(sandbox.mutations) == first_mutations)
+        second_size = (state / "engine-ownership.json").stat().st_size
+        require(second_size == first_size)
+
+        # The persisted ledger round-trips through the real engine reader.
+        reread = _engine_manifest(engine, state, 8)
+        restored = engine.owner(reread, False)
+        require(len(restored["resources"]) == first_count)
+
+
+@contract_case("proxyOwnershipLedgerLargeStateRoundTrip")
+def proxy_ownership_ledger_large_state_round_trip() -> None:
+    engine = _load_proxy_engine()
+    with _engine_sandbox(engine) as sandbox:
+        state = sandbox.base / "instance-state"
+        manifest = _engine_manifest(engine, state, 3)
+        resources = [
+            _command_resource(
+                manifest["resourceTag"], manifest["runtimeEpoch"], index
+            )
+            for index in range(600)
+        ]
+        ownership = _ownership_document(
+            instance_id=ID_A,
+            resource_tag=manifest["resourceTag"],
+            runtime_epoch=manifest["runtimeEpoch"],
+            generation=3,
+            manifest_digest=manifest["manifestDigest"],
+            lease_digest=engine.lease_digest(manifest),
+            binary_sha256=manifest["engine"]["binarySha256"],
+            resources=resources,
+        )
+        engine.save_owner(manifest, ownership)
+        size = (state / "engine-ownership.json").stat().st_size
+        # Valid protocol data larger than the former host read limit.
+        require(65536 < size < 1048576)
+        reread = _engine_manifest(engine, state, 3)
+        restored = engine.owner(reread, False)
+        require(len(restored["resources"]) == 600)
+        require(restored["resources"][0] == resources[0])
+        require(restored["resources"][-1] == resources[-1])
+
+
+@contract_case("proxyOwnershipLedgerBoundsAreConsistent")
+def proxy_ownership_ledger_bounds_are_consistent() -> None:
+    engine = _load_proxy_engine()
+    with _engine_sandbox(engine) as sandbox:
+        state = sandbox.base / "instance-state"
+        manifest = _engine_manifest(engine, state, 3)
+        identity = {
+            "instance_id": ID_A,
+            "resource_tag": manifest["resourceTag"],
+            "runtime_epoch": manifest["runtimeEpoch"],
+            "generation": 3,
+            "manifest_digest": manifest["manifestDigest"],
+            "lease_digest": engine.lease_digest(manifest),
+            "binary_sha256": manifest["engine"]["binarySha256"],
+        }
+        # Writer never emits more resources than the reader's 2048 bound.
+        too_many = [
+            _command_resource(
+                manifest["resourceTag"], manifest["runtimeEpoch"], index
+            )
+            for index in range(2049)
+        ]
+        ownership = _ownership_document(resources=too_many, **identity)
+        _require_engine_error(
+            engine,
+            "ownership_invalid",
+            lambda: engine.save_owner(manifest, ownership),
+        )
+        # Writer never emits a payload beyond the 1 MiB read_json bound, even
+        # with a bounded resource count.
+        oversized = [
+            _command_resource(
+                manifest["resourceTag"],
+                manifest["runtimeEpoch"],
+                index,
+                padding_args=40,
+            )
+            for index in range(100)
+        ]
+        ownership = _ownership_document(resources=oversized, **identity)
+        require(
+            len(
+                json.dumps(ownership, sort_keys=True, separators=(",", ":")).encode()
+            )
+            > 1048576
+        )
+        _require_engine_error(
+            engine,
+            "ownership_invalid",
+            lambda: engine.save_owner(manifest, ownership),
+        )
+        # Reader refuses a file beyond the 1 MiB protocol bound.
+        state.mkdir(parents=True, exist_ok=True)
+        path = state / "engine-ownership.json"
+        path.write_bytes(b" " * 1048577)
+        _require_engine_error(
+            engine,
+            "ownership_invalid",
+            lambda: engine.read_json(path, "ownership_invalid"),
+        )
+        # Reader refuses a resource count beyond the 2048 protocol bound even
+        # when the file size is within the byte bound.
+        ownership = _ownership_document(resources=too_many, **identity)
+        payload = (
+            json.dumps(ownership, sort_keys=True, separators=(",", ":")).encode()
+            + b"\n"
+        )
+        require(len(payload) <= 1048576)
+        path.write_bytes(payload)
+        _require_engine_error(
+            engine,
+            "ownership_invalid",
+            lambda: engine.owner(_engine_manifest(engine, state, 3), False),
+        )
+        # Reader still refuses structurally invalid resources.
+        invalid = _ownership_document(
+            resources=[
+                {
+                    "kind": "command",
+                    "delete": [
+                        "/usr/sbin/iptables", "-w", "-t", "filter",
+                        "-D", "DOCKER-USER", "-j", "DROP",
+                    ],
+                    "scope": "transient",
+                    "state": "committed",
+                }
+            ],
+            **identity,
+        )
+        path.write_bytes(
+            json.dumps(invalid, sort_keys=True, separators=(",", ":")).encode()
+            + b"\n"
+        )
+        _require_engine_error(
+            engine,
+            "ownership_invalid",
+            lambda: engine.owner(_engine_manifest(engine, state, 3), False),
+        )
+
+
+def _canonical_json(document: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        + b"\n"
+    )
+
+
+def _proxy_restore_fixture(
+    roots: Roots,
+) -> tuple[backend.RuntimeManager, dict[str, Any], dict[str, Any], bytes, str, str]:
+    context, cfg, lease = initialize(roots, "phone-a")
+    manager = backend.RuntimeManager(context, cfg, lease)
+    epoch = f"control-{context.resource_tag}-" + "1" * 32
+    container_id = "ab" * 32
+    network_id = "cd" * 32
+    expected = manager._proxy_manifest_document(
+        epoch, 6, container_id, network_id
+    )
+    resources = [
+        _command_resource(context.resource_tag, epoch, index)
+        for index in range(300)
+    ]
+    owner = _ownership_document(
+        instance_id=context.instance_id,
+        resource_tag=context.resource_tag,
+        runtime_epoch=epoch,
+        generation=6,
+        manifest_digest=expected["manifestDigest"],
+        lease_digest="e" * 64,
+        binary_sha256=expected["engine"]["binarySha256"],
+        resources=resources,
+    )
+    return (
+        manager,
+        expected,
+        owner,
+        _canonical_json(owner),
+        container_id,
+        network_id,
+    )
+
+
+@contextmanager
+def _restore_mocks(
+    manager: backend.RuntimeManager,
+    payload: bytes,
+    container_id: str,
+    network_id: str,
+    *,
+    file_valid: bool = True,
+) -> Iterator[SimpleNamespace]:
+    staged: list[dict[str, Any]] = []
+
+    def fake_root_process(
+        arguments: list[str], **kwargs: Any
+    ) -> tuple[int, bytes]:
+        output_limit = kwargs.get("output_limit", 8192)
+        # Same bound semantics as _proxy_process: refuse over-limit output.
+        if len(payload) > output_limit:
+            raise config.InstanceError(
+                "engine_response_invalid",
+                "proxy engine response exceeded its bound",
+            )
+        return (0, payload)
+
+    with mock.patch.object(
+        manager, "_proxy_remote_regular_valid", return_value=file_valid
+    ), mock.patch.object(
+        manager, "_proxy_root_process", side_effect=fake_root_process
+    ), mock.patch.object(
+        manager, "_proxy_live_identity", return_value=(container_id, network_id)
+    ), mock.patch.object(
+        manager,
+        "_proxy_stage_manifest",
+        side_effect=lambda document: staged.append(document),
+    ):
+        yield SimpleNamespace(staged=staged)
+
+
+@contract_case("proxyOwnershipRestoreAcceptsLargeValidLedger")
+def proxy_ownership_restore_accepts_large_valid_ledger() -> None:
+    with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
+        (
+            manager,
+            expected,
+            owner,
+            payload,
+            container_id,
+            network_id,
+        ) = _proxy_restore_fixture(roots)
+        # A supported large ledger must restore the volatile manifest.
+        require(len(payload) > 65536)
+        with _restore_mocks(
+            manager, payload, container_id, network_id
+        ) as mocks:
+            restored = manager._proxy_restore_manifest_from_ownership(
+                allow_stopped=False
+            )
+        require(restored == expected)
+        require(mocks.staged == [expected])
+
+
+@contract_case("proxyOwnershipRestoreRejectsInvalidLedger")
+def proxy_ownership_restore_rejects_invalid_ledger() -> None:
+    with isolated_roots() as roots, fixed_uuids(ID_A, TX_A):
+        (
+            manager,
+            expected,
+            owner,
+            payload,
+            container_id,
+            network_id,
+        ) = _proxy_restore_fixture(roots)
+
+        def attempt(candidate: bytes, *, file_valid: bool = True) -> None:
+            with _restore_mocks(
+                manager, candidate, container_id, network_id,
+                file_valid=file_valid,
+            ):
+                manager._proxy_restore_manifest_from_ownership(
+                    allow_stopped=False
+                )
+
+        # Beyond the 1 MiB protocol bound the transport limit trips first.
+        require_error(
+            "engine_response_invalid",
+            lambda: attempt(payload + b" " * (1048577 - len(payload))),
+        )
+        # Resource count beyond the engine's 2048-resource protocol bound.
+        bloated = dict(owner)
+        bloated["resources"] = [
+            _command_resource(owner["resourceTag"], owner["runtimeEpoch"], index)
+            for index in range(2049)
+        ]
+        bloated_payload = _canonical_json(bloated)
+        require(len(bloated_payload) <= 1048576)
+        require_error("ownership_mismatch", lambda: attempt(bloated_payload))
+        # Non-canonical encodings: missing trailing newline, spaced
+        # separators, unsorted keys.
+        require_error("ownership_mismatch", lambda: attempt(payload[:-1]))
+        spaced = (
+            json.dumps(owner, ensure_ascii=True, sort_keys=True).encode("ascii")
+            + b"\n"
+        )
+        require_error("ownership_mismatch", lambda: attempt(spaced))
+        unsorted = (
+            json.dumps(
+                dict(reversed(list(owner.items()))),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            + b"\n"
+        )
+        require(unsorted != payload)
+        require_error("ownership_mismatch", lambda: attempt(unsorted))
+        # Malformed JSON and truncated output.
+        require_error("ownership_mismatch", lambda: attempt(b"{not json\n"))
+        require_error("ownership_mismatch", lambda: attempt(b""))
+        # Ownership identity mismatch.
+        wrong_instance = dict(owner)
+        wrong_instance["instanceId"] = ID_B
+        require_error(
+            "ownership_mismatch", lambda: attempt(_canonical_json(wrong_instance))
+        )
+        wrong_tag = dict(owner)
+        wrong_tag["resourceTag"] = "f" * 12
+        require_error(
+            "ownership_mismatch", lambda: attempt(_canonical_json(wrong_tag))
+        )
+        # Stale digest: recomputed live manifest identity disagrees.
+        stale = dict(owner)
+        stale["manifestDigest"] = "0" * 64
+        require_error(
+            "ownership_mismatch", lambda: attempt(_canonical_json(stale))
+        )
+        # Type strictness: boolean generation, non-list resources, missing key.
+        bool_generation = dict(owner)
+        bool_generation["manifestGeneration"] = True
+        require_error(
+            "ownership_mismatch",
+            lambda: attempt(_canonical_json(bool_generation)),
+        )
+        bad_resources = dict(owner)
+        bad_resources["resources"] = {}
+        require_error(
+            "ownership_mismatch", lambda: attempt(_canonical_json(bad_resources))
+        )
+        missing_key = dict(owner)
+        del missing_key["previous"]
+        require_error(
+            "ownership_mismatch", lambda: attempt(_canonical_json(missing_key))
+        )
+        # Unsafe file metadata still refuses before any read.
+        require_error(
+            "ownership_mismatch", lambda: attempt(payload, file_valid=False)
+        )
+
+
 def main() -> int:
     results: dict[str, bool] = {}
     for name, test in CASES.items():

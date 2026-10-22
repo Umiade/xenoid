@@ -316,6 +316,7 @@ proxy_status_keys = {
     "selectedNode",
     "udpAllowed",
     "allowInsecureHttp",
+    "ipv6Allowed",
     "quarantined",
     "checkId",
     "runtimeEpoch",
@@ -406,6 +407,7 @@ source_request = {
     "selectedNode": "",
     "udpAllowed": False,
     "allowInsecureHttp": False,
+    "ipv6Allowed": True,
 }
 source_type_negatives = (
     {**source_request, "kind": 1},
@@ -537,6 +539,7 @@ expect(
         "selectedNode": "fixture-node",
         "udpAllowed": True,
         "allowInsecureHttp": True,
+        "ipv6Allowed": True,
     }
 )
 

@@ -35,13 +35,15 @@ sdkmanager_path() {
 }
 
 cmds=(
-  "brew install docker colima android-platform-tools scrcpy openjdk@17"
+  "brew install docker docker-buildx colima android-platform-tools scrcpy openjdk@17"
+  "register Homebrew docker-buildx in the Docker CLI plugin directory"
+  "docker --context colima buildx version"
   "brew link --force openjdk@17"
   "brew install --cask android-commandlinetools"
   "sdkmanager --sdk_root=$SDK_ROOT --licenses"
   "sdkmanager --sdk_root=$SDK_ROOT platform-tools platforms;android-35 build-tools;35.0.0 ndk;$NDK_VERSION"
   "colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8"
-  "docker pull --platform linux/arm64 $BASE_IMAGE_DIRECT (content-addressed mirror fallback)"
+  "docker --context colima pull --platform linux/arm64 $BASE_IMAGE_DIRECT (content-addressed mirror fallback)"
   "colima ssh -- sh -c '<ensure binder_linux and mount binderfs>'"
 )
 if [[ "$DRY" == 1 ]]; then
@@ -72,7 +74,7 @@ MSG
   exit 127
 fi
 
-if brew install docker colima android-platform-tools scrcpy openjdk@17; then
+if brew install docker docker-buildx colima android-platform-tools scrcpy openjdk@17; then
   :
 else
   brew_status=$?
@@ -90,6 +92,20 @@ MSG
   fi
   exit "$brew_status"
 fi
+BUILDX_BIN="$(brew --prefix docker-buildx)/bin/docker-buildx"
+BUILDX_LINK="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins/docker-buildx"
+[[ -x "$BUILDX_BIN" ]] || {
+  echo "Homebrew docker-buildx did not provide a usable plugin" >&2
+  exit 127
+}
+if [[ -e "$BUILDX_LINK" && ! -L "$BUILDX_LINK" ]]; then
+  echo "An unmanaged docker-buildx file occupies the CLI plugin path; move it aside and retry" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$BUILDX_LINK")"
+ln -sfn "$BUILDX_BIN" "$BUILDX_LINK"
+docker --context colima buildx version >/dev/null
+
 JDK_PREFIX="$(brew --prefix openjdk@17)"
 JAVA_HOME="$JDK_PREFIX/libexec/openjdk.jdk/Contents/Home"
 [[ -x "$JAVA_HOME/bin/java" ]] || {
@@ -116,18 +132,18 @@ mkdir -p "$SDK_ROOT"
   "ndk;$NDK_VERSION"
 
 colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8
-if docker pull --platform linux/arm64 "$BASE_IMAGE_DIRECT"; then
+if docker --context colima pull --platform linux/arm64 "$BASE_IMAGE_DIRECT"; then
   BASE_IMAGE_SOURCE="$BASE_IMAGE_DIRECT"
 else
   BASE_IMAGE_SOURCE="$BASE_IMAGE_MIRROR"
-  docker pull --platform linux/arm64 "$BASE_IMAGE_SOURCE"
+  docker --context colima pull --platform linux/arm64 "$BASE_IMAGE_SOURCE"
 fi
-ACTUAL_BASE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$BASE_IMAGE_SOURCE")"
+ACTUAL_BASE_IMAGE_ID="$(docker --context colima image inspect --format '{{.Id}}' "$BASE_IMAGE_SOURCE")"
 if [[ "$ACTUAL_BASE_IMAGE_ID" != "$BASE_IMAGE_ID" ]]; then
   echo "redroid base image identity mismatch: expected $BASE_IMAGE_ID" >&2
   exit 1
 fi
-docker image tag "$BASE_IMAGE_SOURCE" "$BASE_IMAGE"
+docker --context colima image tag "$BASE_IMAGE_SOURCE" "$BASE_IMAGE"
 colima ssh -- sh -c "$BINDER_SETUP"
 
 
@@ -154,8 +170,8 @@ NDK_CLANG="$(find "$SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt" -type f 
   echo "Android NDK $NDK_VERSION does not provide aarch64-linux-android21-clang" >&2
   exit 127
 }
-docker info >/dev/null
-docker image inspect "$BASE_IMAGE" >/dev/null
+docker --context colima info >/dev/null
+docker --context colima image inspect "$BASE_IMAGE" >/dev/null
 colima ssh -- test -e /dev/binderfs/binder-control
 
 cat <<'MSG'

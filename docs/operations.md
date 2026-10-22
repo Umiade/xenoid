@@ -13,11 +13,31 @@ cd xenoid
 ./xenoid view
 ```
 
-`install-runtime` installs and validates Docker CLI, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It prepares the ARM64 Colima VM and binderfs and explicitly pulls the canonical ARM64 redroid base at its pinned image identity. If direct Docker Hub access is unavailable, it uses a content-addressed mirror and rejects any identity mismatch; `up` never implicitly refreshes the base and `init` remains the explicit instance-creation step.
+`install-runtime` installs and validates the Homebrew Docker CLI and Buildx plugin, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It registers Buildx in the Docker CLI plugin directory without reading or rewriting Docker authentication configuration. It prepares the ARM64 Colima VM and binderfs and explicitly pulls the canonical ARM64 redroid base at its pinned image identity through the `colima` context. If direct Docker Hub access is unavailable, it uses a content-addressed mirror and rejects any identity mismatch; `up` never implicitly refreshes the base and `init` remains the explicit instance-creation step.
+
+Docker Desktop is not required. Before uninstalling it, verify that both
+`docker` and `docker buildx version` work independently of its app bundle;
+Desktop may have supplied CLI-plugin symlinks even when containers use Colima.
+Keep the Colima VM, its data disks, Docker context, and Xenoid instance state.
+Do not delete the entire Docker configuration directory. `docker context use
+colima` changes the default for manual commands; Xenoid selects its configured
+context explicitly.
 
 `up` is the sole production convergence owner. It validates/reuses artifacts, ensures a content-addressed image only when needed, selects the minimum safe runtime action, reconciles independent components, and returns success only after fresh `LiveAcceptance` for the final runtime. Healthy repeated runs are no-ops apart from fresh observation; daemon/helper/proxy-only drift does not recreate the container.
 
-When the configured engine is stopped — Colima VM after a macOS reboot, or the local docker service on Linux — `up` starts it before observing; remote engines and first-time installation are never attempted (that stays with `install-runtime`/`init`). The same phase ensures the engine host's kernel-matched prerequisites: the binder module is loaded before protection maintenance, and missing `linux-headers-$(uname -r)` are installed on apt-managed engine hosts before the kmod build. A retained convergence journal whose recorded inputs no longer match the environment is discarded and replanned fresh rather than failing `convergence_inputs_changed`.
+When the configured engine is stopped — Colima VM after a macOS reboot, or the local docker service on Linux — `up` starts it before observing; remote engines and first-time installation are never attempted (that stays with `install-runtime`/`init`). The same phase ensures the engine host's kernel-matched prerequisites: the binder module is loaded before protection maintenance, and missing `linux-headers-$(uname -r)` are installed on apt-managed engine hosts before the kmod build.
+
+A retained convergence plan cannot reuse readiness lost during a reboot.
+`up` rechecks image inputs, runtime, control-plane, and protection state and
+replans when inputs change or recorded immutable identities still match but
+assumed readiness is gone. Unobservable image inputs block convergence rather
+than being treated as a complete reuse plan; any retained journal stays intact.
+Boot-seed targets are retained through replanning only when healthy committed
+storage proves the exact filesystem UUIDs; unknown ownership, unproven seed
+targets, and unobserved protection fail closed with the journal preserved.
+Regeneration-linked journals remain owned by regeneration recovery. Low-level
+`start`, including `start --recreate`, refuses a pending convergence journal;
+use `up` rather than bypassing or deleting that journal.
 
 ## Instance lifecycle and data persistence
 
@@ -55,31 +75,54 @@ Device identity is generated once per instance. `device regenerate` publishes it
 
 ### Reclaiming host disk space (macOS Colima)
 
-Docker state lives in two raw disk images that never shrink on their own:
-`~/.colima/_lima/_disks/colima/datadisk` (Docker images/volumes) and
-`~/.colima/_lima/colima/disk` (VM root). Measure real usage with `du -h`; the
-`ls -lh` logical size never changes, and guest `fstrim` does not propagate to
-the host files.
+The Colima data disk and VM root disk are sparse files. Guest capacity, guest
+filesystem usage, and host allocation are different measurements. A 100 GiB
+logical disk does not reserve 100 GiB of host storage. Compaction must not
+reduce the configured capacity or shrink Xenoid's committed Android data image;
+future app installs and builds need both guest and host headroom.
+
+Start with observations, not pruning or a disk rewrite:
 
 ```bash
-# 1. Free guest filesystem space first.
-docker system prune
-
-# 2. Optional: zero the guest's free blocks so step 3 can hole-punch them.
-#    The fill temporarily grows host allocation; keep it below free host space.
-colima ssh -- sudo sh -c 'dd if=/dev/zero of=/mnt/lima-colima/.zerofill bs=1M || true; rm -f /mnt/lima-colima/.zerofill; sync'
-
-# 3. Rewrite the disks sparsely while the VM is stopped.
-colima stop
-/bin/dd if=~/.colima/_lima/_disks/colima/datadisk of=~/.colima/_lima/_disks/colima/datadisk.sparse bs=4m conv=sparse
-mv ~/.colima/_lima/_disks/colima/datadisk.sparse ~/.colima/_lima/_disks/colima/datadisk
-/bin/dd if=~/.colima/_lima/colima/disk of=~/.colima/_lima/colima/disk.sparse bs=4m conv=sparse
-mv ~/.colima/_lima/colima/disk.sparse ~/.colima/_lima/colima/disk
-colima start
+docker --context colima system df
+colima ssh -- df -h / /var/lib/docker
+df -h "$HOME"
+du -h ~/.colima/_lima/_disks/colima/datadisk ~/.colima/_lima/colima/disk
 ```
 
-The existing files may be APFS-compressed, so compare `du -h` before replacing
-the original: rewriting without the zero-fill in step 2 can grow host usage.
+`du` measures host allocation, not logical size. For an exact byte comparison,
+use `stat().st_size` for logical capacity and `stat().st_blocks * 512` for allocated
+bytes. A scan for nonzero bytes is not a physical-allocation measurement. Discard
+and sparse-file reclamation depend on the VM/filesystem implementation; measure
+the settled result rather than promising a particular saving.
+
+Remove only resources whose ownership and lack of use have been established.
+Build cache is rebuildable but deleting it slows later builds. Stopped Xenoid
+containers, data volumes, the pinned base image, and required runtime images
+are not disposable cache. Rootfs scratch directories are invocation-owned;
+do not delete a shared scratch tree while a build or storage transaction can
+still be using it. Avoid blanket `system prune --volumes` commands.
+
+Offline disk compaction is optional maintenance, not part of `up`:
+
+1. Complete pending instance transactions, then stop every instance through
+   `./xenoid --instance <name> stop`. Stop other workloads before stopping Colima.
+2. Budget peak host usage for both the original disk and a replacement, plus
+   host/guest safety reserves. Never fill the guest filesystem to `ENOSPC` to
+   force zeros; concurrent daemon writes can fail, and sparse disks can grow
+   toward their full logical capacity. Do not perform an unbounded zero-fill.
+3. With Colima stopped, retain the original until a replacement has the same
+   logical length and byte content, preserved required metadata, durable writes,
+   and a measured allocation benefit. A sparse rewrite can increase allocation;
+   do not replace blindly or discard the only verified original first.
+4. Restart through ordinary `./xenoid --instance <name> up`, then run
+   `./xenoid --instance <name> doctor --require-runtime`. Check final structured
+   results and exit codes, not a truncated pipeline or `status.ok` alone.
+
+Keep ownership ledgers and convergence journals intact during maintenance.
+They contain rollback/recovery obligations, not expendable logs. A failed
+recovery is a reason to diagnose the owning mechanism, not to delete its state
+or bypass it with a manual container recreation.
 
 ## Linux ARM
 

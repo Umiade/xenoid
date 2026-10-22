@@ -8,6 +8,12 @@ Normal `./xenoid build all` hashes inputs and reuses valid records. Missing muta
 
 `./xenoid build all --force` deliberately rebuilds every target. If the same input/tool identity produces different bytes, modes, or sizes, it fails `artifact_nondeterministic` and retains the prior successful record. `./xenoid up --skip-build` is validation-only: it refuses missing/stale records, unsafe or changed objects, wrong modes/architecture, and source/tool drift instead of compiling.
 
+Both Gradle and standalone daemon builds use the shared Android SDK resolver:
+`ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then the host's conventional SDK
+directory. Runtime-image APK identity verification uses the existing Python
+SDK resolver with the same locations. An SDK installed by `install-runtime`
+needs no shell-only export for subsequent builds or image verification.
+
 The `runtimeContext`, `liveDeploy`, and `release` consumers stage only validated record/object snapshots. Generated runtime contexts are canonical: paths are sorted, modes and timestamps are fixed, symlinks/special files are rejected, and `context-manifest.json` records each relative path/type/mode/size/SHA-256. Both patched JAR producers use the same pinned apktool and canonical ZIP writer.
 
 ## Content-addressed runtime images
@@ -15,6 +21,13 @@ The `runtimeContext`, `liveDeploy`, and `release` consumers stage only validated
 `./xenoid runtime-build-image` and production `up` share `RuntimeImageBuilder`. Its full `inputSha256` covers the immutable ARM64 base image ID, validated runtime-context artifact tuples, canonical recipes and redroid sources, Python/zlib/Java/BuildKit identities, pinned apktool, and sorted Google inputs. For microG those inputs include both source releases, the two private import manifests, all three component byte/signer/path identities, framework policy commits/certificates, and every product-policy input/output. `bootInputSha256` substitutes the daemon seed integration contract for ordinary daemon APK bytes, so an update-compatible APK-only change can be live-installed without recreating storage ownership.
 
 The configured `runtime_image_tag` is a repository namespace, not a mutable effective tag. Publication uses `<repository>:xenoid-<first-32-input-hex>` and labels the full input, boot input, and immutable base ID under an engine-host lock. Production base references should be digest-pinned. Mutable tags remain explicit locally observed update inputs and are never implicitly pulled by `up`; an explicit digest must match. A conflicting occupied content tag, changed base/input during build, or unsupported reproducibility control fails without replacing the prior image. `start --recreate` consumes a verified image and never builds one.
+
+macOS uses the Homebrew `docker` and `docker-buildx` formulae with Colima, not
+Docker Desktop. `./xenoid install-runtime` registers the Homebrew Buildx binary
+as a CLI plugin and validates `docker --context colima buildx version`; a
+working `docker` client alone is insufficient. Buildx is required even to
+validate the tool identity of a previously built image. Replacing its version
+can change the content-derived image identity without changing Android data.
 
 ## Host CLI/MCP
 
@@ -54,6 +67,10 @@ python3 scripts/smoke-storage-surfaces.py
 ```
 
 Covers fresh initialization, pending recovery, tagged adoption, committed hard-failure, legacy migration with backup, safe container removal order, and dual-instance isolation.
+
+Rootfs extraction workspaces belong to one storage transaction. The builder
+removes its extracted tree after successful rootfs publication as well as on
+failure; published images and the persistent Android data volume are retained.
 
 ## Global proxy runtime
 

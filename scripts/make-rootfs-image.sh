@@ -178,6 +178,7 @@ mv '$VOL_PATH/.xenoid-rootfs.img.source.sha256.$$' '$VOL_PATH/xenoid-rootfs.img.
 sync -f '$VOL_PATH'
 EOF
 )"
+  cleanup_rootfs_build
   trap - EXIT
   echo "rootfs image rebuilt"
 fi

@@ -5935,6 +5935,29 @@ cat >/dev/null
                 "message": "device regeneration must resume through convergence",
                 "plan": plan,
             }
+        if not dry_run:
+            from .convergence import ConvergenceError, ConvergenceJournal
+
+            try:
+                convergence_pending = (
+                    ConvergenceJournal(
+                        self.context.state_root,
+                        instance_id=self.context.instance_id,
+                    ).load()
+                    is not None
+                )
+            except ConvergenceError:
+                # An invalid or unreadable journal is unresolved mutation
+                # state: fail closed instead of replacing resources that the
+                # retained journal pins.
+                convergence_pending = True
+            if convergence_pending:
+                return {
+                    "ok": False,
+                    "error": "convergence_pending",
+                    "message": "a convergence journal is pending; resume it with ./xenoid up before low-level start",
+                    "plan": plan,
+                }
         try:
             selected_image = self.selected_runtime_image()
             plan["runtimeImage"] = selected_image
@@ -12603,12 +12626,16 @@ cat >/dev/null
         owner_path = f"{self._proxy_state_path}/engine-ownership.json"
         if not self._proxy_remote_regular_valid(owner_path, 0o600):
             raise InstanceError("ownership_mismatch", "proxy ownership state is invalid")
+        # The ledger is engine protocol state: accept exactly what the engine
+        # accepts (read_json 1 MiB size bound, validate_owner 2048-resource
+        # bound) so a valid ledger always restores the volatile /run manifest
+        # after an engine-host reboot without hand edits.
         returncode, output = self._proxy_root_process(
             ["cat", "--", owner_path],
             timeout=30,
-            output_limit=65536,
+            output_limit=1048576,
         )
-        if returncode != 0 or not 3 <= len(output) <= 65536:
+        if returncode != 0 or not 3 <= len(output) <= 1048576:
             raise InstanceError("ownership_mismatch", "proxy ownership state could not be read")
         try:
             owner = self._proxy_json_document(output.decode("ascii", "strict"))
@@ -12631,6 +12658,8 @@ cat >/dev/null
             or isinstance(owner.get("manifestGeneration"), bool)
             or not isinstance(owner.get("manifestDigest"), str)
             or re.fullmatch(r"[0-9a-f]{64}", owner["manifestDigest"]) is None
+            or not isinstance(owner.get("resources"), list)
+            or len(owner["resources"]) > 2048
         ):
             raise InstanceError("ownership_mismatch", "proxy ownership state is invalid")
         canonical = (

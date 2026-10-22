@@ -513,8 +513,12 @@ class FakeManager:
         self, expected_container_id: str, boot_seed_target: Mapping[str, Any]
     ) -> dict[str, Any]:
         del boot_seed_target
-        self.snapshot["runtime"]["bootSeedRequired"] = False
-        return self._result("seed-initialize", containerId=expected_container_id)
+        # A failed offline seed leaves the identity uninitialized: only a
+        # successful initialize clears the boot-seed requirement.
+        result = self._result("seed-initialize", containerId=expected_container_id)
+        if result.get("ok") is True:
+            self.snapshot["runtime"]["bootSeedRequired"] = False
+        return result
 
     def remove_owned_container_for_recreate(
         self,
@@ -651,7 +655,26 @@ class FakeManager:
         )
 
     def reconcile_protection(self, action: Any, expected_digest: str | None) -> dict[str, Any]:
-        self.snapshot["components"]["protection"]["state"] = "matching"
+        protection = self.snapshot["components"]["protection"]
+        protection["state"] = "matching"
+        if expected_digest is not None:
+            # A successful reconcile/ensure leaves the engine-host deployment
+            # at exactly the expected digest, matching the real owner.
+            protection.update(
+                {
+                    "currentDigest": expected_digest,
+                    "replacementRequired": False,
+                    "maintenanceRequired": False,
+                }
+            )
+            protection["observed"].update(
+                {
+                    "ok": True,
+                    "currentDigest": expected_digest,
+                    "replacementRequired": False,
+                    "maintenanceRequired": False,
+                }
+            )
         return self._result("protection", action=action, currentDigest=expected_digest)
 
 class FakeArtifacts:
@@ -2282,6 +2305,69 @@ def stale_journal_inputs_trigger_fresh_replan() -> None:
         require(second.get("resumed") is False, "stale journal must not be resumed")
 
 
+@case("unobservedImageInputsRefuseAndPreserveJournal")
+def unobserved_image_inputs_refuse_and_preserve_journal() -> None:
+    for retained in (False, True):
+        snapshot = healthy_snapshot()
+        snapshot["runtime"]["state"] = "stopped"
+        with manager_fixture(snapshot) as manager:
+            journal = convergence.ConvergenceJournal(manager)
+            if retained:
+                plan = convergence.ConvergencePlanner(manager).inspect()
+                journal.create(plan, observation=manager.snapshot)
+            before = journal.load()
+            manager.snapshot.update(
+                desiredImageInputSha256=None,
+                desiredImageBootInputSha256=None,
+                selectedImageRecord=None,
+                imageError="runtime_image_android_tools_unavailable",
+            )
+            result = convergence.ConvergenceExecutor(
+                manager,
+                live_acceptance=FakeAcceptance(manager),
+                artifact_builder=FakeArtifacts(manager),
+            ).run()
+            require(
+                result.get("error") == "convergence_image_input_unavailable",
+                "unobserved image inputs reached runtime mutation",
+            )
+            require(journal.load() == before, "unobserved image inputs changed the journal")
+            require(
+                all(name in {"observe", "lock"} for name, _ in manager.calls),
+                "unobserved image inputs mutated the runtime",
+            )
+
+
+@case("resolvedImageInputsReplanPreviouslyUnboundJournal")
+def resolved_image_inputs_replan_previously_unbound_journal() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["state"] = "stopped"
+    with manager_fixture(snapshot) as manager:
+        journal = convergence.ConvergenceJournal(manager)
+        plan = dataclasses.replace(
+            convergence.ConvergencePlanner(manager).inspect(),
+            desired_image_input_sha256=None,
+            desired_image_boot_input_sha256=None,
+            selected_image_record=None,
+            plan_digest="",
+        )
+        journal.create(plan, observation=manager.snapshot)
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=_RebootResumeAcceptance(manager, "reuse"),
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(result.get("ok") is True, f"image-input recovery failed: {result.get('error')}")
+        require(result.get("resumed") is False, "unbound image plan was reused")
+        require(journal.load() is None, "accepted recovery retained its journal")
+        require(
+            manager.snapshot["runtime"]["state"] == "running"
+            and manager.snapshot["runtime"]["containerId"] == OLD_CONTAINER
+            and manager.snapshot["runtime"]["dataUuid"] == DATA_UUID,
+            "image-input recovery replaced matching runtime or storage",
+        )
+
+
 @case("deadlineCancellationProgressHeartbeatAndRedaction")
 def deadline_cancellation_progress_heartbeat_and_redaction() -> None:
     with manager_fixture() as manager:
@@ -2390,6 +2476,562 @@ def journaled_start_pins_container_and_image_digests() -> None:
         rejected.get("error") == "runtime_spec_mismatch",
         "journaled start accepted mismatched image labels",
     )
+
+
+class _RebootResumeAcceptance(FakeAcceptance):
+    """Live resolution for a runtime whose host-side location/protection facts
+    are already converged; only the protection action differs per scenario."""
+
+    def __init__(self, manager: FakeManager, protection_action: str) -> None:
+        super().__init__(manager)
+        self.protection_action = protection_action
+
+    def observe(
+        self,
+        context: Any,
+        expected: Mapping[str, Any],
+        mode: str,
+        deadline: float | None,
+        progress: Callable[[Mapping[str, Any]], None] | None,
+    ) -> dict[str, Any]:
+        result = super().observe(context, expected, mode, deadline, progress)
+        if mode == "convergence-resolve":
+            result["componentActions"]["location"] = "reuse"
+            result["componentActions"]["protection"] = self.protection_action
+        return result
+
+
+def _simulate_engine_reboot(snapshot: dict[str, Any]) -> None:
+    """Model a Colima/engine reboot: the same container ID stays stopped and
+    the kmod/eBPF deployment is unloaded, while every recorded input digest
+    (engine ID, expected protection digest) still matches."""
+    snapshot["runtime"]["state"] = "stopped"
+    protection = snapshot["components"]["protection"]
+    protection.update(
+        {
+            "state": "maintenance",
+            "currentDigest": None,
+            "replacementRequired": True,
+            "maintenanceRequired": True,
+        }
+    )
+    protection["observed"].update(
+        {
+            "ok": False,
+            "currentDigest": None,
+            "replacementRequired": True,
+            "maintenanceRequired": True,
+        }
+    )
+
+
+@case("retainedJournalReplansAfterVolatileEngineReboot")
+def retained_journal_replans_after_volatile_engine_reboot() -> None:
+    # Incident replica: a journal retained after proxy convergence whose plan
+    # assumed a running runtime and healthy protection must not skip straight
+    # to acceptance after an engine/VM reboot. Resume discards the volatile-
+    # stale journal and replans, so protection maintenance (which also
+    # restores binder) runs before the same container is started.
+    snapshot = healthy_snapshot()
+    snapshot["components"]["proxy"]["state"] = "drift"
+    snapshot["components"]["proxy"]["generation"] = None
+    with manager_fixture(snapshot) as manager:
+        acceptance = _RebootResumeAcceptance(manager, "maintenance")
+        acceptance.fail_final = True
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False and first["error"] == "acceptance_failed",
+            "fixture did not retain a proxy-era journal",
+        )
+        retained = convergence.ConvergenceJournal(manager).load()
+        require(
+            retained is not None and retained["phase"] == "proxy_converged",
+            "journal did not retain the incident shape",
+        )
+        plan = convergence.ConvergencePlan.from_dict(retained["plan"])
+        require(
+            plan.runtime_action == "reuse" and plan.protection_action == "reuse",
+            "incident plan did not assume volatile readiness",
+        )
+        _simulate_engine_reboot(manager.snapshot)
+        calls_before = len(manager.calls)
+        acceptance.fail_final = False
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            second["ok"] is True,
+            f"reboot replan failed: {second.get('error')}",
+        )
+        require(second.get("resumed") is False, "volatile-stale journal was resumed")
+        require(
+            second["plan"]["runtimeAction"] == "start"
+            and second["plan"]["protectionAction"] == "maintenance",
+            "replan did not select start + protection maintenance",
+        )
+        resumed_calls = manager.calls[calls_before:]
+        names = [name for name, _ in resumed_calls]
+        require(
+            "maintain-protection" in names and "start" in names,
+            "reboot recovery skipped protection maintenance or container start",
+        )
+        require(
+            names.index("maintain-protection") < names.index("start"),
+            "protection maintenance did not precede container start",
+        )
+        started = [values for name, values in resumed_calls if name == "start"]
+        require(
+            started[0].get("containerId") == OLD_CONTAINER,
+            "reboot recovery replaced the owned container",
+        )
+        require(
+            not ({"create", "remove", "seed-start"} & set(names)),
+            "reboot recovery mutated container identity",
+        )
+        require(
+            not (manager.context.state_root / "convergence-v1.json").exists(),
+            "accepted reboot recovery retained its journal",
+        )
+
+
+@case("retainedJournalReplansAfterControlPlaneRestart")
+def retained_journal_replans_after_control_plane_restart() -> None:
+    # Same retained reuse journal, but the container was restarted out of band
+    # (still running, new StartedAt): completed phases strand the recorded
+    # adb/rootd/bootstrap transports, so resume replans into the idempotent
+    # restart path instead of running acceptance against a dead control plane.
+    snapshot = healthy_snapshot()
+    snapshot["components"]["proxy"]["state"] = "drift"
+    snapshot["components"]["proxy"]["generation"] = None
+    with manager_fixture(snapshot) as manager:
+        acceptance = _RebootResumeAcceptance(manager, "reuse")
+        acceptance.fail_final = True
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False and first["error"] == "acceptance_failed",
+            "fixture did not retain a proxy-era journal",
+        )
+        manager.snapshot["controlPlane"] = {
+            "ready": False,
+            "observedStartedAt": "2026-01-02T00:00:00.000000000Z",
+            "recordedStartedAt": "2026-01-01T00:00:00.000000000Z",
+        }
+        calls_before = len(manager.calls)
+        acceptance.fail_final = False
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            second["ok"] is True,
+            f"control-plane restart replan failed: {second.get('error')}",
+        )
+        require(second.get("resumed") is False, "stale control-plane journal was resumed")
+        require(
+            second["plan"]["runtimeAction"] == "restart",
+            "replan did not select the idempotent restart path",
+        )
+        names = [name for name, _ in manager.calls[calls_before:]]
+        require("start" in names, "stale control plane did not rerun start")
+        require(
+            "maintain-protection" not in names,
+            "healthy protection was reloaded",
+        )
+        require(
+            not ({"create", "remove", "seed-start"} & set(names)),
+            "control-plane restart mutated container identity",
+        )
+
+
+@case("retainedCreateJournalResumesStoppedIntermediate")
+def retained_create_journal_resumes_stopped_intermediate() -> None:
+    # A recreate journal retained between container_created and runtime_started
+    # legitimately holds a stopped container: resume must adopt and finish it,
+    # not discard the journal as volatile-stale.
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["createSpecMatches"] = False
+    with manager_fixture(snapshot) as manager:
+        manager.fail_once["start"] = "container_start_failed"
+        acceptance = _RebootResumeAcceptance(manager, "reuse")
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False and first["error"] == "container_start_failed",
+            "fixture did not fail at runtime start",
+        )
+        retained = convergence.ConvergenceJournal(manager).load()
+        require(
+            retained is not None and retained["phase"] == "container_created",
+            "journal did not retain the created-but-stopped phase",
+        )
+        # container_start_failed means docker never started it: the pinned
+        # container is still stopped (the fake's start marks it running before
+        # reporting the failure, so restore the real post-failure state).
+        manager.snapshot["runtime"]["state"] = "stopped"
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            second["ok"] is True,
+            f"stopped intermediate resume failed: {second.get('error')}",
+        )
+        require(
+            second.get("resumed") is True,
+            "legitimate stopped intermediate journal was discarded",
+        )
+        names = [name for name, _ in manager.calls]
+        require(names.count("remove") == 1, "resume repeated container removal")
+        require(names.count("create") == 1, "resume repeated container creation")
+        require(
+            manager.snapshot["runtime"]["containerId"] == NEW_CONTAINER,
+            "resume replaced the pinned container",
+        )
+
+
+@case("retainedMaintenanceJournalReplansAfterProtectionUnload")
+def retained_maintenance_journal_replans_after_protection_unload() -> None:
+    # A journal that recorded shared_protection_maintained must not fail
+    # closed forever when an engine reboot later unloads the deployment:
+    # maintenance is idempotent and digest-bound, so resume replans and
+    # re-ensures instead of reporting an unrecoverable conflict.
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["createSpecMatches"] = False
+    _simulate_engine_reboot(snapshot)
+    with manager_fixture(snapshot) as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect()
+        require(
+            plan.protection_action == "maintenance",
+            "unloaded protection did not select maintenance",
+        )
+        journal = convergence.ConvergenceJournal(manager)
+        journal.create(plan, operation_id="9" * 32, observation=manager.snapshot)
+        journal.advance("quarantined", proxyQuarantined=False)
+        journal.advance(
+            "image_ensured",
+            selectedImageInputSha256=INPUT_DIGEST,
+            selectedImageBootInputSha256=BOOT_DIGEST,
+        )
+        journal.advance("runtime_quiesced")
+        journal.advance("shared_protection_maintained")
+        acceptance = _RebootResumeAcceptance(manager, "maintenance")
+        result = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            result["ok"] is True,
+            f"maintenance replan after unload failed: {result.get('error')}",
+        )
+        require(
+            result.get("resumed") is False,
+            "maintenance journal for an unloaded deployment was resumed",
+        )
+        names = [name for name, _ in manager.calls]
+        require(
+            names.count("maintain-protection") == 1,
+            "replan did not re-ensure the unloaded deployment",
+        )
+        require(names.count("remove") == 1, "recreate did not remove exactly once")
+        require(
+            not (manager.context.state_root / "convergence-v1.json").exists(),
+            "accepted maintenance replan retained its journal",
+        )
+
+
+@case("seedJournalRebootReplansWithAdoptedTargets")
+def seed_journal_reboot_replans_with_adopted_targets() -> None:
+    # A boot-seed journal interrupted after seed_runtime_started and then hit
+    # by an engine reboot must keep its exact target UUID obligations: the
+    # seed transaction committed them to storage, so the volatile replan
+    # adopts the committed UUIDs instead of generating conflicting targets.
+    snapshot = healthy_snapshot()
+    snapshot["runtime"].update(
+        {
+            "state": "absent",
+            "containerId": None,
+            "dataUuid": None,
+            "rootfsUuid": None,
+            "bootSeedRequired": True,
+        }
+    )
+    with manager_fixture(snapshot) as manager:
+        manager.fail_once["seed-initialize"] = "device_boot_seed_failed"
+        acceptance = _RebootResumeAcceptance(manager, "maintenance")
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False and first["error"] == "device_boot_seed_failed",
+            "fixture did not stop after the seed runtime started",
+        )
+        retained = convergence.ConvergenceJournal(manager).load()
+        require(
+            retained is not None and retained["phase"] == "seed_runtime_started",
+            "seed journal did not retain the started phase",
+        )
+        target = retained["bootSeedTarget"]
+        require(isinstance(target, Mapping), "seed journal lost its boot target")
+        # start_seed_runtime commits the target UUIDs through the storage
+        # transaction; model that committed state, then the engine reboot
+        # (same seed container ID stopped, protection unloaded).
+        manager.snapshot["runtime"]["dataUuid"] = target["dataUuid"]
+        manager.snapshot["runtime"]["rootfsUuid"] = target["rootfsUuid"]
+        _simulate_engine_reboot(manager.snapshot)
+        calls_before = len(manager.calls)
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            second["ok"] is True,
+            f"seed reboot replan failed: {second.get('error')}",
+        )
+        require(second.get("resumed") is False, "volatile-stale seed journal was resumed")
+        resumed_calls = manager.calls[calls_before:]
+        names = [name for name, _ in resumed_calls]
+        require(
+            "maintain-protection" in names and "seed-start" in names,
+            "seed reboot recovery skipped protection maintenance or seed start",
+        )
+        require(
+            names.index("maintain-protection") < names.index("seed-start"),
+            "protection maintenance did not precede the seed runtime start",
+        )
+        storage_calls = [
+            values for name, values in resumed_calls if name == "storage"
+        ]
+        require(
+            storage_calls
+            and storage_calls[0].get("dataUuid") == target["dataUuid"]
+            and storage_calls[0].get("rootfsUuid") == target["rootfsUuid"],
+            "replanned seed transaction did not preserve the target UUIDs",
+        )
+        require(
+            not (manager.context.state_root / "convergence-v1.json").exists(),
+            "accepted seed reboot recovery retained its journal",
+        )
+
+
+@case("seedJournalRebootWithUnprovenTargetRefuses")
+def seed_journal_reboot_with_unproven_target_refuses() -> None:
+    # The same volatile loss with a boot-seed target whose UUIDs are not
+    # provably committed in the observed storage must fail closed and preserve
+    # the journal rather than discarding obligations a replan cannot re-derive.
+    snapshot = healthy_snapshot()
+    snapshot["runtime"].update(
+        {
+            "state": "absent",
+            "containerId": None,
+            "dataUuid": None,
+            "rootfsUuid": None,
+            "bootSeedRequired": True,
+        }
+    )
+    with manager_fixture(snapshot) as manager:
+        manager.fail_once["seed-initialize"] = "device_boot_seed_failed"
+        acceptance = _RebootResumeAcceptance(manager, "maintenance")
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(first["ok"] is False, "fixture did not retain a seed journal")
+        retained = convergence.ConvergenceJournal(manager).load()
+        require(
+            retained is not None and retained["phase"] == "seed_runtime_started",
+            "seed journal did not retain the started phase",
+        )
+        # The committed storage still carries the pre-seed UUIDs recorded as
+        # observedDataUuid (identity validation passes), but they differ from
+        # the recorded boot-seed target: the replan cannot prove adoption, so
+        # the volatile loss must refuse and preserve the journal.
+        _simulate_engine_reboot(manager.snapshot)
+        calls_before = len(manager.calls)
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(second["ok"] is False, "unproven seed target was discarded")
+        require(
+            second["error"] == "convergence_state_conflict",
+            "unproven seed stage error drifted",
+        )
+        mutations = [
+            name
+            for name, _ in manager.calls[calls_before:]
+            if name in {"create", "remove", "seed-start", "start", "maintain-protection"}
+        ]
+        require(not mutations, "refused seed resume performed a mutation")
+        require(
+            (manager.context.state_root / "convergence-v1.json").exists(),
+            "refused seed resume deleted its journal",
+        )
+
+
+@case("regenerationLinkedJournalSurvivesVolatileObservation")
+def regeneration_linked_journal_survives_volatile_observation() -> None:
+    # A convergence journal bound to a regeneration transaction is only ever
+    # resumed through the device-regeneration owner, which restores the pinned
+    # protection deployment and runtime before convergence resumes. Volatile-
+    # shaped observations must therefore never discard it as inputs-changed.
+    snapshot = healthy_snapshot()
+    snapshot["components"]["proxy"]["state"] = "drift"
+    snapshot["components"]["proxy"]["generation"] = None
+    with manager_fixture(snapshot) as manager:
+        capability = {"transactionId": "ab" * 16}
+        acceptance = FakeAcceptance(manager)
+        acceptance.fail_final = True
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run(regeneration_capability=capability)
+        require(
+            first["ok"] is False and first["error"] == "acceptance_failed",
+            "fixture did not retain a regeneration-linked journal",
+        )
+        retained = convergence.ConvergenceJournal(manager).load()
+        require(
+            retained is not None
+            and retained["regenerationTransactionId"] == capability["transactionId"],
+            "journal lost its regeneration binding",
+        )
+        _simulate_engine_reboot(manager.snapshot)
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run(regeneration_capability=capability)
+        require(
+            second.get("resumed") is True,
+            "regeneration-linked journal was discarded on volatile observation",
+        )
+
+
+@case("retainedReuseJournalHealthyResumeStaysNoOp")
+def retained_reuse_journal_healthy_resume_stays_no_op() -> None:
+    # The same retained reuse-plan journal with an unchanged environment must
+    # resume without replaying volatile work: the volatile revalidation only
+    # fires on genuine runtime/protection/control-plane loss.
+    snapshot = healthy_snapshot()
+    snapshot["components"]["proxy"]["state"] = "drift"
+    snapshot["components"]["proxy"]["generation"] = None
+    with manager_fixture(snapshot) as manager:
+        acceptance = FakeAcceptance(manager)
+        acceptance.fail_final = True
+        first = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            first["ok"] is False and first["error"] == "acceptance_failed",
+            "fixture did not retain a proxy-era journal",
+        )
+        acceptance.fail_final = False
+        calls_before = len(manager.calls)
+        second = convergence.ConvergenceExecutor(
+            manager,
+            live_acceptance=acceptance,
+            artifact_builder=FakeArtifacts(manager),
+        ).run()
+        require(
+            second["ok"] is True,
+            f"healthy resume failed: {second.get('error')}",
+        )
+        require(second.get("resumed") is True, "healthy retained journal was discarded")
+        names = {name for name, _ in manager.calls[calls_before:]}
+        require(
+            not (
+                {
+                    "start",
+                    "maintain-protection",
+                    "proxy",
+                    "create",
+                    "remove",
+                    "seed-start",
+                    "deploy",
+                    "control",
+                }
+                & names
+            ),
+            "healthy resume replayed journaled work",
+        )
+
+
+@case("lowLevelStartRefusesPendingConvergenceJournal")
+def low_level_start_refuses_pending_convergence_journal() -> None:
+    # Low-level start --recreate removes the owned container without consulting
+    # the convergence journal that pins it, leaving the journal unresumable.
+    # Refuse any low-level start while a journal is pending instead of
+    # replacing pinned resources; dry-run stays observational.
+    with manager_fixture() as manager:
+        plan = convergence.ConvergencePlanner(manager).inspect()
+        journal = convergence.ConvergenceJournal(manager)
+        _create_journal(journal, plan)
+        host = SimpleNamespace(
+            context=manager.context,
+            cfg=SimpleNamespace(backend="colima-docker"),
+            adb_target="127.0.0.1:5555",
+            lease=SimpleNamespace(host_daemon_port=0),
+            ensure_instance_lease=lambda: None,
+            selected_runtime_image=lambda: {"derivedTag": "xenoid/redroid:test"},
+            docker_create_command=lambda: ["docker", "create", "xenoid-test"],
+        )
+        refused = RuntimeManager.start(host, dry_run=False, recreate=True)
+        require(refused.get("ok") is False, "pending journal allowed low-level recreate")
+        require(
+            refused.get("error") == "convergence_pending",
+            "low-level start refusal error drifted",
+        )
+        refused_plain = RuntimeManager.start(host, dry_run=False, recreate=False)
+        require(
+            refused_plain.get("error") == "convergence_pending",
+            "plain low-level start bypassed the journal guard",
+        )
+        require(journal.exists(), "low-level start refusal deleted the journal")
+        preview = RuntimeManager.start(host, dry_run=True, recreate=True)
+        require(
+            preview.get("ok") is True
+            and preview.get("plan", {}).get("recreate") is True,
+            "observational dry-run was blocked by the journal guard",
+        )
+        journal.clear()
+        path = manager.context.state_root / "convergence-v1.json"
+        path.write_bytes(b"{not-json")
+        path.chmod(0o600)
+        refused_corrupt = RuntimeManager.start(host, dry_run=False)
+        require(
+            refused_corrupt.get("error") == "convergence_pending",
+            "corrupt journal did not fail closed",
+        )
+        path.unlink()
+        cleared = RuntimeManager.start(host, dry_run=True)
+        require(
+            cleared.get("ok") is True,
+            "cleared journal still refused low-level start",
+        )
 
 
 @case("directCallersAndRemovedShellAliases")

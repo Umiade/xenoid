@@ -807,6 +807,21 @@ class ConvergenceJournal:
             nullable=False,
         )
         selected_input, selected_boot = _selected_digests(plan)
+        old_container = runtime.get("containerId")
+        seed_container = None
+        if (
+            plan.boot_seed_action == "initialize_replace"
+            and isinstance(old_container, str)
+            and _seed_adoption_ready(runtime, selected_input, selected_boot)
+        ):
+            # A seed plan's start phase creates-or-adopts the one owned
+            # container. When the observed container already satisfies the
+            # adoption contract (the interrupted-first-boot shape), record it
+            # as the seed runtime rather than as the old runtime: the journal
+            # requires old/seed/new to be distinct, and the container is
+            # removed through the seed role after initialization either way.
+            seed_container = old_container
+            old_container = None
         created = _now_timestamp()
         state = {
             "schema": JOURNAL_SCHEMA,
@@ -818,8 +833,8 @@ class ConvergenceJournal:
             "phase": "planned",
             "selectedImageInputSha256": selected_input,
             "selectedImageBootInputSha256": selected_boot,
-            "oldContainerId": runtime.get("containerId"),
-            "seedContainerId": None,
+            "oldContainerId": old_container,
+            "seedContainerId": seed_container,
             "protectionEngineId": protection_engine_id,
             "protectionExpectedDigest": protection_expected,
             "newContainerId": None,
@@ -1179,7 +1194,7 @@ class ConvergencePlanner:
             if runtime_action in {"create", "recreate"} or boot_seed_action == "initialize_replace"
             else "reuse-selected"
         )
-        if image_action == "ensure-desired" and resolution == "complete" and (
+        if resolution == "complete" and (
             desired_input is None or desired_boot is None
         ):
             if observation.get("imageError") == "google_services_release_retired":
@@ -2377,18 +2392,10 @@ class ConvergenceExecutor:
         } - {None}
         if container_id in expected:
             return dict(journal_state)
-        if (
-            runtime.get("state") != "stopped"
-            or runtime.get("ownershipValid") is not True
-            or runtime.get("integrationIdentityValid") is not True
-            or runtime.get("networkMatches") is not True
-            or runtime.get("volumeMatches") is not True
-            or runtime.get("storageValid") is not True
-            or runtime.get("createSpecMatches") is not True
-            or runtime.get("imageInputSha256")
-            != journal_state.get("selectedImageInputSha256")
-            or runtime.get("imageBootInputSha256")
-            != journal_state.get("selectedImageBootInputSha256")
+        if not _seed_adoption_ready(
+            runtime,
+            journal_state.get("selectedImageInputSha256"),
+            journal_state.get("selectedImageBootInputSha256"),
         ):
             return dict(journal_state)
         boot_seed = journal_state.get("bootSeedTarget") or {}
@@ -2595,16 +2602,108 @@ class ConvergenceExecutor:
             raise ConvergenceError("convergence_protection_unobserved")
         if observed_engine != recorded_engine or observed_digest != recorded_digest:
             raise ConvergenceError("convergence_inputs_changed")
-        if "shared_protection_maintained" in journal_state.get("completed", ()):
-            if (
-                protection_observed.get("ok") is not True
-                or protection.get("currentDigest")
-                != journal_state.get("protectionExpectedDigest")
-            ):
+        # Volatile engine-host state does not survive an engine/VM reboot even
+        # though every recorded identity above still matches: the owned
+        # container keeps its ID but is stopped, and the kmod/eBPF deployment
+        # (with binder) is unloaded. Completed phases and plan actions that
+        # assumed that readiness must not skip the work that restores it, so
+        # the loss replans from the fresh observation through the existing
+        # inputs-changed path. Obligations a replan cannot re-derive are never
+        # discarded: regeneration-linked journals resume only through the
+        # device-regeneration owner (which restores protection and the pinned
+        # runtime before convergence resumes), and a boot-seed target rides
+        # the replan only when healthy committed storage provably owns exactly
+        # those UUIDs (_boot_seed_target_for_plan then adopts them); an
+        # unproven seed stage fails closed with the journal preserved.
+        if journal_state.get("regenerationTransactionId") is not None:
+            return
+        boot_seed_target = journal_state.get("bootSeedTarget")
+        boot_seed_adoptable = boot_seed_target is None or (
+            runtime.get("storageValid") is True
+            and runtime.get("dataUuid") == boot_seed_target.get("dataUuid")
+            and runtime.get("rootfsUuid") == boot_seed_target.get("rootfsUuid")
+        )
+
+        def replan_required() -> None:
+            if not boot_seed_adoptable:
                 raise ConvergenceError(
                     "convergence_state_conflict",
-                    recommended_action="protection-maintenance",
+                    recommended_action="resource-conflict",
                 )
+            raise ConvergenceError("convergence_inputs_changed")
+
+        completed = set(journal_state.get("completed", ()))
+        plan = ConvergencePlan.from_dict(journal_state["plan"])
+        desired_input = observation.get("desiredImageInputSha256")
+        desired_boot = observation.get("desiredImageBootInputSha256")
+        if desired_input is None or desired_boot is None:
+            raise ConvergenceError("convergence_image_input_unavailable")
+        if (
+            desired_input != plan.desired_image_input_sha256
+            or desired_boot != plan.desired_image_boot_input_sha256
+        ):
+            replan_required()
+        protection_lost = (
+            protection_observed.get("ok") is not True
+            or protection.get("currentDigest") != recorded_digest
+        )
+        live_resolution = journal_state.get("liveResolution")
+        live_actions = (
+            live_resolution.get("componentActions")
+            if isinstance(live_resolution, Mapping)
+            else None
+        )
+        protection_assumed = (
+            plan.protection_action == "reuse"
+            or "protection_converged" in completed
+            or (
+                plan.protection_action == "maintenance"
+                and "shared_protection_maintained" in completed
+            )
+            or (
+                isinstance(live_actions, Mapping)
+                and live_actions.get("protection") == "reuse"
+            )
+        )
+        if protection_assumed and protection_lost:
+            replan_required()
+        if not allow_absent:
+            # The start/restart branch deliberately re-executes its idempotent
+            # start phase for a stopped container, and the seed phase's
+            # initialize step quiesces the seed container and works offline,
+            # so neither depends on the recorded runtime still being up. Only
+            # plans whose remaining path has no start work (bare reuse) or
+            # whose completed runtime_started covered the final container
+            # assume a running runtime.
+            executor_restarts = (
+                plan.runtime_action in {"start", "restart"}
+                and plan.boot_seed_action != "initialize_replace"
+            )
+            runtime_assumed = (
+                not executor_restarts
+                and (
+                    (
+                        plan.runtime_action
+                        not in {"create", "recreate", "start", "restart"}
+                        and plan.boot_seed_action != "initialize_replace"
+                    )
+                    or "runtime_started" in completed
+                )
+            )
+            if runtime_assumed and runtime.get("state") != "running":
+                replan_required()
+            # An out-of-band container restart keeps the container running but
+            # strands the control plane (adb/rootd/bootstrap) recorded by the
+            # completed phases; the planner handles this for fresh plans, and
+            # a retained reuse plan must be replanned the same way.
+            control_plane = observation.get("controlPlane")
+            if (
+                plan.runtime_action == "reuse"
+                and plan.boot_seed_action == "none"
+                and isinstance(control_plane, Mapping)
+                and control_plane.get("ready") is False
+            ):
+                replan_required()
 
     def _validate_regeneration_capability(
         self, journal_state: Mapping[str, Any], capability: Any
@@ -2758,18 +2857,34 @@ def _boot_seed_target_for_plan(
         if isinstance(observation.get("runtime"), Mapping)
         else {}
     )
+    data_uuid = runtime.get("dataUuid")
+    rootfs_uuid = runtime.get("rootfsUuid")
+    if (
+        runtime.get("storageValid") is True
+        and data_uuid is not None
+        and rootfs_uuid is not None
+    ):
+        # Healthy committed storage already owns fixed filesystem UUIDs: adopt
+        # them so a replanned seed transaction converges that exact storage
+        # instead of generating conflicting random targets (a discarded
+        # journal's target is thereby transferred with explicit proof).
+        return {
+            "transactionId": secrets.token_hex(16),
+            "dataUuid": str(_require_uuid(data_uuid)),
+            "rootfsUuid": str(_require_uuid(rootfs_uuid)),
+        }
     if runtime.get("bootSeedRequired") is True or (
         runtime.get("state") == "absent"
-        and runtime.get("dataUuid") is None
-        and runtime.get("rootfsUuid") is None
+        and data_uuid is None
+        and rootfs_uuid is None
     ):
         return _new_boot_seed_target()
-    data_uuid = _require_uuid(runtime.get("dataUuid"))
-    rootfs_uuid = _require_uuid(runtime.get("rootfsUuid"))
+    # Exactly one committed UUID (or unhealthy storage): the target cannot be
+    # fixed safely; _require_uuid preserves the missing-identity failure.
     return {
         "transactionId": secrets.token_hex(16),
-        "dataUuid": str(data_uuid),
-        "rootfsUuid": str(rootfs_uuid),
+        "dataUuid": str(_require_uuid(data_uuid)),
+        "rootfsUuid": str(_require_uuid(rootfs_uuid)),
     }
 
 
@@ -2791,6 +2906,26 @@ def _regeneration_transaction_id(capability: Any) -> str | None:
     if not isinstance(value, str) or _HEX_32.fullmatch(value) is None:
         raise ConvergenceError("regeneration_capability_invalid")
     return value
+
+
+def _seed_adoption_ready(
+    runtime: Mapping[str, Any],
+    selected_input: str | None,
+    selected_boot: str | None,
+) -> bool:
+    """The contract under which a stopped owned container is the seed phase's
+    adoption candidate (mirrors create_owned_container(adopt_stopped_only))."""
+    return (
+        runtime.get("state") == "stopped"
+        and runtime.get("ownershipValid") is True
+        and runtime.get("integrationIdentityValid") is True
+        and runtime.get("networkMatches") is True
+        and runtime.get("volumeMatches") is True
+        and runtime.get("storageValid") is True
+        and runtime.get("createSpecMatches") is True
+        and runtime.get("imageInputSha256") == selected_input
+        and runtime.get("imageBootInputSha256") == selected_boot
+    )
 
 
 def _runtime_started_current(observation: Mapping[str, Any]) -> bool:

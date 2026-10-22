@@ -31,9 +31,9 @@ import java.util.Map;
 public final class ProxyStateStoreTest {
     private static final String INSTANCE = "123e4567-e89b-42d3-a456-426614174000";
     private static final ProxyStateStore.Source FIRST = new ProxyStateStore.Source(
-            "endpoint", "socks5://first.invalid:1080", "first", true, false);
+            "endpoint", "socks5://first.invalid:1080", "first", true, false, true);
     private static final ProxyStateStore.Source SECOND = new ProxyStateStore.Source(
-            "subscription", "https://second.invalid/proxies", "second", false, false);
+            "subscription", "https://second.invalid/proxies", "second", false, false, true);
 
     @Test
     public void emptyV2CreationUpdateAndRepeatedStartup() throws Exception {

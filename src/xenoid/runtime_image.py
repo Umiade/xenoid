@@ -26,6 +26,7 @@ from threading import Event
 
 from .artifacts import ArtifactBuilder, ArtifactError, ArtifactSnapshot
 from .process import run_bounded
+from .util import android_sdk_dir
 
 
 RUNTIME_IMAGE_SCHEMA = "dev.xenoid.runtime-image/v1"
@@ -1485,20 +1486,18 @@ class RuntimeImageBuilder:
         )
 
     def _android_build_tool_directory(self) -> Path:
-        roots = [os.environ.get("ANDROID_SDK_ROOT"), os.environ.get("ANDROID_HOME")]
+        sdk = android_sdk_dir()
+        if sdk is None:
+            raise RuntimeImageError("runtime_image_android_tools_unavailable")
         candidates: list[tuple[tuple[int, ...], Path]] = []
-        for raw_root in roots:
-            if not raw_root:
-                continue
-            build_tools = Path(raw_root) / "build-tools"
-            try:
-                directories = list(build_tools.iterdir())
-            except OSError:
-                continue
-            for directory in directories:
-                version = tuple(int(part) for part in re.findall(r"\d+", directory.name))
-                if version:
-                    candidates.append((version, directory))
+        try:
+            directories = list((sdk / "build-tools").iterdir())
+        except OSError as exc:
+            raise RuntimeImageError("runtime_image_android_tools_unavailable") from exc
+        for directory in directories:
+            version = tuple(int(part) for part in re.findall(r"\d+", directory.name))
+            if version:
+                candidates.append((version, directory))
         if not candidates:
             raise RuntimeImageError("runtime_image_android_tools_unavailable")
         candidates.sort(reverse=True)

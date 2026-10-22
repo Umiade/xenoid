@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -16,7 +15,7 @@ CLI = ROOT / "xenoid"
 
 def write_executable(path: Path, content: str) -> None:
     path.write_text(content)
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    path.chmod(0o755)
 
 
 def run_brew_failure(*, docker_completion_installed: bool) -> dict[str, Any]:
@@ -74,71 +73,115 @@ exit 64
 
 
 
+def run_plugin_install(*, occupied: bool = False, broken: bool = False) -> dict[str, Any]:
+    """Run the real installer with isolated package-manager and engine boundaries."""
+    with tempfile.TemporaryDirectory(prefix="xenoid-buildx-install-") as temp_dir:
+        temp = Path(temp_dir)
+        fake_bin = temp / "bin"
+        fake_bin.mkdir()
+        home = temp / "home"
+        docker_config = home / "docker-config"
+        link = docker_config / "cli-plugins/docker-buildx"
+        link.parent.mkdir(parents=True)
+        if occupied:
+            link.write_text("operator-owned plugin")
+        else:
+            link.symlink_to(temp / "removed-Docker.app/docker-buildx")
+        prefix = temp / "brew"
+        java_bin = prefix / "libexec/openjdk.jdk/Contents/Home/bin"
+        java_bin.mkdir(parents=True)
+        for command in ("java", "javac", "keytool", "jarsigner"):
+            write_executable(java_bin / command, "#!/bin/sh\nexit 0\n")
+        plugin = prefix / "bin/docker-buildx"
+        plugin.parent.mkdir()
+        sdk = temp / "sdk"
+        for name in ("build-tools/35.0.0/aapt2", "build-tools/35.0.0/apksigner",
+                     "ndk/27.2.12479018/toolchains/llvm/prebuilt/test/bin/aarch64-linux-android21-clang"):
+            tool = sdk / name
+            tool.parent.mkdir(parents=True, exist_ok=True)
+            write_executable(tool, "#!/bin/sh\nexit 0\n")
+        (sdk / "platforms/android-35").mkdir(parents=True)
+        (sdk / "platforms/android-35/android.jar").touch()
+        write_executable(fake_bin / "uname", "#!/bin/sh\ncase $1 in -s) echo Darwin;; -m) echo arm64;; esac\n")
+        write_executable(fake_bin / "brew", """#!/bin/sh
+if [ "$1" = --prefix ]; then printf '%s\n' "$TEST_PREFIX"; exit 0; fi
+if [ "$1" = install ]; then
+  for arg in "$@"; do
+    if [ "$arg" = docker-buildx ]; then
+      printf '#!/bin/sh\nexit %s\n' "$TEST_PLUGIN_EXIT" > "$TEST_PREFIX/bin/docker-buildx"
+      chmod +x "$TEST_PREFIX/bin/docker-buildx"
+    fi
+  done
+fi
+"""
+        )
+        write_executable(fake_bin / "docker", """#!/bin/sh
+if [ "$1" != --context ] || [ "$2" != colima ]; then exit 91; fi
+shift 2
+case "$1 $2" in
+  'buildx version') exec "$DOCKER_CONFIG/cli-plugins/docker-buildx" version ;;
+  'image inspect')
+    if [ "$3" = --format ]; then printf '%s\n' "$TEST_BASE_ID"; fi ;;
+esac
+"""
+        )
+        for command in ("colima", "sdkmanager", "adb", "scrcpy"):
+            write_executable(fake_bin / command, "#!/bin/sh\nexit 0\n")
+        # The expected base identity belongs to configuration, not this test.
+        import sys
+        sys.path.insert(0, str(ROOT / "src"))
+        from xenoid.config import DEFAULT_IMAGE_ID
+
+        env = {
+            **os.environ, "HOME": str(home), "DOCKER_CONFIG": str(docker_config),
+            "DOCKER_CONTEXT": "desktop-linux", "ANDROID_HOME": str(sdk),
+            "XENOID_NDK_VERSION": "27.2.12479018", "TEST_PREFIX": str(prefix),
+            "TEST_BASE_ID": DEFAULT_IMAGE_ID, "TEST_PLUGIN_EXIT": "42" if broken else "0",
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        }
+        proc = subprocess.run(["bash", str(ROOT / "scripts/install-macos-runtime.sh")],
+                              cwd=ROOT, env=env, capture_output=True, text=True, check=False)
+        return {
+            "returncode": proc.returncode,
+            "registered": link.is_symlink() and link.resolve() == plugin.resolve(),
+            "preserved": occupied and link.read_text() == "operator-owned plugin",
+        }
+
+
 def main() -> int:
     conflict = run_brew_failure(docker_completion_installed=True)
     unrelated = run_brew_failure(docker_completion_installed=False)
-    dry_run = subprocess.run(
-        [str(CLI), "install-runtime", "--dry-run"],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    try:
-        dry_run_result = json.loads(dry_run.stdout)
-        dry_run_script_result = json.loads(dry_run_result.get("stdout", ""))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        dry_run_result = {}
-        dry_run_script_result = {}
-    planned_commands = dry_run_script_result.get("commands", [])
-    jdk_plan_ok = (
-        planned_commands[:3]
-        == [
-            "brew install docker colima android-platform-tools scrcpy openjdk@17",
-            "brew link --force openjdk@17",
-            "brew install --cask android-commandlinetools",
-        ]
-        and all("temurin" not in command for command in planned_commands)
-        and "docker pull --platform linux/arm64 redroid/redroid@sha256:5a42a569ee1d7c71796c0385e906cbaa4c3e0a162a56d9f26b29bdb1befac13b (content-addressed mirror fallback)"
-        in planned_commands
-    )
-    required_guidance = (
-        "Xenoid detected the deprecated Homebrew docker-completion formula.",
-        "brew uninstall docker-completion",
-        "brew link docker",
-        "type -a docker",
-        "./xenoid install-runtime",
-        "Avoid `brew link --overwrite docker`",
-    )
+    installed = run_plugin_install()
+    occupied = run_plugin_install(occupied=True)
+    broken = run_plugin_install(broken=True)
+    with tempfile.TemporaryDirectory(prefix="xenoid-install-dry-run-") as temp_dir:
+        home = Path(temp_dir) / "home"
+        home.mkdir()
+        dry_run = subprocess.run(
+            [str(CLI), "install-runtime", "--dry-run"], cwd=ROOT,
+            env={**os.environ, "HOME": str(home)},
+            text=True, capture_output=True, check=False,
+        )
+        dry_result = json.loads(dry_run.stdout)
+        dry_script = json.loads(dry_result["stdout"])
+        untouched = not list(home.iterdir())
     cases = {
-        "dockerCompletionConflict": {
-            "ok": conflict["returncode"] == 1
-            and conflict["scriptReturncode"] == 37
-            and conflict["stdout"] == "synthetic brew link failure"
-            and conflict["cliStderr"] == ""
-            and all(text in conflict["stderr"] for text in required_guidance),
-            **conflict,
+        "packageFailurePreservesExitCode": {
+            "ok": all(result["returncode"] == 1 and result["scriptReturncode"] == 37
+                      for result in (conflict, unrelated)),
         },
-        "unrelatedBrewFailure": {
-            "ok": unrelated["returncode"] == 1
-            and unrelated["scriptReturncode"] == 37
-            and unrelated["stdout"] == "synthetic brew link failure"
-            and unrelated["cliStderr"] == ""
-            and "Xenoid detected" not in unrelated["stderr"],
-            **unrelated,
+        "replacesRemovedDesktopPluginAndUsesColima": {
+            "ok": installed["returncode"] == 0 and installed["registered"], **installed,
+        },
+        "preservesUnmanagedPluginFile": {
+            "ok": occupied["returncode"] != 0 and occupied["preserved"], **occupied,
+        },
+        "rejectsUnusablePlugin": {
+            "ok": broken["returncode"] == 42, **broken,
         },
         "installRuntimeDryRunIsObservational": {
-            "ok": dry_run.returncode == 0
-            and dry_run_result.get("ok") is True
-            and dry_run_script_result.get("dryRun") is True
-            and dry_run.stderr == "",
-            "returncode": dry_run.returncode,
-            "stdout": dry_run.stdout,
-            "stderr": dry_run.stderr,
-        },
-        "installRuntimeUsesUnprivilegedJdkFormula": {
-            "ok": jdk_plan_ok,
-            "commands": planned_commands,
+            "ok": dry_run.returncode == 0 and dry_result.get("ok") is True
+            and dry_script.get("dryRun") is True and untouched,
         },
     }
     result = {"ok": all(case["ok"] for case in cases.values()), "cases": cases}

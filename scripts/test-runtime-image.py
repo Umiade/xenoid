@@ -895,6 +895,27 @@ def compute_fixture(
     )
 
 
+@contract_case("imageVerificationFindsConventionallyInstalledSdk")
+def image_verification_finds_conventionally_installed_sdk() -> None:
+    for relative in ("Library/Android/sdk", "Android/Sdk"):
+        with tempfile.TemporaryDirectory(prefix="xenoid-image-sdk-") as raw:
+            home = Path(raw)
+            builder = object.__new__(runtime_image.RuntimeImageBuilder)
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                Path, "home", return_value=home
+            ):
+                expect_code(
+                    "runtime_image_android_tools_unavailable",
+                    builder._android_build_tool_directory,
+                )
+                tools = home / relative / "build-tools" / "35.0.0"
+                tools.mkdir(parents=True)
+                require(
+                    builder._android_build_tool_directory() == tools,
+                    "image verification missed the installed SDK without environment exports",
+                )
+
+
 @contract_case("daemonCodeChangesOnlyTheFullImageIdentity")
 def daemon_code_changes_only_the_full_image_identity() -> None:
     first = compute_fixture()

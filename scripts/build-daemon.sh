@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/android-sdk-root.sh"
+ANDROID_HOME="$(xenoid_android_sdk_root)"
+export ANDROID_HOME
 cd "$ROOT/daemon"
 JOBS="${XENOID_BUILD_JOBS:-1}"
 FORCE="${XENOID_FORCE_REBUILD:-0}"

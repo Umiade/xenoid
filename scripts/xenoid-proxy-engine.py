@@ -217,7 +217,13 @@ def runtime_inspect(m,allow_absent=False,allow_stopped=False):
 def live(m,allow_absent=False,allow_stopped=False):return runtime_inspect(m,allow_absent,allow_stopped) is not None
 
 def owner_path(m):return m["_state"]/"engine-ownership.json"
-def save_owner(m,o):atomic(owner_path(m),json.dumps(o,sort_keys=True,separators=(",",":")).encode()+b"\n",0o600)
+def save_owner(m,o):
+ payload=json.dumps(o,sort_keys=True,separators=(",",":")).encode()+b"\n"
+ # Writer and readers share one protocol bound: read_json refuses ownership
+ # state above 1 MiB and validate_owner refuses more than 2048 resources, so
+ # the writer never emits a ledger its own readers would reject.
+ if len(o["resources"])>2048 or len(payload)>1048576:raise Error("ownership_invalid")
+ atomic(owner_path(m),payload,0o600)
 def owned_path(m,value):
  path=Path(value)
  if not path.is_absolute() or ".." in path.parts:return False
@@ -493,7 +499,12 @@ def rule(m,o,exe,table,c,args,insert=False,inside=False,scope="transient"):
  args=list(args)
  if "-m" not in args or "comment" not in args:
   jump=args.index("-j") if "-j" in args else len(args)
-  args[jump:jump]=["-m","comment","--comment",f"xenoid-proxy/{m['resourceTag']}/{c}/{m['runtimeEpoch']}/{m['generation']}"]
+  # Structural hook rules are identical for every generation of one epoch, so
+  # their identity (and ledger delete command) is epoch-scoped: stamping the
+  # generation here would defeat command_resource dedup and append duplicate
+  # ledger/kernel entries on every apply. Per-generation chain content keeps
+  # its generation attribution through restore().
+  args[jump:jump]=["-m","comment","--comment",f"xenoid-proxy/{m['resourceTag']}/{c}/{m['runtimeEpoch']}"]
  p=pref(m,exe,inside);inv=[*p,"-w","-t",table,"-D",c,*args];resource=command_resource(o,inv,scope)
  if not run([*p,"-w","-t",table,"-C",c,*args],check=False).returncode:_commit_existing(m,o,resource)
  else:
@@ -1105,7 +1116,7 @@ def verify_off(m,o):
  if proc_path(m,"process").exists() or proc_path(m,"pending-process").exists():raise Error("off_unverified")
  ensure_baseline(m,o);topology(m,o);policy(m,o);dataplane(m,o);program_baseline(m,False);n=names(m)
  for family,exe in (("4",tool("iptables")),("6",tool("ip6tables"))):
-  address=m["android"]["ipv4" if family=="4" else "ipv6"];hook_owner=f"xenoid-proxy/{m['resourceTag']}/DOCKER-USER/{m['runtimeEpoch']}/{m['generation']}";capture_owner=f"xenoid-proxy/{m['resourceTag']}/PREROUTING/{m['runtimeEpoch']}/{m['generation']}";restore_owner=f"xenoid-proxy/{m['resourceTag']}/{m['runtimeEpoch']}/{m['generation']}"
+  address=m["android"]["ipv4" if family=="4" else "ipv6"];hook_owner=f"xenoid-proxy/{m['resourceTag']}/DOCKER-USER/{m['runtimeEpoch']}";capture_owner=f"xenoid-proxy/{m['resourceTag']}/PREROUTING/{m['runtimeEpoch']}";restore_owner=f"xenoid-proxy/{m['resourceTag']}/{m['runtimeEpoch']}/{m['generation']}"
   check_rule(exe,"filter","DOCKER-USER",["-i",m["bridgeName"],"-m","mac","--mac-source",m["android"]["mac"],"-j",n["guard"+family]],hook_owner);check_rule(exe,"mangle","PREROUTING",["-i",m["bridgeName"],"-m","mac","--mac-source",m["android"]["mac"],"-j",n["capture"+family]],capture_owner);check_rule(exe,"raw","PREROUTING",["-i",m["veth"]["host"],"-d",address,"-j",n["rawReturn"+family]],capture_owner);check_rule(exe,"raw",n["rawReturn"+family],["-j","DROP"],restore_owner)
  if not (Path("/run/netns")/m["proxyNamespace"]).exists() or run([tool("ip"),"link","show","dev",m["veth"]["host"]],check=False).returncode:raise Error("off_unverified")
 def off(m,o,expected_generation=None):
@@ -1150,7 +1161,7 @@ def status(m,o,expected_generation=None):
    chain_specs=((n["guard"+family],"filter",False),(n["capture"+family],"mangle",False),(n["rawReturn"+family],"raw",False),(n["uplink"+family],"filter",False),(n["gatewayMark"+family],"mangle",False),(n["nat"+family],"nat",False),(n["meterIn"+family],"mangle",False),(n["meterUp"+family],"filter",False),(n["meterOut"+family],"filter",False),(n["meterDnsIn"+family],"mangle",False),(n["meterTcpIn"+family],"mangle",False),(n["meterUdpIn"+family],"mangle",False),(n["meterDnsOut"+family],"filter",False),(n["meterTcpOut"+family],"filter",False),(n["meterUdpOut"+family],"filter",False),(n["tproxy"+family],"mangle",True),(n["dns"+family],"nat",True),(n["output"+family],"filter",True),(n["mark"+family],"mangle",True),(n["input"+family],"filter",True),(n["meterDnsUp"+family],"nat",True),(n["meterTcpUp"+family],"mangle",True),(n["meterUdpUp"+family],"mangle",True))
    for chain_name,table,inside in chain_specs:
     if run([*pref(m,exe,inside),"-w","-t",table,"-S",chain_name],check=False).returncode:raise Error("engine_structure_mismatch")
-   address=m["android"]["ipv4" if family=="4" else "ipv6"];restore_owner=f"xenoid-proxy/{m['resourceTag']}/{m['runtimeEpoch']}/{m['generation']}";hook_owner=f"xenoid-proxy/{m['resourceTag']}/DOCKER-USER/{m['runtimeEpoch']}/{m['generation']}";capture_owner=f"xenoid-proxy/{m['resourceTag']}/PREROUTING/{m['runtimeEpoch']}/{m['generation']}";nat_owner=f"xenoid-proxy/{m['resourceTag']}/POSTROUTING/{m['runtimeEpoch']}/{m['generation']}"
+   address=m["android"]["ipv4" if family=="4" else "ipv6"];restore_owner=f"xenoid-proxy/{m['resourceTag']}/{m['runtimeEpoch']}/{m['generation']}";capture_owner=f"xenoid-proxy/{m['resourceTag']}/PREROUTING/{m['runtimeEpoch']}";nat_owner=f"xenoid-proxy/{m['resourceTag']}/POSTROUTING/{m['runtimeEpoch']}"
    if ipv6_allowed:ports,dp,_=((((7893,7895),(7897,7899)),1053,9091) if candidate=="a" else (((7894,7896),(7898,7900)),1054,9092))
    else:ports,dp,_=((((7893,),(7897,)),1053,9091) if candidate=="a" else (((7894,),(7898,)),1054,9092))
    cap,resp,up=marks(m,candidate);mask=m["routing"]["mask"]

@@ -22,6 +22,28 @@ All notable changes to Xenoid are documented here. The format follows
 
 ### Fixed
 
+- macOS installation now supplies and registers Homebrew Buildx independently
+  of Docker Desktop, validates plugin availability, and pins installer engine
+  operations to Colima. Preflight distinguishes an unavailable binderfs probe
+  from a proven missing kernel module.
+- Gradle daemon builds and runtime-image APK verification use the existing SDK
+  resolvers, so an installed SDK is available without shell-only environment
+  setup. Missing image observations fail closed rather than creating an
+  unbound reuse plan; resolved or changed image inputs trigger guarded replanning.
+- Retained convergence plans revalidate reboot-lost runtime, control-plane,
+  and shared-protection readiness before resuming. Safe replanning adopts
+  committed boot-seed filesystem identities; unproven targets still fail
+  closed. Low-level `start` refuses to bypass a pending convergence journal.
+- Successful rootfs builds remove their invocation-owned extraction workspace
+  before disabling the failure cleanup trap, preventing stale extracted trees
+  from accumulating after ordinary builds. Disk-maintenance guidance now
+  distinguishes logical capacity from allocation and avoids unbounded zero-fill
+  and unverified disk replacement.
+- Proxy reboot recovery accepts the engine's supported 1 MiB ownership ledger
+  instead of truncating its read at 64 KiB. Structural hook identity is stable
+  across configuration generations, preventing duplicate rules and rollback
+  records; writer and reader size/resource bounds agree without dropping records.
+
 - The instance `network_dns_servers` configuration now actually reaches the
   Android data plane. The cellular profile's `dataCall.dnses` carries the
   configured list, the daemon publishes it through `net.dns1`/`net.dns2` and
