@@ -50,11 +50,10 @@ while IFS= read -r class_file; do classes+=("$class_file"); done < <(
 )
 "$BUILD_TOOLS/d8" --lib "$ANDROID_JAR" --output "$WORK/dex" "${classes[@]}"
 
-PREBUILT=""
-for candidate in "$SDK"/ndk/*/toolchains/llvm/prebuilt/*; do
-  [[ -x "$candidate/bin/aarch64-linux-android30-clang++" ]] && PREBUILT="$candidate"
-done
-[[ -n "$PREBUILT" ]] || { echo "Android NDK compiler is unavailable" >&2; exit 1; }
+NDK="$(xenoid_ndk_require "$SDK")" || { echo "Android NDK compiler is unavailable" >&2; exit 1; }
+PREBUILT="$(xenoid_ndk_prebuilt "$NDK")" || { echo "Android NDK compiler is unavailable" >&2; exit 1; }
+[[ -x "$PREBUILT/bin/aarch64-linux-android30-clang++" ]] \
+  || { echo "Android NDK compiler is unavailable" >&2; exit 1; }
 mkdir -p "$WORK/lib/arm64-v8a"
 "$PREBUILT/bin/aarch64-linux-android30-clang++" -std=c++17 -O2 -fPIC \
   -fvisibility=hidden -fno-rtti -shared "$PROBE/native/ndk_probe.cpp" \

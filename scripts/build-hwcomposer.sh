@@ -25,32 +25,11 @@ esac
 
 source "$ROOT/scripts/android-sdk-root.sh"
 SDK="$(xenoid_android_sdk_root)"
-PREBUILT=""
-
-select_prebuilt() {
-  local ndk="$1"
-  local candidate
-  [[ -d "$ndk" ]] || return 1
-  for candidate in "$ndk"/toolchains/llvm/prebuilt/*; do
-    [[ -x "$candidate/bin/$TOOL" ]] || continue
-    [[ -x "$candidate/bin/llvm-strip" ]] || continue
-    PREBUILT="$candidate"
-    return 0
-  done
-  return 1
-}
-
-if [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
-  select_prebuilt "$ANDROID_NDK_HOME" || true
-fi
-if [[ -z "$PREBUILT" && -d "$SDK/ndk" ]]; then
-  for ndk in "$SDK"/ndk/*; do
-    select_prebuilt "$ndk" || true
-  done
-fi
-if [[ -z "$PREBUILT" ]]; then
-  printf 'no compatible Android NDK found: need %s under ANDROID_NDK_HOME or %s/ndk\n' \
-    "$TOOL" "$SDK" >&2
+NDK="$(xenoid_ndk_require "$SDK")" || exit 1
+PREBUILT="$(xenoid_ndk_prebuilt "$NDK")" \
+  || { printf 'no compatible Android NDK prebuilt under %s\n' "$NDK" >&2; exit 1; }
+if [[ ! -x "$PREBUILT/bin/$TOOL" || ! -x "$PREBUILT/bin/llvm-strip" ]]; then
+  printf 'Android NDK %s does not provide %s and llvm-strip\n' "$NDK" "$TOOL" >&2
   exit 1
 fi
 

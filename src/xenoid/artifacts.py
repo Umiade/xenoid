@@ -25,6 +25,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable
 from .process import run_bounded
+from .util import DEFAULT_NDK_VERSION
 
 
 RESULT_SCHEMA = "dev.xenoid.artifacts/v1"
@@ -209,6 +210,7 @@ _ANDROID_ENV = (
     "ANDROID_SDK_ROOT",
     "ANDROID_NDK_HOME",
     "ANDROID_NDK_ROOT",
+    "XENOID_NDK_VERSION",
     "ANDROID_API",
     "ANDROID_BUILD_TOOLS",
     "XENOID_ANDROID_API",
@@ -1283,16 +1285,21 @@ class ArtifactBuilder:
         else:
             sdk = Path(self._requested_environment.get("HOME", str(Path.home()))) / "Library" / "Android" / "sdk"
         candidates: list[tuple[str, Path | None, tuple[str, ...] | None]] = []
-        ndk_files = sorted(sdk.glob("ndk/*/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android*-clang"))
+        ndk = self._ndk_root(sdk)
+        ndk_files = (
+            sorted(ndk.glob("toolchains/llvm/prebuilt/*/bin/aarch64-linux-android*-clang"))
+            if ndk is not None
+            else []
+        )
         candidates.append(("ndkClang", ndk_files[-1] if ndk_files else None, ("--version",)))
         aidl_files = sorted(sdk.glob("build-tools/*/aidl"))
         candidates.append(("aidl", aidl_files[-1] if aidl_files else None, ("--version",)))
-        ndk_properties = sorted(sdk.glob("ndk/*/source.properties"))
+        ndk_properties = sorted(ndk.glob("source.properties")) if ndk is not None else []
         candidates.append(("ndkProperties", ndk_properties[-1] if ndk_properties else None, None))
-        strip_files = sorted(
-            sdk.glob(
-                "ndk/*/toolchains/llvm/prebuilt/*/bin/llvm-strip"
-            )
+        strip_files = (
+            sorted(ndk.glob("toolchains/llvm/prebuilt/*/bin/llvm-strip"))
+            if ndk is not None
+            else []
         )
         candidates.append(
             (
@@ -1302,6 +1309,15 @@ class ArtifactBuilder:
             )
         )
         return candidates
+
+    def _ndk_root(self, sdk: Path) -> Path | None:
+        for key in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"):
+            value = self._requested_environment.get(key)
+            if value and Path(value).expanduser().is_dir():
+                return Path(value).expanduser()
+        version = self._requested_environment.get("XENOID_NDK_VERSION", DEFAULT_NDK_VERSION)
+        candidate = sdk / "ndk" / version
+        return candidate if candidate.is_dir() else None
 
     def _version_digest(self, command: tuple[str, ...]) -> str:
         environment = {

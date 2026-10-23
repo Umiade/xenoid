@@ -47,6 +47,7 @@ _ENVIRONMENT_KEYS = (
     "ANDROID_HOME",
     "ANDROID_SDK_ROOT",
     "ANDROID_NDK_HOME",
+    "XENOID_NDK_VERSION",
     "CC",
     "CXX",
     "JAVA_HOME",

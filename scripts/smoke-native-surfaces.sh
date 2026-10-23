@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/android-sdk-root.sh"
 ADB_TARGET="$(python3 - <<'PY'
 import os, sys
 sys.path.insert(0, 'src')
@@ -28,9 +29,8 @@ case "$RUNTIME_ABI" in
   *arm64*|*aarch64*) ARCH=arm64; TOOL=aarch64-linux-android21-clang; SHIM="native/xenoid-shim/libxenoid_shim-arm64.so" ;;
   *) ARCH=x86_64; TOOL=x86_64-linux-android21-clang; SHIM="native/xenoid-shim/libxenoid_shim-x86_64.so" ;;
 esac
-BIN=""
-for ndk in "$SDK"/ndk/*; do for pre in darwin-x86_64 darwin-arm64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
-[[ -n "$BIN" ]] || { echo "{\"ok\":false,\"error\":\"$TOOL clang not found\"}"; exit 1; }
+NDK="$(xenoid_ndk_require "$SDK")" || { echo "{\"ok\":false,\"error\":\"Android NDK not found\"}"; exit 1; }
+BIN="$(xenoid_ndk_tool "$NDK" "$TOOL")" || { echo "{\"ok\":false,\"error\":\"$TOOL clang not found\"}"; exit 1; }
 TMP=/tmp/xenoid-native-surfaces
 rm -rf "$TMP"; mkdir -p "$TMP"
 cat > "$TMP/surfaces.c" <<'C'

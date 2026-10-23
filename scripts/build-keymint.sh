@@ -181,24 +181,11 @@ export CARGO_INCREMENTAL=0 SOURCE_DATE_EPOCH=0 ZERO_AR_DATE=1
 
 source "$ROOT/scripts/android-sdk-root.sh"
 SDK="$(xenoid_android_sdk_root)"
-NDK=""
-HOST_TAG=""
-CC=""
-STRIP=""
-shopt -s nullglob
-for candidate in "$SDK"/ndk/*; do
-  for tag in darwin-arm64 darwin-x86_64 linux-x86_64; do
-    compiler="$candidate/toolchains/llvm/prebuilt/$tag/bin/aarch64-linux-android33-clang"
-    if [[ -x "$compiler" ]]; then
-      NDK="$candidate"
-      HOST_TAG="$tag"
-      CC="$compiler"
-      STRIP="$candidate/toolchains/llvm/prebuilt/$tag/bin/llvm-strip"
-    fi
-  done
-done
-shopt -u nullglob
-[[ -n "$NDK" && -n "$HOST_TAG" && -x "$CC" && -x "$STRIP" ]] || fail "ndk_missing"
+NDK="$(xenoid_ndk_require "$SDK")" || fail "ndk_missing"
+PRE="$(xenoid_ndk_prebuilt "$NDK")" || fail "ndk_missing"
+CC="$PRE/bin/aarch64-linux-android33-clang"
+STRIP="$PRE/bin/llvm-strip"
+[[ -x "$CC" && -x "$STRIP" ]] || fail "ndk_missing"
 
 CMAKE=""
 NINJA=""

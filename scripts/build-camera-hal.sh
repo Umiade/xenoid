@@ -16,18 +16,15 @@ else
   TOOL=aarch64-linux-android30-clang++
   TRIPLE=aarch64-linux-android
 fi
-NDK=""
-PRE=""
-for candidate in "$SDK"/ndk/* "${ANDROID_NDK_HOME:-}"; do
-  [[ -d "$candidate" ]] || continue
-  for prebuilt in "$candidate"/toolchains/llvm/prebuilt/*; do
-    if [[ -f "$prebuilt/sysroot/usr/include/android/binder_enums.h" && -x "$prebuilt/bin/$TOOL" ]]; then
-      NDK="$candidate"
-      PRE="$prebuilt"
-    fi
-  done
-done
-[[ -n "$NDK" && -n "$PRE" ]] || { echo "no compatible NDK with android/binder_enums.h and $TOOL found under $SDK" >&2; exit 1; }
+NDK="$(xenoid_ndk_require "$SDK")" || exit 1
+PRE="$(xenoid_ndk_prebuilt "$NDK")" \
+  || { printf 'no compatible Android NDK prebuilt under %s\n' "$NDK" >&2; exit 1; }
+if [[ ! -f "$PRE/sysroot/usr/include/android/binder_enums.h" ]]; then
+  printf 'Android NDK %s does not provide android/binder_enums.h required by the camera provider AIDL build; use NDK %s\n' \
+    "$NDK" "$(xenoid_ndk_version)" >&2
+  exit 1
+fi
+[[ -x "$PRE/bin/$TOOL" ]] || { printf '%s not found in %s\n' "$TOOL" "$NDK" >&2; exit 1; }
 CXX="$PRE/bin/$TOOL"
 SYSROOT="$PRE/sysroot"
 

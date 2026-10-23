@@ -2,11 +2,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/android-sdk-root.sh"
 
 DRY=0
 [[ "${1:-}" == "--dry-run" ]] && DRY=1
 SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
-NDK_VERSION="${XENOID_NDK_VERSION:-27.2.12479018}"
+NDK_VERSION="$(xenoid_ndk_version)"
 read -r BASE_IMAGE BASE_IMAGE_ID < <(
   PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
     'from xenoid.config import DEFAULT_IMAGE, DEFAULT_IMAGE_ID; print(DEFAULT_IMAGE, DEFAULT_IMAGE_ID)'

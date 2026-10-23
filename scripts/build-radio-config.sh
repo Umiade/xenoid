@@ -15,14 +15,15 @@ else
   TOOL=aarch64-linux-android30-clang++
   TRIPLE=aarch64-linux-android
 fi
-PRE=""
-for candidate in "$SDK"/ndk/* "${ANDROID_NDK_HOME:-}"; do
-  [[ -d "$candidate" ]] || continue
-  for prebuilt in "$candidate"/toolchains/llvm/prebuilt/*; do
-    if [[ -f "$prebuilt/sysroot/usr/include/android/binder_enums.h" && -x "$prebuilt/bin/$TOOL" ]]; then PRE="$prebuilt"; fi
-  done
-done
-[[ -n "$PRE" ]] || { echo "compatible Android NDK not found" >&2; exit 127; }
+NDK="$(xenoid_ndk_require "$SDK")" || exit 127
+PRE="$(xenoid_ndk_prebuilt "$NDK")" \
+  || { printf 'no compatible Android NDK prebuilt under %s\n' "$NDK" >&2; exit 127; }
+if [[ ! -f "$PRE/sysroot/usr/include/android/binder_enums.h" ]]; then
+  printf 'Android NDK %s does not provide android/binder_enums.h required by the RadioConfig AIDL build; use NDK %s\n' \
+    "$NDK" "$(xenoid_ndk_version)" >&2
+  exit 127
+fi
+[[ -x "$PRE/bin/$TOOL" ]] || { printf '%s not found in %s\n' "$TOOL" "$NDK" >&2; exit 127; }
 CXX="$PRE/bin/$TOOL"
 SYSROOT="$PRE/sysroot"
 GEN="$HAL/gen"

@@ -153,7 +153,7 @@ The build and runtime context contain no keybox. Raw keybox XML/DER/private keys
 ./xenoid build input
 ```
 
-The script auto-discovers Android NDK under `$ANDROID_HOME`, `$ANDROID_SDK_ROOT`, or `$HOME/Library/Android/sdk/ndk`.
+The script uses the pinned Android NDK `27.2.12479018` under `$ANDROID_HOME/ndk`; `XENOID_NDK_VERSION` selects another version and `ANDROID_NDK_HOME` overrides the location. NDK 28 and newer are not supported: the camera, sensors, and radio stable-AIDL HAL builds require `android/binder_enums.h`, which those releases no longer ship.
 
 Output:
 

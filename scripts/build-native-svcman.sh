@@ -6,14 +6,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCH="${1:-arm64}"
 source "$ROOT/scripts/android-sdk-root.sh"
 SDK="$(xenoid_android_sdk_root)"
-BIN=""
+NDK="$(xenoid_ndk_require "$SDK")" || exit 1
 if [[ "$ARCH" == x86_64 ]]; then TOOL=x86_64-linux-android24-clang; else TOOL=aarch64-linux-android24-clang; fi
-for ndk in "$SDK"/ndk/*; do for pre in darwin-arm64 darwin-x86_64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
-if [[ -z "$BIN" ]]; then # fall back to API21 toolchain if 24 isn't present
+BIN="$(xenoid_ndk_tool "$NDK" "$TOOL")" || true
+if [[ -z "$BIN" ]]; then # fall back to the API21 toolchain if the host NDK omits API24
   if [[ "$ARCH" == x86_64 ]]; then TOOL=x86_64-linux-android21-clang; else TOOL=aarch64-linux-android21-clang; fi
-  for ndk in "$SDK"/ndk/*; do for pre in darwin-arm64 darwin-x86_64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
+  BIN="$(xenoid_ndk_tool "$NDK" "$TOOL")" || true
 fi
-[[ -n "$BIN" ]] || { echo "$TOOL not found" >&2; exit 1; }
+[[ -n "$BIN" ]] || { echo "$TOOL not found in $NDK" >&2; exit 1; }
 SUF=""; [[ "$ARCH" == x86_64 ]] && SUF="-x86_64"
 OUT="$ROOT/native/xenoid-svcman/libxenoid_svcman$SUF.so"
 "$BIN" -O2 -fPIC -shared -Wall -Wextra -fstack-protector-strong \

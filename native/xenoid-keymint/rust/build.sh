@@ -5,7 +5,8 @@
 # KeyMint service process, so the build needs only BoringSSL's headers
 # (openssl-sys bindgens the FFI from them) — no libcrypto.so of any ABI.
 # Configure via environment:
-#   NDK_HOME   Android NDK (default: newest under $ANDROID_HOME/ndk)
+#   NDK_HOME   Android NDK (default: pinned $XENOID_NDK_VERSION, else
+#              27.2.12479018, under $ANDROID_HOME/ndk)
 #   ABI        Android ABI (default: arm64-v8a)
 #   API        platform level (default: 29)
 #   BORINGSSL  BoringSSL headers dir (default: ../.deps/boringssl)
@@ -13,6 +14,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
+source "$REPO_ROOT/scripts/android-sdk-root.sh"
 ABI="${ABI:-arm64-v8a}"
 API="${API:-29}"
 
@@ -26,7 +29,7 @@ esac
 ENVPREFIX="$(echo "$TRIPLE" | tr '[:lower:]-' '[:upper:]_')"
 
 if [ -z "${NDK_HOME:-}" ]; then
-  NDK_HOME="$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)"
+  NDK_HOME="$(xenoid_ndk_require "$(xenoid_android_sdk_root)")" || exit 1
 fi
 [ -d "$NDK_HOME" ] || { echo "NDK not found; set NDK_HOME" >&2; exit 1; }
 # Set every NDK variable cargo-ndk consults to the one NDK we resolved, so it neither warns about a

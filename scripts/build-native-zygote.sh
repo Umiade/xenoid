@@ -16,14 +16,15 @@ case "$ARCH" in
 esac
 source "$ROOT/scripts/android-sdk-root.sh"
 SDK="$(xenoid_android_sdk_root)"
-BIN=""
+NDK="$(xenoid_ndk_require "$SDK")" || exit 1
 TOOL=aarch64-linux-android24-clang
-for ndk in "$SDK"/ndk/*; do for pre in darwin-arm64 darwin-x86_64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
-if [[ -z "$BIN" ]]; then # fall back to API21 toolchain if 24 isn't present
+BIN="$(xenoid_ndk_tool "$NDK" "$TOOL")" || true
+if [[ -z "$BIN" ]]; then # fall back to the API21 toolchain if the host NDK omits API24
+  echo "warning: $NDK has no API 24 clang; falling back to API 21" >&2
   TOOL=aarch64-linux-android21-clang
-  for ndk in "$SDK"/ndk/*; do for pre in darwin-arm64 darwin-x86_64 linux-x86_64; do [[ -x "$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL" ]] && BIN="$ndk/toolchains/llvm/prebuilt/$pre/bin/$TOOL"; done; done
+  BIN="$(xenoid_ndk_tool "$NDK" "$TOOL")" || true
 fi
-[[ -n "$BIN" ]] || { echo "$TOOL not found" >&2; exit 1; }
+[[ -n "$BIN" ]] || { echo "$TOOL not found in $NDK" >&2; exit 1; }
 OUT="$ROOT/native/xenoid-zygote/libxenoid_zygote.so"
 "$BIN" -O2 -fPIC -shared -Wall -Wextra -fstack-protector-strong \
   -Wl,-z,global -D_FORTIFY_SOURCE=2 -DXENOID_COMBINED_SHIM \

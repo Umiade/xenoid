@@ -16,6 +16,7 @@ from .process import run_bounded
 
 
 _RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+DEFAULT_NDK_VERSION = "27.2.12479018"
 _COMMAND_DEADLINE: ContextVar[Optional[float]] = ContextVar(
     "xenoid_command_deadline",
     default=None,
@@ -43,6 +44,19 @@ def android_sdk_dir() -> Optional[Path]:
     return None
 
 
+def android_ndk_dir(sdk: Optional[Path] = None) -> Optional[Path]:
+    for key in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"):
+        value = os.environ.get(key)
+        if value and Path(value).is_dir():
+            return Path(value)
+    root = sdk if sdk is not None else android_sdk_dir()
+    if root is None:
+        return None
+    version = os.environ.get("XENOID_NDK_VERSION", DEFAULT_NDK_VERSION)
+    candidate = root / "ndk" / version
+    return candidate if candidate.is_dir() else None
+
+
 def which(name: str) -> Optional[str]:
     found = shutil.which(name)
     if found:
@@ -65,12 +79,13 @@ def which(name: str) -> Optional[str]:
             "zipalign": sorted((sdk / "build-tools").glob("*/zipalign"), reverse=True) if (sdk / "build-tools").exists() else [],
             "apksigner": sorted((sdk / "build-tools").glob("*/apksigner"), reverse=True) if (sdk / "build-tools").exists() else [],
         }
-        if name == "aarch64-linux-android21-clang" and (sdk / "ndk").exists():
-            ndks = sorted([p for p in (sdk / "ndk").iterdir() if p.is_dir()], reverse=True)
-            arr = []
-            for ndk in ndks:
-                arr.extend(ndk.glob("toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang"))
-            candidates[name] = arr
+        if name == "aarch64-linux-android21-clang":
+            ndk = android_ndk_dir(sdk)
+            candidates[name] = (
+                list(ndk.glob("toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang"))
+                if ndk is not None
+                else []
+            )
         for c in candidates.get(name, []):
             if c.exists() and os.access(c, os.X_OK):
                 return str(c)

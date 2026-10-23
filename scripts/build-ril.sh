@@ -9,14 +9,8 @@ if [[ "$ARCH" == "x86_64" ]]; then
 else
   TOOL="aarch64-linux-android30-clang"
 fi
-COMPILER=""
-for candidate in "$SDK"/ndk/* "${ANDROID_NDK_HOME:-}"; do
-  [[ -d "$candidate" ]] || continue
-  for prebuilt in "$candidate"/toolchains/llvm/prebuilt/*; do
-    if [[ -x "$prebuilt/bin/$TOOL" ]]; then COMPILER="$prebuilt/bin/$TOOL"; fi
-  done
-done
-[[ -n "$COMPILER" ]] || { echo "$TOOL not found" >&2; exit 127; }
+NDK="$(xenoid_ndk_require "$SDK")" || exit 127
+COMPILER="$(xenoid_ndk_tool "$NDK" "$TOOL")" || { echo "$TOOL not found in $NDK" >&2; exit 127; }
 OUT="$ROOT/native/xenoid-ril/libxenoid-ril.so"
 "$COMPILER" -std=c11 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
   -fvisibility=hidden -ffunction-sections -fdata-sections \

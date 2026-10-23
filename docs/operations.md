@@ -126,7 +126,7 @@ or bypass it with a manual container recreation.
 
 ## Linux ARM
 
-Requirements: Ubuntu 22.04 or 24.04 ARM64, Python 3.9 or newer, Docker Engine, root or sudo access, and a kernel with `binder_linux`. Source builds also require JDK 17, Android SDK platform 35, Android build-tools 35.0.0, and Android NDK 27.2.12479018 or a compatible newer release.
+Requirements: Ubuntu 22.04 or 24.04 ARM64, Python 3.9 or newer, Docker Engine, root or sudo access, and a kernel with `binder_linux`. Source builds also require JDK 17, Android SDK platform 35, Android build-tools 35.0.0, and the pinned Android NDK 27.2.12479018. NDK 28 and newer are not supported: the camera, sensors, and radio stable-AIDL HAL builds require `android/binder_enums.h`, which those releases no longer ship.
 
 ```bash
 cd xenoid

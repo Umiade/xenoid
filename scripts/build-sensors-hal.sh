@@ -17,20 +17,17 @@ else
   TOOL=aarch64-linux-android29-clang++
   TRIPLE=aarch64-linux-android
 fi
-# Stable binder headers were removed in NDK 29. Select an installed host
-# prebuilt that still contains them and the requested target compiler.
-NDK=""
-PRE=""
-for candidate in "$SDK"/ndk/* "${ANDROID_NDK_HOME:-}"; do
-  [[ -d "$candidate" ]] || continue
-  for prebuilt in "$candidate"/toolchains/llvm/prebuilt/*; do
-    if [[ -f "$prebuilt/sysroot/usr/include/android/binder_enums.h" && -x "$prebuilt/bin/$TOOL" ]]; then
-      NDK="$candidate"
-      PRE="$prebuilt"
-    fi
-  done
-done
-[[ -n "$NDK" && -n "$PRE" ]] || { echo "no compatible NDK with android/binder_enums.h and $TOOL found under $SDK" >&2; exit 1; }
+# android/binder_enums.h is absent from NDK 28 and newer. The pinned NDK
+# still ships it; an explicit ANDROID_NDK_HOME override must do the same.
+NDK="$(xenoid_ndk_require "$SDK")" || exit 1
+PRE="$(xenoid_ndk_prebuilt "$NDK")" \
+  || { printf 'no compatible Android NDK prebuilt under %s\n' "$NDK" >&2; exit 1; }
+if [[ ! -f "$PRE/sysroot/usr/include/android/binder_enums.h" ]]; then
+  printf 'Android NDK %s does not provide android/binder_enums.h required by the sensors HAL AIDL build; use NDK %s\n' \
+    "$NDK" "$(xenoid_ndk_version)" >&2
+  exit 1
+fi
+[[ -x "$PRE/bin/$TOOL" ]] || { printf '%s not found in %s\n' "$TOOL" "$NDK" >&2; exit 1; }
 CXX="$PRE/bin/$TOOL"
 SYSROOT="$PRE/sysroot"
 
