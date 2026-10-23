@@ -13,7 +13,7 @@ cd xenoid
 ./xenoid view
 ```
 
-`install-runtime` installs and validates the Homebrew Docker CLI and Buildx plugin, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, and Android NDK. It registers Buildx in the Docker CLI plugin directory without reading or rewriting Docker authentication configuration. It prepares the ARM64 Colima VM and binderfs and explicitly pulls the canonical ARM64 redroid base at its pinned image identity through the `colima` context. If direct Docker Hub access is unavailable, it uses a content-addressed mirror and rejects any identity mismatch; `up` never implicitly refreshes the base and `init` remains the explicit instance-creation step.
+`install-runtime` installs and validates the Homebrew Docker CLI and Buildx plugin, Colima, ADB, scrcpy, JDK 17, Android SDK platform/build-tools 35, Android NDK, Android SDK CMake/Ninja, and the source-build toolchain for KeyMint (Homebrew `rustup`, the stable Rust toolchain with the `aarch64-linux-android` target, and `cargo-ndk`). It registers Buildx in the Docker CLI plugin directory without reading or rewriting Docker authentication configuration. It prepares the ARM64 Colima VM and binderfs and explicitly pulls the canonical ARM64 redroid base at its pinned image identity through the `colima` context. If direct Docker Hub access is unavailable, it uses a content-addressed mirror and rejects any identity mismatch; `up` never implicitly refreshes the base and `init` remains the explicit instance-creation step.
 
 Docker Desktop is not required. Before uninstalling it, verify that both
 `docker` and `docker buildx version` work independently of its app bundle;

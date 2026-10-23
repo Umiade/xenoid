@@ -29,33 +29,36 @@ SYSROOT="$PRE/sysroot"
 GEN="$HAL/gen"
 rm -rf "$GEN"
 mkdir -p "$GEN"
-while IFS= read -r aidl; do
-  case "$aidl" in
-    */android/hardware/radio/config/*) hash=dd9c3f8e21930f9b4c46a4125bd5f5cec90318ec ;;
-    */android/hardware/radio/*) hash=31b668688e937e8e1eff48fea7b4bb37681114a0 ;;
-    *) echo "unknown RadioConfig AIDL package: $aidl" >&2; exit 1 ;;
+source "$ROOT/scripts/hal-build-lib.sh"
+radio_aidl_package() {
+  case "$1" in
+    */android/hardware/radio/config/*) echo "--hash dd9c3f8e21930f9b4c46a4125bd5f5cec90318ec" ;;
+    */android/hardware/radio/*) echo "--hash 31b668688e937e8e1eff48fea7b4bb37681114a0" ;;
+    *) echo "unknown RadioConfig AIDL package: $1" >&2; return 1 ;;
   esac
-  "$AIDL_BIN" --lang=ndk --structured --stability=vintf --min_sdk_version=30 \
-    --version 1 --hash "$hash" -o"$GEN" -h"$GEN" \
-    -p"$HAL/framework-min.aidl" -I"$HAL/aidl" "$aidl"
-done < <(find "$HAL/aidl" -name '*.aidl' | sort)
+}
+find "$HAL/aidl" -name '*.aidl' -print0 | LC_ALL=C sort -z \
+  | xenoid_aidl_generate "$AIDL_BIN" "$GEN" radio_aidl_package \
+      --lang=ndk --structured --stability=vintf --min_sdk_version=30 --version 1 \
+      -p"$HAL/framework-min.aidl" -I"$HAL/aidl"
 python3 "$ROOT/scripts/sanitize-aidl-output.py" "$GEN"
-if [[ ! -f "$HAL/libbinder_ndk.so" ]]; then
-  cid="$(docker create "${XENOID_BASE_IMAGE:-redroid/redroid:13.0.0_64only-latest}")"
-  docker cp "$cid:/system/lib64/libbinder_ndk.so" "$HAL/libbinder_ndk.so"
-  docker rm "$cid" >/dev/null
-fi
+LIBBINDER="$("$ROOT/scripts/platform-libs.sh" libbinder_ndk.so)"
+[[ -f "$LIBBINDER" ]] || { echo "failed to resolve libbinder_ndk.so" >&2; exit 1; }
 SRCS=("$HAL/radio_config.cpp")
-while IFS= read -r source; do SRCS+=("$source"); done < <(find "$GEN" -name '*.cpp' | sort)
+while IFS= read -r source; do SRCS+=("$source"); done < <(find "$GEN" -name '*.cpp' | LC_ALL=C sort)
 OUT="$HAL/$SERVICE"
-"$CXX" -std=c++17 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-  -fvisibility=hidden -fvisibility-inlines-hidden -fno-rtti \
-  "-ffile-prefix-map=$HAL=android/hardware/radio/config/default" \
-  "-fmacro-prefix-map=$HAL=android/hardware/radio/config/default" \
-  "-ffile-prefix-map=$SDK=android-sdk" \
-  "-fmacro-prefix-map=$SDK=android-sdk" \
-  -ffunction-sections -fdata-sections --sysroot="$SYSROOT" -I"$GEN" -I"$SYSROOT/usr/include" \
-  -o "$OUT" "${SRCS[@]}" -L"$SYSROOT/usr/lib/$TRIPLE/30" \
-  "$HAL/libbinder_ndk.so" -llog -static-libstdc++ \
+CXXFLAGS=(
+  -std=c++17 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2
+  -fvisibility=hidden -fvisibility-inlines-hidden -fno-rtti
+  "-ffile-prefix-map=$HAL=android/hardware/radio/config/default"
+  "-fmacro-prefix-map=$HAL=android/hardware/radio/config/default"
+  "-ffile-prefix-map=$SDK=android-sdk"
+  "-fmacro-prefix-map=$SDK=android-sdk"
+  -ffunction-sections -fdata-sections --sysroot="$SYSROOT" -I"$GEN" -I"$SYSROOT/usr/include"
+)
+LDFLAGS=(
+  -L"$SYSROOT/usr/lib/$TRIPLE/30" "$LIBBINDER" -llog -static-libstdc++
   -Wl,-z,defs,--gc-sections,--exclude-libs,ALL,-s,-z,relro,-z,now
+)
+xenoid_compile_link "$CXX" "$OUT" "${XENOID_BUILD_JOBS:-1}"
 printf '%s\n' "$OUT"

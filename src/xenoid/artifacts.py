@@ -15,6 +15,7 @@ import secrets
 import shutil
 import stat
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -29,6 +30,15 @@ from .util import DEFAULT_NDK_VERSION
 
 
 RESULT_SCHEMA = "dev.xenoid.artifacts/v1"
+# Tool identity carries this schema instead of a digest of this module, so
+# edits that do not change build semantics keep existing records reusable.
+# Bump it whenever identity inputs, record semantics, or executed command
+# construction change in a way that must invalidate prior records.
+BUILDER_SCHEMA = 2
+_DIGEST_STORE_NAME = "digests-v1.json"
+_DIGEST_STORE_SCHEMA = 1
+_DIGEST_RACY_WINDOW_NS = 2_000_000_000
+_MAX_DIGEST_STORE_BYTES = 64 * 1024 * 1024
 RECORD_SCHEMA = "dev.xenoid.artifact/v1"
 SNAPSHOT_SCHEMA = "dev.xenoid.artifact-snapshot/v1"
 _RECORD_FIELDS = frozenset({"schema", "target", "inputSha256", "toolSha256", "outputs", "completedAt"})
@@ -227,6 +237,21 @@ _BASE_ENV = (
     *_ANDROID_ENV,
 )
 _DOCKER_ENV = ("DOCKER_HOST", "DOCKER_CONTEXT", "COLIMA_PROFILE")
+# scripts/platform-libs.sh pins extracted bytes by SHA-256, so the Docker engine
+# is not a tool identity input; its selection environment is still forwarded for
+# the cold-cache extraction path.
+_PLATFORM_LIB_ENV = (*_ANDROID_ENV, *_DOCKER_ENV, "XENOID_DOCKER_CONTEXT")
+# Homebrew's rustup formula is keg-only; scripts/install-macos-runtime.sh and
+# scripts/build-keymint.sh look for its proxies here as well as ~/.cargo/bin.
+_RUSTUP_KEG_DIRECTORIES = (Path("/opt/homebrew/opt/rustup/bin"), Path("/usr/local/opt/rustup/bin"))
+# Toolchain entries a build cannot succeed without. Missing ones fail fast with
+# an actionable code instead of a script failure deep inside the build.
+_REQUIRED_TOOL_ENTRIES: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "rust": frozenset({"rustup", "cargoNdk"}),
+        "cmake": frozenset({"cmake", "ninja"}),
+    }
+)
 _BUILD_OVERRIDE_NAMES = frozenset(
     {
         "CC",
@@ -326,10 +351,6 @@ _TARGET_LIST = (
             "native/xenoid-keymint/rust/teesim-km/**/*",
             "native/xenoid-keymint/rust/patches/**/*",
             "native/xenoid-keymint/android.hardware.security.keymint.IKeyMintDevice.xml",
-            "native/xenoid-keymint/.deps/keymint/**/*",
-            "native/xenoid-keymint/.deps/interfaces/**/*",
-            "native/xenoid-keymint/.deps/frameworks-native/**/*",
-            "native/xenoid-keymint/.deps/boringssl/**/*",
         ),
         (
             _out("native/xenoid-keymint/xenoid-keymint"),
@@ -411,13 +432,14 @@ _TARGET_LIST = (
         (
             *_COMMON_ANDROID,
             "scripts/build-sensors-hal.sh",
+            "scripts/hal-build-lib.sh",
+            "scripts/platform-libs.sh",
             "scripts/sanitize-aidl-output.py",
             "native/xenoid-sensorshal/xenoid_sensors_hal.cpp",
             "native/xenoid-sensorshal/sensor_catalog.cpp",
             "native/xenoid-sensorshal/sensor_catalog.h",
             "native/xenoid-sensorshal/aidl/**/*.aidl",
             "native/xenoid-sensorshal/android.hardware.sensors.ISensors.xml",
-            "native/xenoid-sensorshal/libbinder_ndk.so",
         ),
         (
             _out("native/xenoid-sensorshal/xenoid-sensorshal"),
@@ -425,6 +447,7 @@ _TARGET_LIST = (
         ),
         "native/xenoid-sensorshal",
         cpu_slots=2,
+        environment=_PLATFORM_LIB_ENV,
     ),
     _target(
         "gralloc",
@@ -432,17 +455,18 @@ _TARGET_LIST = (
         (
             *_COMMON_ANDROID,
             "scripts/build-gralloc.sh",
+            "scripts/platform-libs.sh",
             "native/xenoid-gralloc/gralloc.cpp",
             "native/xenoid-gralloc/mapper.cpp",
             "native/xenoid-gralloc/framebuffer.cpp",
             "native/xenoid-gralloc/gr.h",
             "native/xenoid-gralloc/gralloc_priv.h",
             "native/xenoid-gralloc/android_compat.h",
-            "native/xenoid-gralloc/libcutils.so",
         ),
         (_out("native/xenoid-gralloc/gralloc.redroid.so"),),
         "native/xenoid-gralloc",
         cpu_slots=2,
+        environment=_PLATFORM_LIB_ENV,
     ),
     _target(
         "hwcomposer",
@@ -457,6 +481,8 @@ _TARGET_LIST = (
         (
             *_COMMON_ANDROID,
             "scripts/build-camera-hal.sh",
+            "scripts/hal-build-lib.sh",
+            "scripts/platform-libs.sh",
             "scripts/sanitize-aidl-output.py",
             "native/xenoid-camerahal/*.cpp",
             "native/xenoid-camerahal/*.h",
@@ -464,11 +490,6 @@ _TARGET_LIST = (
             "native/xenoid-camerahal/framework-min.aidl",
             "native/xenoid-camerahal/android.hardware.camera.provider.ICameraProvider.xml",
             "native/xenoid-camerahal/media_profiles_V1_0.xml",
-            "native/xenoid-camerahal/libbinder_ndk.so",
-            "native/xenoid-camerahal/libcamera_metadata.so",
-            "native/xenoid-camerahal/libcamera_device*.so",
-            "native/xenoid-camerahal/libcamera_provider*.so",
-            "native/xenoid-camerahal/libcamera_common*.so",
         ),
         (
             _out("native/xenoid-camerahal/android.hardware.camera.provider-service-aidl"),
@@ -477,8 +498,7 @@ _TARGET_LIST = (
         ),
         "native/xenoid-camerahal",
         cpu_slots=2,
-        tools=("android", "docker"),
-        environment=(*_ANDROID_ENV, *_DOCKER_ENV, "XENOID_BASE_IMAGE"),
+        environment=_PLATFORM_LIB_ENV,
     ),
     _target(
         "ril",
@@ -503,12 +523,13 @@ _TARGET_LIST = (
         (
             *_COMMON_ANDROID,
             "scripts/build-radio-config.sh",
+            "scripts/hal-build-lib.sh",
+            "scripts/platform-libs.sh",
             "scripts/sanitize-aidl-output.py",
             "native/xenoid-radio-config/radio_config.cpp",
             "native/xenoid-radio-config/aidl/**/*.aidl",
             "native/xenoid-radio-config/framework-min.aidl",
             "native/xenoid-radio-config/android.hardware.radio.config.IRadioConfig.xml",
-            "native/xenoid-radio-config/libbinder_ndk.so",
         ),
         (
             _out("native/xenoid-radio-config/android.hardware.radio.config-service.xenoid"),
@@ -516,8 +537,7 @@ _TARGET_LIST = (
         ),
         "native/xenoid-radio-config",
         cpu_slots=2,
-        tools=("android", "docker"),
-        environment=(*_ANDROID_ENV, *_DOCKER_ENV, "XENOID_BASE_IMAGE"),
+        environment=_PLATFORM_LIB_ENV,
     ),
     _target(
         "shimArm64",
@@ -677,6 +697,11 @@ class ArtifactBuilder:
         self._cancelled: threading.Event | Callable[[], bool] | None = None
         self._internal_cancel = threading.Event()
         self._file_digest_cache: dict[tuple[Any, ...], str] = {}
+        # Content digests survive across invocations keyed by the full stat
+        # fingerprint, so a warm `up` stats sources instead of re-reading them.
+        self._digest_store_path: Path | None = self._cache_root / _DIGEST_STORE_NAME
+        self._digest_store_loaded = False
+        self._digest_store_mutex = threading.Lock()
         self._version_digest_cache: dict[tuple[Any, ...], str] = {}
         self._tool_identity_cache: dict[
             tuple[Any, ...],
@@ -792,6 +817,7 @@ class ArtifactBuilder:
                             "code": "artifact_internal_error",
                         }
 
+        self._save_digest_store()
         tail_budget = _MAX_FAILED_TAIL_BYTES
         public_results: dict[str, dict[str, Any]] = {}
         for name in ordered:
@@ -966,6 +992,15 @@ class ArtifactBuilder:
                             "inputSha256": input_sha256,
                             "toolSha256": tool_sha256,
                         }
+                    missing_tools = self._missing_required_tools(target)
+                    if missing_tools:
+                        return {
+                            "status": "failed",
+                            "durationMs": _duration_ms(started),
+                            "code": "artifact_tool_missing",
+                            "missingTools": missing_tools,
+                            "hint": "install the missing build toolchain with ./xenoid install-runtime",
+                        }
                     rollback_records = self._directory_records(target.output_directory)
                     command = target.force_command if force and target.force_command is not None else target.command
                     environment = self._execution_environment(target, allocation)
@@ -1130,7 +1165,7 @@ class ArtifactBuilder:
         tool_payload = {
             "schema": 1,
             "target": target.name,
-            "builderImplementationSha256": self._cached_file_digest(Path(__file__)),
+            "builderSchema": BUILDER_SCHEMA,
             "tools": [self._tool_identity(tool) for tool in target.tools],
         }
         return _canonical_digest(input_payload), _canonical_digest(tool_payload)
@@ -1176,6 +1211,7 @@ class ArtifactBuilder:
 
     def _cached_file_digest(self, path: Path) -> str:
         fingerprint = self._file_fingerprint(path)
+        self._load_digest_store()
         cache = self._file_digest_cache
         digest = cache.get(fingerprint)
         if digest is None:
@@ -1183,6 +1219,66 @@ class ArtifactBuilder:
             cache[fingerprint] = digest
         return digest
 
+
+    def _digest_store(self) -> Path | None:
+        # Builders assembled without __init__ (read-only record observation)
+        # keep the purely in-memory cache.
+        return getattr(self, "_digest_store_path", None)
+
+    def _load_digest_store(self) -> None:
+        store = self._digest_store()
+        if store is None or self._digest_store_loaded:
+            return
+        with self._digest_store_mutex:
+            if self._digest_store_loaded:
+                return
+            for fingerprint, digest in _read_digest_store(store).items():
+                self._file_digest_cache.setdefault(fingerprint, digest)
+            self._digest_store_loaded = True
+
+    def _save_digest_store(self) -> None:
+        store = self._digest_store()
+        if store is None or not self._digest_store_loaded:
+            return
+        # Entries whose file changed within the timestamp-granularity window
+        # are not persisted: a same-tick rewrite would otherwise be invisible.
+        racy_after_ns = time.time_ns() - _DIGEST_RACY_WINDOW_NS
+        try:
+            with self._file_lock(self._lock_root / "digests.lock"):
+                candidates = dict(_read_digest_store(store))
+                candidates.update(dict(self._file_digest_cache))
+                current: dict[str, tuple[tuple[Any, ...], str]] = {}
+                for fingerprint, digest in candidates.items():
+                    resolved = fingerprint[0]
+                    if resolved in current:
+                        continue
+                    try:
+                        live = self._file_fingerprint(Path(resolved))
+                    except OSError:
+                        continue
+                    if live != fingerprint or max(live[5], live[6]) >= racy_after_ns:
+                        continue
+                    current[resolved] = (fingerprint, digest)
+                entries = {
+                    resolved: [*fingerprint[1:], digest]
+                    for resolved, (fingerprint, digest) in sorted(current.items())
+                }
+                payload = _canonical_json({"schema": _DIGEST_STORE_SCHEMA, "entries": entries})
+                _atomic_write(store, payload, 0o600)
+        except (ArtifactError, OSError, ValueError):
+            # The store is an accelerator only; identity never depends on it.
+            return
+
+    def _missing_required_tools(self, target: BuildTarget) -> list[str]:
+        missing: list[str] = []
+        for tool in target.tools:
+            required = _REQUIRED_TOOL_ENTRIES.get(tool)
+            if not required:
+                continue
+            for entry in self._tool_identity(tool)["entries"]:
+                if entry["name"] in required and entry.get("missing"):
+                    missing.append(f"{tool}.{entry['name']}")
+        return missing
 
     def _tool_identity(self, tool: str) -> Mapping[str, Any]:
         candidates = self._tool_candidates(tool)
@@ -1250,13 +1346,40 @@ class ArtifactBuilder:
             gradle = wrapper if wrapper.is_file() else executable("gradle")
             return [("gradle", gradle, ("--version",))]
         if tool == "rust":
+            # Mirror scripts/build-keymint.sh: rustup proxies and cargo-ndk may
+            # live outside the caller's PATH (keg-only Homebrew rustup,
+            # ~/.cargo/bin). The build uses the rustup stable toolchain rather
+            # than any rustc/cargo that happens to be first on PATH, so its
+            # identity is the stable toolchain's verbose version.
+            rust_path = os.pathsep.join(
+                (*(str(directory) for directory in self._rust_directories()), path_value)
+            )
+
+            def rust_executable(name: str) -> Path | None:
+                found = shutil.which(name, path=rust_path)
+                return None if found is None else Path(found)
+
             return [
-                ("rustup", executable("rustup"), ("--version",)),
-                ("cargo", executable("cargo"), ("--version",)),
-                ("rustc", executable("rustc"), ("--version",)),
+                ("rustup", rust_executable("rustup"), ("run", "stable", "rustc", "-vV")),
+                ("cargoNdk", rust_executable("cargo-ndk"), None),
             ]
         if tool == "cmake":
-            return [("cmake", executable("cmake"), ("--version",)), ("ninja", executable("ninja"), ("--version",))]
+            # Mirror scripts/build-keymint.sh: the newest SDK CMake package
+            # (which also ships ninja) wins over PATH.
+            sdk = self._android_sdk_root()
+
+            def sdk_cmake_tool(name: str) -> Path | None:
+                found = [
+                    candidate
+                    for candidate in sorted(sdk.glob(f"cmake/*/bin/{name}"))
+                    if os.access(candidate, os.X_OK)
+                ]
+                return found[-1] if found else executable(name)
+
+            return [
+                ("cmake", sdk_cmake_tool("cmake"), ("--version",)),
+                ("ninja", sdk_cmake_tool("ninja"), ("--version",)),
+            ]
         if tool == "docker":
             return [("docker", executable("docker"), ("version", "--format", "{{json .}}")), ("colima", executable("colima"), ("version",))]
         if tool == "proxyCompiler":
@@ -1278,12 +1401,24 @@ class ArtifactBuilder:
             return [(tool, self.project_root / tool, None)]
         return [(tool, executable(tool), ("--version",))]
 
-    def _android_tool_candidates(self) -> list[tuple[str, Path | None, tuple[str, ...] | None]]:
-        sdk_value = self._requested_environment.get("ANDROID_SDK_ROOT") or self._requested_environment.get("ANDROID_HOME")
+    def _android_sdk_root(self) -> Path:
+        # Mirror scripts/android-sdk-root.sh.
+        sdk_value = self._requested_environment.get("ANDROID_HOME") or self._requested_environment.get("ANDROID_SDK_ROOT")
         if sdk_value:
-            sdk = Path(sdk_value).expanduser()
-        else:
-            sdk = Path(self._requested_environment.get("HOME", str(Path.home()))) / "Library" / "Android" / "sdk"
+            return Path(sdk_value).expanduser()
+        home = Path(self._requested_environment.get("HOME", str(Path.home())))
+        if sys.platform == "darwin":
+            return home / "Library" / "Android" / "sdk"
+        return home / "Android" / "Sdk"
+
+    def _rust_directories(self) -> tuple[Path, ...]:
+        home = Path(self._requested_environment.get("HOME", str(Path.home())))
+        cargo_home = self._requested_environment.get("CARGO_HOME")
+        cargo_bin = Path(cargo_home) / "bin" if cargo_home else home / ".cargo" / "bin"
+        return (cargo_bin, *_RUSTUP_KEG_DIRECTORIES)
+
+    def _android_tool_candidates(self) -> list[tuple[str, Path | None, tuple[str, ...] | None]]:
+        sdk = self._android_sdk_root()
         candidates: list[tuple[str, Path | None, tuple[str, ...] | None]] = []
         ndk = self._ndk_root(sdk)
         ndk_files = (
@@ -2000,6 +2135,48 @@ def _manifest_digest(records: Sequence[ArtifactRecord]) -> str:
             }
         )
     return _canonical_digest(tuples)
+
+
+def _read_digest_store(path: Path) -> dict[tuple[Any, ...], str]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return {}
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_size > _MAX_DIGEST_STORE_BYTES
+        ):
+            return {}
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            document = json.loads(handle.read(_MAX_DIGEST_STORE_BYTES + 1))
+    except (OSError, ValueError):
+        return {}
+    finally:
+        os.close(fd)
+    if not isinstance(document, dict) or document.get("schema") != _DIGEST_STORE_SCHEMA:
+        return {}
+    entries = document.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    loaded: dict[tuple[Any, ...], str] = {}
+    for resolved, value in entries.items():
+        if (
+            not isinstance(resolved, str)
+            or not resolved.startswith("/")
+            or not isinstance(value, list)
+            or len(value) != 7
+            or not all(type(item) is int for item in value[:6])
+            or not isinstance(value[6], str)
+            or _SHA256_RE.match(value[6]) is None
+        ):
+            continue
+        loaded[(resolved, *value[:6])] = value[6]
+    return loaded
 
 
 def _atomic_write(path: Path, payload: bytes, mode: int) -> None:

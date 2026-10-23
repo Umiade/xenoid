@@ -96,6 +96,7 @@ def run_plugin_install(*, occupied: bool = False, broken: bool = False) -> dict[
         plugin.parent.mkdir()
         sdk = temp / "sdk"
         for name in ("build-tools/35.0.0/aapt2", "build-tools/35.0.0/apksigner",
+                     "cmake/3.22.1/bin/cmake", "cmake/3.22.1/bin/ninja",
                      "ndk/27.2.12479018/toolchains/llvm/prebuilt/test/bin/aarch64-linux-android21-clang"):
             tool = sdk / name
             tool.parent.mkdir(parents=True, exist_ok=True)
@@ -125,6 +126,10 @@ case "$1 $2" in
 esac
 """
         )
+        write_executable(fake_bin / "rustup", """#!/bin/sh
+if [ "$1 $2" = 'target list' ]; then echo aarch64-linux-android; fi
+exit 0
+""")
         for command in ("colima", "sdkmanager", "adb", "scrcpy"):
             write_executable(fake_bin / command, "#!/bin/sh\nexit 0\n")
         # The expected base identity belongs to configuration, not this test.

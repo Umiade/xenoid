@@ -143,7 +143,7 @@ Source rebuilds are explicit and self-contained:
 ./xenoid build keymint
 ```
 
-The first build fetches the pinned dependencies (network access to android.googlesource.com and boringssl.googlesource.com); later builds reuse them. Never encode a workstation checkout path in tracked files or release metadata. Release packaging includes the same validated binary under both `native/xenoid-keymint/` and `artifacts/`, and release verification requires them to match.
+Source builds need a rustup-managed stable toolchain with the `aarch64-linux-android` target, `cargo-ndk`, Android NDK, and CMake/Ninja (the Android SDK `cmake;3.22.1` package is preferred over `PATH`); `./xenoid install-runtime` installs and validates all of them. Every build runs the dependency fetcher, which returns immediately when each checkout's HEAD matches its pin and re-fetches otherwise (the first build needs network access to android.googlesource.com and boringssl.googlesource.com), so `.deps` cannot drift from the pins that define the artifact identity. The CMake/Ninja tree persists under the private, gitignored `.xenoid/cache/keymint-build/` so later builds are incremental; it is discarded whenever the fetcher pins, `CMakeLists.txt`, NDK, SDK, or CMake/Ninja selection change. Never encode a workstation checkout path in tracked files or release metadata. Release packaging includes the same validated binary under both `native/xenoid-keymint/` and `artifacts/`, and release verification requires them to match.
 
 The build and runtime context contain no keybox. Raw keybox XML/DER/private keys, source/staging paths, digests, transient control JSON, and private daemon state must never be tracked or copied into the image or release bundle.
 

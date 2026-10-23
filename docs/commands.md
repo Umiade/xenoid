@@ -13,7 +13,7 @@ Commands marked *(internal)* run as part of `up` convergence and are not everyda
 
 ## Host setup and lifecycle
 
-- `./xenoid install-runtime [--dry-run]` — install macOS runtime dependencies via Homebrew and start Colima.
+- `./xenoid install-runtime [--dry-run]` — install macOS runtime and native build dependencies (Docker/Colima, ADB, JDK, Android SDK/NDK/CMake, Rust with cargo-ndk) via Homebrew, sdkmanager, and rustup, and start Colima.
 - `./xenoid linux-binderfs [--dry-run]` — set up Linux binderfs devices for redroid.
 - `./xenoid init [--image IMAGE] [--backend BACKEND] [--config CONFIG] [--from FROM_INSTANCE] [--no-google-services]` — initialize the selected immutable instance.
 - `./xenoid up [--dry-run] [--skip-build]` — converge the complete Xenoid production runtime. `--skip-build` remains supported and validates existing artifact records without compiling. The final result is `dev.xenoid.convergence/v1` normally, or the canonical top-level `dev.xenoid.device-regenerate/v3` result when `up` resumes a pending regeneration.

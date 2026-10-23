@@ -8,6 +8,8 @@ DRY=0
 [[ "${1:-}" == "--dry-run" ]] && DRY=1
 SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 NDK_VERSION="$(xenoid_ndk_version)"
+# SDK CMake ships both cmake and ninja; the KeyMint build prefers it over PATH.
+CMAKE_VERSION="3.22.1"
 read -r BASE_IMAGE BASE_IMAGE_ID < <(
   PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
     'from xenoid.config import DEFAULT_IMAGE, DEFAULT_IMAGE_ID; print(DEFAULT_IMAGE, DEFAULT_IMAGE_ID)'
@@ -36,13 +38,16 @@ sdkmanager_path() {
 }
 
 cmds=(
-  "brew install docker docker-buildx colima android-platform-tools scrcpy openjdk@17"
+  "brew install docker docker-buildx colima android-platform-tools scrcpy openjdk@17 rustup"
   "register Homebrew docker-buildx in the Docker CLI plugin directory"
   "docker --context colima buildx version"
+  "rustup toolchain install stable --profile minimal"
+  "rustup target add --toolchain stable aarch64-linux-android"
+  "rustup run stable cargo install --locked cargo-ndk (when cargo ndk is unavailable)"
   "brew link --force openjdk@17"
   "brew install --cask android-commandlinetools"
   "sdkmanager --sdk_root=$SDK_ROOT --licenses"
-  "sdkmanager --sdk_root=$SDK_ROOT platform-tools platforms;android-35 build-tools;35.0.0 ndk;$NDK_VERSION"
+  "sdkmanager --sdk_root=$SDK_ROOT platform-tools platforms;android-35 build-tools;35.0.0 ndk;$NDK_VERSION cmake;$CMAKE_VERSION"
   "colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8"
   "docker --context colima pull --platform linux/arm64 $BASE_IMAGE_DIRECT (content-addressed mirror fallback)"
   "colima ssh -- sh -c '<ensure binder_linux and mount binderfs>'"
@@ -75,7 +80,7 @@ MSG
   exit 127
 fi
 
-if brew install docker docker-buildx colima android-platform-tools scrcpy openjdk@17; then
+if brew install docker docker-buildx colima android-platform-tools scrcpy openjdk@17 rustup; then
   :
 else
   brew_status=$?
@@ -107,6 +112,16 @@ mkdir -p "$(dirname "$BUILDX_LINK")"
 ln -sfn "$BUILDX_BIN" "$BUILDX_LINK"
 docker --context colima buildx version >/dev/null
 
+# KeyMint builds need a rustup-managed stable toolchain with the Android std,
+# plus cargo-ndk. Homebrew's rustup is keg-only, so put its proxies first; that
+# also keeps a Homebrew `rust` formula's cargo from shadowing the proxies.
+export PATH="$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$PATH"
+rustup toolchain install stable --profile minimal
+rustup target add --toolchain stable aarch64-linux-android
+if ! rustup run stable cargo ndk --version >/dev/null 2>&1; then
+  rustup run stable cargo install --locked cargo-ndk
+fi
+
 JDK_PREFIX="$(brew --prefix openjdk@17)"
 JAVA_HOME="$JDK_PREFIX/libexec/openjdk.jdk/Contents/Home"
 [[ -x "$JAVA_HOME/bin/java" ]] || {
@@ -130,7 +145,8 @@ mkdir -p "$SDK_ROOT"
   "platform-tools" \
   "platforms;android-35" \
   "build-tools;35.0.0" \
-  "ndk;$NDK_VERSION"
+  "ndk;$NDK_VERSION" \
+  "cmake;$CMAKE_VERSION"
 
 colima start --arch aarch64 --vm-type vz --memory 8 --cpu 8
 if docker --context colima pull --platform linux/arm64 "$BASE_IMAGE_DIRECT"; then
@@ -169,6 +185,27 @@ done
 NDK_CLANG="$(find "$SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt" -type f -name aarch64-linux-android21-clang -perm -111 -print -quit 2>/dev/null || true)"
 [[ -n "$NDK_CLANG" ]] || {
   echo "Android NDK $NDK_VERSION does not provide aarch64-linux-android21-clang" >&2
+  exit 127
+}
+for tool in cmake ninja; do
+  [[ -x "$SDK_ROOT/cmake/$CMAKE_VERSION/bin/$tool" ]] || {
+    echo "Android SDK CMake $CMAKE_VERSION does not provide $tool" >&2
+    exit 127
+  }
+done
+rustup run stable rustc --version >/dev/null 2>&1 || {
+  echo "the rustup stable toolchain is unavailable after installation" >&2
+  exit 127
+}
+case "$(rustup target list --toolchain stable --installed 2>/dev/null)" in
+  *aarch64-linux-android*) ;;
+  *)
+    echo "the rustup stable toolchain lacks the aarch64-linux-android target" >&2
+    exit 127
+    ;;
+esac
+rustup run stable cargo ndk --version >/dev/null 2>&1 || {
+  echo "cargo-ndk is unavailable after installation" >&2
   exit 127
 }
 docker --context colima info >/dev/null

@@ -61,33 +61,10 @@ if [[ ! -d "$LIBDIR" ]]; then
   exit 1
 fi
 
-LIBCUTILS="$HAL/libcutils.so"
-if [[ ! -f "$LIBCUTILS" ]]; then
-  SELECTED_DOCKER_CONTEXT="${XENOID_DOCKER_CONTEXT:-${DOCKER_CONTEXT:-}}"
-  INSTANCE_RUNTIME=()
-  while IFS= read -r value; do INSTANCE_RUNTIME+=("$value"); done < <(
-    PYTHONPATH="$ROOT/src" python3 -c 'from pathlib import Path; from xenoid.backend import RuntimeManager; from xenoid.config import resolve_instance; c,g,l=resolve_instance(project_root=Path.cwd()); r=RuntimeManager(c,g,l); print(r.effective_docker_context()); print(l.container_name)'
-  )
-  [[ ${#INSTANCE_RUNTIME[@]} -eq 2 ]] || { printf 'failed to resolve Xenoid instance runtime\n' >&2; exit 1; }
-  [[ -n "$SELECTED_DOCKER_CONTEXT" ]] || SELECTED_DOCKER_CONTEXT="${INSTANCE_RUNTIME[0]}"
-  CONTAINER_NAME="${INSTANCE_RUNTIME[1]}"
-  DOCKER=(docker)
-  if [[ -n "$SELECTED_DOCKER_CONTEXT" ]]; then
-    DOCKER+=(--context "$SELECTED_DOCKER_CONTEXT")
-  fi
-  if ! "${DOCKER[@]}" cp "$CONTAINER_NAME:/system/lib64/libcutils.so" "$LIBCUTILS" >/dev/null 2>&1; then
-    IMAGE="${XENOID_BASE_IMAGE:-redroid/redroid:13.0.0_64only-latest}"
-    CID="$("${DOCKER[@]}" create "$IMAGE")"
-    if ! "${DOCKER[@]}" cp "$CID:/system/lib64/libcutils.so" "$LIBCUTILS"; then
-      "${DOCKER[@]}" rm "$CID" >/dev/null 2>&1 || true
-      printf 'failed to extract /system/lib64/libcutils.so from %s\n' "$IMAGE" >&2
-      exit 1
-    fi
-    "${DOCKER[@]}" rm "$CID" >/dev/null
-  fi
-fi
-
-[[ -f "$LIBCUTILS" ]] || { printf 'missing Android libcutils link library: %s\n' "$LIBCUTILS" >&2; exit 1; }
+# libcutils is not part of the NDK; link the pinned on-device library (cached
+# outside the source tree, verified by SHA-256).
+LIBCUTILS="$("$ROOT/scripts/platform-libs.sh" libcutils.so)"
+[[ -f "$LIBCUTILS" ]] || { printf 'missing Android libcutils link library\n' >&2; exit 1; }
 
 
 OUTPUT="$HAL/gralloc.redroid.so"

@@ -34,44 +34,35 @@ SYSROOT="$PRE/sysroot"
 GEN="$HAL/gen"
 rm -rf "$GEN"
 mkdir -p "$GEN"
+source "$ROOT/scripts/hal-build-lib.sh"
+# Unversioned AIDL packages: no extra per-package arguments.
+sensors_aidl_package() { :; }
 # Regenerate all stable AIDL stubs on every build. Keeping generated sources
 # across AIDL schema changes silently changes the Binder wire format.
-for f in "$HAL"/aidl/android/hardware/sensors/*.aidl \
-         "$HAL"/aidl/android/hardware/common/NativeHandle.aidl \
-         "$HAL"/aidl/android/hardware/common/fmq/*.aidl; do
-  [[ -f "$f" ]] || continue
-  "$AIDL_BIN" --lang=ndk --structured --stability=vintf \
-    -o"$GEN" -h"$GEN" -I"$HAL/aidl" "$f"
-done
+{
+  find "$HAL/aidl/android/hardware/sensors" -maxdepth 1 -name '*.aidl' -print0 | LC_ALL=C sort -z
+  printf '%s\0' "$HAL/aidl/android/hardware/common/NativeHandle.aidl"
+  find "$HAL/aidl/android/hardware/common/fmq" -maxdepth 1 -name '*.aidl' -print0 | LC_ALL=C sort -z
+} | xenoid_aidl_generate "$AIDL_BIN" "$GEN" sensors_aidl_package \
+      --lang=ndk --structured --stability=vintf -I"$HAL/aidl"
 python3 "$ROOT/scripts/sanitize-aidl-output.py" "$GEN"
 
-
-INC=( -I"$GEN" -I"$GEN/aidl" -I"$SYSROOT/usr/include" )
 # Service-side binder API (AServiceManager_addService, ABinderProcess_*) is not in the
-# NDK's libbinder_ndk stub; link the on-device libbinder_ndk.so (versioned symbols).
-if [[ ! -f "$HAL/libbinder_ndk.so" ]]; then
-  _container_name="$(PYTHONPATH="$ROOT/src" python3 -c 'import os; from pathlib import Path; from xenoid.config import resolve_instance; c,g,l=resolve_instance(project_root=Path.cwd(), env={}); print(l.container_name)' 2>/dev/null || echo xenoid-android)"
-  docker cp "${_container_name}:/system/lib64/libbinder_ndk.so" "$HAL/libbinder_ndk.so" >/dev/null 2>&1 \
-    || docker cp "${_container_name}:/apex/com.android.runtime/lib64/bionic/libbinder_ndk.so" "$HAL/libbinder_ndk.so" >/dev/null 2>&1 \
-    || {
-      _image="${XENOID_BASE_IMAGE:-redroid/redroid:13.0.0_64only-latest}"
-      _cid="$(docker create "$_image")"
-      trap 'docker rm -f "$_cid" >/dev/null 2>&1 || true' EXIT
-      docker cp "$_cid:/system/lib64/libbinder_ndk.so" "$HAL/libbinder_ndk.so" >/dev/null 2>&1 \
-        || docker cp "$_cid:/apex/com.android.runtime/lib64/bionic/libbinder_ndk.so" "$HAL/libbinder_ndk.so"
-      docker rm "$_cid" >/dev/null
-      trap - EXIT
-    }
-fi
-SRCS=( "$HAL/xenoid_sensors_hal.cpp" "$HAL/sensor_catalog.cpp" )
-while IFS= read -r c; do SRCS+=( "$c" ); done < <(find "$GEN" -name '*.cpp')
+# NDK's libbinder_ndk stub; link the pinned on-device libbinder_ndk.so (cached
+# outside the source tree).
+LIBBINDER="$("$ROOT/scripts/platform-libs.sh" libbinder_ndk.so)"
+[[ -f "$LIBBINDER" ]] || { echo "failed to resolve libbinder_ndk.so" >&2; exit 1; }
 
-"$CXX" -std=c++17 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-  "-ffile-prefix-map=$HAL=android/hardware/sensors/default" \
-  "-fmacro-prefix-map=$HAL=android/hardware/sensors/default" \
-  "-ffile-prefix-map=$SDK=android-sdk" \
-  "-fmacro-prefix-map=$SDK=android-sdk" \
-  --sysroot="$SYSROOT" "${INC[@]}" \
-  -o "$HAL/xenoid-sensorshal" "${SRCS[@]}" \
-  -L"$SYSROOT/usr/lib/$TRIPLE/29" "$HAL/libbinder_ndk.so" -llog -landroid -static-libstdc++ -Wl,-s
+SRCS=( "$HAL/xenoid_sensors_hal.cpp" "$HAL/sensor_catalog.cpp" )
+while IFS= read -r c; do SRCS+=( "$c" ); done < <(find "$GEN" -name '*.cpp' | LC_ALL=C sort)
+CXXFLAGS=(
+  -std=c++17 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2
+  "-ffile-prefix-map=$HAL=android/hardware/sensors/default"
+  "-fmacro-prefix-map=$HAL=android/hardware/sensors/default"
+  "-ffile-prefix-map=$SDK=android-sdk"
+  "-fmacro-prefix-map=$SDK=android-sdk"
+  --sysroot="$SYSROOT" -I"$GEN" -I"$GEN/aidl" -I"$SYSROOT/usr/include"
+)
+LDFLAGS=( -L"$SYSROOT/usr/lib/$TRIPLE/29" "$LIBBINDER" -llog -landroid -static-libstdc++ -Wl,-s )
+xenoid_compile_link "$CXX" "$HAL/xenoid-sensorshal" "${XENOID_BUILD_JOBS:-1}"
 echo "$HAL/xenoid-sensorshal"

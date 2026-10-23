@@ -148,11 +148,12 @@ export CARGO_BUILD_JOBS="$JOBS"
 # --build: compile from the in-tree sources.
 [[ -f "$ARTIFACT_DIR/CMakeLists.txt" && -f "$ARTIFACT_DIR/src/keymint_service.cpp" ]] \
   || fail "source_invalid"
-if [[ ! -d "$ARTIFACT_DIR/.deps/keymint" ]]; then
-  bash "$ROOT/scripts/fetch-keymint-deps.sh" >/dev/null || fail "deps_missing"
-fi
+# Always run the fetcher: it returns immediately when every checkout's HEAD
+# matches its pin and re-fetches otherwise, so .deps cannot silently drift.
+bash "$ROOT/scripts/fetch-keymint-deps.sh" >/dev/null || fail "deps_missing"
 
-PATH="$HOME/.cargo/bin:$PATH"
+# Homebrew's rustup is keg-only; its proxies are not linked onto PATH.
+PATH="${CARGO_HOME:-$HOME/.cargo}/bin:/opt/homebrew/opt/rustup/bin:/usr/local/opt/rustup/bin:$PATH"
 export PATH RUSTUP_TOOLCHAIN=stable
 command -v cargo >/dev/null 2>&1 || fail "cargo_missing"
 command -v rustup >/dev/null 2>&1 || fail "rustup_missing"
@@ -202,11 +203,22 @@ if [[ -z "$NINJA" ]]; then NINJA="$(command -v ninja || true)"; fi
 [[ -n "$CMAKE" && -x "$CMAKE" ]] || fail "cmake_missing"
 [[ -n "$NINJA" && -x "$NINJA" ]] || fail "ninja_missing"
 
-mkdir -p "$ROOT/.tmp"
-WORK="$(mktemp -d "$ROOT/.tmp/keymint-build.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# Persistent CMake build tree so unchanged objects are not recompiled. CMake's
+# AIDL generation is guarded by a one-shot sentinel and the toolchain is fixed at
+# configure time, so the tree is discarded whenever the dependency pins, NDK,
+# SDK, or CMake/Ninja change.
+WORK="$ROOT/.xenoid/cache/keymint-build"
 BUILD="$WORK/keymint"
 LOG="$WORK/build.log"
+STAMP="$(cat "$ROOT/scripts/fetch-keymint-deps.sh" "$ARTIFACT_DIR/CMakeLists.txt" \
+  | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-64)"
+STAMP="$STAMP $NDK $SDK $CMAKE $NINJA"
+if [[ ! -f "$WORK/stamp" || "$(cat "$WORK/stamp")" != "$STAMP" ]]; then
+  rm -rf "$WORK"
+fi
+mkdir -p "$WORK"
+chmod 0700 "$WORK"
+printf '%s\n' "$STAMP" >"$WORK/stamp"
 
 if ! ANDROID_HOME="$SDK" ANDROID_SDK_ROOT="$SDK" ANDROID_NDK="$NDK" \
   "$CMAKE" -S "$ARTIFACT_DIR" -B "$BUILD" -G Ninja \
