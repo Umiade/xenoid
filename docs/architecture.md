@@ -150,6 +150,12 @@ xenoid mcp-config
 - `POST /fingerprint/apply`
 - `POST /fingerprint/set`
 - `POST /automation/run`
+
+  Automation uses one WebView-backed executor. An explicit native completion
+  callback, not `evaluateJavascript`'s submission callback, resolves the request.
+  Failed steps stop further actions; timeout cancels the request's root connection
+  and destroys the WebView. There is no regex execution fallback.
+
 - `POST /frida/start`
 - `POST /frida/stop`
 - `POST /input/tap`

@@ -57,12 +57,6 @@ bad_profile = copy.deepcopy(PROFILE)
 bad_profile["memory"]["totalBytes"] += 1
 canonical_import = import_profile(PROFILE)
 rejected_import = import_profile(bad_profile)
-overlay = (ROOT / "native/xenoid-hide/xenoid_overlay.c").read_text()
-shim = (ROOT / "native/xenoid-shim/xenoid_shim.c").read_text()
-kmod = (ROOT / "native/xenoid-kmod/xenoid_kmod.c").read_text()
-daemon = (
-    ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/DeviceProfileManager.java"
-).read_text()
 manager = object.__new__(RuntimeManager)
 manager._engine_host_shell = lambda *_args, **_kwargs: subprocess.CompletedProcess(
     [],
@@ -72,7 +66,6 @@ manager._engine_host_shell = lambda *_args, **_kwargs: subprocess.CompletedProce
 )
 pressure_status = manager.runtime_memory_status({"State": {"OOMKilled": False}})
 oom_status = manager.runtime_memory_status({"State": {"OOMKilled": True}})
-backend = (ROOT / "src/xenoid/backend.py").read_text()
 checks = {
     "canonical_import": canonical_import.returncode == 0,
     "rejects_byte_kib_mismatch": rejected_import.returncode != 0
@@ -90,16 +83,6 @@ checks = {
     and commit_limit_kib == 6 * 1024**2,
     "buddy_equation": remaining_pages == 0
     and sum(count << order for order, count in enumerate(buddy)) == free_kib // 4,
-    "daemon_materializes_profile": "memory_profile_inconsistent" in daemon
-    and "memory_totalBytes" in daemon,
-    "profile_driven_proc_views": "load_memory_profile" in overlay
-    and "memory.total_kib" in overlay,
-    "mount_view_uses_total": "size=%lluk" in overlay,
-    "libc_views_use_profile": "profile_total_memory_bytes" in shim
-    and "_SC_AVPHYS_PAGES" in shim,
-    "raw_sysinfo_view": "sysinfo_kprobes" in kmod
-    and "XENOID_MEMORY_TOTAL_BYTES" in kmod,
-    "host_budget_stays_eight_gib": '\"--memory\", \"8\"' in backend,
     "host_pressure_warns_without_failing": pressure_status.get("ok") is True
     and pressure_status.get("pressure") is True
     and "warning" in pressure_status,

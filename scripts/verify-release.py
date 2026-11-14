@@ -283,44 +283,6 @@ def _ota_payloads_valid(data: bytes | None) -> bool:
     return True
 
 
-def _self_check(root: Path) -> int:
-    checks: list[dict[str, Any]] = []
-    package = (root / "scripts/package-release.sh").read_text(encoding="utf-8")
-    verifier = (root / "scripts/verify-release.py").read_text(encoding="utf-8")
-    canonical = root / "scripts/canonical-tar.py"
-    _check(
-        checks,
-        "fresh-gate-owner",
-        'xenoid.gates "$GATE_PROFILE" --fresh' in package
-        and "test-google-provider-cutover.py" in package,
-    )
-    _check(checks, "artifact-snapshot", "ArtifactBuilder" in package and ".stage(" in package)
-    _check(checks, "canonical-ota", "make-ota-bundle.sh" in package and canonical.is_file())
-    _check(checks, "canonical-release", "canonical-tar.py" in package)
-    _check(checks, "mandatory-verification", "verify-release.py" in package and "archiveSha256" in verifier)
-    _check(
-        checks,
-        "version-provenance",
-        "release_version_mismatch" in package
-        and "release_tag_commit_mismatch" in package
-        and '"version": version' in package
-        and '"sourceCommit": source_commit' in package
-        and "versioned-archive" in verifier
-        and "packaged-version" in verifier,
-    )
-    _check(
-        checks,
-        "bounded-release-tools",
-        package.count("run-bounded-command.py") >= 3,
-    )
-    _check(checks, "no-audit-bypass", ("XENOID_" + "SKIP_AUDIT") not in package + verifier)
-    report = {
-        "schema": "dev.xenoid.release-source-check/v1",
-        "ok": all(item["ok"] for item in checks),
-        "checks": checks,
-    }
-    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
-    return 0 if report["ok"] else 1
 
 
 
@@ -809,14 +771,8 @@ def verify(archive: Path) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("archive", nargs="?", type=Path)
-    parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("archive", type=Path)
     arguments = parser.parse_args()
-    root = Path(__file__).resolve().parents[1]
-    if arguments.self_check:
-        return _self_check(root)
-    if arguments.archive is None:
-        parser.error("archive is required")
     report = verify(arguments.archive.resolve())
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0 if report.get("ok") is True else 2

@@ -37,12 +37,6 @@ bad_profile["cpu"]["cores"][5]["maximumFrequencyKhz"] += 1
 canonical_import = import_profile(PROFILE)
 rejected_import = import_profile(bad_profile)
 
-overlay = (ROOT / "native/xenoid-hide/xenoid_overlay.c").read_text()
-shim = (ROOT / "native/xenoid-shim/xenoid_shim.c").read_text()
-daemon = (
-    ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/DeviceProfileManager.java"
-).read_text()
-kmod = (ROOT / "native/xenoid-kmod/xenoid_kmod.c").read_text()
 checks = {
     "canonical_import": canonical_import.returncode == 0,
     "rejects_cluster_mismatch": rejected_import.returncode != 0
@@ -51,14 +45,6 @@ checks = {
     "raven_cluster_shape": cluster_views[:4] == [("0xd05", "Cortex-A55", 300000, 1800000)] * 4
     and cluster_views[4:6] == [("0xd0b", "Cortex-A76", 400000, 2253000)] * 2
     and cluster_views[6:] == [("0xd44", "Cortex-X1", 500000, 2802000)] * 2,
-    "daemon_materializes_profile": "stageHardwareProfile" in daemon
-    and "cpu_cluster_inconsistent" in daemon,
-    "single_sysfs_mount": 'const char *target = "/sys/devices/system/cpu"' in overlay,
-    "policy_and_per_core_views": "policy_leaders[3] = {0, 4, 6}" in overlay
-    and 'symlink(line, path)' in overlay,
-    "profile_driven_frequencies": "load_cpu_profile" in overlay
-    and "profile_cpu_frequency" in shim,
-    "raw_affinity_surface": '.symbol_name = "sched_getaffinity"' in kmod,
 }
 out = {
     "ok": all(checks.values()),

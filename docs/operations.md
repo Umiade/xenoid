@@ -464,6 +464,19 @@ An interrupted v3 transaction is resumable by either `device regenerate` or plai
 ./xenoid automation run examples/automation/ordered-task.js
 ```
 
+Tasks must export a default function and await each Xenoid action. Device execution
+waits for the returned promise, reports script/action failures, and stops after
+30 seconds; failures are never replayed through a second runner. Shell commands
+already completed are not rolled back. The device WebView is destroyed after
+completion or timeout and cannot load external network resources.
+
+`automation run-host SCRIPT` evaluates the task with planned Xenoid actions;
+`--execute` uses the selected instance's authenticated daemon API. Both require
+Node.js and report failure instead of silently substituting a static plan. Host
+execution has the same 30-second task deadline. Credentials travel only over
+stdin, not command arguments or environment variables. `automation plan` remains
+a static call listing, not proof that arbitrary JavaScript will execute.
+
 The daemon requires the init-managed native input service. Its persistent profile-backed touchscreen writes Linux `input_event` records through `/dev/uinput`; Android InputReader consumes the published `/dev/input/event*` node. Tap and swipe never fall back to the framework `input` command, accessibility, or instrumentation.
 
 ## Shared protection policy

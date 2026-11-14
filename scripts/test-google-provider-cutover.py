@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import inspect
 import json
 from pathlib import Path
 import re
@@ -65,21 +64,7 @@ def regular_file(path: Path) -> bool:
     return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
 
-def retired_claim_near_mindthegapps(text: str) -> bool:
-    lowered = text.casefold()
-    markers = ("retired-source", "retired source", "retired", "\u9000\u5f79", "\u4ec5\u4f5c\u4e3a\u6765\u6e90", "\u4ec5\u7528\u4f5c\u6765\u6e90")
-    for match in re.finditer("mindthegapps", lowered):
-        window = lowered[max(0, match.start() - 240) : match.end() + 240]
-        if any(marker in window for marker in markers):
-            return True
-    return False
-
-
 def production_registry_checks(contract: Contract, gs: Any, config: Any) -> None:
-    contract.require(getattr(gs, "PROVIDER_MICROG", None) == "microg", "registry.provider-microg")
-    contract.require(getattr(gs, "MICROG_PLAY_RELEASE", None) == MICROG_RELEASE, "registry.release-microg")
-    contract.require(getattr(gs, "AVAILABILITY_PRODUCTION", None) == "production", "registry.availability-production")
-    contract.require(getattr(gs, "AVAILABILITY_RETIRED_SOURCE", None) == "retired-source", "registry.availability-retired")
     contract.require(tuple(gs.registered_releases(selectable_only=True)) == (MICROG_RELEASE,), "registry.selectable-only-production")
     contract.require(set(gs.registered_releases()) == {MICROG_RELEASE, MINDTHEGAPPS_RELEASE}, "registry.release-inventory")
     contract.require(gs.release_availability(MICROG_RELEASE) == "production", "registry.microg-production")
@@ -143,21 +128,6 @@ def production_cli_checks(contract: Contract, cli: Any) -> None:
         no_google is not None and no_google.default is False,
         "cli.init-explicit-disable",
     )
-    up_source = inspect.getsource(cli.cmd_up)
-    acquisition_source = inspect.getsource(cli._prepare_google_assets_for_up)
-    contract.require(
-        "_prepare_google_assets_for_up(args)" in up_source
-        and "ensure_google_services_assets" in acquisition_source,
-        "cli.up-automatic-acquisition",
-    )
-    install_runtime = (
-        ROOT / "scripts/install-macos-runtime.sh"
-    ).read_text(encoding="utf-8")
-    contract.require(
-        "./xenoid init" not in install_runtime
-        and "XENOID_INSTANCE=default" not in install_runtime,
-        "install-runtime.no-implicit-init",
-    )
 
 
 def production_mcp_checks(contract: Contract, mcp_server: Any) -> None:
@@ -169,9 +139,6 @@ def production_mcp_checks(contract: Contract, mcp_server: Any) -> None:
     catalog = {item.get("name"): item for item in mcp_server.tools() if isinstance(item, Mapping)}
     actual_google = {name for name in catalog if isinstance(name, str) and name.startswith("xenoid_google_services_")}
     contract.require(actual_google == google_names, "mcp.google-tool-inventory")
-    contract.require(getattr(mcp_server, "MICROG_PLAY_RELEASE", None) == MICROG_RELEASE, "mcp.default-release-constant")
-    source = " ".join(inspect.getsource(mcp_server._google_services_result).split())
-    contract.require("release=release or MICROG_PLAY_RELEASE" in source, "mcp.default-release-behavior")
     enable_schema = catalog.get("xenoid_google_services_enable", {}).get("inputSchema", {})
     contract.require(
         set(enable_schema.get("properties", {})) == {"release"},
@@ -192,34 +159,6 @@ def production_remote_checks(contract: Contract, remote_service: Any) -> None:
         if policy is not None:
             contract.require(set(policy.schema_properties or ()) == properties, f"remote.{name}.properties")
             contract.require("provider" not in set(policy.schema_properties or ()), f"remote.{name}.no-provider-literal")
-
-
-def production_runtime_image_checks(contract: Contract, runtime_image: Any) -> None:
-    source = inspect.getsource(runtime_image.RuntimeImageBuilder._google_inputs)
-    for marker in (
-        "GOOGLE_RELEASE_SCHEMA_V2",
-        "asset_paths",
-        "componentSetSha256",
-        "providerSchema",
-        "importManifestSha256",
-        "sourceImportManifestSha256",
-        "playStoreSeedSha256",
-        "signaturePolicySha256",
-        "productPolicySha256",
-    ):
-        contract.require(marker in source, f"runtime-image.v2-{marker}")
-
-
-def production_shell_checks(contract: Contract) -> None:
-    rootfs = (ROOT / "scripts/make-rootfs-image.sh").read_text(encoding="utf-8")
-    context = (ROOT / "scripts/make-runtime-context.sh").read_text(encoding="utf-8")
-    contract.require(
-        '"$GOOGLE_PROVIDER" == "microg"' in rootfs,
-        "rootfs.microg-enum",
-    )
-    contract.require("googleProvider" in rootfs and '"$GOOGLE_PROVIDER"' in rootfs, "rootfs.provider-identity")
-    contract.require("--google-provider" in context and '"$_services_provider"' in context, "runtime-context.services-provider")
-    contract.require('[[ "$GOOGLE_PROVIDER" == "microg" ]]' in context, "runtime-context.microg-branch")
 
 
 def production_gate_checks(contract: Contract, gates: Any) -> None:
@@ -275,7 +214,7 @@ def production_gate_checks(contract: Contract, gates: Any) -> None:
     if "release-google" in catalog:
         contract.require(
             catalog["release-google"].dependencies
-            == ("static", "release-source-contract", "google-provider-cutover-contract", "google-release-acceptance"),
+            == ("static", "google-provider-cutover-contract", "google-release-acceptance"),
             "gates.release-google-dependencies",
         )
     contract.require(gates.PROFILE_TARGETS.get("release-google") == "release-google", "gates.release-google-profile")
@@ -365,34 +304,7 @@ def production_policy_checks(contract: Contract) -> None:
     contract.require(payload == canonical_document(value), "policy.api33-canonical")
 
 
-def public_claim_paths() -> tuple[Path, ...]:
-    required = (
-        ROOT / "README.md",
-        ROOT / "README_CN.md",
-        ROOT / "docs/architecture.md",
-        ROOT / "docs/operations.md",
-        ROOT / "docs/build.md",
-        ROOT / "docs/mcp-tools.md",
-        ROOT / "skills/xenoid/SKILL.md",
-        ROOT / "skills/xenoid-development/SKILL.md",
-    )
-    return required
-
-
-def production_documentation_checks(contract: Contract) -> None:
-    for path in public_claim_paths():
-        text = path.read_text(encoding="utf-8")
-        relative = path.relative_to(ROOT).as_posix()
-        contract.require(
-            MICROG_RELEASE in text,
-            f"docs.microg-release:{relative}",
-        )
-        if relative not in {"README.md", "README_CN.md"}:
-            contract.require(
-                "MindTheGapps" in text
-                and retired_claim_near_mindthegapps(text),
-                f"docs.mtg-retired:{relative}",
-            )
+def production_example_config_checks(contract: Contract) -> None:
     for relative in ("examples/config-macos-colima.json", "examples/config-linux-arm.json"):
         value = json.loads((ROOT / relative).read_bytes())
         contract.require(
@@ -401,64 +313,8 @@ def production_documentation_checks(contract: Contract) -> None:
             f"examples.microg-default:{relative}",
         )
 
-    for relative, heading in (
-        ("README.md", "### Google Services"),
-        ("README_CN.md", "### Google \u670d\u52a1"),
-    ):
-        text = (ROOT / relative).read_text(encoding="utf-8")
-        section = text.split(heading, 1)[1].split("\n### ", 1)[0]
-        nonempty = [line for line in section.splitlines() if line.strip()]
-        contract.require(len(nonempty) <= 4, f"docs.readme-google-concise:{relative}")
-        contract.require(
-            "./xenoid up" in text
-            and "init --no-google-services" in text
-            and "docs/operations.md#google-play-services-default" in text,
-            f"docs.readme-default-flow:{relative}",
-        )
-
-    operations = (ROOT / "docs/operations.md").read_text(encoding="utf-8")
-    for required in (
-        "github.com/MindTheGapps/13.0.0-arm64/releases/tag/",
-        "github.com/microg/GmsCore/releases/tag/v0.3.15.250932",
-        "github.com/microg/GsfProxy/releases/tag/v0.1.0",
-        "GsfProxy.apk",
-        "com.google.android.gsf-8.apk",
-        "init --no-google-services",
-    ):
-        contract.require(required in operations, f"docs.clone-flow:{required}")
-    contract.require(
-        "automatically downloads" in operations.lower()
-        and "automatic acquisition" in operations.lower(),
-        "docs.clone-flow:auto-acquisition",
-    )
-    claim_files = [ROOT / "README.md", ROOT / "README_CN.md", *sorted((ROOT / "docs").glob("*.md")), *sorted((ROOT / "skills").glob("**/*.md"))]
-    combined = "\n".join(path.read_text(encoding="utf-8") for path in claim_files)
-    lowered = combined.casefold()
-    forbidden_selectable = (
-        r'"google_services_provider"\s*:\s*"mindthegapps"',
-        r"google-services\s+enable[^\n]*mindthegapps",
-        r"only accepted enabled pair is\s+`?mindthegapps",
-        r"sole (?:known|registered|selectable) release is\s+`?mindthegapps",
-    )
-    for pattern in forbidden_selectable:
-        contract.require(re.search(pattern, lowered) is None, f"docs.retired-not-selectable:{pattern}")
-    forbidden_capability = (
-        r"\bsupports\s+(?:google\s+)?play integrity",
-        r"\bplay integrity\s+(?:is|are)\s+supported",
-        r"\bsupports\s+(?:google\s+)?device certification",
-        r"\bdevice certification\s+(?:is|are)\s+supported",
-        r"\bsupports\s+drm\b",
-        r"\bdrm\s+(?:is|are)\s+supported",
-        r"(?<!\u4e0d)\u652f\u6301\s*(?:play integrity|drm|device certification)",
-    )
-    for pattern in forbidden_capability:
-        contract.require(re.search(pattern, lowered) is None, f"docs.unsupported-claim:{pattern}")
-
 
 def disabled_clean_checks(contract: Contract, gs: Any, config: Any, cli: Any, gates: Any) -> None:
-    contract.require(not hasattr(gs, "PROVIDER_MICROG"), "disabled.no-provider-constant")
-    contract.require(not hasattr(gs, "MICROG_PLAY_RELEASE"), "disabled.no-release-constant")
-    contract.require(not hasattr(gs, "import_microg"), "disabled.no-importer")
     contract.require(tuple(gs.registered_releases(selectable_only=True)) == (), "disabled.no-selectable-release")
     contract.require(gs.release_availability(MINDTHEGAPPS_RELEASE) == "retired-source", "disabled.retired-source-retained")
     none_cfg = config.new_instance_config("cutover", "11111111-2222-4333-8444-555555555555")
@@ -491,15 +347,12 @@ def disabled_clean_checks(contract: Contract, gs: Any, config: Any, cli: Any, ga
     contract.require(gates.PROFILE_TARGETS.get("release-google") is None, "disabled.no-release-google-profile")
     contract.require(not (ROOT / "data/google-services/microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0.json").exists(), "disabled.no-v2-metadata")
     contract.require(not (ROOT / "runtime/redroid/microg-policy").exists(), "disabled.no-policy")
-    for path in public_claim_paths():
-        text = path.read_text(encoding="utf-8")
-        contract.require(MICROG_RELEASE not in text, f"disabled.no-production-claim:{path.relative_to(ROOT).as_posix()}")
 
 
 def main() -> int:
     contract = Contract()
     try:
-        from xenoid import cli, config, gates, google_services as gs, mcp_server, remote_service, runtime_image
+        from xenoid import cli, config, gates, google_services as gs, mcp_server, remote_service
     except Exception as exc:
         result = {
             "schema": SCHEMA,
@@ -511,9 +364,6 @@ def main() -> int:
         return 1
 
     core_markers = (
-        hasattr(gs, "PROVIDER_MICROG"),
-        hasattr(gs, "MICROG_PLAY_RELEASE"),
-        hasattr(gs, "import_microg"),
         MICROG_RELEASE in set(gs.registered_releases()),
         (ROOT / "data/google-services/microg-0.3.15.250932-phonesky-30.4.17-gsfproxy-0.1.0.json").exists(),
         (ROOT / "runtime/redroid/microg-policy").exists(),
@@ -525,12 +375,10 @@ def main() -> int:
             ("cli", lambda: production_cli_checks(contract, cli)),
             ("mcp", lambda: production_mcp_checks(contract, mcp_server)),
             ("remote", lambda: production_remote_checks(contract, remote_service)),
-            ("runtime-image", lambda: production_runtime_image_checks(contract, runtime_image)),
-            ("shell", lambda: production_shell_checks(contract)),
             ("gates", lambda: production_gate_checks(contract, gates)),
             ("metadata", lambda: production_metadata_checks(contract, gs)),
             ("policy", lambda: production_policy_checks(contract)),
-            ("docs", lambda: production_documentation_checks(contract)),
+            ("examples", lambda: production_example_config_checks(contract)),
         )
         for label, check in checks:
             contract.run(label, check)

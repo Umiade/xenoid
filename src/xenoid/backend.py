@@ -11013,10 +11013,7 @@ cat >/dev/null
         node = which("node")
         runner = self.context.project_root / "scripts" / "xenoid-js-runner.mjs"
         if node is None:
-            plan = self.automation_plan(script_path)
-            plan["node"] = False
-            plan["note"] = "node not found; returned static automation plan"
-            return plan
+            return {"ok": False, "error": "node_unavailable"}
         expected_endpoint = f"http://127.0.0.1:{self.lease.host_daemon_port}"
         if endpoint is not None and endpoint != expected_endpoint:
             return {
@@ -11025,14 +11022,28 @@ cat >/dev/null
                 "message": "automation endpoint does not match instance daemon",
             }
         cmd = [node, str(runner), str(Path(script_path).resolve()), f"--endpoint={expected_endpoint}"]
+        token = self.daemon_client().read_private_token() if execute else None
+        if execute and token is None:
+            return {"ok": False, "error": "automation_auth_unavailable"}
         if execute:
             cmd.append("--execute")
-        proc = run(cmd)
-        data = {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip(), "command": cmd, "node": node}
         try:
-            data.update(json.loads(proc.stdout))
-        except Exception:
-            pass
+            # Secret stdin bypasses generic process capture; never place the token in argv/env.
+            proc = subprocess.run(
+                cmd, input=token or "", text=True, capture_output=True,
+                timeout=bounded_timeout(35),
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "automation_timeout"}
+        stdout = proc.stdout.replace(token, "[REDACTED]") if token else proc.stdout
+        try:
+            data = json.loads(stdout)
+            if not isinstance(data, dict):
+                raise ValueError("automation result must be an object")
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "automation_result_invalid", "returncode": proc.returncode}
+        data["ok"] = proc.returncode == 0 and data.get("ok") is True
+        data["returncode"] = proc.returncode
         return data
 
     def deploy_profile_helper(

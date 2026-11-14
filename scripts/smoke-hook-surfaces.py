@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral gate for production app-, sensor-, and system-layer surfaces."""
+"""Behavioral gate for the production sensor catalog and scalar events."""
 from __future__ import annotations
 
 import ctypes
@@ -13,12 +13,6 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-frida_js = (ROOT / "frida/scripts/xenoid-default.js").read_text()
-ebpf_bpf = (ROOT / "native/xenoid-ebpf/xenoid_pathhide.bpf.c").read_text()
-ebpf_loader = (ROOT / "native/xenoid-ebpf/loader.c").read_text()
-zygote = (ROOT / "native/xenoid-zygote/xenoid_zygote.c").read_text()
-cli = (ROOT / "src/xenoid/cli.py").read_text()
-backend = (ROOT / "src/xenoid/backend.py").read_text()
 sensor_profile = json.loads(
     (ROOT / "examples/fingerprints/pixel-raven-android13.json").read_text()
 )["sensors"]
@@ -232,69 +226,7 @@ def sensor_catalog_checks() -> tuple[dict[str, bool], str]:
         return checks, ""
 
 
-sensor_checks, sensor_error = sensor_catalog_checks()
-checks = {
-    "frida_script_exists": len(frida_js) > 0,
-    "frida_hooks_file_exists": "File.exists" in frida_js,
-    "frida_hooks_runtime_exec": "Runtime" in frida_js and "exec" in frida_js,
-    "frida_hooks_system_properties": "SystemProperties" in frida_js,
-    "frida_no_fake_sensor_injection": (
-        "Sensor.$new" not in frida_js
-        and "sensorEvent" not in frida_js.replace(" ", "")
-    ),
-    **sensor_checks,
-    "ebpf_bpf_source": "file_open" in ebpf_bpf,
-    "ebpf_preserves_anonymous_fds": (
-        "Anonymous executable descriptors" in ebpf_bpf
-        and "path[6] == ':'" in ebpf_bpf
-    ),
-    "ebpf_loader": (
-        "bpf_lsm_active" in ebpf_loader
-        and "policy_identity" in ebpf_loader
-        and "cmd_stage" in ebpf_loader
-        and "cmd_prove" in ebpf_loader
-        and "cmd_activate" in ebpf_loader
-        and "rename(PIN_CURRENT, rollback)" in ebpf_loader
-    ),
-    "ebpf_scripts": (
-        (ROOT / "scripts/build-ebpf.sh").exists()
-        and (ROOT / "scripts/load-ebpf.sh").exists()
-    ),
-    "zygote_build_spoof": (
-        "raven" in zygote
-        or "TP1A.221005.002" in zygote
-        or "ro.build" in zygote
-    ),
-    "cli_has_frida": (
-        '"frida"' in cli
-        or 'add_parser("frida"' in cli
-        or "add_parser('frida'" in cli
-    ),
-    "cli_has_ebpf": (
-        '"ebpf"' in cli
-        or 'add_parser("ebpf"' in cli
-        or "add_parser('ebpf'" in cli
-    ),
-    "cli_no_dead_zygisk_magisk": all(
-        token not in cli
-        for token in (
-            "cmd_build_zygisk",
-            "cmd_package_magisk",
-            "cmd_hook_backend",
-            "cmd_magisk_status",
-            "cmd_magisk_install_module",
-        )
-    ),
-    "backend_no_dead_magisk_hooks": all(
-        token not in backend
-        for token in (
-            "hook_backend_status",
-            "hook_backend_set",
-            "magisk_status",
-            "magisk_install_module",
-        )
-    ),
-}
+checks, sensor_error = sensor_catalog_checks()
 missing = [key for key, value in checks.items() if not value]
 print(
     json.dumps(

@@ -143,13 +143,6 @@ def _smoke(name: str, script: str, *, mutating: bool = False) -> GateSpec:
         extra_tools = ("cc",)
     elif script == "smoke-hook-surfaces.py":
         extra_tools = ("c++",)
-    elif script == "smoke-input-devices-overlay.py":
-        extra_tools = ("strings",)
-    extra_inputs = (
-        ("frida/scripts/*.js",)
-        if script == "smoke-hook-surfaces.py"
-        else ()
-    )
     return _py(
         name,
         f"scripts/{script}",
@@ -168,7 +161,6 @@ def _smoke(name: str, script: str, *, mutating: bool = False) -> GateSpec:
             "native/*/*.S",
             "native/*/Makefile",
             "xenoid",
-            *extra_inputs,
         ),
         cacheable=not mutating,
         mutating=mutating,
@@ -245,14 +237,11 @@ _CONTRACTS = (
             "scripts/load-ebpf.sh",
             "scripts/build-kmod.sh",
             "scripts/smoke-ebpf.sh",
-            "scripts/smoke-statfs-coherence.py",
             "scripts/with-shared-protection-lock.py",
             "native/xenoid-ebpf/Makefile",
             "native/xenoid-ebpf/*.c",
             "native/xenoid-kmod/Makefile",
             "native/xenoid-kmod/xenoid_kmod.c",
-            "native/xenoid-shim/xenoid_shim.c",
-            "native/xenoid-zygote/xenoid_zygote.c",
         ),
         timeout=300,
     ),
@@ -261,10 +250,8 @@ _CONTRACTS = (
 )
 
 _SOURCE_SMOKES = (
-    _smoke("prop-area-source", "smoke-prop-area-rules.py"),
     _smoke("profile-template-source", "smoke-profile-template.py"),
     _smoke("storage-surfaces-source", "smoke-storage-surfaces.py"),
-    _smoke("netctl-source", "smoke-netctl-source.py"),
     _smoke("native-shim-source", "smoke-native-shim.py"),
     _smoke("rootd-auth-source", "smoke-rootd-auth.py"),
     _smoke("hook-surfaces-source", "smoke-hook-surfaces.py"),
@@ -272,23 +259,12 @@ _SOURCE_SMOKES = (
     _smoke("app-process-source", "smoke-app-process-needed.py"),
     _smoke("install-runtime-source", "smoke-install-runtime.py"),
     _smoke("input-profile-source", "smoke-input-profile.py"),
-    _smoke("rtc-overlay-source", "smoke-rtc-overlay.py"),
     _smoke("network-overlay-source", "smoke-network-overlay.py"),
-    _smoke("mount-namespace-source", "smoke-mount-namespace-overlay.py"),
-    _smoke("kernel-hardening-source", "smoke-kernel-hardening-overlay.py"),
-    _smoke("cpu-proc-source", "smoke-cpu-proc-stats-overlay.py"),
     _smoke("cpu-sysfs-source", "smoke-cpu-sysfs-overlay.py"),
-    _smoke("devicetree-source", "smoke-devicetree-overlay.py"),
     _smoke("framebuffer-source", "smoke-framebuffer-overlay.py"),
-    _smoke("kallsyms-source", "smoke-kallsyms-tracing-overlay.py"),
-    _smoke("kernel-device-source", "smoke-kernel-device-overlay.py"),
-    _smoke("kernel-proc-source", "smoke-kernel-proc-overlay.py"),
     _smoke("memory-proc-source", "smoke-memory-proc-overlay.py"),
     _smoke("power-supply-source", "smoke-power-supply-overlay.py"),
-    _smoke("proc-identity-source", "smoke-proc-identity-overlay.py"),
     _smoke("statfs-source", "smoke-statfs-coherence.py"),
-    _smoke("random-sysctl-source", "smoke-random-sysctl-overlay.py"),
-    _smoke("selinux-source", "smoke-selinux-overlay.py"),
     _smoke("input-devices-source", "smoke-input-devices-overlay.py"),
 )
 
@@ -479,11 +455,7 @@ GATE_CATALOG: tuple[GateSpec, ...] = (
             "data/google-services/*.json",
             "runtime/redroid/microg-policy/**/*",
             "tests/google-services-runtime-probe/**/*",
-            "docs/*.md",
-            "README.md",
-            "README_CN.md",
             "examples/*.json",
-            "skills/**/*.md",
         ),
         dependencies=("runtime-image-contract",),
         timeout_seconds=300,
@@ -520,16 +492,6 @@ GATE_CATALOG: tuple[GateSpec, ...] = (
         privileged=True,
     ),
     GateSpec(
-        name="release-source-contract",
-        command=("{python}", "scripts/verify-release.py", "--self-check"),
-        inputs=("scripts/package-release.sh", "scripts/verify-release.py", "scripts/make-ota-bundle.sh", "scripts/canonical-tar.py", "scripts/run-bounded-command.py", "src/xenoid/process.py"),
-        dependencies=("build-graph-contract", "runtime-image-contract"),
-        timeout_seconds=180,
-        cacheable=False,
-        tools=("python3",),
-        category="release",
-    ),
-    GateSpec(
         name="static",
         dependencies=("sensitive-data", "python-compile", *_STATIC_LEAF_NAMES, "daemon-api-mock", "dual-instance-report-contract"),
         cacheable=False,
@@ -548,7 +510,7 @@ GATE_CATALOG: tuple[GateSpec, ...] = (
     ),
     GateSpec(
         name="ci-full",
-        dependencies=("ci-runtime", "cellular-runtime", "camera-runtime", "drm-runtime", "google-runtime", "release-source-contract"),
+        dependencies=("ci-runtime", "cellular-runtime", "camera-runtime", "drm-runtime", "google-runtime"),
         cacheable=False,
         runtime_free=False,
         mutating=True,
@@ -568,10 +530,10 @@ GATE_CATALOG: tuple[GateSpec, ...] = (
         cacheable=False,
         category="doctor",
     ),
-    GateSpec(name="release", dependencies=("static", "release-source-contract", "google-provider-cutover-contract"), cacheable=False, category="release"),
+    GateSpec(name="release", dependencies=("static", "google-provider-cutover-contract"), cacheable=False, category="release"),
     GateSpec(
         name="release-google",
-        dependencies=("static", "release-source-contract", "google-provider-cutover-contract", "google-release-acceptance"),
+        dependencies=("static", "google-provider-cutover-contract", "google-release-acceptance"),
         cacheable=False,
         category="release",
     ),

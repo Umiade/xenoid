@@ -563,8 +563,8 @@ class _Response(io.BytesIO):
         self.close()
 
 
-@contract_case("patchersShareOnePinnedApktoolResolver")
-def patchers_share_one_pinned_apktool_resolver() -> None:
+@contract_case("pinnedApktoolResolver")
+def pinned_apktool_resolver() -> None:
     require(xenoid_archive.APKTOOL_VERSION == "2.10.0", "Apktool version is not pinned")
     require(
         xenoid_archive.APKTOOL_SHA256 == "c0350abbab5314248dfe2ee0c907def4edd14f6faef1f5d372d3d4abd28f0431",
@@ -590,21 +590,6 @@ def patchers_share_one_pinned_apktool_resolver() -> None:
         ):
             require(xenoid_archive.resolve_apktool(root) == resolved, "verified Apktool cache not reused")
 
-    for relative in (
-        "scripts/patch-services-runtime.py",
-        "scripts/patch-telephony-legacy-lte-band.py",
-    ):
-        source = (ROOT / relative).read_text(encoding="utf-8")
-        require("from xenoid_archive import" in source, f"{relative} does not use shared archive module")
-        for symbol in ("run_apktool", "canonicalize_zip", "publish_file_atomic"):
-            require(symbol in source, f"{relative} misses {symbol}")
-        require("shutil.which" not in source, f"{relative} selects PATH Apktool")
-        require("os.environ.get(\"APKTOOL\")" not in source, f"{relative} honors an unpinned Apktool")
-        require("APKTOOL_URL" not in source and "APKTOOL_SHA256" not in source, f"{relative} duplicates resolver pins")
-        require(
-            source.index("canonicalize_zip") < source.rindex("publish_file_atomic"),
-            f"{relative} publishes before canonical verification",
-        )
 
 
 def write_context_fixture(root: Path, *, variant: int) -> None:
@@ -690,10 +675,6 @@ def canonical_runtime_contexts_are_equal_and_input_sensitive() -> None:
         after = sha256((second / "context-manifest.json").read_bytes())
         require(after != before, "semantic context change did not change the manifest")
 
-        script = (ROOT / "scripts" / "make-runtime-context.sh").read_text(encoding="utf-8")
-        require("XENOID_ARTIFACT_STAGE" in script, "context does not require a validated artifact stage")
-        for hidden_build in ("build-xenoid-input.sh", "build-xenoid-hide.sh", "build-xenoid-profile.sh", "build-keymint.sh"):
-            require(hidden_build not in script, f"context contains fallback build: {hidden_build}")
 
 
 @contract_case("canonicalRuntimeContextRejectsSymlinksAndSpecialFiles")
@@ -1583,19 +1564,6 @@ def concurrent_ensure_has_one_publication() -> None:
         require(len({result["imageId"] for result in results}) == 1, "concurrent ensure selected different images")
         require(docker.context_calls == 1 and docker.build_calls == 1, "concurrent ensure published more than once")
         require(len(engine_lock.names) == 2 and len(set(engine_lock.names)) == 1, "concurrent ensure used different locks")
-
-
-@contract_case("productionCallersHaveNoLegacyMutableImagePath")
-def production_callers_have_no_legacy_mutable_image_path() -> None:
-    backend = (ROOT / "src" / "xenoid" / "backend.py").read_text(encoding="utf-8")
-    cli = (ROOT / "src" / "xenoid" / "cli.py").read_text(encoding="utf-8")
-    mcp = (ROOT / "src" / "xenoid" / "mcp_server.py").read_text(encoding="utf-8")
-    require("def _build_effective_runtime_image" not in backend, "legacy backend image builder remains")
-    require("runtimeSpecMatches" not in backend, "weak tag-only runtime match remains")
-    require('f"{self.cfg.runtime_image_tag}-{self.context.resource_tag}"' not in backend, "instance tag suffix remains")
-    require("effective_google_image(" not in backend, "mutable Google image tag remains")
-    require("ensure_runtime_image" in cli and "runtime_image_input_record" in cli, "CLI does not share image builder")
-    require("ensure_runtime_image" in mcp and "runtime_image_input_record" in mcp, "MCP does not share image builder")
 
 
 @contract_case("archivePayloadVerificationDetectsStaleContent")

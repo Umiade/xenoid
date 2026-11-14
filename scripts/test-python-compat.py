@@ -43,7 +43,7 @@ def _tracked_python_files() -> list[Path]:
         capture_output=True,
         text=True,
     ).stdout.split()
-    return [ROOT / rel for rel in out]
+    return [ROOT / rel for rel in out if (ROOT / rel).is_file()]
 
 
 def _is_dataclass_decorator(node: ast.AST) -> bool:

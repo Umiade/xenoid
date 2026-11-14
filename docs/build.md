@@ -284,7 +284,7 @@ Runtime-free contracts for the location identity layer:
 
 ```bash
 python3 scripts/test-cellular-profile.py   # seven-country profiles, MSISDN templates, crash-safe state machine
-python3 scripts/test-ril-source.py         # canonical binary profile and RIL/SIM-file source contracts
+python3 scripts/test-ril-source.py         # canonical binary profile and RIL artifact metadata
 python3 scripts/test-proxy-control.py      # generation/check-bound proxy data-plane proof (no region evidence)
 ```
 

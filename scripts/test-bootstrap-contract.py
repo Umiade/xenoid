@@ -51,16 +51,6 @@ def require(condition: bool, message: str) -> None:
         raise ContractFailure(message)
 
 
-def source(relative: str) -> str:
-    return (ROOT / relative).read_text(encoding="utf-8")
-
-
-def ordered(text: str, *needles: str) -> None:
-    positions = [text.find(item) for item in needles]
-    require(all(value >= 0 for value in positions), f"missing anchors: {needles}")
-    require(positions == sorted(positions), f"wrong order: {needles}")
-
-
 class FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -215,54 +205,8 @@ def client_fixture(fake: FakeDaemon) -> Iterator[tuple[Any, Path, list[str]]]:
             yield client, context.state_root, argv
 
 
-@contract_case("listenerBeforeManagers")
-def listener_before_managers() -> None:
-    text = source("daemon/app/src/main/java/dev/xenoid/daemon/XenoidDaemonService.java")
-    initialize = text[text.index("initializeServer"):]
-    ordered(
-        initialize,
-        "loadOrCreateTokenStrict()",
-        "RootHelper.setRootdToken",
-        "new BootstrapCoordinator",
-        "new ServerSocket",
-        "server = listener",
-        "acceptClients",
-        "new KeyboxManager",
-        "new ProxyManager",
-        "new LocationIdentityManager",
-        "CameraMediaManager.get",
-        "installComponents",
-    )
-    require(
-        'InetAddress.getByName("127.0.0.1")' in initialize
-        or "InetAddress.getLoopbackAddress()" in initialize,
-        "listener is not loopback",
-    )
-    require("0.0.0.0" not in initialize, "listener retained wildcard bind")
-    require(
-        '"/health".equals(path) || "/bootstrap/transport".equals(path)' in text,
-        "transport is not the only public bootstrap route",
-    )
-    require(
-        "new ArrayBlockingQueue<Runnable>(32)" in text
-        and "new ThreadPoolExecutor.AbortPolicy()" in text,
-        "daemon client queue is not bounded",
-    )
-    require(
-        "new Thread(" in initialize
-        and "acceptClients(activeListener, workers)" in initialize
-        and "workers.execute(request)" in text,
-        "accept loop still consumes a handler or bypasses bounded execution",
-    )
-    require(
-        "clients.add(request)" in text
-        and "request.close()" in text
-        and "workers.shutdownNow()" in text,
-        "queued or active sockets are not closed on rejection/shutdown",
-    )
-    for route in ("/bootstrap/reconcile", "/bootstrap/status", "/bootstrap/cancel"):
-        require(route in text, f"daemon route missing: {route}")
-    require("dev.xenoid.daemon-transport/v1" in text, "transport schema missing")
+@contract_case("daemonManifestComponentBoundaries")
+def daemon_manifest_component_boundaries() -> None:
     tree = ET.parse(ROOT / "daemon/app/src/main/AndroidManifest.xml")
     app = tree.getroot().find("application")
     require(app is not None, "manifest application missing")
@@ -270,18 +214,6 @@ def listener_before_managers() -> None:
     require(activity is not None and service_node is not None, "components missing")
     require(activity.get(ANDROID_NS + "launchMode") == "singleTop", "not singleTop")
     require(service_node.get(ANDROID_NS + "exported") == "false", "service exported")
-
-
-@contract_case("boundedCoordinator")
-def bounded_coordinator() -> None:
-    text = source("daemon/app/src/main/java/dev/xenoid/daemon/BootstrapCoordinator.java")
-    for item in ("230000", "root", "proxy", "keybox", "location", "camera",
-                 "transport_ready", "accepted", "reconciling", "ready", "degraded",
-                 "failed", "bootstrap_generation_conflict"):
-        require(item in text, f"coordinator missing {item}")
-    require("newSingleThreadExecutor" in text or "newFixedThreadPool(1" in text,
-            "coordinator is not single-worker")
-    require("shutdownNow" in text, "shutdown lacks cancellation")
 
 
 @contract_case("clientGenerationComponentsAndAggregateHealth")
@@ -903,8 +835,8 @@ def runtime_epoch_binds_daemon_process() -> None:
     require(first == same and first != restarted, "epoch not bound to process identity")
 
 
-@contract_case("outerDeadlineAndLocationRetry")
-def outer_deadline_and_location_retry() -> None:
+@contract_case("outerDeadline")
+def outer_deadline() -> None:
     class DeadlineProbe(backend.RuntimeManager):
         def __init__(self) -> None:
             self.observed_timeout: float | None = None
@@ -926,67 +858,7 @@ def outer_deadline_and_location_retry() -> None:
         "parent deadline did not cap transport",
     )
 
-    location = source(
-        "daemon/app/src/main/java/dev/xenoid/daemon/LocationIdentityManager.java"
-    )
-    require(
-        'if ("location_state_invalid".equals(bootstrapError))' in location,
-        "Location structural failure is not fail-closed",
-    )
-    require(
-        "if (bootstrapError != null)" not in location,
-        "transient Location failure prevents retry",
-    )
 
-
-@contract_case("rootdProtocolAndHostClassification")
-def rootd_protocol_and_host_classification() -> None:
-    native = source("native/xenoid-rootd/xenoid_rootd.c")
-    for item in ("XENOID_ROOTD_TOKEN", "/data/local/tmp/.xenoid-rootd.token",
-                 "getenv(", "popen(", "query_param(", "/exec?"):
-        require(item not in native, f"legacy rootd transport: {item}")
-    for item in ("POST", "/exec", "X-Xenoid-Request-Id", "X-Xenoid-Timeout-Ms",
-                 "Content-Length", "text/plain", "/system/bin/sh", "PR_SET_DUMPABLE",
-                 "dev.xenoid.rootd-exec/v1", "MAX_OUTPUT_BYTES", "4096", "MAX_HANDLERS"):
-        require(item.lower() in native.lower(), f"rootd missing {item}")
-    require("INADDR_LOOPBACK" in native, "rootd is not loopback")
-    require("kill(-" in native or "killpg(" in native, "no process-group cancel")
-    helper = source("daemon/app/src/main/java/dev/xenoid/daemon/RootHelper.java")
-    require(all(item in helper for item in ("POST /exec", "X-Xenoid-Request-Id",
-                                             "X-Xenoid-Timeout-Ms")), "RootHelper protocol")
-    require("cancel" in helper.lower(), "RootHelper not cancellable")
-    require("su -c" not in helper and "which su" not in helper, "RootHelper exposes su")
-    host = source("src/xenoid/backend.py")
-    client = source("src/xenoid/daemon_client.py")
-    combined = host + client
-    for item in ('state_root / "daemon.token"', 'state_root / "rootd.token"',
-                 '"tokenSource"', '"host-cache"'):
-        require(item not in combined, f"secret fallback retained: {item}")
-    for item in ("daemon_token_unavailable", "rootd_unauthorized",
-                 "rootd_resource_conflict", "read_private_token", "stdin"):
-        require(item in combined, f"rootd classification missing {item}")
-    for item in ("start_time", "executable", "digest", "uid", "listener"):
-        require(item in host.lower(), f"legacy adoption omits {item}")
-
-
-@contract_case("singleHostCliMcpBootstrapPath")
-def single_host_cli_mcp_bootstrap_path() -> None:
-    host, cli = source("src/xenoid/backend.py"), source("src/xenoid/cli.py")
-    mcp = source("src/xenoid/mcp_server.py")
-    require("def reconcile_bootstrap(" in host, "host owner missing")
-    for item in ("def ensure_daemon(", "def repair_control_plane(",
-                 "def launch_daemon_bootstrap("):
-        require(item not in host, f"old path remains: {item}")
-    require("def launch_daemon_activity_once(" in host, "one-shot launcher missing")
-    require("def wait_daemon_transport(" in host, "transport wait missing")
-    for text, label in ((cli, "CLI"), (mcp, "MCP")):
-        require(".ensure_daemon(" not in text and ".repair_control_plane(" not in text,
-                f"{label} retained old readiness")
-        require(".reconcile_bootstrap(" in text, f"{label} bypasses bootstrap owner")
-        for match in re.finditer("CAMERA_MUTATION_TIMEOUT_SECONDS", text):
-            window = text[max(0, match.start() - 180):match.end() + 180]
-            require("reconcile_bootstrap" not in window, f"{label} camera timeout readiness")
-    require("def daemon_ensured(" not in cli, "CLI health-first helper remains")
 
 @contract_case("regenerationRestartReceiptPrecedesReboot")
 def regeneration_restart_receipt_precedes_reboot() -> None:

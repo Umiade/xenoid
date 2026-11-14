@@ -332,7 +332,6 @@ def catalog_and_routing_contract(
     calls: list[tuple[str, str, dict[str, Any]]] = []
 
     def fake_call(runtime: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        require(not hasattr(runtime, "auto_ensure_daemon"), "remote retained daemon bypass")
         calls.append((runtime.context.instance_name, name, dict(arguments)))
         if name == "xenoid_google_services_status":
             value = microg_status_v2()

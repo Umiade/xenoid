@@ -1668,7 +1668,7 @@ class DaemonClient:
 
     def run_automation(self, script_path: Union[str, Path]) -> dict[str, Any]:
         script = Path(script_path).read_text()
-        return self.request("POST", "/automation/run", {"language": "js", "script": script, "name": Path(script_path).name})
+        return self.request("POST", "/automation/run", {"language": "js", "script": script, "name": Path(script_path).name}, timeout=35)
 
     def tap(self, x: int, y: int) -> dict[str, Any]:
         return self.request("POST", "/input/tap", {"x": x, "y": y})

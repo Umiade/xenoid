@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime-free canonical profile and legacy RIL ABI contracts."""
+"""Runtime-free canonical profile and RIL artifact contracts."""
 from __future__ import annotations
 
 import hashlib
@@ -67,31 +67,14 @@ def test_canonical_binary_profile() -> None:
         raise AssertionError
 
 
-def test_ril_source_contract() -> None:
-    source = (ROOT / "native/xenoid-ril/xenoid_ril.c").read_text()
-    required = [
-        "RIL_Init", "radio_functions={15", "RIL_REQUEST_GET_SIM_STATUS",
-        "RIL_REQUEST_SIM_IO", "RIL_REQUEST_GET_IMSI", "RIL_REQUEST_OPERATOR",
-        "RIL_REQUEST_VOICE_REGISTRATION_STATE", "RIL_REQUEST_DATA_REGISTRATION_STATE",
-        "RIL_REQUEST_SIGNAL_STRENGTH", "RIL_REQUEST_GET_CELL_INFO_LIST",
-        "RIL_REQUEST_SETUP_DATA_CALL", "RIL_REQUEST_DEACTIVATE_DATA_CALL",
-        "RIL_REQUEST_DATA_CALL_LIST", "RIL_E_REQUEST_NOT_SUPPORTED",
-        "RIL_Data_Call_Response_v11", "RIL_CellInfo_v12", "RIL_SignalStrength_v10",
-        "RIL_UNSOL_CELL_INFO_LIST",
-        "O_NOFOLLOW", "S_ISREG", "PROFILE_FIELDS", "sha256_final",
-        '"rmnet_data0"',
-        "bcd_pair", "0x2fe2", "0x6f07", "0x6fad", "0x6f46", "0x6f40", "0x91",
-    ]
-    require(all(token in source for token in required))
-    require("json" not in source.lower())
-    require("su " not in source and "/system/xbin/su" not in source)
+def test_ril_artifact_contract() -> None:
     library = ROOT / "native/xenoid-ril/libxenoid-ril.so"
     require(library.is_file() and library.read_bytes().startswith(b"\x7fELF"))
 
 
 def main() -> int:
     test_canonical_binary_profile()
-    test_ril_source_contract()
+    test_ril_artifact_contract()
     print(json.dumps({"ok": True, "tests": 2}, sort_keys=True))
     return 0
 

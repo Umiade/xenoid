@@ -142,9 +142,9 @@ Frida is never part of normal production startup. After any instrumentation sess
 - `./xenoid input deploy PATH [--remote-path PATH]` — deploy the input injection helper.
 - `./xenoid input tap X Y` — inject a tap.
 - `./xenoid input swipe X1 Y1 X2 Y2 [DURATION_MS]` — inject a swipe.
-- `./xenoid automation plan SCRIPT` — plan an automation script without executing it.
-- `./xenoid automation run-host SCRIPT [--execute]` — plan on the host; `--execute` executes through the daemon API.
-- `./xenoid automation run SCRIPT` — execute an automation script through the daemon.
+- `./xenoid automation plan SCRIPT` — statically list recognizable automation calls; does not evaluate JavaScript.
+- `./xenoid automation run-host SCRIPT [--execute]` — evaluate with Node.js and planned actions; `--execute` uses the authenticated daemon API. Requires Node.js; failures are not converted to plans.
+- `./xenoid automation run SCRIPT` — execute a JavaScript task on-device; await completion, fail on action/script errors, and stop after 30 seconds without replay.
 
 ## Environment hiding
 

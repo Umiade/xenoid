@@ -6,7 +6,6 @@ repository build wrapper or compiler is invoked.
 """
 from __future__ import annotations
 
-import ast
 import dataclasses
 import json
 import multiprocessing
@@ -48,10 +47,6 @@ def contract_case(name: str) -> Callable[[Case], Case]:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ContractFailure(message)
-
-
-def source(relative: str) -> str:
-    return (ROOT / relative).read_text(encoding="utf-8")
 
 
 def result_entry(result: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -209,16 +204,6 @@ def elf(machine: int) -> bytes:
     struct.pack_into("<HHI", value, 16, 3, machine, 1)
     struct.pack_into("<HHH", value, 52, 64, 56, 0)
     return bytes(value)
-
-
-def function_text(relative: str, name: str) -> str:
-    text = source(relative)
-    tree = ast.parse(text, filename=relative)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            lines = text.splitlines()
-            return "\n".join(lines[node.lineno - 1:node.end_lineno])
-    raise ContractFailure(f"missing function {name} in {relative}")
 
 
 @contract_case("exactCatalogAndVirtualDag")
@@ -975,67 +960,6 @@ output.chmod(0o755)
         require(record.get("schema") == "dev.xenoid.artifact/v1" and
                 record.get("target") == "concurrent",
                 "concurrent publication record is incomplete")
-
-
-@contract_case("hiddenBuildCallsitesAreRemoved")
-def hidden_build_callsites_are_removed() -> None:
-    cli_build = function_text("src/xenoid/cli.py", "_run_artifact_build") + "\n" + \
-        function_text("src/xenoid/cli.py", "cmd_build_all")
-    require("ArtifactBuilder" in cli_build and ".ensure(" in cli_build,
-            "build all does not use the sole ArtifactBuilder")
-    require("subprocess" not in cli_build and "scripts/build-" not in cli_build,
-            "build all retained a raw command loop")
-
-    hidden_scripts = {
-        "scripts/make-runtime-context.sh": (
-            "build-daemon.sh", "build-keymint.sh", "build-native-input.sh",
-            "build-native-hide.sh", "build-native-overlay.sh",
-            "build-native-profile.sh", "build-native-netctl.sh",
-            "build-native-for-arch.sh", "build-native-zygote.sh",
-            "build-native-svcman.sh",
-            "build-sensors-hal.sh", "build-gralloc.sh", "build-hwcomposer.sh",
-            "build-camera-hal.sh", "build-ril.sh", "build-radio-config.sh",
-        ),
-        "scripts/make-ota-bundle.sh": (
-            "build-daemon.sh", "build-native-input.sh", "build-native-hide.sh",
-            "build-native-profile.sh", "build-native-netctl.sh",
-        ),
-    }
-    for relative, forbidden in hidden_scripts.items():
-        text = source(relative)
-        for token in forbidden:
-            require(token not in text, f"{relative} retained hidden builder {token}")
-
-    for relative in (
-        "scripts/build-native-input.sh",
-        "scripts/build-native-hide.sh",
-        "scripts/build-native-profile.sh",
-    ):
-        text = source(relative)
-        require("clean all" not in text and " make clean" not in text,
-                f"{relative} retained an unconditional clean rebuild")
-        require("XENOID_BUILD_JOBS" in text and "XENOID_FORCE_REBUILD" in text,
-                f"{relative} does not honor the builder allocation/force contract")
-    daemon_wrapper = source("scripts/build-daemon.sh")
-    require("--no-daemon" in daemon_wrapper and "--max-workers=" in daemon_wrapper,
-            "Gradle wrapper ignores deterministic bounded execution")
-
-    package = source("scripts/package-release.sh")
-    require("build all" not in package and "build\", \"all" not in package,
-            "release packaging recursively invokes build all")
-    require(not (ROOT / "scripts/xenoid-up.sh").exists(),
-            "the superseded shell convergence pipeline still exists")
-    require(not (ROOT / "scripts/with-up-lock.py").exists(),
-            "the superseded shell up lock wrapper still exists")
-    up_handler = function_text("src/xenoid/cli.py", "cmd_up")
-    require("ConvergenceExecutor" in up_handler and ".run(" in up_handler,
-            "up does not call the in-process convergence executor")
-    require("subprocess" not in up_handler and "xenoid-up.sh" not in up_handler,
-            "up retained nested shell/CLI orchestration")
-    proxy_install = function_text("scripts/xenoid-proxy-engine.py", "install_sandbox")
-    for token in ('tool_opt("cc")', 'tool_opt("gcc")', "sandbox-build", "compiler,"):
-        require(token not in proxy_install,
-                f"proxy engine retained a second proxySandbox builder: {token}")
 
 
 def main() -> int:

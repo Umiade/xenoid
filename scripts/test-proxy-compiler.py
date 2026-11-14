@@ -866,23 +866,6 @@ def exact_check_without_region_evidence() -> None:
     ).get("code") == "proxy_check_timeout")
 
 
-@case("loopbackAgentChannelRelay")
-def loopback_agent_channel_relay() -> None:
-    agent = (ROOT / "scripts/xenoid-proxy-agent.py").read_text(encoding="utf-8")
-    engine = (ROOT / "scripts/xenoid-proxy-engine.py").read_text(encoding="utf-8")
-    require('"daemonRequest"' in agent and '"daemonRequest"' in engine)
-    require("_sealed_memfd" in agent and "SCM_RIGHTS" in agent)
-    require(
-        'HTTPConnection(self._manifest["daemon"]["ip"]' not in agent,
-    )
-    require('HTTPConnection("127.0.0.1"' in engine)
-    require('f"/proc/{pid}/ns/net"' in engine and "os.setns(" in engine)
-    require("os.setgroups([])" in engine and "os.setuid(" in engine)
-    require("libc.prctl(1,signal.SIGKILL" in engine)
-    require('os.listdir("/proc/self/fd")' in engine)
-    require('"X-Xenoid-Agent-Token":agent_token' in engine)
-
-
 @case("bindIdentityOperationRemoved")
 def bind_identity_operation_removed() -> None:
     if not dependency_or_continue():

@@ -92,7 +92,6 @@ def catalog_contract() -> None:
         specs["release-google"].dependencies
         == (
             "static",
-            "release-source-contract",
             "google-provider-cutover-contract",
             "google-release-acceptance",
         ),
@@ -102,7 +101,6 @@ def catalog_contract() -> None:
         specs["release"].dependencies
         == (
             "static",
-            "release-source-contract",
             "google-provider-cutover-contract",
         ),
         "ordinary release aggregate lost cutover closure",

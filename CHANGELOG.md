@@ -22,6 +22,14 @@ All notable changes to Xenoid are documented here. The format follows
 
 ### Fixed
 
+- Automation waits for task completion and propagates action/script failures.
+  The daemon no longer replays failed scripts through a regex fallback, bounds
+  execution to 30 seconds, and releases its WebView. Host execution authenticates
+  through secret stdin and rejects missing Node.js instead of reporting a plan
+  as execution. JSON responses preserve control characters and structured results.
+- Removed source-string, AST-wiring, documentation-wording, and duplicate
+  implementation checks from existing test scripts and gate registrations;
+  retained behavioral, protocol, artifact, persistence, and live checks.
 - macOS installation now supplies and registers Homebrew Buildx independently
   of Docker Desktop, validates plugin availability, and pins installer engine
   operations to Colima. Preflight distinguishes an unavailable binderfs probe

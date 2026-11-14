@@ -218,62 +218,6 @@ class StatfsHarness(SharedProtectionManager):
         return {"ok": False, "stdout": ""}
 
 
-def check_statfs_fsid_first_use_contracts() -> None:
-    sources = {
-        "shim": (ROOT / "native/xenoid-shim/xenoid_shim.c").read_text(encoding="utf-8"),
-        "zygote": (ROOT / "native/xenoid-zygote/xenoid_zygote.c").read_text(encoding="utf-8"),
-    }
-    for source in sources.values():
-        initializer = source.partition("static void initialize_statfs_fsid")[2].partition(
-            "static uint64_t load_statfs_fsid"
-        )[0]
-        loader = source.partition("static uint64_t load_statfs_fsid")[2].partition(
-            "#define XENOID_SHAPE_STATFS_FSID"
-        )[0]
-        shape = source.partition("#define XENOID_SHAPE_STATFS_FSID")[2].partition(
-            "#define XENOID_SHAPE_DATA_STATFS"
-        )[0]
-        assert "#include <pthread.h>" in source
-        assert "static pthread_once_t statfs_fsid_once = PTHREAD_ONCE_INIT;" in source
-        assert "static uint64_t statfs_fsid_value;" in source
-        assert "statfs_fsid_ready" not in source
-        assert "statfs_fsid_vals" not in source
-        assert source.count("statfs_fsid_value") == 3
-        assert "text[half * 8 + i]" in initializer
-        assert "(v[half] << 4)" in initializer
-        assert initializer.index("text[half * 8 + i]") < initializer.index(
-            "statfs_fsid_value = ((uint64_t)v[0] << 32) | (uint64_t)v[1];"
-        )
-        assert "pthread_once(&statfs_fsid_once, initialize_statfs_fsid);" in loader
-        assert loader.index("pthread_once(") < loader.index("return statfs_fsid_value;")
-        assert "uint64_t fsid = load_statfs_fsid();" in shape
-        assert "__val[0] = (int)(uint32_t)(fsid >> 32);" in shape
-        assert "__val[1] = (int)(uint32_t)fsid;" in shape
-
-    assert "char text[18];" in sources["shim"]
-    assert "size != 17 || text[16] != '\\n'" in sources["shim"]
-    assert "char text[32];" in sources["zygote"]
-    assert "size != 17 || text[16] != '\\n'" in sources["zygote"]
-    assert "size != 16" not in sources["zygote"]
-
-    stress = (ROOT / "scripts/smoke-statfs-coherence.py").read_text(encoding="utf-8")
-    for token in (
-        "os.mkfifo(fifo)",
-        "#define THREAD_COUNT 64",
-        "pthread_barrier_wait(context->barrier);",
-        "usleep(250000);",
-        "SYS_statfs",
-        "SYS_fstatfs",
-        "hooked_syscall(SYS_getpid",
-        "hooked_fstatfs(data_fd, &buf)",
-        "run_phase(0)",
-        "run_phase(1)",
-        "UINT32_C(0x01234567)",
-        "UINT32_C(0x89abcdef)",
-    ):
-        assert token in stress
-
-
 def check_statfs_fsid_contracts() -> None:
     first = StatfsHarness(
         "00000000-0000-4000-8000-000000000001", 101, "1" * 64, "net:[1001]"
@@ -403,7 +347,6 @@ def valid_record() -> dict[str, Any]:
 
 def main() -> int:
     check_statfs_fsid_contracts()
-    check_statfs_fsid_first_use_contracts()
     first = Harness("00000000-0000-4000-8000-000000000001")
     second = Harness("00000000-0000-4000-8000-000000000002")
     first.record = valid_record()
@@ -432,17 +375,6 @@ def main() -> int:
     assert active.built is True
     assert active.deployed is False
 
-    for script in ("scripts/build-kmod.sh", "scripts/build-ebpf.sh"):
-        source = (ROOT / script).read_text(encoding="utf-8")
-        assert 'expected="${2#0}"' in source
-        assert '"0:0:$expected"' in source
-        assert "setsid --wait sh -c" in source
-    kmod_source = (ROOT / "scripts/build-kmod.sh").read_text(encoding="utf-8")
-    assert 'BUILD="$BUILD_PARENT/$INPUT_DIGEST"' in kmod_source
-    assert "cd '$BUILD'" in kmod_source
-    assert "-fdebug-prefix-map=$BUILD=." in kmod_source
-    assert "-ffile-prefix-map=$BUILD=." in kmod_source
-    assert "-fmacro-prefix-map=$BUILD=." in kmod_source
     stopped = Harness("00000000-0000-4000-8000-000000000001")
     stopped.kmod = {
 

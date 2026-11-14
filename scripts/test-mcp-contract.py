@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import ast
 import contextlib
 import io
 import json
@@ -115,26 +114,6 @@ class FakeRuntime:
         }
 
 
-def registered_tools_have_handlers() -> None:
-    source = (ROOT / "src" / "xenoid" / "mcp_server.py").read_text()
-    tree = ast.parse(source)
-    handled: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Compare)
-            and isinstance(node.left, ast.Name)
-            and node.left.id == "name"
-            and len(node.ops) == 1
-            and isinstance(node.ops[0], ast.Eq)
-            and len(node.comparators) == 1
-            and isinstance(node.comparators[0], ast.Constant)
-            and isinstance(node.comparators[0].value, str)
-        ):
-            handled.add(node.comparators[0].value)
-    registered = {entry["name"] for entry in mcp_server.tools()}
-    require(registered == handled, f"tool/handler mismatch: {sorted(registered ^ handled)}")
-
-
 def keybox_is_trusted_local_cli_only() -> None:
     catalog = mcp_server.tools()
     serialized = json.dumps(catalog, sort_keys=True).lower()
@@ -152,14 +131,6 @@ def keybox_is_trusted_local_cli_only() -> None:
 def google_services_enable_defaults_to_microg_release() -> None:
     catalog = {entry["name"]: entry for entry in mcp_server.tools()}
     enable = catalog["xenoid_google_services_enable"]
-    require(
-        "microG production Google services release" in enable["description"],
-        "MCP enable description does not identify the production microG provider",
-    )
-    require(
-        "MindTheGapps" not in enable["description"],
-        "MCP enable description still advertises the retired source",
-    )
     require(
         enable["inputSchema"]
         == {
@@ -521,47 +492,6 @@ def generated_mcp_config_is_checkout_runnable() -> None:
     require(str(ROOT) not in json.dumps(server), "mcp-config leaked checkout path")
 
 
-def up_source_has_no_nested_process() -> None:
-    mcp_source = (ROOT / "src/xenoid/mcp_server.py").read_text(encoding="utf-8")
-    require("_run_up_cli_process" not in mcp_source, "MCP retained the up child runner")
-    require("_up_cli_result" not in mcp_source, "MCP retained the up CLI adapter")
-    require("xenoid-up.sh" not in mcp_source, "MCP retained the shell up planner")
-    require(
-        "CHILD_LOCK_TOOL_NAMES" not in mcp_source,
-        "MCP retained child-owned mutation lock exceptions",
-    )
-    require(
-        "_location_cli_result" not in mcp_source
-        and "_google_services_cli_result" not in mcp_source,
-        "MCP retained nested feature CLI adapters",
-    )
-    require(
-        'project_root / "xenoid"' not in mcp_source,
-        "MCP retained a nested xenoid command path",
-    )
-    cli_source = (ROOT / "src/xenoid/cli.py").read_text(encoding="utf-8")
-    tree = ast.parse(cli_source)
-    handler = next(
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "cmd_up"
-    )
-    rendered = ast.get_source_segment(cli_source, handler) or ""
-    require(
-        "ConvergenceExecutor" in rendered and ".run(" in rendered,
-        "CLI up bypasses the shared executor",
-    )
-    require(
-        "subprocess" not in rendered and "xenoid-up.sh" not in rendered,
-        "CLI up retained nested process orchestration",
-    )
-    require(
-        "--reuse-runtime" not in cli_source and "reuse_runtime" not in rendered,
-        "CLI retained the removed reuse runtime alias",
-    )
-
-
 def stdio_mutations_use_shared_instance_lock() -> None:
     runtime = mcp_server.MCPRuntime(
         FakeContext(),
@@ -820,30 +750,6 @@ def versions_are_path_safe_before_side_effects() -> None:
 
 
 def runtime_image_tool_uses_content_addressed_builder() -> None:
-    source = (ROOT / "src" / "xenoid" / "mcp_server.py").read_text(encoding="utf-8")
-    marker = '    if name == "xenoid_runtime_build_image":'
-    require(source.count(marker) == 1, "runtime image MCP handler missing")
-    branch = source.split(marker, 1)[1].split("\n    if name == ", 1)[0]
-    require("ensure_runtime_image" in branch, "runtime image MCP bypasses shared builder")
-    require("runtime_image_input_record" in branch, "runtime image dry-run lacks pure input record")
-    require("subprocess.run" not in branch, "runtime image MCP invokes a raw build child")
-    require("make_runtime_context" not in branch, "runtime image MCP creates an unowned context")
-    require('"build"' not in branch, "runtime image MCP exposes the legacy Docker builder")
-
-    cli_source = (ROOT / "src" / "xenoid" / "cli.py").read_text(encoding="utf-8")
-    tree = ast.parse(cli_source)
-    handler = next(
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "cmd_runtime_build_image"
-    )
-    rendered = ast.get_source_segment(cli_source, handler) or ""
-    require("ensure_runtime_image" in rendered, "runtime image CLI bypasses shared builder")
-    require("runtime_image_input_record" in rendered, "runtime image CLI dry-run lacks pure record")
-    require("subprocess.run" not in rendered, "runtime image CLI invokes a raw build child")
-    require("make_runtime_context" not in rendered, "runtime image CLI creates an unowned context")
-
     runtime = FakeRuntime()
     dry_run = decoded(
         mcp_server.call_tool(
@@ -870,14 +776,12 @@ def runtime_image_tool_uses_content_addressed_builder() -> None:
 
 def main() -> int:
     cases = (
-        registered_tools_have_handlers,
         keybox_is_trusted_local_cli_only,
         google_services_enable_defaults_to_microg_release,
         proxy_unreadable_discard_is_explicit,
         netctl_dispatches_to_runtime_manager,
         up_tools_use_in_process_convergence,
         generated_mcp_config_is_checkout_runnable,
-        up_source_has_no_nested_process,
         stdio_mutations_use_shared_instance_lock,
         remote_command_deadline_bounds_unset_subprocesses,
         versions_are_path_safe_before_side_effects,

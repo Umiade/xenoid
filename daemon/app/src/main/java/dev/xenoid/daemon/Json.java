@@ -3,9 +3,10 @@ package dev.xenoid.daemon;
 import java.util.*;
 
 final class Json {
-    static String quote(String s) { return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""; }
+    static String quote(String s) { return org.json.JSONObject.quote(s); }
     static String stringify(Object o) {
-        if (o == null) return "null";
+        if (o == null || o == org.json.JSONObject.NULL) return "null";
+        if (o instanceof org.json.JSONObject || o instanceof org.json.JSONArray) return o.toString();
         if (o instanceof Boolean || o instanceof Number) return String.valueOf(o);
         if (o instanceof Map) {
             StringBuilder b = new StringBuilder("{"); boolean first = true;

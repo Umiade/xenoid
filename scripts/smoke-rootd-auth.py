@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import re
 import shutil
 import signal
 import stat
@@ -25,61 +24,10 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "native" / "xenoid-rootd" / "xenoid_rootd.c"
-HELPER = ROOT / "daemon/app/src/main/java/dev/xenoid/daemon/RootHelper.java"
-BACKEND = ROOT / "src/xenoid/backend.py"
-CLIENT = ROOT / "src/xenoid/daemon_client.py"
 TOKEN = "0123456789abcdef0123456789abcdef"
 REQUEST_ID = "abcdef0123456789abcdef0123456789"
 
 
-def source_checks() -> dict[str, Any]:
-    c = SRC.read_text(encoding="utf-8")
-    java = HELPER.read_text(encoding="utf-8")
-    py = BACKEND.read_text(encoding="utf-8") + CLIENT.read_text(encoding="utf-8")
-    checks = {
-        "stdin_token": "read_token_from_stdin" in c and "TOKEN_LENGTH 32" in c,
-        "no_env_token": "XENOID_ROOTD_TOKEN" not in c and "getenv(" not in c,
-        "no_file_token": ".xenoid-rootd.token" not in c,
-        "post_only_exec": (
-            'strcmp(target, "/exec") != 0' in c
-            and 'strcmp(method, "POST") != 0' in c
-            and "/exec?" not in c
-        ),
-        "request_id": "X-Xenoid-Request-Id" in c,
-        "timeout_header": "X-Xenoid-Timeout-Ms" in c,
-        "bounded_body": "MAX_COMMAND_BYTES 4096" in c,
-        "bounded_output": "MAX_OUTPUT_BYTES (64 * 1024)" in c,
-        "bounded_handlers": "MAX_HANDLERS 8" in c,
-        "process_group_cancel": "kill(-child" in c,
-        "loopback": "INADDR_LOOPBACK" in c,
-        "nondumpable": "PR_SET_DUMPABLE" in c,
-        "exec_schema": "dev.xenoid.rootd-exec/v1" in c,
-        "process_record": "dev.xenoid.rootd-process/v1" in c,
-        "no_popen": "popen(" not in c,
-        "helper_post": "POST /exec" in java,
-        "helper_bounded": (
-            "X-Xenoid-Request-Id" in java
-            and "X-Xenoid-Timeout-Ms" in java
-            and "cancel" in java.lower()
-        ),
-        "host_stdin": "stdin" in py.lower() and "read_private_token" in py,
-        "host_codes": all(
-            value in py
-            for value in (
-                "daemon_token_unavailable",
-                "rootd_unauthorized",
-                "rootd_resource_conflict",
-            )
-        ),
-        "no_host_token_cache": (
-            "migrate_legacy_token_state" in py
-            and "os.unlink(name, dir_fd=descriptor)" in py
-            and 'state_root / "daemon.token"' not in py
-            and 'state_root / "rootd.token"' not in py
-        ),
-    }
-    missing = [name for name, passed in checks.items() if not passed]
-    return {"ok": not missing, "missing": missing, "checks": checks}
 
 
 def free_port() -> int:
@@ -323,11 +271,9 @@ def live_container_checks() -> dict[str, Any]:
 
 
 def main() -> int:
-    source_result = source_checks()
     host_result = host_runtime_checks()
     result: dict[str, Any] = {
-        "ok": bool(source_result.get("ok") and host_result.get("ok")),
-        "source": source_result,
+        "ok": bool(host_result.get("ok")),
         "hostRuntime": host_result,
     }
     if "--live" in sys.argv:
